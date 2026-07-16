@@ -152,8 +152,10 @@ let
   storeRegistration = pkgs.closureInfo { rootPaths = containerPaths; };
 
   entrypoint = pkgs.writeShellScript "agent-sandbox-entrypoint" ''
-    if [[ ! -f /nix/var/nix/db/db.sqlite ]]; then
-      nix-store --load-db < /nix/registration
+    if [[ "''${AGENT_SANDBOX_HOST_NIX:-}" != "1" ]]; then
+      if [[ ! -f /nix/var/nix/db/db.sqlite ]]; then
+        nix-store --load-db < /nix/registration
+      fi
     fi
 
     # Forward the host gpg-agent into the user's gnupg home so signed
@@ -382,6 +384,14 @@ let
   #                              containers on the host daemon. (The image also
   #                              ships a full nested-capable podman stack + config
   #                              under /etc/containers for privileged launches.)
+  #   --nix / --no-nix           mount the host /nix into the container. When the
+  #                              nix daemon socket exists (multi-user nix) the
+  #                              store is mounted read-only and builds are
+  #                              delegated to the host daemon. For single-user
+  #                              nix the store is mounted as an overlay (:O) so
+  #                              the container can read host packages and write
+  #                              new ones to an ephemeral upper layer — the host
+  #                              store is never modified.
   #
   # Examples:
   #   agent-sandbox                                       # opencode in CWD
@@ -421,13 +431,14 @@ let
     want_opencode=1
     want_podman=1
     want_devenv=1
+    want_nix=1
     want_workspace=1
 
     mounts=()
     env_args=()
     podman_args=()
     if [[ -f "$PWD/devenv.nix" ]]; then
-      cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--" "${pkgs.opencode}/bin/opencode" ".")
+      cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.opencode}/bin/opencode" ".")
     else
       cmd_args=("${pkgs.opencode}/bin/opencode" ".")
     fi
@@ -446,6 +457,8 @@ let
         --no-opencode)  want_opencode=0 ;;
         --devenv)       want_devenv=1 ;;
         --no-devenv)    want_devenv=0 ;;
+        --nix)          want_nix=1 ;;
+        --no-nix)       want_nix=0 ;;
         --podman)       want_podman=1 ;;
         --no-podman)    want_podman=0 ;;
         --workspace)    want_workspace=1 ;;
@@ -512,6 +525,18 @@ let
     if [[ "$want_devenv" == "1" ]]; then
       mkdir -p "$HOME/.local/share/devenv"
       mounts+=("-v" "$HOME/.local/share/devenv:/home/user/.local/share/devenv:rw")
+    fi
+
+    if [[ "$want_nix" == "1" ]]; then
+      daemon_socket=/nix/var/nix/daemon-socket/socket
+      if [[ -S "$daemon_socket" ]]; then
+        mounts+=("-v" "/nix/store:/nix/store:ro")
+        mounts+=("-v" "$daemon_socket:/nix/var/nix/daemon-socket/socket:rw")
+        env_args+=("-e" "NIX_REMOTE=daemon")
+      elif [[ -d /nix/store ]]; then
+        mounts+=("-v" "/nix:/nix:O")
+      fi
+      env_args+=("-e" "AGENT_SANDBOX_HOST_NIX=1")
     fi
 
     if [[ "$want_podman" == "1" ]]; then
