@@ -192,6 +192,10 @@ let
     # Refresh with: ssh-keyscan github.com gitlab.com bitbucket.org
     if [[ -S /agent.sock ]]; then
       mkdir -p ~/.ssh
+      chmod 700 ~/.ssh
+      if [[ -f ~/.ssh/known_hosts && ! -w ~/.ssh/known_hosts ]]; then
+        chmod 644 ~/.ssh/known_hosts 2>/dev/null || rm -f ~/.ssh/known_hosts
+      fi
       if ! grep -qs 'github.com' ~/.ssh/known_hosts 2>/dev/null; then
         cat >> ~/.ssh/known_hosts << 'KNOWN_HOSTS'
 github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
