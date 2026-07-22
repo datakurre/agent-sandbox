@@ -72,6 +72,7 @@ Every integration is **on by default**.  Disable with the matching `--no-*` flag
 | `--git` / `--no-git`             | on | mount `~/.gitconfig`, forward `user.name`/`user.email` |
 | `--gpg-agent` / `--no-gpg-agent` | on | forward host gpg-agent socket for commit signing       |
 | `--opencode` / `--no-opencode`   | on | mount opencode config, cache, and data dirs            |
+| `--antigravity` / `--no-antigravity` | off | mount antigravity-cli config, cache, and data dirs; use `agy` as default command |
 | `--devenv` / `--no-devenv`       | on | mount `~/.local/share/devenv` across sessions          |
 | `--podman` / `--no-podman`       | on | forward host rootless podman socket (sibling containers) |
 
@@ -84,6 +85,7 @@ the source are resolved against `$PWD`; relative destinations are prefixed with
 ```sh
 agent-sandbox                                    # opencode, everything on
 agent-sandbox --no-podman --no-ssh                # drop two integrations
+agent-sandbox --antigravity                       # antigravity-cli (agy), everything on
 agent-sandbox --no-workspace                      # no CWD mount
 agent-sandbox -- bash                              # interactive bash with all integrations
 agent-sandbox -- devenv shell                      # devenv shell with opencode config mounted
@@ -94,7 +96,7 @@ agent-sandbox -- --privileged                      # nested podman inside contai
 
 | Category      | Tools                                                |
 | ------------- | ---------------------------------------------------- |
-| AI coding     | opencode                                             |
+| AI coding     | opencode, antigravity-cli (agy)                       |
 | Shell / tools | bash, coreutils, ripgrep, fd, jq, curl, wget, …     |
 | Languages     | python3, uv, nodejs, gnumake, gcc libs               |
 | Git / GitHub  | git, gh                                              |

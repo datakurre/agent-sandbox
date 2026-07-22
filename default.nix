@@ -72,6 +72,7 @@ let
       gh
       nodejs
       opencode
+      google-antigravity-cli
       stdenv.cc.cc.lib
       zlib
       glibcLocales
@@ -402,6 +403,9 @@ KNOWN_HOSTS
   #   --gpg-sign / --no-gpg-sign enable/disable git commit signing (default: on,
   #                              disabled via env override when off)
   #   --opencode / --no-opencode mount opencode config/share/cache dirs
+  #   --antigravity / --no-antigravity
+  #                              mount antigravity-cli config/share/cache dirs
+  #                              and use agy as the default command
   #   --devenv / --no-devenv     mount ~/.local/share/devenv (persisted
   #                              devenv state)
   #   --podman / --no-podman     forward the host rootless podman socket so the
@@ -420,6 +424,7 @@ KNOWN_HOSTS
   #
   # Examples:
   #   agent-sandbox                                       # opencode in CWD
+  #   agent-sandbox --antigravity                         # antigravity-cli (agy) in CWD
   #   agent-sandbox -- bash                               # bash shell instead
   #   agent-sandbox --no-podman --no-ssh                   # selective opt-out
   #   agent-sandbox --no-gpg-sign                         # disable commit signing
@@ -454,6 +459,7 @@ KNOWN_HOSTS
     want_gpg=1
     want_gpg_sign=1
     want_opencode=1
+    want_antigravity=0
     want_podman=1
     want_devenv=1
     want_nix=1
@@ -462,11 +468,7 @@ KNOWN_HOSTS
     mounts=()
     env_args=()
     podman_args=()
-    if [[ -f "$PWD/devenv.nix" ]]; then
-      cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.opencode}/bin/opencode" ".")
-    else
-      cmd_args=("${pkgs.opencode}/bin/opencode" ".")
-    fi
+    cmd_args=()
 
     while [[ $# -gt 0 ]]; do
       case "$1" in
@@ -480,6 +482,8 @@ KNOWN_HOSTS
         --no-gpg-sign)  want_gpg_sign=0 ;;
         --opencode)     want_opencode=1 ;;
         --no-opencode)  want_opencode=0 ;;
+        --antigravity)  want_antigravity=1 ;;
+        --no-antigravity) want_antigravity=0 ;;
         --devenv)       want_devenv=1 ;;
         --no-devenv)    want_devenv=0 ;;
         --nix)          want_nix=1 ;;
@@ -495,6 +499,18 @@ KNOWN_HOSTS
       esac
       shift
     done
+
+    if [[ "$want_antigravity" == "1" ]]; then
+      if [[ -f "$PWD/devenv.nix" ]]; then
+        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.google-antigravity-cli}/bin/agy" ".")
+      else
+        cmd_args=("${pkgs.google-antigravity-cli}/bin/agy" ".")
+      fi
+    elif [[ -f "$PWD/devenv.nix" ]]; then
+      cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.opencode}/bin/opencode" ".")
+    else
+      cmd_args=("${pkgs.opencode}/bin/opencode" ".")
+    fi
 
     # Everything after -- overrides the container command (default: opencode).
     if [[ $# -gt 0 ]]; then
@@ -555,6 +571,14 @@ KNOWN_HOSTS
       mounts+=("-v" "$HOME/.local/share/opencode:/home/user/.local/share/opencode:rw")
       mounts+=("-v" "$HOME/.config/opencode:/home/user/.config/opencode:rw")
       mounts+=("-v" "$HOME/.cache/opencode:/home/user/.cache/opencode:rw")
+    fi
+
+    if [[ "$want_antigravity" == "1" ]]; then
+      mkdir -p "$HOME/.local/share/antigravity-cli" "$HOME/.config/antigravity-cli" "$HOME/.cache/antigravity-cli" "$HOME/.gemini"
+      mounts+=("-v" "$HOME/.local/share/antigravity-cli:/home/user/.local/share/antigravity-cli:rw")
+      mounts+=("-v" "$HOME/.config/antigravity-cli:/home/user/.config/antigravity-cli:rw")
+      mounts+=("-v" "$HOME/.cache/antigravity-cli:/home/user/.cache/antigravity-cli:rw")
+      mounts+=("-v" "$HOME/.gemini:/home/user/.gemini:rw")
     fi
 
     if [[ "$want_devenv" == "1" ]]; then

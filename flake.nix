@@ -2,9 +2,13 @@
   description = "Sandboxed AI coding environment via podman";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  inputs.antigravity-nix = {
+    url = "github:jacopone/antigravity-nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { self, nixpkgs, ... }:
+    { self, nixpkgs, antigravity-nix, ... }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -19,7 +23,11 @@
             name = system;
             value = {
               default = import ./default.nix {
-                pkgs = nixpkgs.legacyPackages.${system};
+                pkgs = import nixpkgs {
+                  inherit system;
+                  config.allowUnfree = true;
+                  overlays = [ antigravity-nix.overlays.default ];
+                };
                 inherit lib;
               };
             };
