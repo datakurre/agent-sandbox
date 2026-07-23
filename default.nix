@@ -139,7 +139,6 @@ let
   # All paths baked into the image root, shared between copyToRoot and
   # closureInfo so they stay in sync.
   containerPaths = baseTools ++ [
-    pkgs.dockerTools.fakeNss
     pkgs.cacert
     nixConf
     containersConf
