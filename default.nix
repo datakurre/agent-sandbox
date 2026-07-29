@@ -72,6 +72,7 @@ let
       gh
       nodejs
       opencode
+      claude-code
       google-antigravity-cli
       stdenv.cc.cc.lib
       zlib
@@ -402,6 +403,9 @@ KNOWN_HOSTS
   #   --gpg-sign / --no-gpg-sign enable/disable git commit signing (default: on,
   #                              disabled via env override when off)
   #   --opencode / --no-opencode mount opencode config/share/cache dirs
+  #   --claude-code / --no-claude-code
+  #                              mount claude configuration files and use
+  #                              claude as the default command
   #   --antigravity / --no-antigravity
   #                              mount antigravity-cli config/share/cache dirs
   #                              and use agy as the default command
@@ -458,6 +462,7 @@ KNOWN_HOSTS
     want_gpg=1
     want_gpg_sign=1
     want_opencode=1
+    want_claude_code=0
     want_antigravity=0
     want_podman=1
     want_devenv=1
@@ -481,6 +486,8 @@ KNOWN_HOSTS
         --no-gpg-sign)  want_gpg_sign=0 ;;
         --opencode)     want_opencode=1 ;;
         --no-opencode)  want_opencode=0 ;;
+        --claude-code)  want_claude_code=1 ;;
+        --no-claude-code) want_claude_code=0 ;;
         --antigravity)  want_antigravity=1 ;;
         --no-antigravity) want_antigravity=0 ;;
         --devenv)       want_devenv=1 ;;
@@ -504,6 +511,12 @@ KNOWN_HOSTS
         cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.google-antigravity-cli}/bin/agy" ".")
       else
         cmd_args=("${pkgs.google-antigravity-cli}/bin/agy" ".")
+      fi
+    elif [[ "$want_claude_code" == "1" ]]; then
+      if [[ -f "$PWD/devenv.nix" ]]; then
+        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.claude-code}/bin/claude")
+      else
+        cmd_args=("${pkgs.claude-code}/bin/claude")
       fi
     elif [[ -f "$PWD/devenv.nix" ]]; then
       cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.opencode}/bin/opencode" ".")
@@ -570,6 +583,13 @@ KNOWN_HOSTS
       mounts+=("-v" "$HOME/.local/share/opencode:/home/user/.local/share/opencode:rw")
       mounts+=("-v" "$HOME/.config/opencode:/home/user/.config/opencode:rw")
       mounts+=("-v" "$HOME/.cache/opencode:/home/user/.cache/opencode:rw")
+    fi
+
+    if [[ "$want_claude_code" == "1" ]]; then
+      mkdir -p "$HOME/.claude"
+      touch "$HOME/.claude.json"
+      mounts+=("-v" "$HOME/.claude:/home/user/.claude:rw")
+      mounts+=("-v" "$HOME/.claude.json:/home/user/.claude.json:rw")
     fi
 
     if [[ "$want_antigravity" == "1" ]]; then
