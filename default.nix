@@ -1,4 +1,10 @@
-{ pkgs, lib }:
+{
+  pkgs,
+  lib,
+  agents ? import ./agents.nix { inherit pkgs; },
+  defaultAgent ? "opencode",
+  defaultArgs ? [ ],
+}:
 
 let
   # Full rootless podman stack (c.f. devenv-module-devcontainer/tweaks/podman.nix):
@@ -71,16 +77,52 @@ let
       git
       gh
       nodejs
-      opencode
-      claude-code
-      google-antigravity-cli
-      github-copilot-cli
       stdenv.cc.cc.lib
       zlib
       glibcLocales
     ]
     ++ podmanStack
     ++ [ dockerAlias ];
+
+  tools = baseTools ++ map (a: a.package) agents;
+
+  unknownAgent = throw "agent-sandbox: unknown defaultAgent '${defaultAgent}'";
+  defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
+
+  # Every agent contributes a toggle, a --<name>/--no-<name> pair, a command
+  # and its state mounts to the launcher below.  Nix strips indentation from
+  # literal lines but not from spliced ones, so each fragment carries the
+  # indentation of its splice point.
+  block = indent: lib.concatStringsSep "\n${indent}";
+  toggle = a: "want_${lib.replaceStrings [ "-" ] [ "_" ] a.name}";
+
+  agentToggles = map (a: "${toggle a}=${if a.name == defaultAgent then "1" else "0"}") agents;
+
+  agentFlags = lib.concatMap (a: [
+    "--${a.name}) ${toggle a}=1; agent=${a.name} ;;"
+    "--no-${a.name}) ${toggle a}=0 ;;"
+  ]) agents;
+
+  agentCommands = map (a: "${a.name}) cmd=(${lib.escapeShellArgs a.command}) ;;") agents;
+
+  agentMounts = lib.concatMap (
+    a:
+    let
+      dirs = a.state or [ ];
+      files = a.stateFiles or [ ];
+      mount = p: "  mounts+=(\"-v\" \"$HOME/${p}:/home/user/${p}:$rw_mount_opts\")";
+    in
+    lib.optionals (dirs ++ files != [ ]) (
+      [ "if [[ \"\$${toggle a}\" == \"1\" ]]; then" ]
+      ++ lib.optional (dirs != [ ]) "  mkdir -p ${lib.concatMapStringsSep " " (d: "\"$HOME/${d}\"") dirs}"
+      ++ map (f: "  [[ -s \"$HOME/${f}\" ]] || echo '{}' > \"$HOME/${f}\"") files
+      ++ map mount (dirs ++ files)
+      ++ [
+        "fi"
+        ""
+      ]
+    )
+  ) agents;
 
   nixConf = pkgs.writeTextFile {
     name = "nix-conf";
@@ -140,7 +182,7 @@ let
 
   # All paths baked into the image root, shared between copyToRoot and
   # closureInfo so they stay in sync.
-  containerPaths = baseTools ++ [
+  containerPaths = tools ++ [
     pkgs.cacert
     nixConf
     containersConf
@@ -262,9 +304,9 @@ KNOWN_HOSTS
     config = {
       WorkingDir = "/workspace";
       Entrypoint = [ "${entrypoint}" ];
-      Cmd = [ "${pkgs.opencode}/bin/opencode" ];
+      Cmd = defaultAgentDef.command;
       Env = [
-        "PATH=${lib.makeBinPath baseTools}"
+        "PATH=${lib.makeBinPath tools}"
         "LD_LIBRARY_PATH=${
           lib.makeLibraryPath [
             pkgs.stdenv.cc.cc.lib
@@ -285,6 +327,20 @@ KNOWN_HOSTS
       ];
     };
   };
+
+  # The launcher bind-mounts the host's /nix/store over the image's own, so
+  # every path baked into the image must also exist on the host.  Nothing
+  # references them -- the image is a tarball nix cannot scan -- so
+  # `nix-collect-garbage -d` reaps them and the next start dies in crun with
+  # "Read-only file system".  Listing them here roots them in this package's
+  # closure.  Every output, because buildEnv installs more than the default one
+  # (`man` for most, `xxd` for vim); the entrypoint, because only the image
+  # config refers to it.
+  imageStorePaths = pkgs.writeTextDir "share/agent-sandbox/image-store-paths" (
+    lib.concatMapStringsSep "\n" toString (
+      lib.concatMap (p: map (o: p.${o}) (p.outputs or [ "out" ])) containerPaths ++ [ entrypoint ]
+    )
+  );
 
   loadScript = pkgs.writeShellScriptBin "agent-sandbox-load" ''
     set -euo pipefail
@@ -403,16 +459,8 @@ KNOWN_HOSTS
   #                              gpg keys are usable for signing inside
   #   --gpg-sign / --no-gpg-sign enable/disable git commit signing (default: on,
   #                              disabled via env override when off)
-  #   --opencode / --no-opencode mount opencode config/share/cache dirs
-  #   --claude-code / --no-claude-code
-  #                              mount claude configuration files and use
-  #                              claude as the default command
-  #   --copilot / --no-copilot
-  #                              mount github-copilot-cli configuration files
-  #                              and use copilot as the default command
-  #   --antigravity / --no-antigravity
-  #                              mount antigravity-cli config/share/cache dirs
-  #                              and use agy as the default command
+  #   --<agent> / --no-<agent>   launch that agent and persist its login state
+  #                              (see agents.nix for the list)
   #   --devenv / --no-devenv     mount ~/.local/share/devenv (persisted
   #                              devenv state)
   #   --podman / --no-podman     forward the host rootless podman socket so the
@@ -448,7 +496,7 @@ KNOWN_HOSTS
     if ! ${pkgs.podman}/bin/podman image exists localhost/agent-sandbox:latest 2>/dev/null; then
       echo "agent-sandbox image not found. Run 'agent-sandbox-load' first." >&2
       exit 1
-    fi
+    fi${lib.optionalString (defaultArgs != [ ]) "\n\nset -- ${lib.escapeShellArgs defaultArgs} \"$@\""}
 
     # Expand relative paths in -v specs
     expand_v() {
@@ -469,10 +517,7 @@ KNOWN_HOSTS
     want_git=1
     want_gpg=1
     want_gpg_sign=1
-    want_opencode=1
-    want_claude_code=0
-    want_copilot=0
-    want_antigravity=0
+    ${block "" agentToggles}
     want_podman=1
     want_devenv=1
     want_nix=1
@@ -482,7 +527,7 @@ KNOWN_HOSTS
     mounts=()
     env_args=()
     podman_args=()
-    cmd_args=()
+    agent=${defaultAgent}
 
     while [[ $# -gt 0 ]]; do
       case "$1" in
@@ -494,14 +539,7 @@ KNOWN_HOSTS
         --no-gpg-agent) want_gpg=0 ;;
         --gpg-sign)     want_gpg_sign=1 ;;
         --no-gpg-sign)  want_gpg_sign=0 ;;
-        --opencode)     want_opencode=1 ;;
-        --no-opencode)  want_opencode=0 ;;
-        --claude-code)  want_claude_code=1 ;;
-        --no-claude-code) want_claude_code=0 ;;
-        --copilot)      want_copilot=1 ;;
-        --no-copilot)   want_copilot=0 ;;
-        --antigravity)  want_antigravity=1 ;;
-        --no-antigravity) want_antigravity=0 ;;
+        ${block "    " agentFlags}
         --devenv)       want_devenv=1 ;;
         --no-devenv)    want_devenv=0 ;;
         --nix)          want_nix=1 ;;
@@ -520,31 +558,17 @@ KNOWN_HOSTS
       shift
     done
 
-    if [[ "$want_antigravity" == "1" ]]; then
-      if [[ -f "$PWD/devenv.nix" ]]; then
-        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.google-antigravity-cli}/bin/agy" ".")
-      else
-        cmd_args=("${pkgs.google-antigravity-cli}/bin/agy" ".")
-      fi
-    elif [[ "$want_copilot" == "1" ]]; then
-      if [[ -f "$PWD/devenv.nix" ]]; then
-        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.github-copilot-cli}/bin/copilot")
-      else
-        cmd_args=("${pkgs.github-copilot-cli}/bin/copilot")
-      fi
-    elif [[ "$want_claude_code" == "1" ]]; then
-      if [[ -f "$PWD/devenv.nix" ]]; then
-        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.claude-code}/bin/claude")
-      else
-        cmd_args=("${pkgs.claude-code}/bin/claude")
-      fi
-    elif [[ -f "$PWD/devenv.nix" ]]; then
-      cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.opencode}/bin/opencode" ".")
+    case "$agent" in
+      ${block "  " agentCommands}
+    esac
+
+    if [[ -f "$PWD/devenv.nix" ]]; then
+      cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "''${cmd[@]}")
     else
-      cmd_args=("${pkgs.opencode}/bin/opencode" ".")
+      cmd_args=("''${cmd[@]}")
     fi
 
-    # Everything after -- overrides the container command (default: opencode).
+    # Everything after -- overrides the container command.
     if [[ $# -gt 0 ]]; then
       cmd_args=("$@")
     fi
@@ -603,33 +627,7 @@ KNOWN_HOSTS
       env_args+=("-e" "GIT_CONFIG_VALUE_0=false")
     fi
 
-    if [[ "$want_opencode" == "1" ]]; then
-      mkdir -p "$HOME/.local/share/opencode" "$HOME/.config/opencode" "$HOME/.cache/opencode"
-      mounts+=("-v" "$HOME/.local/share/opencode:/home/user/.local/share/opencode:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.config/opencode:/home/user/.config/opencode:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.cache/opencode:/home/user/.cache/opencode:$rw_mount_opts")
-    fi
-
-    if [[ "$want_claude_code" == "1" ]]; then
-      mkdir -p "$HOME/.claude"
-      touch "$HOME/.claude.json"
-      mounts+=("-v" "$HOME/.claude:/home/user/.claude:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.claude.json:/home/user/.claude.json:$rw_mount_opts")
-    fi
-
-    if [[ "$want_copilot" == "1" ]]; then
-      mkdir -p "$HOME/.copilot"
-      mounts+=("-v" "$HOME/.copilot:/home/user/.copilot:$rw_mount_opts")
-    fi
-
-    if [[ "$want_antigravity" == "1" ]]; then
-      mkdir -p "$HOME/.local/share/antigravity-cli" "$HOME/.config/antigravity-cli" "$HOME/.cache/antigravity-cli" "$HOME/.gemini"
-      mounts+=("-v" "$HOME/.local/share/antigravity-cli:/home/user/.local/share/antigravity-cli:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.config/antigravity-cli:/home/user/.config/antigravity-cli:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.cache/antigravity-cli:/home/user/.cache/antigravity-cli:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.gemini:/home/user/.gemini:$rw_mount_opts")
-    fi
-
+    ${block "" agentMounts}
     if [[ "$want_devenv" == "1" ]]; then
       mkdir -p "$HOME/.local/share/devenv"
       mounts+=("-v" "$HOME/.local/share/devenv:/home/user/.local/share/devenv:$rw_mount_opts")
@@ -694,7 +692,9 @@ pkgs.symlinkJoin {
     launcher
     loadScript
     purgeScript
+    imageStorePaths
   ];
+  passthru = { inherit agents; };
   meta = {
     description = "Sandboxed AI coding environment via podman";
     mainProgram = "agent-sandbox";

@@ -22,7 +22,8 @@
           (system: {
             name = system;
             value = {
-              default = import ./default.nix {
+              # makeOverridable so downstream can `.override { defaultAgent = …; }`
+              default = lib.makeOverridable (import ./default.nix) {
                 pkgs = import nixpkgs {
                   inherit system;
                   config.allowUnfree = true;
