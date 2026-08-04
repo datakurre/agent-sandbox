@@ -74,6 +74,7 @@ let
       opencode
       claude-code
       google-antigravity-cli
+      github-copilot-cli
       stdenv.cc.cc.lib
       zlib
       glibcLocales
@@ -406,6 +407,9 @@ KNOWN_HOSTS
   #   --claude-code / --no-claude-code
   #                              mount claude configuration files and use
   #                              claude as the default command
+  #   --copilot / --no-copilot
+  #                              mount github-copilot-cli configuration files
+  #                              and use copilot as the default command
   #   --antigravity / --no-antigravity
   #                              mount antigravity-cli config/share/cache dirs
   #                              and use agy as the default command
@@ -429,6 +433,7 @@ KNOWN_HOSTS
   #
   # Examples:
   #   agent-sandbox                                       # opencode in CWD
+  #   agent-sandbox --copilot                             # github-copilot-cli (copilot) in CWD
   #   agent-sandbox --antigravity                         # antigravity-cli (agy) in CWD
   #   agent-sandbox -- bash                               # bash shell instead
   #   agent-sandbox --selinux                             # enable :z relabel on built-in writable binds
@@ -466,6 +471,7 @@ KNOWN_HOSTS
     want_gpg_sign=1
     want_opencode=1
     want_claude_code=0
+    want_copilot=0
     want_antigravity=0
     want_podman=1
     want_devenv=1
@@ -492,6 +498,8 @@ KNOWN_HOSTS
         --no-opencode)  want_opencode=0 ;;
         --claude-code)  want_claude_code=1 ;;
         --no-claude-code) want_claude_code=0 ;;
+        --copilot)      want_copilot=1 ;;
+        --no-copilot)   want_copilot=0 ;;
         --antigravity)  want_antigravity=1 ;;
         --no-antigravity) want_antigravity=0 ;;
         --devenv)       want_devenv=1 ;;
@@ -517,6 +525,12 @@ KNOWN_HOSTS
         cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.google-antigravity-cli}/bin/agy" ".")
       else
         cmd_args=("${pkgs.google-antigravity-cli}/bin/agy" ".")
+      fi
+    elif [[ "$want_copilot" == "1" ]]; then
+      if [[ -f "$PWD/devenv.nix" ]]; then
+        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.github-copilot-cli}/bin/copilot")
+      else
+        cmd_args=("${pkgs.github-copilot-cli}/bin/copilot")
       fi
     elif [[ "$want_claude_code" == "1" ]]; then
       if [[ -f "$PWD/devenv.nix" ]]; then
@@ -601,6 +615,11 @@ KNOWN_HOSTS
       touch "$HOME/.claude.json"
       mounts+=("-v" "$HOME/.claude:/home/user/.claude:$rw_mount_opts")
       mounts+=("-v" "$HOME/.claude.json:/home/user/.claude.json:$rw_mount_opts")
+    fi
+
+    if [[ "$want_copilot" == "1" ]]; then
+      mkdir -p "$HOME/.copilot"
+      mounts+=("-v" "$HOME/.copilot:/home/user/.copilot:$rw_mount_opts")
     fi
 
     if [[ "$want_antigravity" == "1" ]]; then

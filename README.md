@@ -73,6 +73,7 @@ Every integration is **on by default**.  Disable with the matching `--no-*` flag
 | `--git` / `--no-git`             | on | mount `~/.gitconfig`, forward `user.name`/`user.email` |
 | `--gpg-agent` / `--no-gpg-agent` | on | forward host gpg-agent socket for commit signing       |
 | `--opencode` / `--no-opencode`   | on | mount opencode config, cache, and data dirs            |
+| `--copilot` / `--no-copilot`     | off | mount github-copilot-cli config dir; use `copilot` as default command |
 | `--antigravity` / `--no-antigravity` | off | mount antigravity-cli config, cache, and data dirs; use `agy` as default command |
 | `--devenv` / `--no-devenv`       | on | mount `~/.local/share/devenv` across sessions          |
 | `--podman` / `--no-podman`       | on | forward host rootless podman socket (sibling containers) |
@@ -91,6 +92,7 @@ preserved exactly as supplied.
 ```sh
 agent-sandbox                                    # opencode, everything on
 agent-sandbox --no-podman --no-ssh                # drop two integrations
+agent-sandbox --copilot                           # github-copilot-cli (copilot), everything on
 agent-sandbox --antigravity                       # antigravity-cli (agy), everything on
 agent-sandbox --no-workspace                      # no CWD mount
 agent-sandbox --selinux                           # enable :z on built-in writable binds
@@ -103,7 +105,7 @@ agent-sandbox -- --privileged                      # nested podman inside contai
 
 | Category      | Tools                                                |
 | ------------- | ---------------------------------------------------- |
-| AI coding     | opencode, antigravity-cli (agy)                       |
+| AI coding     | opencode, github-copilot-cli (copilot), antigravity-cli (agy) |
 | Shell / tools | bash, coreutils, ripgrep, fd, jq, curl, wget, …     |
 | Languages     | python3, uv, nodejs, gnumake, gcc libs               |
 | Git / GitHub  | git, gh                                              |
