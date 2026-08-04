@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# agent-sandbox launcher.  Wraps `podman run` with the host integrations the
+# sandboxed agent needs, and nothing else.
+#
+# The Nix wrapper prepends definitions for AGENT_SANDBOX_IMAGE and
+# AGENT_SANDBOX_NETWORK, and puts podman, git, and the agent-sandbox-* helpers
+# on PATH.  Commands *inside* the container are named bare (opencode, claude,
+# …) and resolve through the image's own PATH.
+
+usage() {
+  cat <<'USAGE'
+agent-sandbox [FLAGS] [-- PODMAN_ARGS...] [-- COMMAND...]
+
+Runs an AI coding agent inside a rootless podman container with the current
+directory mounted at /workspace/<dirname>.
+
+  agent-sandbox                      opencode, default integrations
+  agent-sandbox --claude-code        claude instead of opencode
+  agent-sandbox -- bash              run bash instead of the agent
+  agent-sandbox -- --privileged      pass --privileged to podman run
+  agent-sandbox -- --privileged -- bash
+
+Agent (pick one; default opencode):
+  --opencode        --claude-code        --copilot        --antigravity
+
+Integrations (--no-X disables):
+  --workspace       mount $PWD at /workspace/<dirname>            [on]
+  --ssh             forward SSH_AUTH_SOCK                         [on]
+  --git             mount git config, forward identity            [on]
+  --gpg-agent       forward host gpg-agent for commit signing     [on]
+  --gpg-sign        allow git commit signing                      [on]
+  --gnupg-private   expose ~/.gnupg even if it holds on-disk keys [off]
+  --devenv          persist ~/.local/share/devenv                 [on]
+  --nix             mount the host /nix                           [on]
+  --podman          forward the host podman socket (see below)    [off]
+  --selinux         add :z to built-in writable binds             [off]
+
+Ports:
+  --port [HOST:]CONTAINER[/PROTO]    publish a port, repeatable
+  --ports / --no-ports               honour [ports] in ./AGENTS.md     [on]
+  --ports-dynamic                    allow `agent-sandbox-port add` later
+  --ports-any-interface              permit binds outside loopback
+
+Mounts:
+  -v SOURCE[:DEST[:OPTS]]   relative SOURCE resolves against $PWD; relative
+                            DEST is placed under /workspace; "." means
+                            /workspace itself
+
+--podman, --ssh and --gpg-agent each hand the agent a capability that reaches
+outside the sandbox.  --podman is the widest (a forwarded podman socket is
+equivalent to host access) which is why it is off by default.  See the trust
+model section in the README.
+USAGE
+}
+
+if ! podman image exists "$AGENT_SANDBOX_IMAGE" 2>/dev/null; then
+  echo "agent-sandbox: image $AGENT_SANDBOX_IMAGE not found. Run 'agent-sandbox-load' first." >&2
+  exit 1
+fi
+
+# ── Defaults ────────────────────────────────────────────────────────────────
+# On by default: things the agent needs to be useful in a normal git workflow.
+# Off by default: things that widen the sandbox boundary (podman socket,
+# on-disk gpg secrets) or that only some hosts want (selinux relabelling).
+want_ssh=1
+want_git=1
+want_gpg=1
+want_gpg_sign=1
+want_gnupg_private=0
+want_devenv=1
+want_nix=1
+want_podman=0
+want_workspace=1
+want_selinux=0
+want_ports=1
+want_ports_dynamic=0
+want_ports_any_interface=0
+
+agent=opencode
+
+mounts=()
+env_args=()
+podman_args=()
+cmd_args=()
+port_specs=()
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+# Expand a -v spec.  Relative sources resolve against $PWD; relative
+# destinations land under /workspace.  A spec with no destination mounts at
+# the same path it came from, rather than emitting a trailing colon.
+expand_v() {
+  local spec="$1" src dest opts
+  IFS=':' read -r src dest opts <<< "$spec"
+  src="${src/#\~/$HOME}"
+  [[ "$src" == "." ]] && src="$PWD"
+  [[ "$src" != /* ]] && src="$PWD/$src"
+  if [[ -z "$dest" ]]; then
+    dest="$src"
+  elif [[ "$dest" != /* ]]; then
+    [[ "$dest" == "." ]] && dest="/workspace" || dest="/workspace/$dest"
+  fi
+  printf '%s\n' "$src:$dest${opts:+:$opts}"
+}
+
+# Bind a host path read-write, creating it first.  Used for every persistent
+# tool-state directory, which is why they all pick up $rw_mount_opts together.
+mount_rw() {
+  local host="$1" container="$2"
+  mkdir -p "$host"
+  mounts+=("-v" "$host:$container:$rw_mount_opts")
+}
+
+# Validate a --port spec and normalise it to bind:host:container/proto.
+parse_port_spec() {
+  local spec="$1" host container proto=tcp
+  if [[ "$spec" == */* ]]; then
+    proto="${spec##*/}"
+    spec="${spec%/*}"
+  fi
+  if [[ "$spec" == *:* ]]; then
+    host="${spec%%:*}"
+    container="${spec##*:}"
+  else
+    host="$spec"
+    container="$spec"
+  fi
+  if [[ ! "$host" =~ ^[0-9]+$ || ! "$container" =~ ^[0-9]+$ ]]; then
+    echo "agent-sandbox: --port '$1': expected [HOST:]CONTAINER[/PROTO]" >&2
+    exit 1
+  fi
+  if (( host < 1 || host > 65535 || container < 1 || container > 65535 )); then
+    echo "agent-sandbox: --port '$1': ports must be within 1-65535" >&2
+    exit 1
+  fi
+  if [[ "$proto" != tcp && "$proto" != udp ]]; then
+    echo "agent-sandbox: --port '$1': protocol must be tcp or udp" >&2
+    exit 1
+  fi
+  printf '%s\n' "$bind_address:$host:$container/$proto"
+}
+
+# ── Flag parsing ────────────────────────────────────────────────────────────
+# Phase 1 (here): agent-sandbox flags.  The first -- ends it.
+# Phase 2: podman run arguments.  A second -- ends those.
+# Phase 3: the command to run inside the container.
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)      usage; exit 0 ;;
+
+    --opencode)     agent=opencode ;;
+    --claude-code)  agent=claude-code ;;
+    --copilot)      agent=copilot ;;
+    --antigravity)  agent=antigravity ;;
+    # --no-<agent> only means anything for the agent that is currently
+    # selected; it reverts to the default rather than leaving none.
+    --no-opencode|--no-claude-code|--no-copilot|--no-antigravity)
+      [[ "$agent" == "${1#--no-}" ]] && agent=opencode ;;
+
+    --ssh)          want_ssh=1 ;;
+    --no-ssh)       want_ssh=0 ;;
+    --git)          want_git=1 ;;
+    --no-git)       want_git=0 ;;
+    --gpg-agent)    want_gpg=1 ;;
+    --no-gpg-agent) want_gpg=0 ;;
+    --gpg-sign)     want_gpg_sign=1 ;;
+    --no-gpg-sign)  want_gpg_sign=0 ;;
+    --gnupg-private)    want_gnupg_private=1 ;;
+    --no-gnupg-private) want_gnupg_private=0 ;;
+    --devenv)       want_devenv=1 ;;
+    --no-devenv)    want_devenv=0 ;;
+    --nix)          want_nix=1 ;;
+    --no-nix)       want_nix=0 ;;
+    --podman)       want_podman=1 ;;
+    --no-podman)    want_podman=0 ;;
+    --workspace)    want_workspace=1 ;;
+    --no-workspace) want_workspace=0 ;;
+    --selinux)      want_selinux=1 ;;
+    --no-selinux)   want_selinux=0 ;;
+
+    --ports)        want_ports=1 ;;
+    --no-ports)     want_ports=0 ;;
+    --ports-dynamic)    want_ports_dynamic=1 ;;
+    --no-ports-dynamic) want_ports_dynamic=0 ;;
+    --ports-any-interface) want_ports_any_interface=1 ;;
+    --port)
+      shift
+      [[ $# -gt 0 ]] || { echo "agent-sandbox: --port needs an argument" >&2; exit 1; }
+      port_specs+=("$1")
+      ;;
+    --port=*)       port_specs+=("${1#--port=}") ;;
+
+    -v)
+      shift
+      [[ $# -gt 0 ]] || { echo "agent-sandbox: -v needs an argument" >&2; exit 1; }
+      mounts+=("-v" "$(expand_v "$1")")
+      ;;
+    -v*) mounts+=("-v" "$(expand_v "${1#-v}")") ;;
+
+    --) shift; break ;;
+
+    --*)
+      # Compatibility path: podman flags used to be accepted here because
+      # unknown arguments were passed through silently.  That also swallowed
+      # typos, so the pass-through now announces itself.
+      echo "agent-sandbox: '$1' is not an agent-sandbox flag; forwarding it to podman." >&2
+      echo "               Prefer: agent-sandbox -- $1" >&2
+      podman_args+=("$1")
+      ;;
+    *)
+      echo "agent-sandbox: unexpected argument '$1'." >&2
+      echo "               To run a command in the sandbox: agent-sandbox -- $1" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+# Phase 2: podman args, up to a second --.
+while [[ $# -gt 0 ]]; do
+  [[ "$1" == "--" ]] && { shift; break; }
+  podman_args+=("$1")
+  shift
+done
+
+# Phase 3: whatever is left replaces the container command.
+if [[ $# -gt 0 ]]; then
+  cmd_args=("$@")
+fi
+
+rw_mount_opts="rw"
+if [[ "$want_selinux" == "1" ]]; then
+  rw_mount_opts="rw,z"
+fi
+
+bind_address="127.0.0.1"
+if [[ "$want_ports_any_interface" == "1" ]]; then
+  bind_address="0.0.0.0"
+fi
+
+# ── Agent selection ─────────────────────────────────────────────────────────
+# One table instead of a branch per agent: adding a fifth agent is one row
+# here plus one row in the state-directory table below.
+
+case "$agent" in
+  opencode)    agent_argv=(opencode .) ;;
+  claude-code) agent_argv=(claude) ;;
+  copilot)     agent_argv=(copilot) ;;
+  antigravity) agent_argv=(agy .) ;;
+esac
+
+# A devenv.nix in the workspace means project dependencies belong on PATH
+# before the agent starts.
+if [[ ${#cmd_args[@]} -eq 0 ]]; then
+  if [[ -f "$PWD/devenv.nix" ]]; then
+    cmd_args=(devenv shell --no-tui -- "${agent_argv[@]}")
+  else
+    cmd_args=("${agent_argv[@]}")
+  fi
+fi
+
+# ── Workspace ───────────────────────────────────────────────────────────────
+
+if [[ "$want_workspace" == "1" ]]; then
+  workspace_name=$(basename "$PWD")
+  workspace_dir="/workspace/$workspace_name"
+  mounts+=("-v" "$PWD:$workspace_dir:$rw_mount_opts")
+else
+  workspace_dir="/workspace"
+fi
+
+# ── Agent state ─────────────────────────────────────────────────────────────
+# Only the selected agent's directories are mounted; mounting all of them
+# would create config directories on the host for tools that never ran.
+
+case "$agent" in
+  opencode)
+    mount_rw "$HOME/.local/share/opencode" /home/user/.local/share/opencode
+    mount_rw "$HOME/.config/opencode"      /home/user/.config/opencode
+    mount_rw "$HOME/.cache/opencode"       /home/user/.cache/opencode
+    ;;
+  claude-code)
+    mount_rw "$HOME/.claude" /home/user/.claude
+    # claude-code expects a JSON object, not a zero-byte file.
+    [[ -s "$HOME/.claude.json" ]] || printf '{}\n' > "$HOME/.claude.json"
+    mounts+=("-v" "$HOME/.claude.json:/home/user/.claude.json:$rw_mount_opts")
+    ;;
+  copilot)
+    mount_rw "$HOME/.copilot" /home/user/.copilot
+    ;;
+  antigravity)
+    mount_rw "$HOME/.local/share/antigravity-cli" /home/user/.local/share/antigravity-cli
+    mount_rw "$HOME/.config/antigravity-cli"      /home/user/.config/antigravity-cli
+    mount_rw "$HOME/.cache/antigravity-cli"       /home/user/.cache/antigravity-cli
+    # agy keeps its auth state under ~/.gemini.
+    mount_rw "$HOME/.gemini" /home/user/.gemini
+    ;;
+esac
+
+# ── SSH ─────────────────────────────────────────────────────────────────────
+
+if [[ "$want_ssh" == "1" && -S "${SSH_AUTH_SOCK:-}" ]]; then
+  mounts+=("-v" "$SSH_AUTH_SOCK:/agent.sock:$rw_mount_opts")
+  env_args+=("-e" "SSH_AUTH_SOCK=/agent.sock")
+fi
+
+# ── Git ─────────────────────────────────────────────────────────────────────
+
+if [[ "$want_git" == "1" ]]; then
+  git_config_mounted=0
+  if [[ -f "$HOME/.gitconfig" ]]; then
+    mounts+=("-v" "$HOME/.gitconfig:/home/user/.gitconfig:ro")
+    git_config_mounted=1
+  fi
+  if [[ -f "$HOME/.config/git/config" ]]; then
+    mounts+=("-v" "$HOME/.config/git/config:/home/user/.config/git/config:ro")
+    git_config_mounted=1
+  fi
+  if [[ "$git_config_mounted" == "1" ]]; then
+    git_name=$(git config --global user.name 2>/dev/null || true)
+    git_email=$(git config --global user.email 2>/dev/null || true)
+    [[ -n "$git_name" ]]  && env_args+=("-e" "GIT_AUTHOR_NAME=$git_name"   "-e" "GIT_COMMITTER_NAME=$git_name")
+    [[ -n "$git_email" ]] && env_args+=("-e" "GIT_AUTHOR_EMAIL=$git_email" "-e" "GIT_COMMITTER_EMAIL=$git_email")
+  fi
+fi
+
+# ── GnuPG ───────────────────────────────────────────────────────────────────
+# The agent socket is forwarded so host keys can sign commits.  The keyring
+# directory is a separate decision: it is only exposed when it holds no usable
+# secret on disk (the smart-card case), unless --gnupg-private overrides.
+
+if [[ "$want_gpg" == "1" ]]; then
+  gpg_socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gnupg/S.gpg-agent"
+  if [[ -S "$gpg_socket" ]]; then
+    mounts+=("-v" "$gpg_socket:/run/host-gpg-agent:ro")
+    env_args+=("-e" "AGENT_SANDBOX_GPG_AGENT=1")
+  fi
+
+  if [[ -d "$HOME/.gnupg" ]]; then
+    gnupg_offenders=""
+    gnupg_status=0
+    gnupg_offenders=$(agent-sandbox-gnupg-scan "$HOME/.gnupg") || gnupg_status=$?
+
+    if [[ "$gnupg_status" == "0" || "$want_gnupg_private" == "1" ]]; then
+      if [[ "$gnupg_status" != "0" ]]; then
+        echo "agent-sandbox: exposing ~/.gnupg with on-disk secret keys (--gnupg-private)." >&2
+      fi
+      # Public material only: the keyring so gpg can name the signing key, and
+      # the trust database so it believes the answer.
+      for keyring in pubring.kbx pubring.gpg trustdb.gpg; do
+        if [[ -f "$HOME/.gnupg/$keyring" ]]; then
+          mounts+=("-v" "$HOME/.gnupg/$keyring:/run/host-gnupg/$keyring:ro")
+        fi
+      done
+      if [[ "$want_gnupg_private" == "1" && -d "$HOME/.gnupg/private-keys-v1.d" ]]; then
+        mounts+=("-v" "$HOME/.gnupg/private-keys-v1.d:/run/host-gnupg/private-keys-v1.d:ro")
+      fi
+    else
+      echo "agent-sandbox: not exposing ~/.gnupg -- it holds secret keys on disk:" >&2
+      while IFS= read -r offender; do
+        printf '               %s\n' "$offender" >&2
+      done <<< "$gnupg_offenders"
+      echo "               A smart-card setup keeps only stubs here and is exposed normally." >&2
+      echo "               Override with --gnupg-private, or silence this with --no-gpg-agent." >&2
+    fi
+  fi
+fi
+
+if [[ "$want_gpg_sign" == "0" ]]; then
+  env_args+=("-e" "GIT_CONFIG_COUNT=1")
+  env_args+=("-e" "GIT_CONFIG_KEY_0=commit.gpgsign")
+  env_args+=("-e" "GIT_CONFIG_VALUE_0=false")
+fi
+
+# ── devenv / nix ────────────────────────────────────────────────────────────
+
+if [[ "$want_devenv" == "1" ]]; then
+  mount_rw "$HOME/.local/share/devenv" /home/user/.local/share/devenv
+fi
+
+if [[ "$want_nix" == "1" ]]; then
+  daemon_socket=/nix/var/nix/daemon-socket/socket
+  if [[ -S "$daemon_socket" ]]; then
+    # Multi-user nix: read-only store, builds delegated to the host daemon.
+    mounts+=("-v" "/nix/store:/nix/store:ro")
+    mounts+=("-v" "$daemon_socket:/nix/var/nix/daemon-socket/socket:$rw_mount_opts")
+    env_args+=("-e" "NIX_REMOTE=daemon")
+  elif [[ -d /nix/store ]]; then
+    # Single-user nix: overlay, so the container can write without touching
+    # the host store.
+    mounts+=("-v" "/nix:/nix:O")
+  fi
+  env_args+=("-e" "AGENT_SANDBOX_HOST_NIX=1")
+fi
+
+# ── Host podman socket ──────────────────────────────────────────────────────
+
+if [[ "$want_podman" == "1" ]]; then
+  host_socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+  if [[ -S "$host_socket" ]]; then
+    mounts+=("-v" "$host_socket:/run/podman/podman.sock:$rw_mount_opts")
+    env_args+=("-e" "CONTAINER_HOST=unix:///run/podman/podman.sock")
+    env_args+=("-e" "DOCKER_HOST=unix:///run/podman/podman.sock")
+  else
+    echo "agent-sandbox: --podman requested but no socket at $host_socket." >&2
+    echo "               Start it with: systemctl --user start podman.socket" >&2
+  fi
+fi
+
+# ── Ports ───────────────────────────────────────────────────────────────────
+# Two sources, both ending as validated bind:host:container/proto triples.
+# Nothing from AGENTS.md is ever passed to podman as an argument of its own.
+
+publish_args=()
+published=()
+
+for spec in "${port_specs[@]}"; do
+  triple=$(parse_port_spec "$spec")
+  publish_args+=("-p" "$triple")
+  published+=("$triple")
+done
+
+if [[ "$want_ports" == "1" && -f "$PWD/AGENTS.md" ]]; then
+  parse_flags=()
+  [[ "$want_ports_any_interface" == "1" ]] && parse_flags+=(--ports-any-interface)
+  if ! declared=$(agent-sandbox-parse-agents "${parse_flags[@]}" "$PWD/AGENTS.md"); then
+    echo "agent-sandbox: refusing to launch on an invalid [ports] block (use --no-ports to skip)." >&2
+    exit 1
+  fi
+  while IFS= read -r triple; do
+    [[ -n "$triple" ]] || continue
+    publish_args+=("-p" "$triple")
+    published+=("$triple")
+  done <<< "$declared"
+fi
+
+# A shared network is what makes `agent-sandbox-port add` possible later:
+# podman cannot add a binding to a running container, so a sidecar has to
+# reach this one by name.  Created lazily so that a launch with no ports at
+# all keeps podman's default rootless networking untouched.
+network_args=()
+if [[ ${#published[@]} -gt 0 || "$want_ports_dynamic" == "1" ]]; then
+  if ! podman network exists "$AGENT_SANDBOX_NETWORK" 2>/dev/null; then
+    podman network create "$AGENT_SANDBOX_NETWORK" >/dev/null
+  fi
+  network_args=(--network "$AGENT_SANDBOX_NETWORK")
+fi
+
+if [[ ${#published[@]} -gt 0 ]]; then
+  echo "agent-sandbox: publishing ${published[*]}" >&2
+  echo "               (a server inside must bind 0.0.0.0, not 127.0.0.1)" >&2
+fi
+
+# ── Identity ────────────────────────────────────────────────────────────────
+
+# Temp passwd/group so tools resolve the username inside the container.
+passwd_tmp=$(mktemp)
+group_tmp=$(mktemp)
+trap 'rm -f "$passwd_tmp" "$group_tmp"' EXIT
+printf 'root:x:0:0:root:/root:/bin/sh\nuser:x:%s:%s::/home/user:/bin/bash\nnobody:x:65534:65534:Nobody:/:/bin/sh\n' "$(id -u)" "$(id -g)" > "$passwd_tmp"
+printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
+
+# A stable name gives port sidecars something to resolve, and the labels let
+# agent-sandbox-port and agent-sandbox-purge find sandboxes without guessing
+# from the image name.
+workspace_slug=$(basename "$PWD")
+workspace_slug="${workspace_slug//[^A-Za-z0-9_.-]/-}"
+container_name="agent-sandbox-${workspace_slug:0:32}-$$"
+
+env_args+=("-e" "TERM=${TERM:-xterm-256color}")
+[[ -n "${COLORTERM:-}" ]] && env_args+=("-e" "COLORTERM=$COLORTERM")
+
+# Only allocate a TTY when there is one to allocate, so piped and CI
+# invocations (agent-sandbox -- bash -c '…' | tee log) still work.
+# GPG_TTY is deliberately not set here: the correct value is the tty podman
+# allocates inside the container, which only the entrypoint can observe.
+tty_args=()
+if [[ -t 0 && -t 1 ]]; then
+  tty_args=(--tty)
+fi
+
+# Not exec'd: the EXIT trap above still has temp files to clean up.
+podman run \
+  --rm \
+  --interactive \
+  "${tty_args[@]}" \
+  --userns=keep-id \
+  --name "$container_name" \
+  --label "agent-sandbox.role=sandbox" \
+  --label "agent-sandbox.workspace=$PWD" \
+  --workdir "$workspace_dir" \
+  -e HOME=/home/user \
+  -v "$passwd_tmp:/etc/passwd:ro" \
+  -v "$group_tmp:/etc/group:ro" \
+  --mount type=tmpfs,dst=/home/user/.config,U=true \
+  --mount type=tmpfs,dst=/home/user/.cache,U=true \
+  --mount type=tmpfs,dst=/home/user/.local,U=true \
+  "${network_args[@]}" \
+  "${publish_args[@]}" \
+  "${mounts[@]}" \
+  "${env_args[@]}" \
+  "${podman_args[@]}" \
+  "$AGENT_SANDBOX_IMAGE" \
+  "${cmd_args[@]}"

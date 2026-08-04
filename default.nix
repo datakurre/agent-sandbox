@@ -1,9 +1,23 @@
 { pkgs, lib }:
 
 let
+  imageName = "agent-sandbox";
+  imageTag = "latest";
+  # podman namespaces locally loaded images under localhost/.
+  imageRef = "localhost/${imageName}:${imageTag}";
+
+  # Shared network for port forwarding.  Only created when a sandbox actually
+  # publishes something; see lib/agent-sandbox-port.sh for why it exists.
+  networkName = "agent-sandbox";
+
+  # Scripts in ./lib keep their own shebang so they can be run and linted in
+  # place; the Nix writers supply theirs, so drop the first line.
+  scriptBody =
+    path: lib.concatStringsSep "\n" (lib.drop 1 (lib.splitString "\n" (builtins.readFile path)));
+
   # Full rootless podman stack (c.f. devenv-module-devcontainer/tweaks/podman.nix):
   # the extra binaries let nested podman build/run work inside the container when
-  # it is launched with enough privileges; the host socket forward below gives a
+  # it is launched with enough privileges; the host socket forward gives a
   # reliable "sibling container" mode that needs no privileges.
   podmanStack = with pkgs; [
     podman
@@ -65,6 +79,8 @@ let
       nettools
       dnsutils
       openssl
+      # socat backs the port-forward sidecars; the image doubles as their image.
+      socat
       git-lfs
       nix
       devenv
@@ -138,7 +154,7 @@ let
     '';
   };
 
-  # All paths baked into the image root, shared between copyToRoot and
+  # All paths baked into the image root, shared between the root env and
   # closureInfo so they stay in sync.
   containerPaths = baseTools ++ [
     pkgs.cacert
@@ -153,86 +169,47 @@ let
   # store paths as valid and won't attempt to re-substitute them.
   storeRegistration = pkgs.closureInfo { rootPaths = containerPaths; };
 
-  entrypoint = pkgs.writeShellScript "agent-sandbox-entrypoint" ''
-    if [[ "''${AGENT_SANDBOX_HOST_NIX:-}" != "1" ]]; then
-      if [[ ! -f /nix/var/nix/db/db.sqlite ]]; then
-        nix-store --load-db < /nix/registration
-      fi
-    fi
+  rootEnv = pkgs.buildEnv {
+    name = "agent-sandbox-root";
+    paths = containerPaths;
+  };
 
-    # Forward the host gpg-agent into the user's gnupg home so signed
-    # commits / git tag operations inside the container reuse host keys.
-    if [[ "''${AGENT_SANDBOX_GPG_AGENT:-}" == "1" && -S /run/host-gpg-agent ]]; then
-      mkdir -p ~/.gnupg
-      rm -f ~/.gnupg/S.gpg-agent
-      ln -s /run/host-gpg-agent ~/.gnupg/S.gpg-agent
+  # Prebuilt native binaries shipped by npm packages (lightningcss, esbuild,
+  # @swc/core, …) hard-code the ELF interpreter path, which is architecture
+  # specific.  An unknown system is a build error rather than a dangling
+  # symlink that only fails once someone runs the affected tool.
+  elfInterpreter =
+    {
+      "x86_64-linux" = {
+        dir = "lib64";
+        name = "ld-linux-x86-64.so.2";
+      };
+      "aarch64-linux" = {
+        dir = "lib";
+        name = "ld-linux-aarch64.so.1";
+      };
+    }
+    .${pkgs.stdenv.hostPlatform.system}
+      or (throw "agent-sandbox: no ELF interpreter mapping for ${pkgs.stdenv.hostPlatform.system}");
 
-      # Populate gpg public keyring from the host's read-only gnupg mount
-      # so gpg can identify which key the forwarded agent should use.
-      if [[ -d /run/host-gnupg ]]; then
-        for f in /run/host-gnupg/*; do
-          name=$(basename "$f")
-          [[ "$name" == "S.gpg-agent"     ]] && continue
-          [[ "$name" == "S.gpg-agent."*   ]] && continue
-          [[ "$name" == "sshcontrol"      ]] && continue
-          [[ "$name" == "private-keys-v1.d"    ]] && continue
-          [[ "$name" == "crls.d"          ]] && continue
-          [[ -e ~/.gnupg/$name ]] && continue
-          cp --no-preserve=mode "$f" ~/.gnupg/ 2>/dev/null || true
-        done
-      fi
+  entrypoint = pkgs.writeShellScript "agent-sandbox-entrypoint" (scriptBody ./lib/entrypoint.sh);
 
-      # Also try to import the signing key's public key from keyserver
-      # as a fallback in case the host keyring didn't have it.
-      if signing_key=$(git config --get user.signingkey 2>/dev/null); then
-        gpg --keyserver keyserver.ubuntu.com --recv-keys "$signing_key" 2>/dev/null || true
-      fi
-    fi
+  # streamLayeredImage rather than buildImage: layers are shared between
+  # rebuilds and nothing materialises a multi-gigabyte tarball in the store.
+  # The result is an executable that writes the tar to stdout.
+  image = pkgs.dockerTools.streamLayeredImage {
+    name = imageName;
+    tag = imageTag;
 
-    # Pre-populate known_hosts for common git forges so first-time
-    # git push/clone works without host key verification prompts.
-    # Refresh with: ssh-keyscan github.com gitlab.com bitbucket.org
-    if [[ -S /agent.sock ]]; then
-      mkdir -p ~/.ssh
-      chmod 700 ~/.ssh
-      if [[ -f ~/.ssh/known_hosts && ! -w ~/.ssh/known_hosts ]]; then
-        chmod 644 ~/.ssh/known_hosts 2>/dev/null || rm -f ~/.ssh/known_hosts
-      fi
-      if ! grep -qs 'github.com' ~/.ssh/known_hosts 2>/dev/null; then
-        cat >> ~/.ssh/known_hosts << 'KNOWN_HOSTS'
-github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
-github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
-github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
-gitlab.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFSMqzJeV9rUzU4kWitGjeR4PWSa29SPqJ1fVkhtj3Hw9xjLVXVYrU9QlYWrOLXBpQ6KWjbjTDTdDkoohFzgbEY=
-gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf
-gitlab.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCsj2bNKTBSpIYDEGk9KxsGh3mySTRgMtXL583qmBpzeQ+jqCMRgBqB98u3z++J1sKlXHWfM9dyhSevkMwSbhoR8XIq/U0tCNyokEi/ueaBMCvbcTHhO7FcwzY92WK4Yt0aGROY5qX2UKSeOvuP4D6TPqKF1onrSzH9bx9XUf2lEdWT/ia1NEKjunUqu1xOB/StKDHMoX4/OKyIzuS0q/T1zOATthvasJFoPrAjkohTyaDUz2LN5JoH839hViyEG82yB+MjcFV5MU3N1l1QL3cVUCh93xSaua1N85qivl+siMkPGbO5xR/En4iEY6K2XPASUEMaieWVNTRCtJ4S8H+9
-bitbucket.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPIQmuzMBuKdWeF4+a2sjSSpBK0iqitSQ+5BM9KhpexuGt20JpTVM7u5BDZngncgrqDMbWdxMWWOGtZ9UgbqgZE=
-bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO
-bitbucket.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDQeJzhupRu0u0cdegZIa8e86EG2qOCsIsD1Xw0xSeiPDlCr7kq97NLmMbpKTX6Esc30NuoqEEHCuc7yWtwp8dI76EEEB1VqY9QJq6vk+aySyboD5QF61I/1WeTwu+deCbgKMGbUijeXhtfbxSxm6JwGrXrhBdofTsbKRUsrN1WoNgUa8uqN1Vx6WAJw1JHPhglEGGHea6QICwJOAr/6mrui/oB7pkaWKHj3z7d1IC4KWLtY47elvjbaTlkN04Kc/5LFEirorGYVbt15kAUlqGM65pk6ZBxtaO3+30LVlORZkxOh+LKL/BvbZ/iRNhItLqNyieoQj/uh/7Iv4uyH/cV/0b4WDSd3DptigWq84lJubb9t/DnZlrJazxyDCulTmKdOR7vs9gMTo+uoIrPSb8ScTtvw65+odKAlBj59dhnVp9zd7QUojOpXlL62Aw56U4oO+FALuevvMjiWeavKhJqlR7i5n9srYcrNV7ttmDw7kf/97P5zauIhxcjX+xHv4M=
-KNOWN_HOSTS
-      fi
-    fi
-
-    exec "$@"
-  '';
-
-  image = pkgs.dockerTools.buildImage {
-    name = "agent-sandbox";
-    tag = "latest";
-
-    copyToRoot = pkgs.buildEnv {
-      name = "agent-sandbox-root";
-      paths = containerPaths;
-    };
+    contents = [ rootEnv ];
 
     extraCommands = ''
       mkdir -p usr/bin
       ln -s ${pkgs.coreutils}/bin/env usr/bin/env
 
-      # ELF interpreter required by prebuilt native binaries shipped by npm packages
-      # (lightningcss, esbuild, @swc/core, etc. all hard-code /lib64/ld-linux-x86-64.so.2)
-      mkdir -p lib64
-      ln -sf ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2
+      test -e ${pkgs.glibc}/lib/${elfInterpreter.name}
+      mkdir -p ${elfInterpreter.dir}
+      ln -sf ${pkgs.glibc}/lib/${elfInterpreter.name} ${elfInterpreter.dir}/${elfInterpreter.name}
 
       mkdir -p home/user
       chmod 1777 home/user
@@ -286,406 +263,126 @@ KNOWN_HOSTS
     };
   };
 
-  loadScript = pkgs.writeShellScriptBin "agent-sandbox-load" ''
-    set -euo pipefail
-    echo "Loading agent-sandbox image into podman..."
-    ${pkgs.podman}/bin/podman load < ${image}
-    echo "Done. Run 'agent-sandbox' to start a session."
+  # ── Host-side helpers ─────────────────────────────────────────────────────
+
+  # Kept out of the launcher so it can be unit-tested against fixture
+  # keyrings, and because "is this GnuPG home card-only?" is a useful question
+  # to be able to ask directly.
+  gnupgScan = pkgs.writeShellApplication {
+    name = "agent-sandbox-gnupg-scan";
+    runtimeInputs = with pkgs; [
+      coreutils
+      findutils
+    ];
+    text = scriptBody ./lib/gnupg-scan.sh;
+  };
+
+  # Wrapper rather than an inlined script: the Python stays a real file that
+  # `python3 -m unittest` can import directly.
+  parseAgents = pkgs.writeShellApplication {
+    name = "agent-sandbox-parse-agents";
+    runtimeInputs = [ pkgs.python3 ];
+    text = ''exec python3 ${./lib/parse_agents.py} "$@"'';
+  };
+
+  # Every launcher-adjacent script gets its image/network identifiers from
+  # here rather than hard-coding them, and writeShellApplication runs
+  # shellcheck over the result at build time.
+  preamble = ''
+    AGENT_SANDBOX_IMAGE="${imageRef}"
+    AGENT_SANDBOX_NETWORK="${networkName}"
   '';
 
-  purgeScript = pkgs.writeShellScriptBin "agent-sandbox-purge" ''
-    set -euo pipefail
+  launcher = pkgs.writeShellApplication {
+    name = "agent-sandbox";
+    runtimeInputs = with pkgs; [
+      podman
+      git
+      coreutils
+    ]
+    ++ [
+      gnupgScan
+      parseAgents
+    ];
+    text = preamble + scriptBody ./lib/agent-sandbox.sh;
+  };
 
-    force=0
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        -f|--force) force=1 ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
-      esac
-      shift
-    done
+  portScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-port";
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+      gnugrep
+    ];
+    text = preamble + scriptBody ./lib/agent-sandbox-port.sh;
+  };
 
-    confirm() {
-      if [[ "$force" == "1" ]]; then
-        return 0
-      fi
-      local ans
-      read -r -p "$1 [y/N] " ans
-      [[ "$ans" =~ ^[Yy] ]]
-    }
+  purgeScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-purge";
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+      findutils
+    ];
+    text = preamble + scriptBody ./lib/agent-sandbox-purge.sh;
+  };
 
-    PODMAN="${pkgs.podman}/bin/podman"
+  loadScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-load";
+    runtimeInputs = [ pkgs.podman ];
+    text = ''
+      AGENT_SANDBOX_IMAGE="${imageRef}"
+      AGENT_SANDBOX_IMAGE_STREAM="${image}"
+    ''
+    + scriptBody ./lib/agent-sandbox-load.sh;
+  };
 
-    echo "=== agent-sandbox-purge ==="
-    echo
+  # ── Checks ────────────────────────────────────────────────────────────────
+  # Building the launcher already runs shellcheck (writeShellApplication), so
+  # these cover what that cannot: the parser's behaviour, the gnupg
+  # classifier's verdicts, and the entrypoint, which is a plain script.
 
-    # ── Containers ────────────────────────────────────────────────
-    containers=$("$PODMAN" ps -a \
-      --filter ancestor=localhost/agent-sandbox:latest \
-      -q 2>/dev/null || true)
-    if [[ -n "$containers" ]]; then
-      echo "Agent-sandbox containers:"
-      "$PODMAN" ps -a \
-        --filter ancestor=localhost/agent-sandbox:latest \
-        --format "  {{.ID}}  {{.Names}}  {{.Status}}"
-      echo
-      if confirm "Remove these containers?"; then
-        echo "$containers" | xargs -r "$PODMAN" rm -f
-        echo "Containers removed."
-      else
-        echo "Skipped."
-      fi
-    else
-      echo "No agent-sandbox containers found."
-    fi
-    echo
+  checks = {
+    parser = pkgs.runCommand "agent-sandbox-parser-tests" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+      cp ${./lib/parse_agents.py} parse_agents.py
+      cp ${./lib/test_parse_agents.py} test_parse_agents.py
+      python3 -m unittest test_parse_agents -v
+      touch "$out"
+    '';
 
-    # ── Volumes ───────────────────────────────────────────────────
-    volumes=$("$PODMAN" volume ls \
-      --filter name=agent-sandbox -q 2>/dev/null || true)
-    if [[ -n "$volumes" ]]; then
-      echo "Agent-sandbox volumes:"
-      "$PODMAN" volume ls --filter name=agent-sandbox
-      echo
-      if confirm "Remove these volumes?"; then
-        echo "$volumes" | xargs -r "$PODMAN" volume rm -f
-        echo "Volumes removed."
-      else
-        echo "Skipped."
-      fi
-    else
-      echo "No agent-sandbox volumes found."
-    fi
-    echo
+    gnupg-scan =
+      pkgs.runCommand "agent-sandbox-gnupg-tests"
+        {
+          nativeBuildInputs = with pkgs; [
+            bash
+            coreutils
+            gnugrep
+          ];
+        }
+        ''
+          bash ${./lib/test-gnupg-scan.sh} ${gnupgScan}/bin/agent-sandbox-gnupg-scan
+          touch "$out"
+        '';
 
-    # ── Image ─────────────────────────────────────────────────────
-    if "$PODMAN" image exists localhost/agent-sandbox:latest 2>/dev/null; then
-      echo "Image: localhost/agent-sandbox:latest"
-      echo
-      if confirm "Remove this image?"; then
-        "$PODMAN" rmi -f localhost/agent-sandbox:latest
-        echo "Image removed."
-      else
-        echo "Skipped."
-      fi
-    else
-      echo "No agent-sandbox image found."
-    fi
+    shellcheck = pkgs.runCommand "agent-sandbox-shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
+      shellcheck --shell=bash ${./lib}/*.sh
+      touch "$out"
+    '';
 
-    echo
-    echo "Done."
-  '';
-
-  # Usage:
-  #   agent-sandbox [FLAGS] [-- PODMAN_ARGS...] [-- COMMAND...]
-  #
-  # The default command inside the container is opencode.  If the current
-  # directory contains a devenv.nix, opencode is launched inside a devenv
-  # shell (`devenv shell -- opencode .`).  Pass a different command after --
-  #
-  # Podman run arguments (--privileged, --network=host, …) also go after --.
-  #
-  # -v SOURCE:DEST[:OPTIONS]  Standard podman volume mount (processed
-  #   before --).  Relative paths are expanded automatically:
-  #     SOURCE  relative paths are expanded to absolute ($PWD/...)
-  #     DEST    relative paths are prefixed with /workspace/
-  #             use "." as DEST to mean /workspace itself
-  #
-  # Integrations (all ON by default, disable with the --no-* flag):
-  #   --workspace / --no-workspace
-  #                              mount CWD as /workspace/<dirname>:rw
-  #                              (default: on; no mount = empty /workspace)
-  #   --ssh / --no-ssh           forward SSH_AUTH_SOCK into the container
-  #   --git / --no-git           mount ~/.gitconfig and/or ~/.config/git/config
-  #                              and forward git identity
-  #   --gpg-agent / --no-gpg-agent
-  #                              forward the host gpg-agent socket so host
-  #                              gpg keys are usable for signing inside
-  #   --gpg-sign / --no-gpg-sign enable/disable git commit signing (default: on,
-  #                              disabled via env override when off)
-  #   --opencode / --no-opencode mount opencode config/share/cache dirs
-  #   --claude-code / --no-claude-code
-  #                              mount claude configuration files and use
-  #                              claude as the default command
-  #   --copilot / --no-copilot
-  #                              mount github-copilot-cli configuration files
-  #                              and use copilot as the default command
-  #   --antigravity / --no-antigravity
-  #                              mount antigravity-cli config/share/cache dirs
-  #                              and use agy as the default command
-  #   --devenv / --no-devenv     mount ~/.local/share/devenv (persisted
-  #                              devenv state)
-  #   --podman / --no-podman     forward the host rootless podman socket so the
-  #                              container's podman client can run sibling
-  #                              containers on the host daemon. (The image also
-  #                              ships a full nested-capable podman stack + config
-  #                              under /etc/containers for privileged launches.)
-  #   --nix / --no-nix           mount the host /nix into the container. When the
-  #                              nix daemon socket exists (multi-user nix) the
-  #                              store is mounted read-only and builds are
-  #                              delegated to the host daemon. For single-user
-  #                              nix the store is mounted as an overlay (:O) so
-  #                              the container can read host packages and write
-  #                              new ones to an ephemeral upper layer — the host
-  #                              store is never modified.
-  #   --selinux / --no-selinux   apply shared SELinux relabeling (:z) to built-in
-  #                              writable bind mounts (default: off)
-  #
-  # Examples:
-  #   agent-sandbox                                       # opencode in CWD
-  #   agent-sandbox --copilot                             # github-copilot-cli (copilot) in CWD
-  #   agent-sandbox --antigravity                         # antigravity-cli (agy) in CWD
-  #   agent-sandbox -- bash                               # bash shell instead
-  #   agent-sandbox --selinux                             # enable :z relabel on built-in writable binds
-  #   agent-sandbox --no-podman --no-ssh                   # selective opt-out
-  #   agent-sandbox --no-gpg-sign                         # disable commit signing
-  #   agent-sandbox --no-workspace                         # no CWD mount
-  #   agent-sandbox -v ~/src:/workspace/mysrc:rw             # custom workspace
-  #   agent-sandbox -- --privileged                         # enable nested podman
-  launcher = pkgs.writeShellScriptBin "agent-sandbox" ''
-    set -euo pipefail
-
-    if ! ${pkgs.podman}/bin/podman image exists localhost/agent-sandbox:latest 2>/dev/null; then
-      echo "agent-sandbox image not found. Run 'agent-sandbox-load' first." >&2
-      exit 1
-    fi
-
-    # Expand relative paths in -v specs
-    expand_v() {
-      local spec="$1"
-      local src dest opts
-      IFS=':' read -r src dest opts <<< "$spec"
-      src="''${src/#\~/$HOME}"
-      [[ "$src" == "." ]] && src="$PWD"
-      [[ "$src" != /* ]] && src="$PWD/$src"
-      if [[ -n "$dest" && "$dest" != /* ]]; then
-        [[ "$dest" == "." ]] && dest="/workspace" || dest="/workspace/$dest"
-      fi
-      echo "$src:$dest''${opts:+:$opts}"
-    }
-
-    # Integration toggles - all enabled by default.
-    want_ssh=1
-    want_git=1
-    want_gpg=1
-    want_gpg_sign=1
-    want_opencode=1
-    want_claude_code=0
-    want_copilot=0
-    want_antigravity=0
-    want_podman=1
-    want_devenv=1
-    want_nix=1
-    want_workspace=1
-    want_selinux=0
-
-    mounts=()
-    env_args=()
-    podman_args=()
-    cmd_args=()
-
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --ssh)          want_ssh=1 ;;
-        --no-ssh)       want_ssh=0 ;;
-        --git)          want_git=1 ;;
-        --no-git)       want_git=0 ;;
-        --gpg-agent)    want_gpg=1 ;;
-        --no-gpg-agent) want_gpg=0 ;;
-        --gpg-sign)     want_gpg_sign=1 ;;
-        --no-gpg-sign)  want_gpg_sign=0 ;;
-        --opencode)     want_opencode=1 ;;
-        --no-opencode)  want_opencode=0 ;;
-        --claude-code)  want_claude_code=1 ;;
-        --no-claude-code) want_claude_code=0 ;;
-        --copilot)      want_copilot=1 ;;
-        --no-copilot)   want_copilot=0 ;;
-        --antigravity)  want_antigravity=1 ;;
-        --no-antigravity) want_antigravity=0 ;;
-        --devenv)       want_devenv=1 ;;
-        --no-devenv)    want_devenv=0 ;;
-        --nix)          want_nix=1 ;;
-        --no-nix)       want_nix=0 ;;
-        --podman)       want_podman=1 ;;
-        --no-podman)    want_podman=0 ;;
-        --workspace)    want_workspace=1 ;;
-        --no-workspace) want_workspace=0 ;;
-        --selinux)      want_selinux=1 ;;
-        --no-selinux)   want_selinux=0 ;;
-        -v)  shift; mounts+=("-v" "$(expand_v "$1")") ;;
-        -v*) mounts+=("-v" "$(expand_v "''${1#-v}")") ;;
-        --) shift; break ;;
-        *)   podman_args+=("$1") ;;
-      esac
-      shift
-    done
-
-    if [[ "$want_antigravity" == "1" ]]; then
-      if [[ -f "$PWD/devenv.nix" ]]; then
-        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.google-antigravity-cli}/bin/agy" ".")
-      else
-        cmd_args=("${pkgs.google-antigravity-cli}/bin/agy" ".")
-      fi
-    elif [[ "$want_copilot" == "1" ]]; then
-      if [[ -f "$PWD/devenv.nix" ]]; then
-        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.github-copilot-cli}/bin/copilot")
-      else
-        cmd_args=("${pkgs.github-copilot-cli}/bin/copilot")
-      fi
-    elif [[ "$want_claude_code" == "1" ]]; then
-      if [[ -f "$PWD/devenv.nix" ]]; then
-        cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.claude-code}/bin/claude")
-      else
-        cmd_args=("${pkgs.claude-code}/bin/claude")
-      fi
-    elif [[ -f "$PWD/devenv.nix" ]]; then
-      cmd_args=("${pkgs.devenv}/bin/devenv" "shell" "--no-tui" "--" "${pkgs.opencode}/bin/opencode" ".")
-    else
-      cmd_args=("${pkgs.opencode}/bin/opencode" ".")
-    fi
-
-    # Everything after -- overrides the container command (default: opencode).
-    if [[ $# -gt 0 ]]; then
-      cmd_args=("$@")
-    fi
-
-    rw_mount_opts="rw"
-    if [[ "$want_selinux" == "1" ]]; then
-      rw_mount_opts="rw,z"
-    fi
-
-    if [[ "$want_workspace" == "1" ]]; then
-      workspace_name=$(basename "$PWD")
-      workspace_dir="/workspace/$workspace_name"
-      mounts+=("-v" "$PWD:$workspace_dir:$rw_mount_opts")
-    else
-      workspace_dir="/workspace"
-    fi
-
-    if [[ "$want_ssh" == "1" && -S "''${SSH_AUTH_SOCK:-}" ]]; then
-      mounts+=("-v" "$SSH_AUTH_SOCK:/agent.sock:$rw_mount_opts")
-      env_args+=("-e" "SSH_AUTH_SOCK=/agent.sock")
-    fi
-
-    if [[ "$want_git" == "1" ]]; then
-      git_config_mounted=0
-      if [[ -f "$HOME/.gitconfig" ]]; then
-        mounts+=("-v" "$HOME/.gitconfig:/home/user/.gitconfig:ro")
-        git_config_mounted=1
-      fi
-      if [[ -f "$HOME/.config/git/config" ]]; then
-        mounts+=("-v" "$HOME/.config/git/config:/home/user/.config/git/config:ro")
-        git_config_mounted=1
-      fi
-      if [[ "$git_config_mounted" == "1" ]]; then
-        git_name=$(${pkgs.git}/bin/git config --global user.name 2>/dev/null || true)
-        git_email=$(${pkgs.git}/bin/git config --global user.email 2>/dev/null || true)
-        [[ -n "$git_name" ]]  && env_args+=("-e" "GIT_AUTHOR_NAME=$git_name"   "-e" "GIT_COMMITTER_NAME=$git_name")
-        [[ -n "$git_email" ]] && env_args+=("-e" "GIT_AUTHOR_EMAIL=$git_email" "-e" "GIT_COMMITTER_EMAIL=$git_email")
-      fi
-    fi
-
-    if [[ "$want_gpg" == "1" ]]; then
-      gpg_socket="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gnupg/S.gpg-agent"
-      if [[ -S "$gpg_socket" ]]; then
-        mounts+=("-v" "$gpg_socket:/run/host-gpg-agent:ro")
-        env_args+=("-e" "AGENT_SANDBOX_GPG_AGENT=1")
-        env_args+=("-e" "GPG_TTY=/dev/pts/0")
-      fi
-      if [[ -d "$HOME/.gnupg" ]]; then
-        mounts+=("-v" "$HOME/.gnupg:/run/host-gnupg:ro")
-      fi
-    fi
-
-    if [[ "$want_gpg_sign" == "0" ]]; then
-      env_args+=("-e" "GIT_CONFIG_COUNT=1")
-      env_args+=("-e" "GIT_CONFIG_KEY_0=commit.gpgsign")
-      env_args+=("-e" "GIT_CONFIG_VALUE_0=false")
-    fi
-
-    if [[ "$want_opencode" == "1" ]]; then
-      mkdir -p "$HOME/.local/share/opencode" "$HOME/.config/opencode" "$HOME/.cache/opencode"
-      mounts+=("-v" "$HOME/.local/share/opencode:/home/user/.local/share/opencode:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.config/opencode:/home/user/.config/opencode:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.cache/opencode:/home/user/.cache/opencode:$rw_mount_opts")
-    fi
-
-    if [[ "$want_claude_code" == "1" ]]; then
-      mkdir -p "$HOME/.claude"
-      touch "$HOME/.claude.json"
-      mounts+=("-v" "$HOME/.claude:/home/user/.claude:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.claude.json:/home/user/.claude.json:$rw_mount_opts")
-    fi
-
-    if [[ "$want_copilot" == "1" ]]; then
-      mkdir -p "$HOME/.copilot"
-      mounts+=("-v" "$HOME/.copilot:/home/user/.copilot:$rw_mount_opts")
-    fi
-
-    if [[ "$want_antigravity" == "1" ]]; then
-      mkdir -p "$HOME/.local/share/antigravity-cli" "$HOME/.config/antigravity-cli" "$HOME/.cache/antigravity-cli" "$HOME/.gemini"
-      mounts+=("-v" "$HOME/.local/share/antigravity-cli:/home/user/.local/share/antigravity-cli:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.config/antigravity-cli:/home/user/.config/antigravity-cli:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.cache/antigravity-cli:/home/user/.cache/antigravity-cli:$rw_mount_opts")
-      mounts+=("-v" "$HOME/.gemini:/home/user/.gemini:$rw_mount_opts")
-    fi
-
-    if [[ "$want_devenv" == "1" ]]; then
-      mkdir -p "$HOME/.local/share/devenv"
-      mounts+=("-v" "$HOME/.local/share/devenv:/home/user/.local/share/devenv:$rw_mount_opts")
-    fi
-
-    if [[ "$want_nix" == "1" ]]; then
-      daemon_socket=/nix/var/nix/daemon-socket/socket
-      if [[ -S "$daemon_socket" ]]; then
-        mounts+=("-v" "/nix/store:/nix/store:ro")
-        mounts+=("-v" "$daemon_socket:/nix/var/nix/daemon-socket/socket:$rw_mount_opts")
-        env_args+=("-e" "NIX_REMOTE=daemon")
-      elif [[ -d /nix/store ]]; then
-        mounts+=("-v" "/nix:/nix:O")
-      fi
-      env_args+=("-e" "AGENT_SANDBOX_HOST_NIX=1")
-    fi
-
-    if [[ "$want_podman" == "1" ]]; then
-      host_socket="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
-      if [[ -S "$host_socket" ]]; then
-        mounts+=("-v" "$host_socket:/run/podman/podman.sock:$rw_mount_opts")
-        env_args+=("-e" "CONTAINER_HOST=unix:///run/podman/podman.sock")
-        env_args+=("-e" "DOCKER_HOST=unix:///run/podman/podman.sock")
-      else
-        echo "Warning: podman socket not found at $host_socket (nested podman still available)" >&2
-      fi
-    fi
-
-    # Temp passwd/group so tools resolve username correctly inside container
-    passwd_tmp=$(mktemp)
-    group_tmp=$(mktemp)
-    trap 'rm -f "$passwd_tmp" "$group_tmp"' EXIT
-    printf 'root:x:0:0:root:/root:/bin/sh\nuser:x:%s:%s::/home/user:/bin/bash\nnobody:x:65534:65534:Nobody:/:/bin/sh\n' "$(id -u)" "$(id -g)" > "$passwd_tmp"
-    printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
-
-    env_args+=("-e" "TERM=''${TERM:-xterm-256color}")
-    [[ -n "''${COLORTERM:-}" ]] && env_args+=("-e" "COLORTERM=$COLORTERM")
-
-    ${pkgs.podman}/bin/podman run \
-      --rm \
-      --interactive \
-      --tty \
-      --userns=keep-id \
-      --workdir "$workspace_dir" \
-      -e HOME=/home/user \
-      -v "$passwd_tmp:/etc/passwd:ro" \
-      -v "$group_tmp:/etc/group:ro" \
-      --mount type=tmpfs,dst=/home/user/.config,U=true \
-      --mount type=tmpfs,dst=/home/user/.cache,U=true \
-      --mount type=tmpfs,dst=/home/user/.local,U=true \
-      "''${mounts[@]}" \
-      "''${env_args[@]}" \
-      "''${podman_args[@]}" \
-      localhost/agent-sandbox:latest \
-      "''${cmd_args[@]}"
-  '';
+    # Builds every host-side script, which is what runs shellcheck over the
+    # generated (preamble + body) text.  Deliberately excludes the load
+    # script, so `nix flake check` does not have to build the image.
+    scripts = pkgs.symlinkJoin {
+      name = "agent-sandbox-scripts";
+      paths = [
+        launcher
+        portScript
+        purgeScript
+        gnupgScan
+        parseAgents
+      ];
+    };
+  };
 
 in
 pkgs.symlinkJoin {
@@ -693,11 +390,27 @@ pkgs.symlinkJoin {
   paths = [
     launcher
     loadScript
+    portScript
     purgeScript
+    gnupgScan
+    parseAgents
   ];
+  passthru = {
+    inherit
+      image
+      checks
+      launcher
+      loadScript
+      portScript
+      purgeScript
+      ;
+  };
   meta = {
     description = "Sandboxed AI coding environment via podman";
     mainProgram = "agent-sandbox";
-    platforms = lib.platforms.linux;
+    platforms = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
   };
 }

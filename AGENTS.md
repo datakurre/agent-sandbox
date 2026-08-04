@@ -3,10 +3,10 @@
 ## Project overview
 
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
-("agent-sandbox") together with a launcher binary (`agent-sandbox`) and a
-loader binary (`agent-sandbox-load`).
+("agent-sandbox") together with a launcher binary (`agent-sandbox`), a
+loader binary (`agent-sandbox-load`), and a purge utility (`agent-sandbox-purge`).
 
-- **default.nix** – single Nix module; builds the image and the two scripts.
+- **default.nix** – single Nix module; builds the image and the three scripts.
 - **flake.nix**  – flake entry point; exposes `packages.<system>.default` and
   `apps.<system>.default`.
 
@@ -29,12 +29,13 @@ Key layers:
 | `/home/user`          | Home directory (uid/gid mapped at runtime)             |
 | `/workspace`          | Default working directory                              |
 
-### Entrypoint (`safepilot-entrypoint`)
+### Entrypoint (`agent-sandbox-entrypoint`)
 
-1. Loads the Nix store registration on first start.
-2. When `AGENT_SANDBOX_GPG_AGENT=1`, symlinks the forwarded host gpg-agent
+1. Loads the Nix store registration on first start (unless `AGENT_SANDBOX_HOST_NIX=1`, in which case the host's `/nix` mount is used).
+2. Sets up `known_hosts` for common git forges to avoid first-time connection prompts.
+3. When `AGENT_SANDBOX_GPG_AGENT=1`, symlinks the forwarded host gpg-agent
    socket into `~/.gnupg/S.gpg-agent`.
-3. `exec "$@"`.
+4. `exec "$@"`.
 
 ### Launcher (`agent-sandbox`)
 
@@ -58,14 +59,13 @@ A bash script that wraps `podman run`.  Call flow:
 
 ## How to add a new integration
 
-1. Add a `want_{name}=1` toggle after the existing toggles (line ~280).
-2. Add `--{name}` / `--no-{name}` cases in the `while` loop (line ~290).
-3. Add the mount/env logic after the existing blocks (after `
-   want_podman`).
+1. Add a `want_{name}=1` toggle after the existing toggles (see integration toggles).
+2. Add `--{name}` / `--no-{name}` cases in the argument parsing loop.
+3. Add the mount/env logic after the existing blocks.
 4. If container-side setup is needed in the entrypoint, gate it on an env
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
 5. Update the usage comment.
-6. Test: `nix flake check --no-build`
+6. Test: `nix flake check`
 
 ## How to add a new tool to the image
 
@@ -84,3 +84,4 @@ and Nix store registration.  No other changes needed.
 - Nested rootless podman inside the container requires `--privileged`.
   The image ships a full podman stack and `/etc/containers` config, so nested
   podman works out of the box when the privilege flag is passed.
+- **Host Nix shadowing**: When `--nix` is enabled (the default), the host `/nix/store` is mounted over the image's own store. Every PATH entry and the entrypoint itself then resolves against the host store rather than the baked-in one. This means the image is not entirely self-contained by default: transferring it to another host, or running garbage collection on a host where it wasn't installed via `nix profile`, may break the container at execution time.
