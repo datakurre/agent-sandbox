@@ -424,11 +424,14 @@ KNOWN_HOSTS
   #                              the container can read host packages and write
   #                              new ones to an ephemeral upper layer — the host
   #                              store is never modified.
+  #   --selinux / --no-selinux   apply shared SELinux relabeling (:z) to built-in
+  #                              writable bind mounts (default: off)
   #
   # Examples:
   #   agent-sandbox                                       # opencode in CWD
   #   agent-sandbox --antigravity                         # antigravity-cli (agy) in CWD
   #   agent-sandbox -- bash                               # bash shell instead
+  #   agent-sandbox --selinux                             # enable :z relabel on built-in writable binds
   #   agent-sandbox --no-podman --no-ssh                   # selective opt-out
   #   agent-sandbox --no-gpg-sign                         # disable commit signing
   #   agent-sandbox --no-workspace                         # no CWD mount
@@ -468,6 +471,7 @@ KNOWN_HOSTS
     want_devenv=1
     want_nix=1
     want_workspace=1
+    want_selinux=0
 
     mounts=()
     env_args=()
@@ -498,6 +502,8 @@ KNOWN_HOSTS
         --no-podman)    want_podman=0 ;;
         --workspace)    want_workspace=1 ;;
         --no-workspace) want_workspace=0 ;;
+        --selinux)      want_selinux=1 ;;
+        --no-selinux)   want_selinux=0 ;;
         -v)  shift; mounts+=("-v" "$(expand_v "$1")") ;;
         -v*) mounts+=("-v" "$(expand_v "''${1#-v}")") ;;
         --) shift; break ;;
@@ -529,16 +535,21 @@ KNOWN_HOSTS
       cmd_args=("$@")
     fi
 
+    rw_mount_opts="rw"
+    if [[ "$want_selinux" == "1" ]]; then
+      rw_mount_opts="rw,z"
+    fi
+
     if [[ "$want_workspace" == "1" ]]; then
       workspace_name=$(basename "$PWD")
       workspace_dir="/workspace/$workspace_name"
-      mounts+=("-v" "$PWD:$workspace_dir:rw")
+      mounts+=("-v" "$PWD:$workspace_dir:$rw_mount_opts")
     else
       workspace_dir="/workspace"
     fi
 
     if [[ "$want_ssh" == "1" && -S "''${SSH_AUTH_SOCK:-}" ]]; then
-      mounts+=("-v" "$SSH_AUTH_SOCK:/agent.sock:rw")
+      mounts+=("-v" "$SSH_AUTH_SOCK:/agent.sock:$rw_mount_opts")
       env_args+=("-e" "SSH_AUTH_SOCK=/agent.sock")
     fi
 
@@ -580,36 +591,36 @@ KNOWN_HOSTS
 
     if [[ "$want_opencode" == "1" ]]; then
       mkdir -p "$HOME/.local/share/opencode" "$HOME/.config/opencode" "$HOME/.cache/opencode"
-      mounts+=("-v" "$HOME/.local/share/opencode:/home/user/.local/share/opencode:rw")
-      mounts+=("-v" "$HOME/.config/opencode:/home/user/.config/opencode:rw")
-      mounts+=("-v" "$HOME/.cache/opencode:/home/user/.cache/opencode:rw")
+      mounts+=("-v" "$HOME/.local/share/opencode:/home/user/.local/share/opencode:$rw_mount_opts")
+      mounts+=("-v" "$HOME/.config/opencode:/home/user/.config/opencode:$rw_mount_opts")
+      mounts+=("-v" "$HOME/.cache/opencode:/home/user/.cache/opencode:$rw_mount_opts")
     fi
 
     if [[ "$want_claude_code" == "1" ]]; then
       mkdir -p "$HOME/.claude"
       touch "$HOME/.claude.json"
-      mounts+=("-v" "$HOME/.claude:/home/user/.claude:rw")
-      mounts+=("-v" "$HOME/.claude.json:/home/user/.claude.json:rw")
+      mounts+=("-v" "$HOME/.claude:/home/user/.claude:$rw_mount_opts")
+      mounts+=("-v" "$HOME/.claude.json:/home/user/.claude.json:$rw_mount_opts")
     fi
 
     if [[ "$want_antigravity" == "1" ]]; then
       mkdir -p "$HOME/.local/share/antigravity-cli" "$HOME/.config/antigravity-cli" "$HOME/.cache/antigravity-cli" "$HOME/.gemini"
-      mounts+=("-v" "$HOME/.local/share/antigravity-cli:/home/user/.local/share/antigravity-cli:rw")
-      mounts+=("-v" "$HOME/.config/antigravity-cli:/home/user/.config/antigravity-cli:rw")
-      mounts+=("-v" "$HOME/.cache/antigravity-cli:/home/user/.cache/antigravity-cli:rw")
-      mounts+=("-v" "$HOME/.gemini:/home/user/.gemini:rw")
+      mounts+=("-v" "$HOME/.local/share/antigravity-cli:/home/user/.local/share/antigravity-cli:$rw_mount_opts")
+      mounts+=("-v" "$HOME/.config/antigravity-cli:/home/user/.config/antigravity-cli:$rw_mount_opts")
+      mounts+=("-v" "$HOME/.cache/antigravity-cli:/home/user/.cache/antigravity-cli:$rw_mount_opts")
+      mounts+=("-v" "$HOME/.gemini:/home/user/.gemini:$rw_mount_opts")
     fi
 
     if [[ "$want_devenv" == "1" ]]; then
       mkdir -p "$HOME/.local/share/devenv"
-      mounts+=("-v" "$HOME/.local/share/devenv:/home/user/.local/share/devenv:rw")
+      mounts+=("-v" "$HOME/.local/share/devenv:/home/user/.local/share/devenv:$rw_mount_opts")
     fi
 
     if [[ "$want_nix" == "1" ]]; then
       daemon_socket=/nix/var/nix/daemon-socket/socket
       if [[ -S "$daemon_socket" ]]; then
         mounts+=("-v" "/nix/store:/nix/store:ro")
-        mounts+=("-v" "$daemon_socket:/nix/var/nix/daemon-socket/socket:rw")
+        mounts+=("-v" "$daemon_socket:/nix/var/nix/daemon-socket/socket:$rw_mount_opts")
         env_args+=("-e" "NIX_REMOTE=daemon")
       elif [[ -d /nix/store ]]; then
         mounts+=("-v" "/nix:/nix:O")
@@ -620,7 +631,7 @@ KNOWN_HOSTS
     if [[ "$want_podman" == "1" ]]; then
       host_socket="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
       if [[ -S "$host_socket" ]]; then
-        mounts+=("-v" "$host_socket:/run/podman/podman.sock:rw")
+        mounts+=("-v" "$host_socket:/run/podman/podman.sock:$rw_mount_opts")
         env_args+=("-e" "CONTAINER_HOST=unix:///run/podman/podman.sock")
         env_args+=("-e" "DOCKER_HOST=unix:///run/podman/podman.sock")
       else

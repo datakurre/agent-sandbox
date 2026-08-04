@@ -68,6 +68,7 @@ Every integration is **on by default**.  Disable with the matching `--no-*` flag
 | Flag                    | Default | What it does                                          |
 | ----------------------- | ------- | ----------------------------------------------------- |
 | `--workspace` / `--no-workspace` | on | mount `$PWD` as `/workspace:rw`                        |
+| `--selinux` / `--no-selinux`     | off | add SELinux shared relabel (`:z`) to built-in writable mounts |
 | `--ssh` / `--no-ssh`             | on | forward `SSH_AUTH_SOCK`                                |
 | `--git` / `--no-git`             | on | mount `~/.gitconfig`, forward `user.name`/`user.email` |
 | `--gpg-agent` / `--no-gpg-agent` | on | forward host gpg-agent socket for commit signing       |
@@ -80,6 +81,11 @@ You can also pass `-v` / `-v*` volume mounts before `--`.  Relative paths in
 the source are resolved against `$PWD`; relative destinations are prefixed with
 `/workspace/`.
 
+By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
+no relabel side-effects.  On SELinux hosts, pass `--selinux` to apply shared
+relabeling (`:z`) to built-in writable binds.  User-provided `-v` options are
+preserved exactly as supplied.
+
 ### Examples
 
 ```sh
@@ -87,6 +93,7 @@ agent-sandbox                                    # opencode, everything on
 agent-sandbox --no-podman --no-ssh                # drop two integrations
 agent-sandbox --antigravity                       # antigravity-cli (agy), everything on
 agent-sandbox --no-workspace                      # no CWD mount
+agent-sandbox --selinux                           # enable :z on built-in writable binds
 agent-sandbox -- bash                              # interactive bash with all integrations
 agent-sandbox -- devenv shell                      # devenv shell with opencode config mounted
 agent-sandbox -- --privileged                      # nested podman inside container
