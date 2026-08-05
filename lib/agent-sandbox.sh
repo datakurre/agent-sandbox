@@ -7,51 +7,7 @@
 # on PATH.  Commands *inside* the container are named bare (opencode, claude,
 # …) and resolve through the image's own PATH.
 
-usage() {
-  cat <<'USAGE'
-agent-sandbox [FLAGS] [-- COMMAND...]
 
-Runs an AI coding agent inside a rootless podman container with the current
-directory mounted at /workspace/<dirname>.
-
-  agent-sandbox                      opencode, default integrations
-  agent-sandbox --claude-code        claude instead of opencode
-  agent-sandbox -- bash              run bash instead of the agent
-  agent-sandbox --privileged         pass --privileged to podman run
-  agent-sandbox --podman-args --cap-add NET_ADMIN -- bash
-
-Agent (pick one; default opencode):
-  --opencode        --claude-code        --copilot        --antigravity
-
-Integrations (--no-X disables):
-  --workspace       mount $PWD at /workspace/<dirname>            [on]
-  --ssh             forward SSH_AUTH_SOCK                         [on]
-  --git             mount git config, forward identity            [on]
-  --gpg-agent       forward host gpg-agent for commit signing     [on]
-  --gpg-sign        allow git commit signing                      [on]
-  --gnupg-private   expose ~/.gnupg even if it holds on-disk keys [off]
-  --devenv          persist ~/.local/share/devenv                 [on]
-  --nix             mount the host /nix                           [on]
-  --podman          forward the host podman socket (see below)    [off]
-  --selinux         add :z to built-in writable binds             [off]
-
-Ports:
-  --port [HOST:]CONTAINER[/PROTO]    publish a port, repeatable
-  --ports / --no-ports               honour [ports] in ./AGENTS.md     [on]
-  --ports-dynamic                    allow `agent-sandbox-ctl port add` later
-  --ports-any-interface              permit binds outside loopback
-
-Mounts:
-  -v SOURCE[:DEST[:OPTS]]   relative SOURCE resolves against $PWD; relative
-                            DEST is placed under /workspace; "." means
-                            /workspace itself
-
---podman, --ssh and --gpg-agent each hand the agent a capability that reaches
-outside the sandbox.  --podman is the widest (a forwarded podman socket is
-equivalent to host access) which is why it is off by default.  See the trust
-model section in the README.
-USAGE
-}
 
 if ! podman image exists "$AGENT_SANDBOX_IMAGE" 2>/dev/null; then
   echo "agent-sandbox: image $AGENT_SANDBOX_IMAGE not found. Run 'agent-sandbox-ctl load' first." >&2
@@ -78,7 +34,60 @@ want_ports_any_interface=0
 want_firewall=0
 want_meter_network=0
 
-agent=opencode
+agent=""
+want_help=0
+
+if [[ $# -eq 0 ]]; then
+  want_help=1
+fi
+
+usage() {
+  cat <<USAGE
+agent-sandbox [FLAGS] [AGENT] [-- COMMAND...]
+
+Runs an AI coding agent inside a rootless podman container with the current
+directory mounted at /workspace/<dirname>.
+
+  agent-sandbox                      prints this help
+  agent-sandbox opencode             launch opencode with its specific mounts
+  agent-sandbox --podman opencode    launch opencode with podman enabled
+  agent-sandbox opencode -- bash     launch bash with opencode mounts
+  agent-sandbox -- bash              launch bash without agent specific mounts
+  agent-sandbox --privileged opencode
+                                     pass --privileged to podman run
+
+Agents:
+  opencode       claude-code       copilot       antigravity       bash
+
+Integrations (--no-X disables):
+  --workspace       mount \$PWD at /workspace/<dirname>            $([[ "$want_workspace" == "1" ]] && echo "[on ]" || echo "[off]")
+  --ssh             forward SSH_AUTH_SOCK                         $([[ "$want_ssh" == "1" ]] && echo "[on ]" || echo "[off]")
+  --git             mount git config, forward identity            $([[ "$want_git" == "1" ]] && echo "[on ]" || echo "[off]")
+  --gpg-agent       forward host gpg-agent for commit signing     $([[ "$want_gpg" == "1" ]] && echo "[on ]" || echo "[off]")
+  --gpg-sign        allow git commit signing                      $([[ "$want_gpg_sign" == "1" ]] && echo "[on ]" || echo "[off]")
+  --gnupg-private   expose ~/.gnupg even if it holds on-disk keys $([[ "$want_gnupg_private" == "1" ]] && echo "[on ]" || echo "[off]")
+  --devenv          persist ~/.local/share/devenv                 $([[ "$want_devenv" == "1" ]] && echo "[on ]" || echo "[off]")
+  --nix             mount the host /nix                           $([[ "$want_nix" == "1" ]] && echo "[on ]" || echo "[off]")
+  --podman          forward the host podman socket (see below)    $([[ "$want_podman" == "1" ]] && echo "[on ]" || echo "[off]")
+  --selinux         add :z to built-in writable binds             $([[ "$want_selinux" == "1" ]] && echo "[on ]" || echo "[off]")
+
+Ports:
+  --port [HOST:]CONTAINER[/PROTO]    publish a port, repeatable
+  --ports / --no-ports               honour [ports] in ./AGENTS.md     $([[ "$want_ports" == "1" ]] && echo "[on ]" || echo "[off]")
+  --ports-dynamic                    allow \`agent-sandbox-ctl port add\` later
+  --ports-any-interface              permit binds outside loopback
+
+Mounts:
+  -v SOURCE[:DEST[:OPTS]]   relative SOURCE resolves against \$PWD; relative
+                            DEST is placed under /workspace; "." means
+                            /workspace itself
+
+--podman, --ssh and --gpg-agent each hand the agent a capability that reaches
+outside the sandbox.  --podman is the widest (a forwarded podman socket is
+equivalent to host access) which is why it is off by default.  See the trust
+model section in the README.
+USAGE
+}
 
 mounts=()
 env_args=()
@@ -163,16 +172,11 @@ while [[ $# -gt 0 ]]; do
   fi
 
   case "$1" in
-    -h|--help)      usage; exit 0 ;;
+    -h|--help)      want_help=1 ;;
 
-    --opencode)     agent=opencode ;;
-    --claude-code)  agent=claude-code ;;
-    --copilot)      agent=copilot ;;
-    --antigravity)  agent=antigravity ;;
-    # --no-<agent> only means anything for the agent that is currently
-    # selected; it reverts to the default rather than leaving none.
-    --no-opencode|--no-claude-code|--no-copilot|--no-antigravity|--no-bash)
-      [[ "$agent" == "${1#--no-}" ]] && agent=opencode ;;
+    opencode|claude-code|copilot|antigravity|bash)
+      agent="$1"
+      ;;
 
     --ssh)          want_ssh=1 ;;
     --no-ssh)       want_ssh=0 ;;
@@ -249,12 +253,17 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "agent-sandbox: unexpected argument '$1'." >&2
-      echo "               To run a command in the sandbox: agent-sandbox -- $1" >&2
+      echo "               Valid agents: opencode, claude-code, copilot, antigravity, bash" >&2
       exit 1
       ;;
   esac
   shift
 done
+
+if [[ "$want_help" == "1" ]] || [[ -z "$agent" && ${#cmd_args[@]} -eq 0 ]]; then
+  usage
+  exit 0
+fi
 
 rw_mount_opts="rw"
 if [[ "$want_selinux" == "1" ]]; then
@@ -276,11 +285,12 @@ case "$agent" in
   copilot)     agent_argv=(copilot) ;;
   antigravity) agent_argv=(agy .) ;;
   bash)        agent_argv=(bash) ;;
+  "")          agent_argv=() ;;
 esac
 
 # A devenv.nix in the workspace means project dependencies belong on PATH
 # before the agent starts.
-if [[ ${#cmd_args[@]} -eq 0 ]]; then
+if [[ ${#cmd_args[@]} -eq 0 && -n "$agent" ]]; then
   if [[ -f "$PWD/devenv.nix" ]]; then
     cmd_args=(devenv shell --no-tui -- "${agent_argv[@]}")
   else
