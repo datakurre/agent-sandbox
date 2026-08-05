@@ -11,6 +11,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Force DNS resolution to use the default route's gateway (the external network),
+# ignoring the internal network's DNS server which drops external queries.
+DEFAULT_GW_HEX=$(awk '$2 == 00000000 {print $3}' /proc/net/route | head -n1)
+if [[ -n "$DEFAULT_GW_HEX" ]]; then
+  GW_IP=$(( 0x${DEFAULT_GW_HEX:6:2} )).$(( 0x${DEFAULT_GW_HEX:4:2} )).$(( 0x${DEFAULT_GW_HEX:2:2} )).$(( 0x${DEFAULT_GW_HEX:0:2} ))
+  echo "nameserver $GW_IP" > /tmp/resolv.conf
+  cat /tmp/resolv.conf > /etc/resolv.conf
+fi
+
 if [[ "${METER_NETWORK:-0}" == "1" ]]; then
   tcpdump -nni any -w /sidecar_shared/traffic.pcap >/dev/null 2>&1 &
   tcpdump_pid=$!
@@ -43,6 +52,8 @@ if [[ "${FIREWALL:-0}" == "1" ]]; then
   cat <<EOF > /tmp/tinyproxy.conf
 Port 8888
 Allow 0.0.0.0/0
+ConnectPort 443
+ConnectPort 80
 Filter "/sidecar_shared/allowed_domains"
 FilterDefaultDeny Yes
 FilterExtended On
@@ -53,6 +64,8 @@ else
   cat <<EOF > /tmp/tinyproxy.conf
 Port 8888
 Allow 0.0.0.0/0
+ConnectPort 443
+ConnectPort 80
 EOF
 fi
 
