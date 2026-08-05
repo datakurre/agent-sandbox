@@ -75,6 +75,8 @@ want_selinux=0
 want_ports=1
 want_ports_dynamic=0
 want_ports_any_interface=0
+want_firewall=0
+want_meter_network=0
 
 agent=opencode
 
@@ -184,6 +186,10 @@ while [[ $# -gt 0 ]]; do
     --ports-dynamic)    want_ports_dynamic=1 ;;
     --no-ports-dynamic) want_ports_dynamic=0 ;;
     --ports-any-interface) want_ports_any_interface=1 ;;
+    --firewall)         want_firewall=1 ;;
+    --no-firewall)      want_firewall=0 ;;
+    --meter-network)    want_meter_network=1 ;;
+    --no-meter-network) want_meter_network=0 ;;
     --port)
       shift
       [[ $# -gt 0 ]] || { echo "agent-sandbox: --port needs an argument" >&2; exit 1; }
@@ -331,7 +337,10 @@ fi
 # secret on disk (the smart-card case), unless --gnupg-private overrides.
 
 if [[ "$want_gpg" == "1" ]]; then
-  gpg_socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gnupg/S.gpg-agent"
+  if command -v gpgconf >/dev/null 2>&1; then
+    gpg_socket=$(gpgconf --list-dir agent-socket 2>/dev/null || true)
+  fi
+  gpg_socket="${gpg_socket:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gnupg/S.gpg-agent}"
   if [[ -S "$gpg_socket" ]]; then
     mounts+=("-v" "$gpg_socket:/run/host-gpg-agent:ro")
     env_args+=("-e" "AGENT_SANDBOX_GPG_AGENT=1")
@@ -363,6 +372,7 @@ if [[ "$want_gpg" == "1" ]]; then
       done <<< "$gnupg_offenders"
       echo "               A smart-card setup keeps only stubs here and is exposed normally." >&2
       echo "               Override with --gnupg-private, or silence this with --no-gpg-agent." >&2
+      exit 1
     fi
   fi
 fi
@@ -457,7 +467,22 @@ fi
 # Temp passwd/group so tools resolve the username inside the container.
 passwd_tmp=$(mktemp)
 group_tmp=$(mktemp)
-trap 'rm -f "$passwd_tmp" "$group_tmp"' EXIT
+
+cleanup() {
+  rm -f "$passwd_tmp" "$group_tmp"
+  if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
+    podman stop -t 1 "$sidecar_id" >/dev/null 2>&1 || true
+    if [[ "$want_meter_network" == "1" ]]; then
+      printf '\n=== Network Traffic Summary ===\n'
+      tshark -r "$sidecar_shared/traffic.pcap" -T fields -e tls.handshake.extensions_server_name -Y 'tls.handshake.type == 1' 2>/dev/null | sort | uniq -c
+      printf '\n--- IP Addresses and Byte Volumes ---\n'
+      tshark -r "$sidecar_shared/traffic.pcap" -q -z conv,ip 2>/dev/null
+    fi
+    podman network rm "$sidecar_id" >/dev/null 2>&1 || true
+    rm -rf "$sidecar_shared"
+  fi
+}
+trap cleanup EXIT
 printf 'root:x:0:0:root:/root:/bin/sh\nuser:x:%s:%s::/home/user:/bin/bash\nnobody:x:65534:65534:Nobody:/:/bin/sh\n' "$(id -u)" "$(id -g)" > "$passwd_tmp"
 printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
 
@@ -467,6 +492,34 @@ printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
 workspace_slug=$(basename "$PWD")
 workspace_slug="${workspace_slug//[^A-Za-z0-9_.-]/-}"
 container_name="agent-sandbox-${workspace_slug:0:32}-$$"
+
+# ── Sidecar Proxy & Metering ────────────────────────────────────────────────
+if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
+  sidecar_id="sidecar-$(head -c 12 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)"
+  sidecar_shared=$(mktemp -d)
+  podman network create --internal "$sidecar_id" >/dev/null 2>&1 || true
+
+  proxy_domains=()
+  if [[ "$want_firewall" == "1" && -f "$PWD/AGENTS.md" ]]; then
+    read -ra proxy_domains <<< "$(agent-sandbox-parse-agents --proxy-domains "$PWD/AGENTS.md" 2>/dev/null || true)"
+  fi
+
+  sidecar_caps=()
+  if [[ "$want_meter_network" == "1" ]]; then
+    sidecar_caps=("--cap-add=NET_ADMIN" "--cap-add=NET_RAW")
+  fi
+
+  podman run -d --rm --name "$sidecar_id" \
+    --network bridge --network "$sidecar_id" \
+    "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:rw" \
+    -e "METER_NETWORK=$want_meter_network" \
+    -e "FIREWALL=$want_firewall" \
+    "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar "${proxy_domains[@]}" >/dev/null 2>&1
+
+  network_args+=(--network "$sidecar_id")
+  mounts+=("-v" "$sidecar_shared:/sidecar_shared:rw")
+  env_args+=("-e" "HTTP_PROXY=http://$sidecar_id:8888" "-e" "HTTPS_PROXY=http://$sidecar_id:8888")
+fi
 
 env_args+=("-e" "TERM=${TERM:-xterm-256color}")
 [[ -n "${COLORTERM:-}" ]] && env_args+=("-e" "COLORTERM=$COLORTERM")

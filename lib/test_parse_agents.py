@@ -6,7 +6,7 @@ Run directly (`python3 lib/test_parse_agents.py`) or via `nix flake check`.
 
 import unittest
 
-from parse_agents import ConfigError, Mapping, parse_ports
+from parse_agents import ConfigError, Mapping, parse_ports, parse_proxy_domains
 
 
 def block(body: str, info: str = "toml agent-sandbox") -> str:
@@ -210,6 +210,54 @@ class TestAllocate(unittest.TestCase):
             name="web", bind="127.0.0.1", host=3000, container=3000, protocol="tcp"
         )
         self.assertIs(allocate(fixed), fixed)
+
+
+class TestProxyDomains(unittest.TestCase):
+    def test_valid_domains(self):
+        text = block('[proxy]\nallow_domains = ["github.com", "api.example.org"]')
+        self.assertEqual(parse_proxy_domains(text), ["github.com", "api.example.org"])
+
+    def test_wildcard_domains(self):
+        text = block('[proxy]\nallow_domains = ["*.github.com", "*.example.org"]')
+        self.assertEqual(parse_proxy_domains(text), ["*.github.com", "*.example.org"])
+
+    def test_empty_list(self):
+        text = block("[proxy]\nallow_domains = []")
+        self.assertEqual(parse_proxy_domains(text), [])
+
+    def test_no_proxy_block(self):
+        text = block("[ports]\nweb = 3000")
+        self.assertEqual(parse_proxy_domains(text), [])
+
+    def test_newline_injection_rejected(self):
+        text = block('[proxy]\nallow_domains = ["github.com\\nevil.com"]')
+        with self.assertRaisesRegex(ConfigError, "not a valid domain name"):
+            parse_proxy_domains(text)
+
+    def test_trailing_newline_rejected(self):
+        text = block('[proxy]\nallow_domains = ["github.com\\n"]')
+        with self.assertRaisesRegex(ConfigError, "not a valid domain name"):
+            parse_proxy_domains(text)
+
+    def test_space_injection_rejected(self):
+        text = block('[proxy]\nallow_domains = ["github.com --privileged"]')
+        with self.assertRaisesRegex(ConfigError, "not a valid domain name"):
+            parse_proxy_domains(text)
+
+    def test_empty_string_rejected(self):
+        text = block('[proxy]\nallow_domains = [""]')
+        with self.assertRaisesRegex(ConfigError, "not a valid domain name"):
+            parse_proxy_domains(text)
+
+    def test_invalid_wildcard_rejected(self):
+        text = block('[proxy]\nallow_domains = ["*github.com"]')
+        with self.assertRaisesRegex(ConfigError, "not a valid domain name"):
+            parse_proxy_domains(text)
+
+    def test_non_string_rejected(self):
+        text = block("[proxy]\nallow_domains = [42]")
+        with self.assertRaisesRegex(ConfigError, "must be strings"):
+            parse_proxy_domains(text)
 
 
 if __name__ == "__main__":

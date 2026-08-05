@@ -55,7 +55,8 @@ expect "empty private-keys-v1.d" "$empty" 0
 # The smart-card setup: stubs only.
 card=$(make_home card \
   "AB12.key:(shadowed-private-key" \
-  "CD34.key:(shadowed-private-key")
+  "CD34.key:(shadowed-private-key" \
+  "9999.key:Token: foo Key: (shadowed-private-key")
 expect "smart-card stubs only" "$card" 0
 
 # --- unsafe cases ----------------------------------------------------------
@@ -84,6 +85,12 @@ expect "legacy secring.gpg" "$legacy" 2
 empty_legacy=$(make_home empty-legacy "AB12.key:(shadowed-private-key")
 : > "$empty_legacy/secring.gpg"
 expect "empty legacy secring.gpg is ignored" "$empty_legacy" 0
+
+# A file whose S-expression starts with (protected-private-key but also
+# mentions (shadowed-private-key in a comment must still be flagged as unsafe.
+spoofed=$(make_home spoofed \
+  "SPOOF.key:(protected-private-key (comment (shadowed-private-key)")
+expect "protected key with shadowed-key in comment" "$spoofed" 2
 
 # --- output shape ----------------------------------------------------------
 

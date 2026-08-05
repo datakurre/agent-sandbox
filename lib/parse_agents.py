@@ -37,6 +37,7 @@ MAX_PORTS = 32
 
 FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+DOMAIN_RE = re.compile(r"\A(?:\*\.)?[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?\Z")
 
 ENTRY_FIELDS = frozenset({"container", "host", "bind", "protocol"})
 PROTOCOLS = frozenset({"tcp", "udp"})
@@ -159,6 +160,36 @@ def parse_entry(name: str, value: object, allow_any_interface: bool) -> Mapping:
     )
 
 
+def parse_proxy_domains(text: str) -> list[str]:
+    domains = []
+    for body in iter_tagged_blocks(text):
+        try:
+            block = tomllib.loads(body)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"malformed TOML in agent-sandbox block: {exc}") from exc
+
+        proxy = block.get("proxy")
+        if proxy is None:
+            continue
+        if not isinstance(proxy, dict):
+            raise ConfigError("[proxy] must be a table")
+
+        allow_domains = proxy.get("allow_domains")
+        if allow_domains is not None:
+            if not isinstance(allow_domains, list):
+                raise ConfigError("[proxy].allow_domains must be a list of strings")
+            for domain in allow_domains:
+                if not isinstance(domain, str):
+                    raise ConfigError("[proxy].allow_domains elements must be strings")
+                if not DOMAIN_RE.match(domain):
+                    raise ConfigError(
+                        f"[proxy].allow_domains: {domain!r} is not a valid domain name "
+                        f"(must match {DOMAIN_RE.pattern})"
+                    )
+                domains.append(domain)
+    return domains
+
+
 def parse_ports(
     text: str, *, allow_any_interface: bool = False, max_ports: int = MAX_PORTS
 ) -> list[Mapping]:
@@ -222,6 +253,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="leave `host = 0` unresolved instead of picking a free port",
     )
+    parser.add_argument(
+        "--proxy-domains",
+        action="store_true",
+        help="extract allow_domains from the [proxy] block instead of port mappings",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -232,6 +268,16 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"agent-sandbox: cannot read {args.path}: {exc}", file=sys.stderr)
         return 1
+
+    if args.proxy_domains:
+        try:
+            domains = parse_proxy_domains(text)
+            if domains:
+                print(" ".join(domains))
+        except ConfigError as exc:
+            print(f"agent-sandbox: {args.path}: {exc}", file=sys.stderr)
+            return 1
+        return 0
 
     try:
         mappings = parse_ports(

@@ -80,6 +80,9 @@ Some integrations are **on by default** while others are opt-in. Enable or disab
 | `--devenv` / `--no-devenv`       | on | mount `~/.local/share/devenv` across sessions          |
 | `--podman` / `--no-podman`       | off | forward host rootless podman socket (sibling containers) |
 | `--nix` / `--no-nix`             | on | mount host `/nix/store` to delegate builds to host daemon |
+| `--gnupg-private` / `--no-gnupg-private` | off | expose `~/.gnupg` even when it holds on-disk secret keys |
+| `--firewall` / `--no-firewall`   | off | route container traffic through a domain-filtering proxy |
+| `--meter-network` / `--no-meter-network` | off | capture network traffic for a post-run summary           |
 
 You can also pass `-v` / `-v*` volume mounts before `--`.  Relative paths in
 the source are resolved against `$PWD`; relative destinations are prefixed with

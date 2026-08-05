@@ -36,10 +36,16 @@ if [[ -d "$private_dir" ]]; then
   while IFS= read -r -d '' key; do
     # The header is ASCII at byte 0.  Strip NULs so command substitution
     # cannot swallow the value, and collapse whitespace for the match.
-    header=$(head -c 64 -- "$key" 2>/dev/null | tr -d '\0' | tr -s ' \t\n' ' ' || true)
+    header=$(head -c 256 -- "$key" 2>/dev/null | tr -d '\0' | tr -s ' \t\n' ' ' || true)
     case "$header" in
-      "(shadowed-private-key"*) continue ;;
-      *) offenders+=("$key") ;;
+      # Match unsafe formats first — a key containing both
+      # "(protected-private-key" and "(shadowed-private-key" in metadata
+      # is treated as unsafe.
+      *"(protected-private-key"*) offenders+=("$key") ;;
+      *"(shadowed-private-key"*)  continue ;;
+      *"(private-key"*)           offenders+=("$key") ;;
+      # Anything unrecognised counts as unsafe (fail closed).
+      *)                          offenders+=("$key") ;;
     esac
   done < <(find "$private_dir" -maxdepth 1 -type f -print0 2>/dev/null | sort -z)
 fi

@@ -31,6 +31,9 @@ let
   # `docker` alias so anything calling docker hits podman.
   dockerAlias = pkgs.writeShellScriptBin "docker" ''exec ${pkgs.podman}/bin/podman "$@"'';
 
+  sidecarScript = pkgs.writeShellScriptBin "agent-sandbox-sidecar" (scriptBody ./lib/agent-sandbox-sidecar.sh);
+  allowScript = pkgs.writeShellScriptBin "agent-sandbox-allow" (scriptBody ./lib/agent-sandbox-allow.sh);
+
   baseTools =
     with pkgs;
     [
@@ -84,6 +87,10 @@ let
       git-lfs
       nix
       devenv
+      tinyproxy
+      inotify-tools
+      tcpdump
+      wireshark-cli
       git
       gh
       nodejs
@@ -96,7 +103,7 @@ let
       glibcLocales
     ]
     ++ podmanStack
-    ++ [ dockerAlias ];
+    ++ [ dockerAlias sidecarScript allowScript ];
 
   nixConf = pkgs.writeTextFile {
     name = "nix-conf";
@@ -299,6 +306,8 @@ let
       podman
       git
       coreutils
+      gnupg       # gpgconf --list-dir agent-socket
+      wireshark-cli # tshark for --meter-network cleanup
     ]
     ++ [
       gnupgScan
@@ -325,6 +334,12 @@ let
       findutils
     ];
     text = preamble + scriptBody ./lib/agent-sandbox-purge.sh;
+  };
+
+  listScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-list";
+    runtimeInputs = with pkgs; [ podman ];
+    text = preamble + scriptBody ./lib/agent-sandbox-list.sh;
   };
 
   loadScript = pkgs.writeShellApplication {
@@ -378,6 +393,7 @@ let
         launcher
         portScript
         purgeScript
+        listScript
         gnupgScan
         parseAgents
       ];
@@ -392,6 +408,7 @@ pkgs.symlinkJoin {
     loadScript
     portScript
     purgeScript
+    listScript
     gnupgScan
     parseAgents
   ];
@@ -403,6 +420,7 @@ pkgs.symlinkJoin {
       loadScript
       portScript
       purgeScript
+      listScript
       ;
   };
   meta = {
