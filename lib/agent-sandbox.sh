@@ -57,7 +57,7 @@ directory mounted at /workspace/<dirname>.
                                      pass --privileged to podman run
 
 Agents:
-  opencode       claude-code       copilot       antigravity       bash
+  opencode       claude-code       copilot       antigravity
 
 Integrations (--no-X disables):
   --workspace       mount \$PWD at /workspace/<dirname>            $([[ "$want_workspace" == "1" ]] && echo "[on ]" || echo "[off]")
@@ -174,7 +174,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)      want_help=1 ;;
 
-    opencode|claude-code|copilot|antigravity|bash)
+    opencode|claude-code|copilot|antigravity)
       agent="$1"
       ;;
 
@@ -253,7 +253,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "agent-sandbox: unexpected argument '$1'." >&2
-      echo "               Valid agents: opencode, claude-code, copilot, antigravity, bash" >&2
+      echo "               Valid agents: opencode, claude-code, copilot, antigravity" >&2
       exit 1
       ;;
   esac
@@ -284,7 +284,6 @@ case "$agent" in
   claude-code) agent_argv=(claude) ;;
   copilot)     agent_argv=(copilot) ;;
   antigravity) agent_argv=(agy .) ;;
-  bash)        agent_argv=(bash) ;;
   "")          agent_argv=() ;;
 esac
 
@@ -333,8 +332,6 @@ case "$agent" in
     mount_rw "$HOME/.cache/antigravity-cli"       /home/user/.cache/antigravity-cli
     # agy keeps its auth state under ~/.gemini.
     mount_rw "$HOME/.gemini" /home/user/.gemini
-    ;;
-  bash)
     ;;
 esac
 

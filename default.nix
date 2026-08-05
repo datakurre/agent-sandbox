@@ -354,7 +354,12 @@ let
 
   ctlScript = pkgs.writeShellApplication {
     name = "agent-sandbox-ctl";
-    runtimeInputs = [ ];
+    runtimeInputs = [
+      loadScript
+      portScript
+      purgeScript
+      listScript
+    ];
     text = scriptBody ./lib/agent-sandbox-ctl.sh;
   };
 
@@ -412,13 +417,7 @@ pkgs.symlinkJoin {
   name = "agent-sandbox";
   paths = [
     launcher
-    loadScript
-    portScript
-    purgeScript
-    listScript
     ctlScript
-    gnupgScan
-    parseAgents
   ];
   passthru = {
     inherit
