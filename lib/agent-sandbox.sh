@@ -9,7 +9,7 @@
 
 usage() {
   cat <<'USAGE'
-agent-sandbox [FLAGS] [-- PODMAN_ARGS...] [-- COMMAND...]
+agent-sandbox [FLAGS] [-- COMMAND...]
 
 Runs an AI coding agent inside a rootless podman container with the current
 directory mounted at /workspace/<dirname>.
@@ -17,8 +17,8 @@ directory mounted at /workspace/<dirname>.
   agent-sandbox                      opencode, default integrations
   agent-sandbox --claude-code        claude instead of opencode
   agent-sandbox -- bash              run bash instead of the agent
-  agent-sandbox -- --privileged      pass --privileged to podman run
-  agent-sandbox -- --privileged -- bash
+  agent-sandbox --privileged         pass --privileged to podman run
+  agent-sandbox --podman-args --cap-add NET_ADMIN -- bash
 
 Agent (pick one; default opencode):
   --opencode        --claude-code        --copilot        --antigravity
@@ -143,11 +143,25 @@ parse_port_spec() {
 }
 
 # ── Flag parsing ────────────────────────────────────────────────────────────
-# Phase 1 (here): agent-sandbox flags.  The first -- ends it.
-# Phase 2: podman run arguments.  A second -- ends those.
-# Phase 3: the command to run inside the container.
+# Phase 1: agent-sandbox flags and podman options. The first -- ends it.
+# Phase 2: the command to run inside the container.
+
+parsing_podman=0
 
 while [[ $# -gt 0 ]]; do
+  if [[ "$parsing_podman" == "1" ]]; then
+    if [[ "$1" == "--" ]]; then
+      parsing_podman=0
+      shift
+      cmd_args=("$@")
+      break
+    else
+      podman_args+=("$1")
+      shift
+      continue
+    fi
+  fi
+
   case "$1" in
     -h|--help)      usage; exit 0 ;;
 
@@ -204,15 +218,34 @@ while [[ $# -gt 0 ]]; do
       ;;
     -v*) mounts+=("-v" "$(expand_v "${1#-v}")") ;;
 
-    --) shift; break ;;
+    --podman-args)
+      parsing_podman=1
+      ;;
+    --privileged)
+      podman_args+=("--privileged")
+      ;;
+    -e|--env)
+      shift
+      [[ $# -gt 0 ]] || { echo "agent-sandbox: -e/--env needs an argument" >&2; exit 1; }
+      env_args+=("-e" "$1")
+      ;;
+    -e*)
+      env_args+=("-e" "${1#-e}")
+      ;;
+    --env=*)
+      env_args+=("-e" "${1#--env=}")
+      ;;
+
+    --) 
+      shift
+      cmd_args=("$@")
+      break
+      ;;
 
     --*)
-      # Compatibility path: podman flags used to be accepted here because
-      # unknown arguments were passed through silently.  That also swallowed
-      # typos, so the pass-through now announces itself.
-      echo "agent-sandbox: '$1' is not an agent-sandbox flag; forwarding it to podman." >&2
-      echo "               Prefer: agent-sandbox -- $1" >&2
-      podman_args+=("$1")
+      echo "agent-sandbox: '$1' is not an agent-sandbox flag." >&2
+      echo "               To pass a podman flag: agent-sandbox --podman-args $1" >&2
+      exit 1
       ;;
     *)
       echo "agent-sandbox: unexpected argument '$1'." >&2
@@ -222,18 +255,6 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
-
-# Phase 2: podman args, up to a second --.
-while [[ $# -gt 0 ]]; do
-  [[ "$1" == "--" ]] && { shift; break; }
-  podman_args+=("$1")
-  shift
-done
-
-# Phase 3: whatever is left replaces the container command.
-if [[ $# -gt 0 ]]; then
-  cmd_args=("$@")
-fi
 
 rw_mount_opts="rw"
 if [[ "$want_selinux" == "1" ]]; then
