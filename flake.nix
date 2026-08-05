@@ -44,7 +44,7 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        default = import ./default.nix { inherit pkgs lib; };
+        default = lib.makeOverridable (import ./default.nix) { inherit pkgs lib; };
         # The image itself, for `nix build .#image` and for shipping it
         # somewhere other than the local podman store.
         image = default.passthru.image;

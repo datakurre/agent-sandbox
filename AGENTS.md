@@ -7,6 +7,7 @@
 loader utility (`agent-sandbox-ctl load`), and a purge utility (`agent-sandbox-ctl purge`).
 
 - **default.nix** – single Nix module; builds the image and the three scripts.
+- **agents.nix** – agent catalog (command + persisted state paths per agent).
 - **flake.nix**  – flake entry point; exposes `packages.<system>.default` and
   `apps.<system>.default`.
 
@@ -66,6 +67,19 @@ A bash script that wraps `podman run`.  Call flow:
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
 5. Update the usage comment.
 6. Test: `nix flake check`
+
+## How to add a new agent
+
+Add an entry to `agents.nix`. The entry drives:
+
+- inclusion of the agent package in the image PATH,
+- accepted agent names in the launcher,
+- command dispatch when selecting that agent,
+- persisted home-state mounts (`state` directories, `stateFiles` files).
+
+Downstream flakes can override the catalog and default agent via:
+
+`(import ./default.nix { inherit pkgs lib; }).override { agents = ...; defaultAgent = "..."; }`
 
 ## How to add a new tool to the image
 

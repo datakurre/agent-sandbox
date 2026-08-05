@@ -37,6 +37,25 @@ want_meter_network=0
 agent=""
 want_help=0
 
+if [[ -z "${AGENT_SANDBOX_AGENT_SPECS:-}" ]]; then
+  AGENT_SANDBOX_AGENT_SPECS=$'opencode\t["opencode","."]\t[".local/share/opencode",".config/opencode",".cache/opencode"]\t[]\nclaude-code\t["claude"]\t[".claude"]\t[".claude.json"]\ncopilot\t["copilot"]\t[".copilot"]\t[]\nantigravity\t["agy","."]\t[".local/share/antigravity-cli",".config/antigravity-cli",".cache/antigravity-cli",".gemini"]\t[]'
+fi
+
+declare -a agent_names=()
+declare -A agent_cmd_json=()
+declare -A agent_state_json=()
+declare -A agent_state_files_json=()
+
+while IFS=$'\t' read -r name cmd_json state_json state_files_json; do
+  [[ -n "$name" ]] || continue
+  agent_names+=("$name")
+  agent_cmd_json["$name"]="$cmd_json"
+  agent_state_json["$name"]="$state_json"
+  agent_state_files_json["$name"]="$state_files_json"
+done <<< "${AGENT_SANDBOX_AGENT_SPECS}"
+
+agent_list="${agent_names[*]}"
+
 if [[ $# -eq 0 ]]; then
   want_help=1
 fi
@@ -57,7 +76,7 @@ directory mounted at /workspace/<dirname>.
                                      pass --privileged to podman run
 
 Agents:
-  opencode       claude-code       copilot       antigravity
+  ${agent_list}
 
 Integrations (--no-X disables):
   --workspace       mount \$PWD at /workspace/<dirname>            $([[ "$want_workspace" == "1" ]] && echo "[on ]" || echo "[off]")
@@ -179,12 +198,14 @@ while [[ $# -gt 0 ]]; do
     fi
   fi
 
+  if [[ -n "${agent_cmd_json[$1]:-}" ]]; then
+    agent="$1"
+    shift
+    continue
+  fi
+
   case "$1" in
     -h|--help)      want_help=1 ;;
-
-    opencode|claude-code|copilot|antigravity)
-      agent="$1"
-      ;;
 
     --ssh)          want_ssh=1 ;;
     --no-ssh)       want_ssh=0 ;;
@@ -261,7 +282,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "agent-sandbox: unexpected argument '$1'." >&2
-      echo "               Valid agents: opencode, claude-code, copilot, antigravity" >&2
+      echo "               Valid agents: ${agent_list}" >&2
       exit 1
       ;;
   esac
@@ -284,16 +305,11 @@ if [[ "$want_ports_any_interface" == "1" ]]; then
 fi
 
 # ── Agent selection ─────────────────────────────────────────────────────────
-# One table instead of a branch per agent: adding a fifth agent is one row
-# here plus one row in the state-directory table below.
-
-case "$agent" in
-  opencode)    agent_argv=(opencode .) ;;
-  claude-code) agent_argv=(claude) ;;
-  copilot)     agent_argv=(copilot) ;;
-  antigravity) agent_argv=(agy .) ;;
-  "")          agent_argv=() ;;
-esac
+if [[ -z "$agent" ]]; then
+  agent_argv=()
+else
+  mapfile -t agent_argv < <(jq -r '.[]' <<< "${agent_cmd_json[$agent]}")
+fi
 
 # A devenv.nix in the workspace means project dependencies belong on PATH
 # before the agent starts.
@@ -316,32 +332,20 @@ else
 fi
 
 # ── Agent state ─────────────────────────────────────────────────────────────
-# Only the selected agent's directories are mounted; mounting all of them
-# would create config directories on the host for tools that never ran.
+# Only the selected agent's paths are mounted, so we avoid creating host-side
+# state directories for tools that never run.
+if [[ -n "$agent" ]]; then
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    mount_rw "$HOME/$rel" "/home/user/$rel"
+  done < <(jq -r '.[]' <<< "${agent_state_json[$agent]}")
 
-case "$agent" in
-  opencode)
-    mount_rw "$HOME/.local/share/opencode" /home/user/.local/share/opencode
-    mount_rw "$HOME/.config/opencode"      /home/user/.config/opencode
-    mount_rw "$HOME/.cache/opencode"       /home/user/.cache/opencode
-    ;;
-  claude-code)
-    mount_rw "$HOME/.claude" /home/user/.claude
-    # claude-code expects a JSON object, not a zero-byte file.
-    [[ -s "$HOME/.claude.json" ]] || printf '{}\n' > "$HOME/.claude.json"
-    mounts+=("-v" "$HOME/.claude.json:/home/user/.claude.json:$rw_mount_opts")
-    ;;
-  copilot)
-    mount_rw "$HOME/.copilot" /home/user/.copilot
-    ;;
-  antigravity)
-    mount_rw "$HOME/.local/share/antigravity-cli" /home/user/.local/share/antigravity-cli
-    mount_rw "$HOME/.config/antigravity-cli"      /home/user/.config/antigravity-cli
-    mount_rw "$HOME/.cache/antigravity-cli"       /home/user/.cache/antigravity-cli
-    # agy keeps its auth state under ~/.gemini.
-    mount_rw "$HOME/.gemini" /home/user/.gemini
-    ;;
-esac
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    [[ -s "$HOME/$rel" ]] || printf '{}\n' > "$HOME/$rel"
+    mounts+=("-v" "$HOME/$rel:/home/user/$rel:$rw_mount_opts")
+  done < <(jq -r '.[]' <<< "${agent_state_files_json[$agent]}")
+fi
 
 # ── SSH ─────────────────────────────────────────────────────────────────────
 

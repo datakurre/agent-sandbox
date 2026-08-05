@@ -1,4 +1,9 @@
-{ pkgs, lib }:
+{
+  pkgs,
+  lib,
+  agents ? import ./agents.nix { inherit pkgs; },
+  defaultAgent ? "opencode",
+}:
 
 let
   imageName = "agent-sandbox";
@@ -33,6 +38,20 @@ let
 
   sidecarScript = pkgs.writeShellScriptBin "agent-sandbox-sidecar" (scriptBody ./lib/agent-sandbox-sidecar.sh);
   allowScript = pkgs.writeShellScriptBin "agent-sandbox-allow" (scriptBody ./lib/agent-sandbox-allow.sh);
+  unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
+  defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
+  agentTools = map (a: a.package) agents;
+  agentSpecs = lib.concatStringsSep "\n" (
+    map (
+      a:
+      lib.concatStringsSep "\t" [
+        a.name
+        (builtins.toJSON a.command)
+        (builtins.toJSON (a.state or [ ]))
+        (builtins.toJSON (a.stateFiles or [ ]))
+      ]
+    ) agents
+  );
 
   baseTools =
     with pkgs;
@@ -94,16 +113,14 @@ let
       git
       gh
       nodejs
-      opencode
-      claude-code
-      google-antigravity-cli
-      github-copilot-cli
       stdenv.cc.cc.lib
       zlib
       glibcLocales
     ]
     ++ podmanStack
     ++ [ dockerAlias sidecarScript allowScript ];
+
+  tools = baseTools ++ agentTools;
 
   nixConf = pkgs.writeTextFile {
     name = "nix-conf";
@@ -163,7 +180,7 @@ let
 
   # All paths baked into the image root, shared between the root env and
   # closureInfo so they stay in sync.
-  containerPaths = baseTools ++ [
+  containerPaths = tools ++ [
     pkgs.cacert
     nixConf
     containersConf
@@ -246,9 +263,9 @@ let
     config = {
       WorkingDir = "/workspace";
       Entrypoint = [ "${entrypoint}" ];
-      Cmd = [ "${pkgs.opencode}/bin/opencode" ];
+      Cmd = defaultAgentDef.command;
       Env = [
-        "PATH=${lib.makeBinPath baseTools}"
+        "PATH=${lib.makeBinPath tools}"
         "LD_LIBRARY_PATH=${
           lib.makeLibraryPath [
             pkgs.stdenv.cc.cc.lib
@@ -269,6 +286,14 @@ let
       ];
     };
   };
+
+  # The launcher mounts host /nix over the image store by default, so image
+  # referenced paths must stay rooted in this package closure as well.
+  imageStorePaths = pkgs.writeTextDir "share/agent-sandbox/image-store-paths" (
+    lib.concatMapStringsSep "\n" toString (
+      lib.concatMap (p: map (o: p.${o}) (p.outputs or [ "out" ])) containerPaths ++ [ entrypoint ]
+    )
+  );
 
   # ── Host-side helpers ─────────────────────────────────────────────────────
 
@@ -300,12 +325,17 @@ let
     AGENT_SANDBOX_NETWORK="${networkName}"
   '';
 
+  launcherPreamble = preamble + ''
+    AGENT_SANDBOX_AGENT_SPECS=${lib.escapeShellArg agentSpecs}
+  '';
+
   launcher = pkgs.writeShellApplication {
     name = "agent-sandbox";
     runtimeInputs = with pkgs; [
       podman
       git
       coreutils
+      jq
       gnupg       # gpgconf --list-dir agent-socket
       wireshark-cli # tshark for --meter-network cleanup
     ]
@@ -313,7 +343,7 @@ let
       gnupgScan
       parseAgents
     ];
-    text = preamble + scriptBody ./lib/agent-sandbox.sh;
+    text = launcherPreamble + scriptBody ./lib/agent-sandbox.sh;
   };
 
   portScript = pkgs.writeShellApplication {
@@ -418,9 +448,12 @@ pkgs.symlinkJoin {
   paths = [
     launcher
     ctlScript
+    imageStorePaths
   ];
   passthru = {
     inherit
+      agents
+      defaultAgent
       image
       checks
       launcher
