@@ -11,31 +11,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-default_iface=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
-if [[ -n "$default_iface" ]]; then
-  > /tmp/resolv.conf
-  ns_found=0
-  while read -r line; do
-    if [[ "$line" =~ ^nameserver\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-      ns="${BASH_REMATCH[1]}"
-      if ip route get "$ns" 2>/dev/null | grep -q -w "$default_iface"; then
-        echo "$line" >> /tmp/resolv.conf
-        ns_found=1
-      fi
-    else
-      echo "$line" >> /tmp/resolv.conf
-    fi
-  done < /etc/resolv.conf
-
-  if [[ "$ns_found" == "0" ]]; then
-    gw_ip=$(ip route show default | awk '{print $3}' | head -n1)
-    [[ -n "$gw_ip" ]] && echo "nameserver $gw_ip" >> /tmp/resolv.conf
-  fi
-  cat /tmp/resolv.conf > /etc/resolv.conf
-fi
+# Rely entirely on Podman's /etc/resolv.conf configuration instead of trying to strip it
 
 if [[ "${METER_NETWORK:-0}" == "1" ]]; then
-  tcpdump -nni any -w /sidecar_shared/traffic.pcap >/dev/null 2>&1 &
+  tcpdump -U -nni any -w /sidecar_shared/traffic.pcap 2>/sidecar_shared/tcpdump.log &
   tcpdump_pid=$!
 fi
 
@@ -86,6 +65,13 @@ fi
 # Run tinyproxy in foreground mode (-d) so we can track its PID.
 tinyproxy -d -c /tmp/tinyproxy.conf &
 tinyproxy_pid=$!
+
+# Wait for tinyproxy to actually bind to port 8888 before signaling readiness.
+for _ in $(seq 1 50); do
+  (echo > /dev/tcp/127.0.0.1/8888) 2>/dev/null && break
+  sleep 0.1
+done
+touch /sidecar_shared/ready
 
 # Watch for filter updates if firewall is active; otherwise just wait.
 if [[ "${FIREWALL:-0}" == "1" ]]; then

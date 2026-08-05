@@ -64,7 +64,7 @@ else
 fi
 echo
 
-# ── Network ───────────────────────────────────────────────────────────────
+# ── Networks ──────────────────────────────────────────────────────────────
 if podman network exists "$AGENT_SANDBOX_NETWORK" 2>/dev/null; then
   echo "Network: $AGENT_SANDBOX_NETWORK"
   echo
@@ -75,7 +75,24 @@ if podman network exists "$AGENT_SANDBOX_NETWORK" 2>/dev/null; then
     echo "Skipped."
   fi
 else
-  echo "No agent-sandbox network found."
+  echo "No main agent-sandbox network found."
+fi
+echo
+
+sidecar_networks=$(podman network ls --filter "name=agent-sandbox-sidecar-" -q 2>/dev/null || true)
+if [[ -n "$sidecar_networks" ]]; then
+  echo "Sidecar networks:"
+  podman network ls --filter "name=agent-sandbox-sidecar-" \
+    --format "  {{.ID}}  {{.Name}}"
+  echo
+  if confirm "Remove these sidecar networks?"; then
+    xargs -r podman network rm -f <<< "$sidecar_networks" > /dev/null
+    echo "Sidecar networks removed."
+  else
+    echo "Skipped."
+  fi
+else
+  echo "No sidecar networks found."
 fi
 echo
 

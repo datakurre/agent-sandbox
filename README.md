@@ -50,15 +50,14 @@ agent-sandbox -- -- devenv shell
 
 ### Pass podman flags
 
-Podman run flags go between two `--` sentinels.  Flags go before the first
-`--`, additional podman args between the first and second, and the container
-command after the second:
+To pass arguments directly to podman, use `--podman-args`. All arguments after `--podman-args` will be passed to podman until a `--` sentinel is reached, which marks the start of the container command.
+
+There are also convenient shortcuts like `--privileged` and `-e` for common podman flags.
 
 ```sh
-agent-sandbox -- --privileged                     # enable nested podman
-agent-sandbox -- --network=host                   # host network
-agent-sandbox -- --privileged -- bash              # podman flag + bash
-agent-sandbox --no-workspace -v ~/src:/workspace:rw   # custom workspace mount
+agent-sandbox --privileged opencode               # enable nested podman
+agent-sandbox --podman-args --network=host -- bash # host network
+agent-sandbox -e MY_VAR=1 opencode                # pass environment variable
 ```
 
 ### Flags
@@ -73,16 +72,19 @@ Some integrations are **on by default** while others are opt-in. Enable or disab
 | `--git` / `--no-git`             | on | mount `~/.gitconfig`, forward `user.name`/`user.email` |
 | `--gpg-agent` / `--no-gpg-agent` | on | forward host gpg-agent socket for commit signing       |
 | `--gpg-sign` / `--no-gpg-sign`   | on | enable/disable git commit signing inside container     |
-| `--opencode` / `--no-opencode`   | on | mount opencode config, cache, and data dirs            |
-| `--claude-code` / `--no-claude-code` | off | mount claude configuration files; use `claude` as default command |
-| `--copilot` / `--no-copilot`     | off | mount github-copilot-cli config dir; use `copilot` as default command |
-| `--antigravity` / `--no-antigravity` | off | mount antigravity-cli config, cache, and data dirs; use `agy` as default command |
 | `--devenv` / `--no-devenv`       | on | mount `~/.local/share/devenv` across sessions          |
 | `--podman` / `--no-podman`       | off | forward host rootless podman socket (sibling containers) |
 | `--nix` / `--no-nix`             | on | mount host `/nix/store` to delegate builds to host daemon |
 | `--gnupg-private` / `--no-gnupg-private` | off | expose `~/.gnupg` even when it holds on-disk secret keys |
 | `--firewall` / `--no-firewall`   | off | route container traffic through a domain-filtering proxy |
 | `--meter-network` / `--no-meter-network` | off | capture network traffic for a post-run summary           |
+| `--ports` / `--no-ports`         | on  | honour `[ports]` declarations in `AGENTS.md` |
+| `--ports-dynamic` / `--no-ports-dynamic` | off | allow `agent-sandbox-ctl port add` later |
+| `--ports-any-interface`          | off | permit port binds outside loopback |
+
+You can use `--port [HOST:]CONTAINER[/PROTO]` to publish a port.
+
+You can pass `-e NAME=VAL` or `--env NAME=VAL` to inject environment variables.
 
 You can also pass `-v` / `-v*` volume mounts before `--`.  Relative paths in
 the source are resolved against `$PWD`; relative destinations are prefixed with
@@ -104,7 +106,7 @@ agent-sandbox --no-workspace                     # no CWD mount
 agent-sandbox --selinux                          # enable :z on built-in writable binds
 agent-sandbox -- -- bash                           # interactive bash with all integrations
 agent-sandbox -- -- devenv shell                   # devenv shell with opencode config mounted
-agent-sandbox -- --privileged                      # nested podman inside container
+agent-sandbox --privileged                         # nested podman inside container
 ```
 
 ## What's in the image
@@ -136,4 +138,10 @@ nested rootless podman is pre-configured when the sandbox is launched with
 By design, `agent-sandbox` includes options that pierce the sandbox boundary. Note that these give any agent running inside the container capabilities on the host:
 - `--ssh` (on by default): The agent can authenticate as you using your forwarded SSH identity (e.g. `git push` to your repos).
 - `--gpg-agent` (on by default): The agent can sign commits or authenticate with any key held by your host GnuPG agent. Note that `agent-sandbox` protects your private key files by checking for them and gracefully failing the GNUPG directory mount if they are present on disk, but the forwarded GnuPG agent socket is still accessible.
-- `--podman` (opt-in): Forwards the host rootless podman socket. The agent can use this to launch new containers on the host, which is equivalent to a full escape (e.g. `podman run -v /:/host ...`).
+- `--podman` (opt-in): Forwards the host rootless podman socket. The agent can use this to launch **sibling containers** on the host, which is equivalent to a full sandbox escape (e.g. `podman run -v /:/host ...`).
+
+#### Running Containers: `--podman` vs `--privileged`
+If you want the agent to be able to run its own containers, `agent-sandbox` supports two distinct models:
+
+1. **Nested Containers (Safe):** Pass `--privileged` when launching the sandbox. The sandbox image contains its own baked-in Podman stack. `--privileged` gives the sandbox container enough kernel permissions to run a securely isolated Podman daemon *inside* the sandbox. The agent cannot use this to escape to the host.
+2. **Sibling Containers (Unsafe):** Pass `--podman` to forward your host's Podman socket into the sandbox. When the agent runs `podman run`, it talks to your host machine's Podman daemon. The container is created on the host alongside the sandbox. This does *not* require `--privileged`, but it allows the agent to control your host's containers and easily escape the sandbox. Use this only when you need the agent to interact with existing host infrastructure or leverage the host's image cache for performance.

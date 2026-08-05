@@ -70,6 +70,8 @@ Integrations (--no-X disables):
   --nix             mount the host /nix                           $([[ "$want_nix" == "1" ]] && echo "[on ]" || echo "[off]")
   --podman          forward the host podman socket (see below)    $([[ "$want_podman" == "1" ]] && echo "[on ]" || echo "[off]")
   --selinux         add :z to built-in writable binds             $([[ "$want_selinux" == "1" ]] && echo "[on ]" || echo "[off]")
+  --firewall        route traffic through domain-filtering proxy  $([[ "$want_firewall" == "1" ]] && echo "[on ]" || echo "[off]")
+  --meter-network   capture network traffic for a post-run summary $([[ "$want_meter_network" == "1" ]] && echo "[on ]" || echo "[off]")
 
 Ports:
   --port [HOST:]CONTAINER[/PROTO]    publish a port, repeatable
@@ -82,10 +84,16 @@ Mounts:
                             DEST is placed under /workspace; "." means
                             /workspace itself
 
+Podman / Environment:
+  --privileged              pass --privileged to podman run (for nested podman)
+  -e, --env NAME=VAL        pass environment variable to podman
+  --podman-args             treat all following args (until --) as podman args
+
 --podman, --ssh and --gpg-agent each hand the agent a capability that reaches
-outside the sandbox.  --podman is the widest (a forwarded podman socket is
-equivalent to host access) which is why it is off by default.  See the trust
-model section in the README.
+outside the sandbox. --podman forwards the host podman socket, allowing the 
+agent to create sibling containers on the host (a full sandbox escape).
+To safely let the agent run containers, use --privileged instead to enable 
+securely nested containers inside the sandbox. See README for details.
 USAGE
 }
 
@@ -504,11 +512,20 @@ cleanup() {
   if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     podman stop -t 1 "$sidecar_id" >/dev/null 2>&1 || true
     if [[ "$want_meter_network" == "1" ]]; then
-      printf '\n=== Network Traffic Summary ===\n'
-      tshark -r "$sidecar_shared/traffic.pcap" -T fields -e tls.handshake.extensions_server_name -Y 'tls.handshake.type == 1' 2>/dev/null | sort | uniq -c
-      printf '\n--- IP Addresses and Byte Volumes ---\n'
-      tshark -r "$sidecar_shared/traffic.pcap" -q -z conv,ip 2>/dev/null
+      if [[ -s "$sidecar_shared/traffic.pcap" ]]; then
+        printf '\n=== Network Traffic Summary ===\n'
+        tshark -r "$sidecar_shared/traffic.pcap" -T fields -e tls.handshake.extensions_server_name -Y 'tls.handshake.type == 1' 2>/dev/null | sort | uniq -c
+        printf '\n--- IP Addresses and Byte Volumes ---\n'
+        tshark -r "$sidecar_shared/traffic.pcap" -q -z conv,ip 2>/dev/null
+      else
+        printf '\n=== Network Traffic Summary ===\n'
+        printf '(no packets captured)\n'
+        if [[ -s "$sidecar_shared/tcpdump.log" ]]; then
+          printf '\ntcpdump: %s\n' "$(cat "$sidecar_shared/tcpdump.log")"
+        fi
+      fi
     fi
+
     podman network rm "$sidecar_id" >/dev/null 2>&1 || true
     rm -rf "$sidecar_shared"
   fi
@@ -526,7 +543,7 @@ container_name="agent-sandbox-${workspace_slug:0:32}-$$"
 
 # ── Sidecar Proxy & Metering ────────────────────────────────────────────────
 if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
-  sidecar_id="sidecar-$(head -c 12 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)"
+  sidecar_id="agent-sandbox-sidecar-$(head -c 12 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)"
   sidecar_shared=$(mktemp -d)
   podman network create --internal "$sidecar_id" >/dev/null 2>&1 || true
 
@@ -540,12 +557,46 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     sidecar_caps=("--cap-add=NET_ADMIN" "--cap-add=NET_RAW")
   fi
 
+  # The sidecar is on both bridge (external) and the internal network.
+  # Podman's aardvark-dns injects the internal network's DNS server into
+  # /etc/resolv.conf, but --internal blocks its upstream forwarding.
+  # Override with the host's nameservers so tinyproxy can resolve external names.
+  # Skip loopback (127.*) and link-local (169.254.*) addresses since they are
+  # not reachable from inside the container's network namespace.
+  sidecar_dns_args=()
+  while IFS= read -r ns; do
+    if [[ "$ns" =~ ^nameserver[[:space:]]+([^[:space:]]+) ]]; then
+      local_ns="${BASH_REMATCH[1]}"
+      [[ "$local_ns" =~ ^127\. || "$local_ns" =~ ^169\.254\. ]] && continue
+      sidecar_dns_args+=(--dns "$local_ns")
+    fi
+  done < /etc/resolv.conf
+  # Fallback to public DNS if no usable host nameservers found.
+  if [[ ${#sidecar_dns_args[@]} -eq 0 ]]; then
+    sidecar_dns_args=(--dns 8.8.8.8 --dns 1.1.1.1)
+  fi
+
+  # The sidecar is our infrastructure container, not the sandboxed agent code.
+  # Disable SELinux labeling so tcpdump can use raw sockets for packet capture.
+  sidecar_selinux=()
+  if [[ "$want_selinux" == "1" ]]; then
+    sidecar_selinux=("--security-opt" "label=disable")
+  fi
+
   podman run -d --rm --name "$sidecar_id" \
     --network bridge --network "$sidecar_id" \
+    "${sidecar_dns_args[@]}" \
+    "${sidecar_selinux[@]}" \
     "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:$rw_mount_opts" \
     -e "METER_NETWORK=$want_meter_network" \
     -e "FIREWALL=$want_firewall" \
     "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar "${proxy_domains[@]}" >/dev/null 2>&1
+
+  # Wait for tinyproxy to signal readiness via the shared volume.
+  for _ in $(seq 1 50); do
+    [[ -f "$sidecar_shared/ready" ]] && break
+    sleep 0.1
+  done
 
   network_args+=(--network "$sidecar_id")
   mounts+=("-v" "$sidecar_shared:/sidecar_shared:$rw_mount_opts")
