@@ -11,7 +11,7 @@ host Podman socket, and `devenv` state all wired through automatically.
 ```sh
 git clone https://github.com/datakurre/agent-sandbox
 cd agent-sandbox
-nix profile add .#          # installs agent-sandbox, load, and purge scripts
+nix profile add .#          # installs agent-sandbox and agent-sandbox-ctl
 ```
 
 ### From a remote flake
@@ -23,7 +23,7 @@ nix profile add github:datakurre/agent-sandbox
 After installing, build the container image (one-time):
 
 ```sh
-agent-sandbox-load
+agent-sandbox-ctl load
 ```
 
 ## Usage
@@ -127,7 +127,7 @@ nested rootless podman is pre-configured when the sandbox is launched with
 
 ## How it works
 
-1. `agent-sandbox-load` imports the OCI image (built with `pkgs.dockerTools.streamLayeredImage`) into the host's podman image store.
+1. `agent-sandbox-ctl load` imports the OCI image (built with `pkgs.dockerTools.streamLayeredImage`) into the host's podman image store.
 2. `agent-sandbox` calls `podman run` with `--userns=keep-id`, tmpfs mounts for ephemeral home subdirectories, explicit bind mounts for persistent state (opencode, devenv, …), and forwarded sockets (ssh, gpg, podman).
 3. A slim entrypoint loads the Nix store registration so `nix` commands work from the start, sets up the gpg-agent symlink when requested, then `exec`s the container command.
 

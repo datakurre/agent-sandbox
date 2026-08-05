@@ -4,7 +4,7 @@
 
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
 ("agent-sandbox") together with a launcher binary (`agent-sandbox`), a
-loader binary (`agent-sandbox-load`), and a purge utility (`agent-sandbox-purge`).
+loader utility (`agent-sandbox-ctl load`), and a purge utility (`agent-sandbox-ctl purge`).
 
 - **default.nix** – single Nix module; builds the image and the three scripts.
 - **flake.nix**  – flake entry point; exposes `packages.<system>.default` and
@@ -53,7 +53,7 @@ A bash script that wraps `podman run`.  Call flow:
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
    final command (default `opencode`, overridable via `-- …`).
 
-### Loader (`agent-sandbox-load`)
+### Loader (`agent-sandbox-ctl load`)
 
 `podman load < ${image}`
 

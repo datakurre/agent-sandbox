@@ -11,12 +11,26 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Force DNS resolution to use the default route's gateway (the external network),
-# ignoring the internal network's DNS server which drops external queries.
-DEFAULT_GW_HEX=$(awk '$2 == 00000000 {print $3}' /proc/net/route | head -n1)
-if [[ -n "$DEFAULT_GW_HEX" ]]; then
-  GW_IP=$(( 0x${DEFAULT_GW_HEX:6:2} )).$(( 0x${DEFAULT_GW_HEX:4:2} )).$(( 0x${DEFAULT_GW_HEX:2:2} )).$(( 0x${DEFAULT_GW_HEX:0:2} ))
-  echo "nameserver $GW_IP" > /tmp/resolv.conf
+default_iface=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
+if [[ -n "$default_iface" ]]; then
+  > /tmp/resolv.conf
+  ns_found=0
+  while read -r line; do
+    if [[ "$line" =~ ^nameserver\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+      ns="${BASH_REMATCH[1]}"
+      if ip route get "$ns" 2>/dev/null | grep -q -w "$default_iface"; then
+        echo "$line" >> /tmp/resolv.conf
+        ns_found=1
+      fi
+    else
+      echo "$line" >> /tmp/resolv.conf
+    fi
+  done < /etc/resolv.conf
+
+  if [[ "$ns_found" == "0" ]]; then
+    gw_ip=$(ip route show default | awk '{print $3}' | head -n1)
+    [[ -n "$gw_ip" ]] && echo "nameserver $gw_ip" >> /tmp/resolv.conf
+  fi
   cat /tmp/resolv.conf > /etc/resolv.conf
 fi
 

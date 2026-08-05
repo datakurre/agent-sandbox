@@ -57,9 +57,7 @@
         in
         {
           default = app "${package}/bin/agent-sandbox";
-          load = app "${package}/bin/agent-sandbox-load";
-          port = app "${package}/bin/agent-sandbox-port";
-          purge = app "${package}/bin/agent-sandbox-purge";
+          ctl = app "${package}/bin/agent-sandbox-ctl";
         }
       );
 

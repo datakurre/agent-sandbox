@@ -352,6 +352,12 @@ let
     + scriptBody ./lib/agent-sandbox-load.sh;
   };
 
+  ctlScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-ctl";
+    runtimeInputs = [ ];
+    text = scriptBody ./lib/agent-sandbox-ctl.sh;
+  };
+
   # ── Checks ────────────────────────────────────────────────────────────────
   # Building the launcher already runs shellcheck (writeShellApplication), so
   # these cover what that cannot: the parser's behaviour, the gnupg
@@ -394,6 +400,7 @@ let
         portScript
         purgeScript
         listScript
+        ctlScript
         gnupgScan
         parseAgents
       ];
@@ -409,6 +416,7 @@ pkgs.symlinkJoin {
     portScript
     purgeScript
     listScript
+    ctlScript
     gnupgScan
     parseAgents
   ];
@@ -421,6 +429,7 @@ pkgs.symlinkJoin {
       portScript
       purgeScript
       listScript
+      ctlScript
       ;
   };
   meta = {

@@ -38,7 +38,7 @@ Integrations (--no-X disables):
 Ports:
   --port [HOST:]CONTAINER[/PROTO]    publish a port, repeatable
   --ports / --no-ports               honour [ports] in ./AGENTS.md     [on]
-  --ports-dynamic                    allow `agent-sandbox-port add` later
+  --ports-dynamic                    allow `agent-sandbox-ctl port add` later
   --ports-any-interface              permit binds outside loopback
 
 Mounts:
@@ -54,7 +54,7 @@ USAGE
 }
 
 if ! podman image exists "$AGENT_SANDBOX_IMAGE" 2>/dev/null; then
-  echo "agent-sandbox: image $AGENT_SANDBOX_IMAGE not found. Run 'agent-sandbox-load' first." >&2
+  echo "agent-sandbox: image $AGENT_SANDBOX_IMAGE not found. Run 'agent-sandbox-ctl load' first." >&2
   exit 1
 fi
 
@@ -157,7 +157,7 @@ while [[ $# -gt 0 ]]; do
     --antigravity)  agent=antigravity ;;
     # --no-<agent> only means anything for the agent that is currently
     # selected; it reverts to the default rather than leaving none.
-    --no-opencode|--no-claude-code|--no-copilot|--no-antigravity)
+    --no-opencode|--no-claude-code|--no-copilot|--no-antigravity|--no-bash)
       [[ "$agent" == "${1#--no-}" ]] && agent=opencode ;;
 
     --ssh)          want_ssh=1 ;;
@@ -254,6 +254,7 @@ case "$agent" in
   claude-code) agent_argv=(claude) ;;
   copilot)     agent_argv=(copilot) ;;
   antigravity) agent_argv=(agy .) ;;
+  bash)        agent_argv=(bash) ;;
 esac
 
 # A devenv.nix in the workspace means project dependencies belong on PATH
@@ -301,6 +302,8 @@ case "$agent" in
     mount_rw "$HOME/.cache/antigravity-cli"       /home/user/.cache/antigravity-cli
     # agy keeps its auth state under ~/.gemini.
     mount_rw "$HOME/.gemini" /home/user/.gemini
+    ;;
+  bash)
     ;;
 esac
 
@@ -445,7 +448,7 @@ if [[ "$want_ports" == "1" && -f "$PWD/AGENTS.md" ]]; then
   done <<< "$declared"
 fi
 
-# A shared network is what makes `agent-sandbox-port add` possible later:
+# A shared network is what makes `agent-sandbox-ctl port add` possible later:
 # podman cannot add a binding to a running container, so a sidecar has to
 # reach this one by name.  Created lazily so that a launch with no ports at
 # all keeps podman's default rootless networking untouched.
@@ -486,9 +489,9 @@ trap cleanup EXIT
 printf 'root:x:0:0:root:/root:/bin/sh\nuser:x:%s:%s::/home/user:/bin/bash\nnobody:x:65534:65534:Nobody:/:/bin/sh\n' "$(id -u)" "$(id -g)" > "$passwd_tmp"
 printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
 
-# A stable name gives port sidecars something to resolve, and the labels let
-# agent-sandbox-port and agent-sandbox-purge find sandboxes without guessing
-# from the image name.
+# Include the hashed workspace path and the launcher PID in the container name so
+# agent-sandbox-ctl port and agent-sandbox-ctl purge find sandboxes without guessing
+# network/PID relationships.
 workspace_slug=$(basename "$PWD")
 workspace_slug="${workspace_slug//[^A-Za-z0-9_.-]/-}"
 container_name="agent-sandbox-${workspace_slug:0:32}-$$"
@@ -511,13 +514,13 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
 
   podman run -d --rm --name "$sidecar_id" \
     --network bridge --network "$sidecar_id" \
-    "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:rw" \
+    "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:$rw_mount_opts" \
     -e "METER_NETWORK=$want_meter_network" \
     -e "FIREWALL=$want_firewall" \
     "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar "${proxy_domains[@]}" >/dev/null 2>&1
 
   network_args+=(--network "$sidecar_id")
-  mounts+=("-v" "$sidecar_shared:/sidecar_shared:rw")
+  mounts+=("-v" "$sidecar_shared:/sidecar_shared:$rw_mount_opts")
   env_args+=("-e" "HTTP_PROXY=http://$sidecar_id:8888" "-e" "HTTPS_PROXY=http://$sidecar_id:8888")
 fi
 
