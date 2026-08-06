@@ -134,20 +134,21 @@ fn handle_client(mut client_sock: TcpStream, config: Arc<ProxyConfig>) {
     let port: u16;
 
     if method == "CONNECT" {
-        let hp: Vec<&str> = url.split(':').collect();
-        if hp.len() != 2 {
-            return;
+        if let Some((h, p)) = url.rsplit_once(':') {
+            host = h.to_string();
+            port = p.parse().unwrap_or(443);
+        } else {
+            host = url.to_string();
+            port = 443;
         }
-        host = hp[0].to_string();
-        port = hp[1].parse().unwrap_or(443);
     } else {
         if let Some(idx) = url.find("://") {
             url = &url[idx + 3..];
         }
         let url_no_path = url.split('/').next().unwrap_or("");
-        if let Some(idx) = url_no_path.find(':') {
-            host = url_no_path[..idx].to_string();
-            port = url_no_path[idx + 1..].parse().unwrap_or(80);
+        if let Some((h, p)) = url_no_path.rsplit_once(':') {
+            host = h.to_string();
+            port = p.parse().unwrap_or(80);
         } else {
             host = url_no_path.to_string();
             port = 80;
@@ -159,28 +160,29 @@ fn handle_client(mut client_sock: TcpStream, config: Arc<ProxyConfig>) {
         return;
     }
 
-    let mut remote_sock = match std::net::TcpStream::connect_timeout(
-        &format!("{}:{}", host, port)
-            .parse::<std::net::SocketAddr>()
-            .unwrap_or_else(|_| {
-                // If parsing fails (e.g., domain name), fallback to normal connect
-                // Note: Rust's ToSocketAddrs resolves domains automatically.
-                // We'll just pass the string formatted host:port
-                return std::net::SocketAddr::from(([0, 0, 0, 0], 0));
-            }),
-        Duration::from_secs(10),
-    ) {
-        Ok(s) => s,
+    let addrs = match std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:{}", host, port)) {
+        Ok(a) => a,
         Err(_) => {
-            // For domains, we just use TcpStream::connect
-            match std::net::TcpStream::connect(format!("{}:{}", host, port)) {
-                Ok(s) => {
-                    let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
-                    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-                    s
-                }
-                Err(_) => return,
-            }
+            let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            return;
+        }
+    };
+
+    let mut remote_sock = None;
+    for addr in addrs {
+        if let Ok(s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            remote_sock = Some(s);
+            break;
+        }
+    }
+
+    let mut remote_sock = match remote_sock {
+        Some(s) => s,
+        None => {
+            let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            return;
         }
     };
 
@@ -190,6 +192,15 @@ fn handle_client(mut client_sock: TcpStream, config: Arc<ProxyConfig>) {
             .is_err()
         {
             return;
+        }
+        // Forward any data after the HTTP headers
+        if let Some(pos) = req_buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+            let extra = &req_buf[pos + 4..n];
+            if !extra.is_empty() {
+                if remote_sock.write_all(extra).is_err() {
+                    return;
+                }
+            }
         }
     } else {
         if remote_sock.write_all(&req_buf[..n]).is_err() {
