@@ -160,22 +160,36 @@ fn handle_client(mut client_sock: TcpStream, config: Arc<ProxyConfig>) {
         return;
     }
 
-    let addrs = match std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:{}", host, port)) {
-        Ok(a) => a,
-        Err(_) => {
-            let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-            return;
+    let mut addrs_vec: Vec<std::net::SocketAddr> = Vec::new();
+    for _ in 0..10 {
+        if let Ok(a) = std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:{}", host, port)) {
+            addrs_vec = a.collect();
+            if !addrs_vec.is_empty() {
+                break;
+            }
         }
-    };
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if addrs_vec.is_empty() {
+        let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        return;
+    }
 
     let mut remote_sock = None;
-    for addr in addrs {
-        if let Ok(s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
-            let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
-            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-            remote_sock = Some(s);
+    for _ in 0..10 {
+        for addr in &addrs_vec {
+            if let Ok(s) = std::net::TcpStream::connect_timeout(addr, Duration::from_secs(10)) {
+                let _ = s.set_write_timeout(Some(Duration::from_secs(60)));
+                let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+                remote_sock = Some(s);
+                break;
+            }
+        }
+        if remote_sock.is_some() {
             break;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     let mut remote_sock = match remote_sock {
