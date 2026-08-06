@@ -93,7 +93,15 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
 - `--nix`: Mounts the host `/nix/store` for native Nix execution.
 - `--podman`: Forwards the host rootless Podman socket (sibling containers).
 - `--selinux`: Applies SELinux shared relabeling (`:z`) to writable binds.
-- `--firewall`: Isolates the container from the internet and routes HTTP(S) traffic through a domain-filtering proxy based on `[proxy-domains]` in `AGENTS.md`. Non-HTTP(S) traffic is blocked.
+- `--firewall`: Isolates the container from the internet and routes HTTP(S) traffic through a domain-filtering proxy based on the `[proxy]` block in `AGENTS.md`. Non-HTTP(S) traffic is blocked.
+  - The `[proxy]` block supports `allow_domains`, `deny_domains`, `allow_ips`, and `deny_ips`.
+  - **Default Policy**: 
+    - If you provide any allow list (`allow_domains` or `allow_ips`), the default policy becomes **deny all**.
+    - If you only provide deny lists (`deny_domains` or `deny_ips`), the default policy is **allow all**.
+  - **Simultaneous Allow & Deny (Most Specific Wins)**: You can specify both allow and deny rules at the same time. When a target matches both, the **more specific rule wins**:
+    - For domains, the longer pattern wins (e.g., an explicit rule for `api.github.com` overrides a wildcard rule for `*.github.com`).
+    - For IPs, the longer CIDR prefix wins (e.g., `10.1.0.0/24` overrides `10.0.0.0/8`).
+  - **Wildcards**: Wildcards are supported for domains (e.g., `*.github.com`). Note that a strict domain like `github.com` only matches that exact domain and **does not** match subdomains like `status.github.com`. To match both, you must specify both `github.com` and `*.github.com`. This applies to both allow and deny domain rules.
 - `--meter-network`: Isolates the container from the internet, routes HTTP(S) traffic through a proxy, and captures it for a post-run summary. Non-HTTP(S) traffic is blocked.
 - `--ports`: Honors `[ports]` declarations from `AGENTS.md`.
 - `--ports-dynamic`: Allows `agent-sandbox-ctl port add` post-launch.

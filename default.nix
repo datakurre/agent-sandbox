@@ -37,6 +37,7 @@ let
   dockerAlias = pkgs.writeShellScriptBin "docker" ''exec ${pkgs.podman}/bin/podman "$@"'';
 
   sidecarScript = pkgs.writeShellScriptBin "agent-sandbox-sidecar" (scriptBody ./lib/agent-sandbox-sidecar.sh);
+  proxyScript = pkgs.writeScriptBin "agent-sandbox-proxy" (builtins.readFile ./lib/agent-sandbox-proxy.py);
   allowScript = pkgs.writeShellScriptBin "agent-sandbox-allow" (scriptBody ./lib/agent-sandbox-allow.sh);
   unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
   defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
@@ -107,6 +108,7 @@ let
       nix
       devenv
       tinyproxy
+      dnsmasq
       inotify-tools
       tcpdump
       wireshark-cli
@@ -118,7 +120,7 @@ let
       glibcLocales
     ]
     ++ podmanStack
-    ++ [ dockerAlias sidecarScript allowScript ];
+    ++ [ dockerAlias sidecarScript proxyScript allowScript ];
 
   tools = baseTools ++ agentTools;
 

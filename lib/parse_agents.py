@@ -160,6 +160,68 @@ def parse_entry(name: str, value: object, allow_any_interface: bool) -> Mapping:
     )
 
 
+def parse_proxy_allow_ips(text: str) -> list[str]:
+    import ipaddress
+
+    ips = []
+    for body in iter_tagged_blocks(text):
+        try:
+            block = tomllib.loads(body)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"malformed TOML in agent-sandbox block: {exc}") from exc
+
+        proxy = block.get("proxy")
+        if proxy is None:
+            continue
+        if not isinstance(proxy, dict):
+            raise ConfigError("[proxy] must be a table")
+
+        allow_ips = proxy.get("allow_ips")
+        if allow_ips is not None:
+            if not isinstance(allow_ips, list):
+                raise ConfigError("[proxy].allow_ips must be a list of strings")
+            for ip in allow_ips:
+                if not isinstance(ip, str):
+                    raise ConfigError("[proxy].allow_ips elements must be strings")
+                try:
+                    ipaddress.ip_network(ip)
+                except ValueError as exc:
+                    raise ConfigError(f"[proxy].allow_ips: {ip!r} is not a valid IP address or network: {exc}")
+                ips.append(ip)
+    return ips
+
+
+def parse_proxy_deny_ips(text: str) -> list[str]:
+    import ipaddress
+
+    ips = []
+    for body in iter_tagged_blocks(text):
+        try:
+            block = tomllib.loads(body)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"malformed TOML in agent-sandbox block: {exc}") from exc
+
+        proxy = block.get("proxy")
+        if proxy is None:
+            continue
+        if not isinstance(proxy, dict):
+            raise ConfigError("[proxy] must be a table")
+
+        deny_ips = proxy.get("deny_ips")
+        if deny_ips is not None:
+            if not isinstance(deny_ips, list):
+                raise ConfigError("[proxy].deny_ips must be a list of strings")
+            for ip in deny_ips:
+                if not isinstance(ip, str):
+                    raise ConfigError("[proxy].deny_ips elements must be strings")
+                try:
+                    ipaddress.ip_network(ip)
+                except ValueError as exc:
+                    raise ConfigError(f"[proxy].deny_ips: {ip!r} is not a valid IP address or network: {exc}")
+                ips.append(ip)
+    return ips
+
+
 def parse_proxy_domains(text: str) -> list[str]:
     domains = []
     for body in iter_tagged_blocks(text):
@@ -184,6 +246,36 @@ def parse_proxy_domains(text: str) -> list[str]:
                 if not DOMAIN_RE.match(domain):
                     raise ConfigError(
                         f"[proxy].allow_domains: {domain!r} is not a valid domain name "
+                        f"(must match {DOMAIN_RE.pattern})"
+                    )
+                domains.append(domain)
+    return domains
+
+
+def parse_proxy_deny_domains(text: str) -> list[str]:
+    domains = []
+    for body in iter_tagged_blocks(text):
+        try:
+            block = tomllib.loads(body)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"malformed TOML in agent-sandbox block: {exc}") from exc
+
+        proxy = block.get("proxy")
+        if proxy is None:
+            continue
+        if not isinstance(proxy, dict):
+            raise ConfigError("[proxy] must be a table")
+
+        deny_domains = proxy.get("deny_domains")
+        if deny_domains is not None:
+            if not isinstance(deny_domains, list):
+                raise ConfigError("[proxy].deny_domains must be a list of strings")
+            for domain in deny_domains:
+                if not isinstance(domain, str):
+                    raise ConfigError("[proxy].deny_domains elements must be strings")
+                if not DOMAIN_RE.match(domain):
+                    raise ConfigError(
+                        f"[proxy].deny_domains: {domain!r} is not a valid domain name "
                         f"(must match {DOMAIN_RE.pattern})"
                     )
                 domains.append(domain)
@@ -258,6 +350,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="extract allow_domains from the [proxy] block instead of port mappings",
     )
+    parser.add_argument(
+        "--proxy-deny-ips",
+        action="store_true",
+        help="extract deny_ips from the [proxy] block instead of port mappings",
+    )
+    parser.add_argument(
+        "--proxy-deny-domains",
+        action="store_true",
+        help="extract deny_domains from the [proxy] block instead of port mappings",
+    )
+    parser.add_argument(
+        "--proxy-allow-ips",
+        action="store_true",
+        help="extract allow_ips from the [proxy] block instead of port mappings",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -272,6 +379,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.proxy_domains:
         try:
             domains = parse_proxy_domains(text)
+            if domains:
+                print(" ".join(domains))
+        except ConfigError as exc:
+            print(f"agent-sandbox: {args.path}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.proxy_deny_ips:
+        try:
+            ips = parse_proxy_deny_ips(text)
+            if ips:
+                print(" ".join(ips))
+        except ConfigError as exc:
+            print(f"agent-sandbox: {args.path}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.proxy_allow_ips:
+        try:
+            ips = parse_proxy_allow_ips(text)
+            if ips:
+                print(" ".join(ips))
+        except ConfigError as exc:
+            print(f"agent-sandbox: {args.path}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.proxy_deny_domains:
+        try:
+            domains = parse_proxy_deny_domains(text)
             if domains:
                 print(" ".join(domains))
         except ConfigError as exc:

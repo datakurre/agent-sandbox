@@ -260,5 +260,87 @@ class TestProxyDomains(unittest.TestCase):
             parse_proxy_domains(text)
 
 
+class TestProxyAllowIpsParsing(unittest.TestCase):
+    def test_valid_ips(self):
+        text = block('[proxy]\nallow_ips = ["10.0.0.0/8", "8.8.8.8"]')
+        from parse_agents import parse_proxy_allow_ips
+        self.assertEqual(parse_proxy_allow_ips(text), ["10.0.0.0/8", "8.8.8.8"])
+
+    def test_empty_list(self):
+        text = block("[proxy]\nallow_ips = []")
+        from parse_agents import parse_proxy_allow_ips
+        self.assertEqual(parse_proxy_allow_ips(text), [])
+
+    def test_invalid_ip_rejected(self):
+        text = block('[proxy]\nallow_ips = ["130.234.0.0/999"]')
+        from parse_agents import parse_proxy_allow_ips, ConfigError
+        with self.assertRaisesRegex(ConfigError, "not a valid IP address or network"):
+            parse_proxy_allow_ips(text)
+
+    def test_non_string_rejected(self):
+        text = block("[proxy]\nallow_ips = [42]")
+        from parse_agents import parse_proxy_allow_ips, ConfigError
+        with self.assertRaisesRegex(ConfigError, "must be strings"):
+            parse_proxy_allow_ips(text)
+
+
+class TestProxyDenyIpsParsing(unittest.TestCase):
+    def test_valid_ips(self):
+        text = block('[proxy]\ndeny_ips = ["130.234.0.0/16", "1.1.1.1"]')
+        from parse_agents import parse_proxy_deny_ips
+        self.assertEqual(parse_proxy_deny_ips(text), ["130.234.0.0/16", "1.1.1.1"])
+
+    def test_empty_list(self):
+        text = block("[proxy]\ndeny_ips = []")
+        from parse_agents import parse_proxy_deny_ips
+        self.assertEqual(parse_proxy_deny_ips(text), [])
+
+    def test_invalid_ip_rejected(self):
+        text = block('[proxy]\ndeny_ips = ["130.234.0.0/999"]')
+        from parse_agents import parse_proxy_deny_ips, ConfigError
+        with self.assertRaisesRegex(ConfigError, "not a valid IP address or network"):
+            parse_proxy_deny_ips(text)
+
+    def test_non_string_rejected(self):
+        text = block("[proxy]\ndeny_ips = [42]")
+        from parse_agents import parse_proxy_deny_ips, ConfigError
+        with self.assertRaisesRegex(ConfigError, "must be strings"):
+            parse_proxy_deny_ips(text)
+
+
+class TestProxyDenyDomainsParsing(unittest.TestCase):
+    def test_valid_domains(self):
+        text = block('[proxy]\ndeny_domains = ["github.com", "api.example.org"]')
+        from parse_agents import parse_proxy_deny_domains
+        self.assertEqual(parse_proxy_deny_domains(text), ["github.com", "api.example.org"])
+
+    def test_wildcard_domains(self):
+        text = block('[proxy]\ndeny_domains = ["*.github.com", "*.example.org"]')
+        from parse_agents import parse_proxy_deny_domains
+        self.assertEqual(parse_proxy_deny_domains(text), ["*.github.com", "*.example.org"])
+
+    def test_empty_list(self):
+        text = block("[proxy]\ndeny_domains = []")
+        from parse_agents import parse_proxy_deny_domains
+        self.assertEqual(parse_proxy_deny_domains(text), [])
+
+    def test_no_proxy_block(self):
+        text = block("[ports]\nweb = 3000")
+        from parse_agents import parse_proxy_deny_domains
+        self.assertEqual(parse_proxy_deny_domains(text), [])
+
+    def test_invalid_wildcard_rejected(self):
+        text = block('[proxy]\ndeny_domains = ["*github.com"]')
+        from parse_agents import parse_proxy_deny_domains, ConfigError
+        with self.assertRaisesRegex(ConfigError, "not a valid domain name"):
+            parse_proxy_deny_domains(text)
+
+    def test_non_string_rejected(self):
+        text = block("[proxy]\ndeny_domains = [42]")
+        from parse_agents import parse_proxy_deny_domains, ConfigError
+        with self.assertRaisesRegex(ConfigError, "must be strings"):
+            parse_proxy_deny_domains(text)
+
+
 if __name__ == "__main__":
     unittest.main()

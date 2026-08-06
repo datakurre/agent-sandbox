@@ -553,13 +553,22 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   podman network create --internal "$sidecar_id" >/dev/null 2>&1 || true
 
   proxy_domains=()
+  proxy_allow_ips=()
+  proxy_deny_ips=()
+  proxy_deny_domains=()
   if [[ "$want_firewall" == "1" && -f "$PWD/AGENTS.md" ]]; then
     read -ra proxy_domains <<< "$(agent-sandbox-parse-agents --proxy-domains "$PWD/AGENTS.md" 2>/dev/null || true)"
+    read -ra proxy_allow_ips <<< "$(agent-sandbox-parse-agents --proxy-allow-ips "$PWD/AGENTS.md" 2>/dev/null || true)"
+    read -ra proxy_deny_ips <<< "$(agent-sandbox-parse-agents --proxy-deny-ips "$PWD/AGENTS.md" 2>/dev/null || true)"
+    read -ra proxy_deny_domains <<< "$(agent-sandbox-parse-agents --proxy-deny-domains "$PWD/AGENTS.md" 2>/dev/null || true)"
   fi
 
   sidecar_caps=()
+  if [[ "$want_meter_network" == "1" || "$want_firewall" == "1" ]]; then
+    sidecar_caps+=("--cap-add=NET_ADMIN")
+  fi
   if [[ "$want_meter_network" == "1" ]]; then
-    sidecar_caps=("--cap-add=NET_ADMIN" "--cap-add=NET_RAW")
+    sidecar_caps+=("--cap-add=NET_RAW")
   fi
 
   # The sidecar is on both bridge (external) and the internal network.
@@ -595,6 +604,9 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:$rw_mount_opts" \
     -e "METER_NETWORK=$want_meter_network" \
     -e "FIREWALL=$want_firewall" \
+    -e "PROXY_ALLOW_IPS=${proxy_allow_ips[*]:-}" \
+    -e "PROXY_DENY_IPS=${proxy_deny_ips[*]:-}" \
+    -e "PROXY_DENY_DOMAINS=${proxy_deny_domains[*]:-}" \
     "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar "${proxy_domains[@]}" >/dev/null 2>&1
 
   # Wait for tinyproxy to signal readiness via the shared volume.
