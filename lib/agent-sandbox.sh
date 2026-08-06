@@ -64,8 +64,9 @@ usage() {
   cat <<USAGE
 agent-sandbox [FLAGS] [AGENT] [-- COMMAND...]
 
-Runs an AI coding agent inside a rootless podman container with the current
-directory mounted at /workspace/<dirname>.
+Runs an AI coding agent inside a rootless podman container.
+Use flags to opt-in to integrations like mounting the current directory,
+forwarding SSH, or exposing Git identity.
 
   agent-sandbox                      prints this help
   agent-sandbox opencode             launch opencode with its specific mounts

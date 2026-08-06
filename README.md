@@ -1,8 +1,8 @@
 # agent-sandbox
 
 Sandboxed AI coding environment that runs inside a rootless Podman container.
-Launch `opencode` (or any other tool) with SSH agent, GPG signing, Git identity,
-host Podman socket, and `devenv` state all wired through automatically.
+Launch `opencode` (or any other tool) and explicitly opt-in to integrations like
+SSH forwarding, GPG signing, Git identity, host Podman socket, and `devenv` state.
 
 ## Install
 
