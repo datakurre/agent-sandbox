@@ -75,4 +75,19 @@ KNOWN_HOSTS
   fi
 fi
 
+if [[ -n "${HTTP_PROXY:-}" ]]; then
+  mkdir -p ~/.ssh
+  chmod 700 ~/.ssh
+  if [[ ! -f ~/.ssh/config && ! -h ~/.ssh/config ]]; then
+    proxy_host_port="${HTTP_PROXY#*://}"
+    proxy_host="${proxy_host_port%:*}"
+    proxy_port="${proxy_host_port##*:}"
+    cat >> ~/.ssh/config << SSH_CONFIG
+Host *
+  ProxyCommand socat - PROXY:${proxy_host}:%h:%p,proxyport=${proxy_port}
+SSH_CONFIG
+    chmod 600 ~/.ssh/config
+  fi
+fi
+
 exec "$@"

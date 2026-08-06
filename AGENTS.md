@@ -36,7 +36,8 @@ Key layers:
 2. Sets up `known_hosts` for common git forges to avoid first-time connection prompts.
 3. When `AGENT_SANDBOX_GPG_AGENT=1`, symlinks the forwarded host gpg-agent
    socket into `~/.gnupg/S.gpg-agent`.
-4. `exec "$@"`.
+4. When `HTTP_PROXY` is set, dynamically generates `~/.ssh/config` to route all SSH traffic through the proxy.
+5. `exec "$@"`.
 
 ### Launcher (`agent-sandbox`)
 

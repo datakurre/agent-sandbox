@@ -37,7 +37,14 @@ let
   dockerAlias = pkgs.writeShellScriptBin "docker" ''exec ${pkgs.podman}/bin/podman "$@"'';
 
   sidecarScript = pkgs.writeShellScriptBin "agent-sandbox-sidecar" (scriptBody ./lib/agent-sandbox-sidecar.sh);
-  proxyScript = pkgs.writeScriptBin "agent-sandbox-proxy" (builtins.readFile ./lib/agent-sandbox-proxy.py);
+  proxyScript = pkgs.rustPlatform.buildRustPackage {
+    pname = "agent-sandbox-proxy";
+    version = "0.1.0";
+    src = lib.cleanSource ./proxy;
+    cargoLock = {
+      lockFile = ./proxy/Cargo.lock;
+    };
+  };
   allowScript = pkgs.writeShellScriptBin "agent-sandbox-allow" (scriptBody ./lib/agent-sandbox-allow.sh);
   unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
   defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
