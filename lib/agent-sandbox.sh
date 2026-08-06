@@ -79,24 +79,24 @@ Agents:
   ${agent_list}
 
 Integrations (use --X to enable, --no-X to disable):
-  --workspace       Mounts the host's current working directory into /workspace/<dirname>. $([[ "$want_workspace" == "1" ]] && echo "[on ]" || echo "[off]")
-  --ssh             Forwards the host's SSH_AUTH_SOCK to the container. $([[ "$want_ssh" == "1" ]] && echo "[on ]" || echo "[off]")
-  --git             Mounts host Git configurations and passes identity env vars. $([[ "$want_git" == "1" ]] && echo "[on ]" || echo "[off]")
-  --gpg-agent       Forwards the host GnuPG agent socket for commit signing. $([[ "$want_gpg" == "1" ]] && echo "[on ]" || echo "[off]")
-  --gpg-sign        Sets git config to enable commit signing inside the container. $([[ "$want_gpg_sign" == "1" ]] && echo "[on ]" || echo "[off]")
-  --gnupg-private   Exposes ~/.gnupg even if it holds on-disk secret keys. $([[ "$want_gnupg_private" == "1" ]] && echo "[on ]" || echo "[off]")
-  --devenv          Persists ~/.local/share/devenv across sessions. $([[ "$want_devenv" == "1" ]] && echo "[on ]" || echo "[off]")
-  --nix             Mounts the host /nix/store for native Nix execution. $([[ "$want_nix" == "1" ]] && echo "[on ]" || echo "[off]")
-  --podman          Forwards the host rootless Podman socket (sibling containers). $([[ "$want_podman" == "1" ]] && echo "[on ]" || echo "[off]")
-  --selinux         Applies SELinux shared relabeling (:z) to writable binds. $([[ "$want_selinux" == "1" ]] && echo "[on ]" || echo "[off]")
-  --firewall        Routes container traffic through a domain-filtering proxy. $([[ "$want_firewall" == "1" ]] && echo "[on ]" || echo "[off]")
-  --meter-network   Captures network traffic for a post-run summary. $([[ "$want_meter_network" == "1" ]] && echo "[on ]" || echo "[off]")
+  --workspace       $([[ "$want_workspace" == "1" ]] && echo "[on ]" || echo "[off]") Mounts the host's current working directory into /workspace/<dirname>.
+  --ssh             $([[ "$want_ssh" == "1" ]] && echo "[on ]" || echo "[off]") Forwards the host's SSH_AUTH_SOCK to the container.
+  --git             $([[ "$want_git" == "1" ]] && echo "[on ]" || echo "[off]") Mounts host Git configurations and passes identity env vars.
+  --gpg-agent       $([[ "$want_gpg" == "1" ]] && echo "[on ]" || echo "[off]") Forwards the host GnuPG agent socket for commit signing.
+  --gpg-sign        $([[ "$want_gpg_sign" == "1" ]] && echo "[on ]" || echo "[off]") Sets git config to enable commit signing inside the container.
+  --gnupg-private   $([[ "$want_gnupg_private" == "1" ]] && echo "[on ]" || echo "[off]") Exposes ~/.gnupg even if it holds on-disk secret keys.
+  --devenv          $([[ "$want_devenv" == "1" ]] && echo "[on ]" || echo "[off]") Persists ~/.local/share/devenv across sessions.
+  --nix             $([[ "$want_nix" == "1" ]] && echo "[on ]" || echo "[off]") Mounts the host /nix/store for native Nix execution.
+  --podman          $([[ "$want_podman" == "1" ]] && echo "[on ]" || echo "[off]") Forwards the host rootless Podman socket (sibling containers).
+  --selinux         $([[ "$want_selinux" == "1" ]] && echo "[on ]" || echo "[off]") Applies SELinux shared relabeling (:z) to writable binds.
+  --firewall        $([[ "$want_firewall" == "1" ]] && echo "[on ]" || echo "[off]") Routes container traffic through a domain-filtering proxy.
+  --meter-network   $([[ "$want_meter_network" == "1" ]] && echo "[on ]" || echo "[off]") Captures network traffic for a post-run summary.
 
 Ports:
-  --port [HOST:]CONTAINER[/PROTO]    publish a port, repeatable
-  --ports / --no-ports               Honors [ports] declarations from AGENTS.md. $([[ "$want_ports" == "1" ]] && echo "[on ]" || echo "[off]")
-  --ports-dynamic                    Allows \`agent-sandbox-ctl port add\` post-launch.
-  --ports-any-interface              Permits port binds outside of loopback interfaces.
+  --port [HOST:]CONTAINER[/PROTO]          Publish a port, repeatable.
+  --ports / --no-ports               $([[ "$want_ports" == "1" ]] && echo "[on ]" || echo "[off]") Honors [ports] declarations from AGENTS.md.
+  --ports-dynamic                          Allows \`agent-sandbox-ctl port add\` post-launch.
+  --ports-any-interface                    Permits port binds outside of loopback interfaces.
 
 Mounts:
   -v SOURCE[:DEST[:OPTS]]   relative SOURCE resolves against \$PWD; relative
