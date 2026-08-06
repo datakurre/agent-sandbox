@@ -90,8 +90,8 @@ Integrations (use --X to enable, --no-X to disable):
   --nix             $([[ "$want_nix" == "1" ]] && echo "[on ]" || echo "[off]") Mounts the host /nix/store for native Nix execution.
   --podman          $([[ "$want_podman" == "1" ]] && echo "[on ]" || echo "[off]") Forwards the host rootless Podman socket (sibling containers).
   --selinux         $([[ "$want_selinux" == "1" ]] && echo "[on ]" || echo "[off]") Applies SELinux shared relabeling (:z) to writable binds.
-  --firewall        $([[ "$want_firewall" == "1" ]] && echo "[on ]" || echo "[off]") Routes container traffic through a domain-filtering proxy.
-  --meter-network   $([[ "$want_meter_network" == "1" ]] && echo "[on ]" || echo "[off]") Captures network traffic for a post-run summary.
+  --firewall        $([[ "$want_firewall" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S) traffic through a domain-filtering proxy (blocks direct internet access).
+  --meter-network   $([[ "$want_meter_network" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S) traffic through a proxy to capture a post-run summary (blocks direct internet access).
 
 Ports:
   --port [HOST:]CONTAINER[/PROTO]          Publish a port, repeatable.

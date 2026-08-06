@@ -93,8 +93,8 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
 - `--nix`: Mounts the host `/nix/store` for native Nix execution.
 - `--podman`: Forwards the host rootless Podman socket (sibling containers).
 - `--selinux`: Applies SELinux shared relabeling (`:z`) to writable binds.
-- `--firewall`: Routes container traffic through a domain-filtering proxy.
-- `--meter-network`: Captures network traffic for a post-run summary.
+- `--firewall`: Isolates the container from the internet and routes HTTP(S) traffic through a domain-filtering proxy based on `[proxy-domains]` in `AGENTS.md`. Non-HTTP(S) traffic is blocked.
+- `--meter-network`: Isolates the container from the internet, routes HTTP(S) traffic through a proxy, and captures it for a post-run summary. Non-HTTP(S) traffic is blocked.
 - `--ports`: Honors `[ports]` declarations from `AGENTS.md`.
 - `--ports-dynamic`: Allows `agent-sandbox-ctl port add` post-launch.
 - `--ports-any-interface`: Permits port binds outside of loopback interfaces.
