@@ -18,17 +18,17 @@ fi
 # On by default: things the agent needs to be useful in a normal git workflow.
 # Off by default: things that widen the sandbox boundary (podman socket,
 # on-disk gpg secrets) or that only some hosts want (selinux relabelling).
-want_ssh=1
-want_git=1
-want_gpg=1
-want_gpg_sign=1
+want_ssh=0
+want_git=0
+want_gpg=0
+want_gpg_sign=0
 want_gnupg_private=0
-want_devenv=1
-want_nix=1
+want_devenv=0
+want_nix=0
 want_podman=0
-want_workspace=1
+want_workspace=0
 want_selinux=0
-want_ports=1
+want_ports=0
 want_ports_dynamic=0
 want_ports_any_interface=0
 want_firewall=0
@@ -78,7 +78,7 @@ directory mounted at /workspace/<dirname>.
 Agents:
   ${agent_list}
 
-Integrations (--no-X disables):
+Integrations (use --X to enable, --no-X to disable):
   --workspace       mount \$PWD at /workspace/<dirname>            $([[ "$want_workspace" == "1" ]] && echo "[on ]" || echo "[off]")
   --ssh             forward SSH_AUTH_SOCK                         $([[ "$want_ssh" == "1" ]] && echo "[on ]" || echo "[off]")
   --git             mount git config, forward identity            $([[ "$want_git" == "1" ]] && echo "[on ]" || echo "[off]")

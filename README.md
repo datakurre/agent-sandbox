@@ -29,23 +29,23 @@ agent-sandbox-ctl load
 ## Usage
 
 ```
-agent-sandbox [FLAGS] [-- PODMAN_ARGS...] [-- COMMAND...]
+agent-sandbox [FLAGS] [AGENT] [-- COMMAND...]
 ```
 
-**With no arguments** `agent-sandbox` launches opencode inside the sandbox with
+To launch `opencode`, use `agent-sandbox opencode`. This launches it inside the sandbox with
 the current working directory mounted at `/workspace` and every integration
-enabled.  If the current directory contains a `devenv.nix`, opencode is started
+enabled. If the current directory contains a `devenv.nix`, opencode is started
 through a devenv shell (`devenv shell -- opencode .`) so project dependencies
-are loaded automatically.
+are loaded automatically. Running `agent-sandbox` with no arguments prints the help menu.
 
 ### Override the container command
 
-Everything after the second `--` replaces the default command:
+Everything after the `--` sentinel replaces the default command:
 
 ```sh
-agent-sandbox -- -- bash                            # interactive shell
-agent-sandbox -- -- bash -c "nix build .# && echo done"
-agent-sandbox -- -- devenv shell
+agent-sandbox -- bash                            # interactive shell
+agent-sandbox -- bash -c "nix build .# && echo done"
+agent-sandbox opencode -- devenv shell           # devenv shell with opencode mounts
 ```
 
 ### Pass podman flags
@@ -60,27 +60,44 @@ agent-sandbox --podman-args --network=host -- bash # host network
 agent-sandbox -e MY_VAR=1 opencode                # pass environment variable
 ```
 
+### Configuring Defaults via Nix
+
+All integrations are **disabled by default**. If you are building downstream tooling, you can establish your own defaults by wrapping the `agent-sandbox` binary in Nix. 
+
+Because the CLI evaluates arguments sequentially (the last flag provided wins), any flags added by `wrapProgram` can be overridden by the user at runtime. For example, if the wrapper adds `--ssh`, running `agent-sandbox --no-ssh` will successfully disable SSH forwarding.
+
+Here is an example that restores the historical defaults of `agent-sandbox`:
+
+```nix
+agent-sandbox = pkgs.symlinkJoin {
+  name = "agent-sandbox";
+  paths = [ inputs.agent-sandbox.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+  nativeBuildInputs = [ pkgs.makeWrapper ];
+  postBuild = ''
+    wrapProgram $out/bin/agent-sandbox --add-flags "--workspace --ssh --git --gpg-agent --gpg-sign --devenv --nix --ports"
+  '';
+};
+```
+
 ### Flags
 
-Some integrations are **on by default** while others are opt-in. Enable or disable with the matching flag.
+Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
 
-| Flag                    | Default | What it does                                          |
-| ----------------------- | ------- | ----------------------------------------------------- |
-| `--workspace` / `--no-workspace` | on | mount `$PWD` as `/workspace/<dirname>:rw`              |
-| `--selinux` / `--no-selinux`     | off | add SELinux shared relabel (`:z`) to built-in writable mounts |
-| `--ssh` / `--no-ssh`             | on | forward `SSH_AUTH_SOCK`                                |
-| `--git` / `--no-git`             | on | mount `~/.gitconfig`, forward `user.name`/`user.email` |
-| `--gpg-agent` / `--no-gpg-agent` | on | forward host gpg-agent socket for commit signing       |
-| `--gpg-sign` / `--no-gpg-sign`   | on | enable/disable git commit signing inside container     |
-| `--devenv` / `--no-devenv`       | on | mount `~/.local/share/devenv` across sessions          |
-| `--podman` / `--no-podman`       | off | forward host rootless podman socket (sibling containers) |
-| `--nix` / `--no-nix`             | on | mount host `/nix/store` to delegate builds to host daemon |
-| `--gnupg-private` / `--no-gnupg-private` | off | expose `~/.gnupg` even when it holds on-disk secret keys |
-| `--firewall` / `--no-firewall`   | off | route container traffic through a domain-filtering proxy |
-| `--meter-network` / `--no-meter-network` | off | capture network traffic for a post-run summary           |
-| `--ports` / `--no-ports`         | on  | honour `[ports]` declarations in `AGENTS.md` |
-| `--ports-dynamic` / `--no-ports-dynamic` | off | allow `agent-sandbox-ctl port add` later |
-| `--ports-any-interface`          | off | permit port binds outside loopback |
+- `--workspace`: Mounts the host's current working directory into `/workspace/<dirname>`.
+- `--ssh`: Forwards the host's `SSH_AUTH_SOCK` to the container.
+- `--git`: Mounts host Git configurations and passes identity env vars.
+- `--gpg-agent`: Forwards the host GnuPG agent socket for commit signing.
+- `--gpg-sign`: Sets git config to enable commit signing inside the container.
+- `--gnupg-private`: Exposes `~/.gnupg` even if it holds on-disk secret keys.
+- `--devenv`: Persists `~/.local/share/devenv` across sessions.
+- `--nix`: Mounts the host `/nix/store` for native Nix execution.
+- `--podman`: Forwards the host rootless Podman socket (sibling containers).
+- `--selinux`: Applies SELinux shared relabeling (`:z`) to writable binds.
+- `--firewall`: Routes container traffic through a domain-filtering proxy.
+- `--meter-network`: Captures network traffic for a post-run summary.
+- `--ports`: Honors `[ports]` declarations from `AGENTS.md`.
+- `--ports-dynamic`: Allows `agent-sandbox-ctl port add` post-launch.
+- `--ports-any-interface`: Permits port binds outside of loopback interfaces.
 
 You can use `--port [HOST:]CONTAINER[/PROTO]` to publish a port.
 
@@ -98,15 +115,16 @@ preserved exactly as supplied.
 ### Examples
 
 ```sh
-agent-sandbox                                    # opencode, everything on
-agent-sandbox --no-ssh                           # drop an integration
-agent-sandbox --copilot                          # github-copilot-cli (copilot), everything on
-agent-sandbox --antigravity                      # antigravity-cli (agy), everything on
-agent-sandbox --no-workspace                     # no CWD mount
-agent-sandbox --selinux                          # enable :z on built-in writable binds
-agent-sandbox -- -- bash                           # interactive bash with all integrations
-agent-sandbox -- -- devenv shell                   # devenv shell with opencode config mounted
-agent-sandbox --privileged                         # nested podman inside container
+agent-sandbox opencode                           # opencode, everything on
+agent-sandbox opencode --no-ssh                  # drop an integration
+agent-sandbox copilot                            # github-copilot-cli (copilot), everything on
+agent-sandbox antigravity                        # antigravity-cli (agy), everything on
+agent-sandbox opencode --no-workspace            # no CWD mount
+agent-sandbox opencode --selinux                 # enable :z on built-in writable binds
+agent-sandbox -- bash                            # interactive bash without agent-specific mounts
+agent-sandbox opencode -- bash                   # interactive bash with opencode configs mounted
+agent-sandbox opencode -- devenv shell           # devenv shell with opencode configs mounted
+agent-sandbox --privileged opencode              # nested podman inside container
 ```
 
 ## What's in the image
