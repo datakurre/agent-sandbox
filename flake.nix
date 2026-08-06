@@ -65,6 +65,6 @@
       # shellchecks every script, without building the container image.
       checks = lib.genAttrs systems (system: (packageFor system).passthru.checks);
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
     };
 }
