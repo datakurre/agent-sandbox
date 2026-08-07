@@ -512,23 +512,86 @@ fi
 passwd_tmp=$(mktemp)
 group_tmp=$(mktemp)
 
+# Render the --meter-network report from the proxy's connection log: one JSON
+# object per connection (see proxy/src/main.rs), aggregated per host.  Hosts are
+# ranked by volume and the tail is collapsed so a long session cannot flood the
+# terminal.
+render_network_summary() {
+  local log="$1"
+  if [[ ! -s "$log" ]]; then
+    printf '\n=== Network Summary ===\n(no connections recorded)\n'
+    return
+  fi
+  jq -rs '
+    def human:
+      if . < 1024 then "\(.) B"
+      elif . < 1048576 then "\(. / 1024 * 10 | round / 10) KiB"
+      elif . < 1073741824 then "\(. / 1048576 * 10 | round / 10) MiB"
+      else "\(. / 1073741824 * 10 | round / 10) GiB"
+      end;
+    def dur:
+      if . < 60 then "\(.)s"
+      elif . < 3600 then "\(. / 60 | floor)m \(. % 60)s"
+      else "\(. / 3600 | floor)h \(. % 3600 / 60 | floor)m"
+      end;
+    def pad($n): tostring | . + (if length < $n then " " * ($n - length) else "" end);
+    def lpad($n): tostring | (if length < $n then " " * ($n - length) else "" end) + .;
+    def clip($n): if length > $n then .[0:($n - 1)] + "…" else . end;
+
+    . as $all
+    | ($all | map(select(.verdict == "allow"))) as $ok
+    | ($all | map(select(.verdict == "deny")) | group_by(.host)
+        | map({host: .[0].host, conns: length}) | sort_by(-.conns)) as $den
+    | ($all | map(select(.verdict == "error")) | group_by(.host)
+        | map({host: .[0].host, conns: length, err: (.[0].err // "?")})
+        | sort_by(-.conns)) as $fail
+    | ($ok | group_by(.host)
+        | map({host: .[0].host, conns: length,
+               up: (map(.up) | add), down: (map(.down) | add)})
+        | sort_by(-(.up + .down))) as $hosts
+    | ($hosts[0:15]) as $shown
+    | ($hosts[15:]) as $rest
+    | ([20] + (($shown + $den + $fail) | map(.host | length)) | max) as $w0
+    | (if $w0 > 40 then 40 else $w0 end) as $w
+    | (($all | map(.ts) | max) - ($all | map(.ts) | min)) as $span
+    | ($ok | map(.up) | add // 0) as $tup
+    | ($ok | map(.down) | add // 0) as $tdown
+    | [ "",
+        "=== Network Summary ===  \($span | dur) · \($all | length) connection\(if ($all | length) == 1 then "" else "s" end) · \($tdown | human) in / \($tup | human) out",
+        "" ]
+      + (if ($shown | length) > 0 then
+          ["  " + ("HOST" | pad($w)) + ("CONNS" | lpad(7))
+                + ("SENT" | lpad(11)) + ("RECV" | lpad(11))]
+          + ($shown | map("  " + (.host | clip($w) | pad($w)) + (.conns | lpad(7))
+                              + (.up | human | lpad(11)) + (.down | human | lpad(11))))
+          + (if ($rest | length) > 0 then
+              ["  " + ("… and \($rest | length) more hosts" | clip($w) | pad($w))
+                    + (($rest | map(.conns) | add) | lpad(7))
+                    + (($rest | map(.up) | add) | human | lpad(11))
+                    + (($rest | map(.down) | add) | human | lpad(11))]
+             else [] end)
+         else [] end)
+      + (if ($den | length) > 0 then
+          ["", "  ── denied " + ("─" * ($w + 19))]
+          + ($den | map("  " + (.host | clip($w) | pad($w)) + (.conns | lpad(7))))
+         else [] end)
+      + (if ($fail | length) > 0 then
+          ["", "  ── failed " + ("─" * ($w + 19))]
+          + ($fail | map("  " + (.host | clip($w) | pad($w)) + (.conns | lpad(7))
+                              + "  (" + .err + ")"))
+         else [] end)
+      + [""]
+    | .[]
+  ' "$log" 2>/dev/null ||
+    printf '\n=== Network Summary ===\n(could not parse %s)\n' "$log"
+}
+
 cleanup() {
   rm -f "$passwd_tmp" "$group_tmp"
   if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     podman stop -t 1 "$sidecar_id" >/dev/null 2>&1 || true
     if [[ "$want_meter_network" == "1" ]]; then
-      if [[ -s "$sidecar_shared/traffic.pcap" ]]; then
-        printf '\n=== Network Traffic Summary ===\n'
-        tshark -r "$sidecar_shared/traffic.pcap" -T fields -e tls.handshake.extensions_server_name -Y 'tls.handshake.type == 1' 2>/dev/null | sort | uniq -c
-        printf '\n--- IP Addresses and Byte Volumes ---\n'
-        tshark -r "$sidecar_shared/traffic.pcap" -q -z conv,ip 2>/dev/null
-      else
-        printf '\n=== Network Traffic Summary ===\n'
-        printf '(no packets captured)\n'
-        if [[ -s "$sidecar_shared/tcpdump.log" ]]; then
-          printf '\ntcpdump: %s\n' "$(cat "$sidecar_shared/tcpdump.log")"
-        fi
-      fi
+      render_network_summary "$sidecar_shared/connections.jsonl"
     fi
 
     podman network rm "$sidecar_id" >/dev/null 2>&1 || true
@@ -563,18 +626,14 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     read -ra proxy_deny_domains <<< "$(agent-sandbox-parse-agents --proxy-deny-domains "$PWD/AGENTS.md" 2>/dev/null || true)"
   fi
 
-  sidecar_caps=()
-  if [[ "$want_meter_network" == "1" || "$want_firewall" == "1" ]]; then
-    sidecar_caps+=("--cap-add=NET_ADMIN")
-  fi
-  if [[ "$want_meter_network" == "1" ]]; then
-    sidecar_caps+=("--cap-add=NET_RAW")
-  fi
+  # NET_ADMIN backs the blackhole routes installed for deny_ips.  Metering used
+  # to also need NET_RAW for packet capture; it is now accounted by the proxy.
+  sidecar_caps=("--cap-add=NET_ADMIN")
 
   # The sidecar is on both bridge (external) and the internal network.
   # Podman's aardvark-dns injects the internal network's DNS server into
   # /etc/resolv.conf, but --internal blocks its upstream forwarding.
-  # Override with the host's nameservers so tinyproxy can resolve external names.
+  # Override with the host's nameservers so the proxy can resolve external names.
   # Skip loopback (127.*) and link-local (169.254.*) addresses since they are
   # not reachable from inside the container's network namespace.
   sidecar_dns_args=()
@@ -591,7 +650,8 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   fi
 
   # The sidecar is our infrastructure container, not the sandboxed agent code.
-  # Disable SELinux labeling so tcpdump can use raw sockets for packet capture.
+  # Disable SELinux labeling so it can write the readiness marker and the
+  # connection log into the shared volume.
   sidecar_selinux=()
   if [[ "$want_selinux" == "1" ]]; then
     sidecar_selinux=("--security-opt" "label=disable")
@@ -609,7 +669,7 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     -e "PROXY_DENY_DOMAINS=${proxy_deny_domains[*]:-}" \
     "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar "${proxy_domains[@]}" >/dev/null 2>&1
 
-  # Wait for tinyproxy to signal readiness via the shared volume.
+  # Wait for the proxy to signal readiness via the shared volume.
   for _ in $(seq 1 50); do
     [[ -f "$sidecar_shared/ready" ]] && break
     sleep 0.1

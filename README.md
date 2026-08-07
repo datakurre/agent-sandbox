@@ -102,7 +102,26 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
     - For domains, the longer pattern wins (e.g., an explicit rule for `api.github.com` overrides a wildcard rule for `*.github.com`).
     - For IPs, the longer CIDR prefix wins (e.g., `10.1.0.0/24` overrides `10.0.0.0/8`).
   - **Wildcards**: Wildcards are supported for domains (e.g., `*.github.com`). Note that a strict domain like `github.com` only matches that exact domain and **does not** match subdomains like `status.github.com`. To match both, you must specify both `github.com` and `*.github.com`. This applies to both allow and deny domain rules.
-- `--meter-network`: Isolates the container from the internet, routes HTTP(S) and SSH traffic through a proxy, and captures it for a post-run summary. Other traffic is blocked.
+  - Domain matching is case-insensitive. When an allow and a deny rule match with equal specificity, allow wins.
+  - Hostnames are also checked against `deny_ips` *after* resolution, so a denied address cannot be reached through an allowed name.
+- `--meter-network`: Isolates the container from the internet, routes HTTP(S) and SSH traffic through a proxy, and prints a post-run summary of it. Other traffic is blocked.
+  - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
+  - The summary ranks hosts by volume, collapses the tail beyond 15 hosts, and lists denied and failed connections separately:
+
+    ```
+    === Network Summary ===  2m 6s · 87 connections · 24.9 MiB in / 362.9 KiB out
+
+      HOST                   CONNS       SENT       RECV
+      api.anthropic.com         64  265.2 KiB   11.3 MiB
+      registry.npmjs.org         8   11.7 KiB    9.5 MiB
+      github.com                11     86 KiB    4.1 MiB
+
+      ── denied ────────────────────────────────────────
+      telemetry.example.com      3
+
+      ── failed ────────────────────────────────────────
+      proxy.example.com          1  (dns)
+    ```
 - `--ports`: Honors `[ports]` declarations from `AGENTS.md`.
 - `--ports-dynamic`: Allows `agent-sandbox-ctl port add` post-launch.
 - `--ports-any-interface`: Permits port binds outside of loopback interfaces.

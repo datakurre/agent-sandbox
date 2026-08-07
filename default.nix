@@ -114,11 +114,7 @@ let
       git-lfs
       nix
       devenv
-      tinyproxy
-      dnsmasq
       inotify-tools
-      tcpdump
-      wireshark-cli
       git
       gh
       nodejs
@@ -346,7 +342,6 @@ let
       coreutils
       jq
       gnupg       # gpgconf --list-dir agent-socket
-      wireshark-cli # tshark for --meter-network cleanup
     ]
     ++ [
       gnupgScan
