@@ -104,6 +104,10 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
   - **Wildcards**: Wildcards are supported for domains (e.g., `*.github.com`). Note that a strict domain like `github.com` only matches that exact domain and **does not** match subdomains like `status.github.com`. To match both, you must specify both `github.com` and `*.github.com`. This applies to both allow and deny domain rules.
   - Domain matching is case-insensitive. When an allow and a deny rule match with equal specificity, allow wins.
   - Hostnames are also checked against `deny_ips` *after* resolution, so a denied address cannot be reached through an allowed name.
+  - `default = "allow"` or `default = "deny"` overrides the derived default explicitly.
+  - An invalid `[proxy]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote.
+  - `--firewall` with no allow rules allows every host — it is then a metering proxy. The launcher says so at startup, and `agent-sandbox-ctl firewall show` reports `default allow`.
+  - **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around. `agent-sandbox-ctl port add` refuses a proxied sandbox for the same reason.
 - `--meter-network`: Isolates the container from the internet, routes HTTP(S) and SSH traffic through a proxy, and prints a post-run summary of it. Other traffic is blocked.
   - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
   - The summary ranks hosts by volume, collapses the tail beyond 15 hosts, and lists denied and failed connections separately:
@@ -122,6 +126,33 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
       ── failed ────────────────────────────────────────
       proxy.example.com          1  (dns)
     ```
+- Either proxy flag also makes these available while the sandbox runs:
+  - `agent-sandbox-ctl status` — one screen: proxy mode, rule and traffic counts, ports.
+  - `agent-sandbox-ctl net` / `net -f` — the summary above for the session so far, or a live feed.
+  - `agent-sandbox-ctl logs [-f]` — the proxy's own log: the policy it started with, and every denial as it happens.
+  - `agent-sandbox-ctl firewall show|allow|deny|rm|reset` — read and change the policy of a **running** sandbox.
+  - A connection record is written when it *closes*, plus one when it opens, so a long-lived HTTPS tunnel appears as `in flight` under `── still open ──` rather than as traffic. Individual requests inside a tunnel are never visible; the proxy does not decrypt it.
+  - The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--meter-network` additionally prints the summary when the session ends, and keeps the log at `$TMPDIR/agent-sandbox-connections-<pid>.jsonl` if anything was denied or failed. `agent-sandbox-network-summary <log>` re-renders a kept log.
+  - Neither the policy nor the log is reachable from inside the sandbox, so the agent can neither widen its own firewall nor edit the record of its traffic.
+
+### Changing the firewall mid-session
+
+```console
+$ agent-sandbox-ctl firewall show
+agent-sandbox-myrepo-4213
+  policy      /tmp/agent-sandbox-policy-Xf3a91cD/policy
+  default     deny  (only the rules below are reachable)
+  allow_domains github.com                         AGENTS.md
+  allow_ips     10.0.0.0/8                         AGENTS.md
+
+$ agent-sandbox-ctl firewall allow api.openai.com
+  allowed     api.openai.com                    domains
+  reloading   the proxy applies this within a second
+```
+
+Changes take effect for new connections within a second. Connections already established keep running: the proxy checks policy when a connection opens and does not re-check it afterwards, so tightening a rule does not cut a tunnel that is already up — end the session for that. `firewall show` says how many are open when it matters.
+
+`reset` restores the `[proxy]` policy from `AGENTS.md` rather than emptying the rules, since an empty policy allows everything.
 - `--ports`: Honors `[ports]` declarations from `AGENTS.md`.
 - `--ports-dynamic`: Allows `agent-sandbox-ctl port add` post-launch.
 - `--ports-any-interface`: Permits port binds outside of loopback interfaces.
@@ -153,6 +184,29 @@ agent-sandbox opencode -- bash                   # interactive bash with opencod
 agent-sandbox opencode -- devenv shell           # devenv shell with opencode configs mounted
 agent-sandbox --privileged opencode              # nested podman inside container
 ```
+
+## Managing running sandboxes
+
+`agent-sandbox-ctl` operates on the host, on sandboxes already running:
+
+| Command | What it does |
+| --- | --- |
+| `load` | build the image and import it into podman |
+| `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows sidecars and forwarders |
+| `status [--sandbox N]` | one screen per sandbox, pointing at the commands below |
+| `net [-f]` | connection summary, or a live feed |
+| `logs [-f]` | the proxy sidecar's log |
+| `firewall show\|allow\|deny\|rm\|reset` | read and change the policy of a running sandbox |
+| `port ls\|add\|rm` | publish a port after launch (needs `--ports-dynamic`, and no proxy) |
+| `purge [--all] [-n]` | reclaim leftovers; running sandboxes are kept unless `--all` |
+
+Each takes `--sandbox NAME`, which may be omitted when only one sandbox is
+running or when exactly one matches the current directory.
+
+`purge` defaults to leftovers only: exited sandboxes, forwarders and sidecars
+whose sandbox is gone, per-session networks nothing is attached to, and temp
+directories from a launcher that was killed before it could clean up. `-n` shows
+what it would remove.
 
 ## What's in the image
 

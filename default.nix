@@ -45,7 +45,6 @@ let
       lockFile = ./proxy/Cargo.lock;
     };
   };
-  allowScript = pkgs.writeShellScriptBin "agent-sandbox-allow" (scriptBody ./lib/agent-sandbox-allow.sh);
   unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
   defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
   agentTools = map (a: a.package) agents;
@@ -123,7 +122,10 @@ let
       glibcLocales
     ]
     ++ podmanStack
-    ++ [ dockerAlias sidecarScript proxyScript allowScript ];
+    # No agent-sandbox-allow: policy now lives on a volume the sandbox cannot
+    # see, so widening the firewall is a host-side operation
+    # (agent-sandbox-ctl firewall allow) by design.
+    ++ [ dockerAlias sidecarScript proxyScript ];
 
   tools = baseTools ++ agentTools;
 
@@ -346,6 +348,7 @@ let
     ++ [
       gnupgScan
       parseAgents
+      networkSummary
     ];
     text = launcherPreamble + scriptBody ./lib/agent-sandbox.sh;
   };
@@ -357,7 +360,7 @@ let
       coreutils
       gnugrep
     ];
-    text = preamble + scriptBody ./lib/agent-sandbox-port.sh;
+    text = preamble + sandboxResolve + scriptBody ./lib/agent-sandbox-port.sh;
   };
 
   purgeScript = pkgs.writeShellApplication {
@@ -370,10 +373,77 @@ let
     text = preamble + scriptBody ./lib/agent-sandbox-purge.sh;
   };
 
+  # No `preamble`: selection is by role label now, so neither the image nor the
+  # network name is needed -- which also retires the `: "${AGENT_SANDBOX_NETWORK:?}"`
+  # line that existed only to keep shellcheck quiet about the unused one.
   listScript = pkgs.writeShellApplication {
     name = "agent-sandbox-list";
     runtimeInputs = with pkgs; [ podman ];
-    text = preamble + scriptBody ./lib/agent-sandbox-list.sh;
+    text = scriptBody ./lib/agent-sandbox-list.sh;
+  };
+
+  # Rendering the connection log lives here rather than inside the launcher so
+  # that `agent-sandbox-ctl net` prints the identical report for a running
+  # sandbox, and so a log kept after a failed session can be re-rendered.
+  networkSummary = pkgs.writeShellApplication {
+    name = "agent-sandbox-network-summary";
+    runtimeInputs = with pkgs; [
+      jq
+      coreutils
+    ];
+    text = scriptBody ./lib/agent-sandbox-network-summary.sh;
+  };
+
+  # Inlined into each consumer instead of being its own binary, so that its
+  # error messages carry the calling script's name.  Same trick as `preamble`.
+  sandboxResolve = scriptBody ./lib/agent-sandbox-resolve.sh;
+
+  statusScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-status";
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+      gnugrep
+      gawk
+    ];
+    text = sandboxResolve + scriptBody ./lib/agent-sandbox-status.sh;
+  };
+
+  logsScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-logs";
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+      gnugrep
+    ];
+    text = sandboxResolve + scriptBody ./lib/agent-sandbox-logs.sh;
+  };
+
+  # proxyScript in runtimeInputs so the host validates a policy with the very
+  # binary that will enforce it -- one implementation, no drift.
+  firewallScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-firewall";
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+      gnugrep
+      gawk
+    ]
+    ++ [ proxyScript ];
+    text = sandboxResolve + scriptBody ./lib/agent-sandbox-firewall.sh;
+  };
+
+  netScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-net";
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+      gnugrep
+    ]
+    ++ [ networkSummary ];
+    # No `preamble`: this script needs neither the image nor the network name,
+    # and writeShellApplication's shellcheck rejects the unused assignment.
+    text = sandboxResolve + scriptBody ./lib/agent-sandbox-net.sh;
   };
 
   loadScript = pkgs.writeShellApplication {
@@ -393,6 +463,10 @@ let
       portScript
       purgeScript
       listScript
+      netScript
+      statusScript
+      logsScript
+      firewallScript
     ];
     text = scriptBody ./lib/agent-sandbox-ctl.sh;
   };
@@ -429,6 +503,70 @@ let
       touch "$out"
     '';
 
+    # The renderer is the only consumer of the proxy's log format, and the two
+    # are versioned independently: a log written before open/close events
+    # existed must still render exactly as it did.
+    network-summary =
+      pkgs.runCommand "agent-sandbox-network-summary-tests"
+        {
+          nativeBuildInputs = with pkgs; [
+            bash
+            coreutils
+            gnugrep
+            jq
+          ];
+        }
+        ''
+          bash ${./lib/test-network-summary.sh} ${networkSummary}/bin/agent-sandbox-network-summary
+          touch "$out"
+        '';
+
+    # The AGENTS.md -> policy file -> proxy hop, which had no coverage at all and
+    # is where the fail-open separator bug lived.  Every list in the fixture has
+    # two entries, since one cannot distinguish a working handoff from a broken
+    # one.
+    firewall-policy =
+      pkgs.runCommand "agent-sandbox-firewall-policy-tests"
+        {
+          nativeBuildInputs = with pkgs; [
+            bash
+            coreutils
+            gnugrep
+            gnused
+          ];
+        }
+        ''
+          bash ${./lib/test-firewall-policy.sh} \
+            ${parseAgents}/bin/agent-sandbox-parse-agents \
+            ${proxyScript}/bin/agent-sandbox-proxy \
+            ${./lib/agent-sandbox-sidecar.sh}
+          touch "$out"
+        '';
+
+    # First behavioural coverage of the ctl subcommands.  Runs against the built
+    # scripts because resolve_sandbox is inlined at build time, and against a
+    # stub podman because a real one cannot run in a nix build.
+    ctl-args =
+      pkgs.runCommand "agent-sandbox-ctl-args-tests"
+        {
+          nativeBuildInputs = with pkgs; [
+            bash
+            coreutils
+            gnugrep
+            gnused
+          ];
+        }
+        ''
+          bash ${./lib/test-ctl-args.sh} ${./lib} \
+            ${proxyScript}/bin/agent-sandbox-proxy
+          touch "$out"
+        '';
+
+    # buildRustPackage runs cargo test in its check phase; the proxy is
+    # otherwise only reachable through the image, which `nix flake check`
+    # deliberately does not build.
+    proxy = proxyScript;
+
     # Builds every host-side script, which is what runs shellcheck over the
     # generated (preamble + body) text.  Deliberately excludes the load
     # script, so `nix flake check` does not have to build the image.
@@ -440,6 +578,11 @@ let
         purgeScript
         listScript
         ctlScript
+        netScript
+        statusScript
+        logsScript
+        firewallScript
+        networkSummary
         gnupgScan
         parseAgents
       ];
@@ -466,6 +609,11 @@ pkgs.symlinkJoin {
       purgeScript
       listScript
       ctlScript
+      netScript
+      statusScript
+      logsScript
+      firewallScript
+      networkSummary
       ;
   };
   meta = {

@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+# Behavioural tests for the agent-sandbox-ctl subcommands, against a stub podman.
+#
+# Podman cannot run in a nix build (nor in most CI), but almost every bug these
+# scripts have had is in argument handling and container selection, which do not
+# need a real container -- only believable answers to `podman ps` / `podman
+# inspect`.  The stub answers from fixtures and records its own argv, so a test
+# can assert both what the script decided and that it did not touch anything it
+# should not have.
+#
+# The scripts are composed here the same way default.nix composes them (preamble
+# + shared resolve helper + body) rather than run from the built store paths:
+# writeShellApplication PREPENDS its runtimeInputs to PATH, so a built script
+# always finds the real podman and a stub could never take effect.  The
+# composition itself is covered by checks.scripts, which shellchecks the
+# generated text.
+#
+# Usage: test-ctl-args.sh LIB_DIR [PROXY_BIN]
+#
+# PROXY_BIN is the policy validator the firewall command shells out to; the
+# firewall tests are skipped without it.
+
+set -euo pipefail
+
+lib="${1:?usage: test-ctl-args.sh LIB_DIR [PROXY_BIN]}"
+proxy_bin="${2:-}"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin"
+
+# /usr/bin/env does not exist inside a nix build, so every generated script gets
+# the interpreter this test is running under.
+bash_bin="${BASH:-$(command -v bash)}"
+
+# Mirror default.nix: preamble, then the inlined resolve helper, then the body.
+compose() { # name source...
+  local out="$tmp/bin/$1"
+  shift
+  {
+    printf '#!%s\n' "$bash_bin"
+    printf 'AGENT_SANDBOX_IMAGE="localhost/agent-sandbox:latest"\n'
+    printf 'AGENT_SANDBOX_NETWORK="agent-sandbox"\n'
+    local src
+    for src in "$@"; do
+      tail -n +2 "$lib/$src"   # strip the shebang, as scriptBody does
+    done
+  } > "$out"
+  chmod +x "$out"
+}
+
+compose agent-sandbox-port   agent-sandbox-resolve.sh agent-sandbox-port.sh
+compose agent-sandbox-net    agent-sandbox-resolve.sh agent-sandbox-net.sh
+compose agent-sandbox-logs   agent-sandbox-resolve.sh agent-sandbox-logs.sh
+compose agent-sandbox-status agent-sandbox-resolve.sh agent-sandbox-status.sh
+compose agent-sandbox-load   agent-sandbox-load.sh
+compose agent-sandbox-firewall agent-sandbox-resolve.sh agent-sandbox-firewall.sh
+compose agent-sandbox-purge  agent-sandbox-purge.sh
+purge_bin="$tmp/bin/agent-sandbox-purge"
+# net shells out to the renderer, so it has to be on PATH like the rest.
+compose agent-sandbox-network-summary agent-sandbox-network-summary.sh
+firewall_bin="$tmp/bin/agent-sandbox-firewall"
+# The firewall command validates with the real proxy binary, so it has to be on
+# PATH next to the stub podman.
+[[ -n "$proxy_bin" ]] && ln -sf "$proxy_bin" "$tmp/bin/agent-sandbox-proxy"
+
+port_bin="$tmp/bin/agent-sandbox-port"
+net_bin="$tmp/bin/agent-sandbox-net"
+logs_bin="$tmp/bin/agent-sandbox-logs"
+status_bin="$tmp/bin/agent-sandbox-status"
+load_bin="$tmp/bin/agent-sandbox-load"
+
+failures=0
+
+# ── the stub ────────────────────────────────────────────────────────────────
+# Fixture protocol, all under $tmp/fixture:
+#   running       newline-separated names of running sandboxes
+#   all           newline-separated names of all sandboxes (defaults to running)
+#   forwarders    newline-separated forwarder names
+#   labels.<name> KEY=VALUE lines, answering inspect --format '{{index .Config.Labels "KEY"}}'
+#   exists        newline-separated names for which `container exists` is true
+# Every invocation is appended to $tmp/argv.
+{ printf '#!%s\n' "$bash_bin"; cat <<'STUB'
+f="$FIXTURE"
+printf '%s\n' "$*" >> "$ARGV_LOG"
+
+fixture() { [[ -f "$f/$1" ]] && cat "$f/$1" || true; }
+
+case "$1" in
+  ps)
+    all=0; labels=(); want_name=""; want_status=""
+    for a in "$@"; do
+      case "$a" in
+        -a|--all) all=1 ;;
+        label=*)  labels+=("${a#label=}") ;;
+        name=*)   want_name="${a#name=}" ;;
+        status=*) want_status="${a#status=}" ;;
+      esac
+    done
+    src=running
+    [[ "$all" == 1 && -f "$f/all" ]] && src=all
+    # A status filter selects from its own fixture, so "exited" does not silently
+    # match everything.
+    [[ -n "$want_status" ]] && src="status.$want_status"
+
+    role=""; target=""
+    for l in ${labels[@]+"${labels[@]}"}; do
+      case "$l" in
+        agent-sandbox.role=*)   role="${l#agent-sandbox.role=}" ;;
+        agent-sandbox.target=*) target="${l#agent-sandbox.target=}" ;;
+      esac
+    done
+
+    case "$role" in
+      port-forward)
+        while IFS= read -r n; do
+          [[ -n "$n" ]] || continue
+          if [[ -n "$target" ]]; then
+            [[ "$(fixture "labels.$n" | sed -n 's/^agent-sandbox\.target=//p')" == "$target" ]] || continue
+          fi
+          if [[ -n "$want_name" ]]; then
+            # podman's name filter is a regex; ^...$ anchors are common here.
+            [[ "$n" =~ ${want_name} ]] || continue
+          fi
+          printf '%s\n' "$n"
+        done < <(fixture forwarders)
+        ;;
+      proxy)
+        while IFS= read -r n; do
+          [[ -n "$n" ]] || continue
+          if [[ -n "$target" ]]; then
+            [[ "$(fixture "labels.$n" | sed -n 's/^agent-sandbox\.target=//p')" == "$target" ]] || continue
+          fi
+          printf '%s\n' "$n"
+        done < <(fixture sidecars)
+        ;;
+      *) fixture "$src" ;;
+    esac
+    ;;
+  inspect)
+    # ${!#} is the last positional: the container.  Not ${*##* }, which applies
+    # the pattern to each argument separately.
+    name="${!#}"
+    all="$*"
+    key=$(sed -n 's/.*Config.Labels "\([^"]*\)".*/\1/p' <<< "$all")
+    dest=$(sed -n 's/.*eq .Destination "\([^"]*\)".*/\1/p' <<< "$all")
+    if [[ -n "$key" ]]; then
+      fixture "labels.$name" | sed -n "s|^${key}=||p"
+    elif [[ -n "$dest" ]]; then
+      fixture "mount.$name${dest//\//.}"
+    elif [[ "$all" == *NetworkSettings.Networks* ]]; then
+      fixture "networks.$name"
+    elif [[ "$all" == *State.Running* ]]; then
+      grep -qxF "$name" <(fixture running) && echo true || echo false
+    fi
+    ;;
+  container)
+    [[ "$2" == exists ]] || exit 0
+    grep -qxF "$3" <(fixture exists) || grep -qxF "$3" <(fixture all) \
+      || grep -qxF "$3" <(fixture running) || grep -qxF "$3" <(fixture forwarders)
+    ;;
+  port|logs|load|rm|network|run|exec) exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+} > "$tmp/bin/podman"
+chmod +x "$tmp/bin/podman"
+
+# ── harness ─────────────────────────────────────────────────────────────────
+
+fixture_reset() {
+  rm -rf "$tmp/fixture"
+  mkdir -p "$tmp/fixture"
+}
+
+fixture_set() { printf '%s\n' "${@:2}" > "$tmp/fixture/$1"; }
+
+# run LABEL BIN ARGS...  -> populates $status, $output, $argv
+run() {
+  : > "$tmp/argv"
+  status=0
+  output=$(FIXTURE="$tmp/fixture" ARGV_LOG="$tmp/argv" PATH="$tmp/bin:$PATH" \
+           "$@" 2>&1) || status=$?
+  argv=$(cat "$tmp/argv")
+}
+
+pass() { printf 'ok       %s\n' "$1"; }
+fail() {
+  printf 'FAIL     %s\n' "$1"
+  printf '%s\n' "${2:-}" | sed 's/^/           /'
+  failures=$((failures + 1))
+}
+
+expect_status() {
+  local label="$1" want="$2"
+  if [[ "$status" == "$want" ]]; then
+    pass "$label"
+  else
+    fail "$label" "exit $status, wanted $want"$'\n'"$output"
+  fi
+}
+
+expect_out() {
+  local label="$1" want="$2"
+  if grep -qF -- "$want" <<< "$output"; then
+    pass "$label"
+  else
+    fail "$label" "missing: $want"$'\n'"$output"
+  fi
+}
+
+expect_no_argv() {
+  local label="$1" unwanted="$2"
+  if grep -qF -- "$unwanted" <<< "$argv"; then
+    fail "$label" "podman was called with: $unwanted"$'\n'"$argv"
+  else
+    pass "$label"
+  fi
+}
+
+# ── load ────────────────────────────────────────────────────────────────────
+
+fixture_reset
+run "$load_bin" --help
+expect_status "load --help exits 0" 0
+expect_out    "load --help prints usage" "Usage: agent-sandbox-ctl load"
+expect_no_argv "load --help does not import the image" "load"
+
+run "$load_bin" typo
+expect_status "load rejects an argument" 1
+expect_no_argv "load typo does not import the image" "load"
+
+# ── port rm against a STOPPED sandbox (the resolve_sandbox regression) ───────
+
+fixture_reset
+fixture_set running
+fixture_set all "agent-sandbox-repo-1"
+fixture_set forwarders "agent-sandbox-fwd-agent-sandbox-repo-1-8080"
+fixture_set "labels.agent-sandbox-fwd-agent-sandbox-repo-1-8080" \
+  "agent-sandbox.target=agent-sandbox-repo-1"
+
+run "$port_bin" rm --sandbox agent-sandbox-repo-1 8080
+expect_status "port rm works on a stopped sandbox" 0
+expect_out    "port rm removes the forwarder" "removed agent-sandbox-fwd-agent-sandbox-repo-1-8080"
+
+# ── port add requires a RUNNING sandbox ─────────────────────────────────────
+
+run "$port_bin" add --sandbox agent-sandbox-repo-1 8080
+expect_status "port add refuses a stopped sandbox" 1
+expect_out    "port add says why" "is not running"
+
+# ── port add must not weaken a firewalled sandbox ───────────────────────────
+# The important half of this is the argv assertion: refusing is only useful if it
+# happens before podman is asked to create or join a network.
+
+fixture_reset
+fixture_set running "agent-sandbox-fw-1"
+fixture_set "labels.agent-sandbox-fw-1" "agent-sandbox.proxy=firewall"
+
+run "$port_bin" add --sandbox agent-sandbox-fw-1 8080
+expect_status  "port add refuses a firewalled sandbox" 1
+expect_out     "port add explains the egress risk" "does not pass through the proxy"
+expect_no_argv "port add creates no network" "network create"
+expect_no_argv "port add joins no network" "network connect"
+expect_no_argv "port add starts no forwarder" "run --detach"
+
+# Metering has the same topology, so the same refusal.
+fixture_set "labels.agent-sandbox-fw-1" "agent-sandbox.proxy=meter"
+run "$port_bin" add --sandbox agent-sandbox-fw-1 8080
+expect_status "port add refuses a metered sandbox" 1
+
+# A sandbox from before the label still has the shared mount to give it away.
+fixture_set "labels.agent-sandbox-fw-1" "agent-sandbox.proxy="
+fixture_set "mount.agent-sandbox-fw-1.sidecar_shared" "/tmp/whatever"
+run "$port_bin" add --sandbox agent-sandbox-fw-1 8080
+expect_status "port add falls back to the shared mount" 1
+
+# And an unproxied sandbox is still allowed through.
+fixture_reset
+fixture_set running "agent-sandbox-plain-1"
+fixture_set "labels.agent-sandbox-plain-1" "agent-sandbox.proxy=off"
+run "$port_bin" add --sandbox agent-sandbox-plain-1 8080
+expect_status "port add still works without a proxy" 0
+
+# ── port ls ─────────────────────────────────────────────────────────────────
+
+fixture_reset
+fixture_set running "agent-sandbox-repo-1"
+fixture_set forwarders "agent-sandbox-fwd-ghost-9000"
+fixture_set "labels.agent-sandbox-fwd-ghost-9000" "agent-sandbox.target=ghost"
+
+run "$port_bin" ls 8080
+expect_status "port ls rejects a stray positional" 1
+expect_out    "port ls says why" "ls takes no arguments"
+
+run "$port_bin" ls
+expect_status "port ls succeeds" 0
+expect_out    "port ls reports orphaned forwarders" "orphaned forwarders"
+
+# ── net argument handling ───────────────────────────────────────────────────
+
+fixture_reset
+fixture_set running "agent-sandbox-repo-1"
+
+run "$net_bin" --sandbox --follow
+expect_status "net rejects a flag as a sandbox name" 1
+expect_out    "net names the bad value" "invalid sandbox name"
+
+run "$net_bin" --sandbox
+expect_status "net rejects an empty --sandbox" 1
+expect_out    "net says --sandbox needs a name" "--sandbox needs a name"
+
+run "$net_bin" --nope
+expect_status "net rejects an unknown flag" 1
+
+run "$net_bin" stray
+expect_status "net rejects a positional" 1
+
+# The metering log lives only in the sidecar now, so that the sandbox cannot
+# rewrite the record of its own traffic.
+fixture_reset
+fixture_set running "agent-sandbox-repo-1"
+run "$net_bin"
+expect_status "net refuses a sandbox with no proxy" 1
+
+fixture_set sidecars "agent-sandbox-sidecar-abc123"
+fixture_set "labels.agent-sandbox-sidecar-abc123" "agent-sandbox.target=agent-sandbox-repo-1"
+run "$net_bin"
+expect_status "net succeeds with a sidecar" 0
+if grep -qE "exec agent-sandbox-sidecar-abc123 cat" <<< "$argv"; then
+  pass "net reads the log from the sidecar"
+else
+  fail "net reads the log from the sidecar" "$argv"
+fi
+if grep -qE "exec agent-sandbox-repo-1 " <<< "$argv"; then
+  fail "net never reads the log from the sandbox" "$argv"
+else
+  pass "net never reads the log from the sandbox"
+fi
+
+# ── logs: sidecar discovery is by label ─────────────────────────────────────
+
+fixture_reset
+fixture_set running "agent-sandbox-repo-1"
+fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=off"
+
+run "$logs_bin"
+expect_status "logs refuses a sandbox with no proxy" 1
+expect_out    "logs says how to get one" "Relaunch it with"
+expect_no_argv "logs does not try to read a log" "logs"
+
+fixture_set sidecars "agent-sandbox-sidecar-abc123"
+fixture_set "labels.agent-sandbox-sidecar-abc123" "agent-sandbox.target=agent-sandbox-repo-1"
+fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=firewall"
+
+run "$logs_bin"
+expect_status "logs finds the sidecar by label" 0
+
+run "$logs_bin" --tail nope
+expect_status "logs validates --tail" 1
+expect_out    "logs says what --tail wants" "needs a line count"
+
+run "$logs_bin" --sandbox --follow
+expect_status "logs rejects a flag as a sandbox name" 1
+
+# ── status ──────────────────────────────────────────────────────────────────
+
+# Give the sidecar real policy and log directories, so status has to find them
+# the way it does in practice: through the sidecar's bind mounts.
+mkdir -p "$tmp/policy" "$tmp/shared"
+printf 'allow_domains github.com\nallow_ips 10.0.0.0/8\n' > "$tmp/policy/policy"
+{
+  printf '{"ts":1,"host":"github.com","port":443,"verdict":"allow","up":1,"down":2,"ms":3}\n'
+  printf '{"ts":2,"host":"blocked.example.com","port":443,"verdict":"deny","up":0,"down":0,"ms":1}\n'
+  printf '{"ev":"open","id":"1-9","ts":3,"host":"live.example.com","port":443}\n'
+} > "$tmp/shared/connections.jsonl"
+fixture_set "mount.agent-sandbox-sidecar-abc123.sidecar_policy" "$tmp/policy"
+fixture_set "mount.agent-sandbox-sidecar-abc123.sidecar_shared" "$tmp/shared"
+
+run "$status_bin"
+expect_status "status succeeds" 0
+expect_out    "status names the sandbox"  "agent-sandbox-repo-1"
+expect_out    "status reports proxy mode" "firewall"
+expect_out    "status counts the policy rules" "2 rule(s), default deny"
+expect_out    "status counts traffic" "1 connection(s), 1 denied"
+expect_out    "status counts what is in flight" "in flight"
+expect_out    "status points at the detail commands" "agent-sandbox-ctl net"
+
+run "$status_bin" stray
+expect_status "status rejects a positional" 1
+
+# ── firewall ────────────────────────────────────────────────────────────────
+
+if [[ -n "$proxy_bin" ]]; then
+  fixture_reset
+  fixture_set running "agent-sandbox-repo-1"
+  fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=firewall"
+  fixture_set sidecars "agent-sandbox-sidecar-abc123"
+  fixture_set "labels.agent-sandbox-sidecar-abc123" "agent-sandbox.target=agent-sandbox-repo-1"
+
+  fw_policy="$tmp/fwpolicy"
+  mkdir -p "$fw_policy"
+  fixture_set "mount.agent-sandbox-sidecar-abc123.sidecar_policy" "$fw_policy"
+  reset_policy() {
+    printf 'allow_domains github.com\nallow_ips 10.0.0.0/8\n' > "$fw_policy/policy"
+    cp "$fw_policy/policy" "$fw_policy/policy.base"
+  }
+  reset_policy
+
+  run "$firewall_bin" show
+  expect_status "firewall show succeeds" 0
+  expect_out    "firewall show lists a rule"  "github.com"
+  expect_out    "firewall show names the default" "default"
+  expect_out    "firewall show marks provenance" "AGENTS.md"
+
+  run "$firewall_bin" allow api.openai.com
+  expect_status "firewall allow succeeds" 0
+  expect_out    "firewall allow echoes the classification" "domains"
+  if grep -qxF "allow_domains api.openai.com" "$fw_policy/policy"; then
+    pass "firewall allow writes the rule"
+  else
+    fail "firewall allow writes the rule" "$(cat "$fw_policy/policy")"
+  fi
+
+  run "$firewall_bin" show
+  expect_out "firewall show marks a runtime addition" "added at runtime"
+
+  run "$firewall_bin" allow 10.1.0.0/24
+  expect_out "firewall allow classifies a CIDR block" "ips"
+
+  # deny of an already-allowed host must replace, not accumulate.
+  reset_policy
+  run "$firewall_bin" deny github.com
+  expect_status "firewall deny succeeds" 0
+  if grep -qxF "allow_domains github.com" "$fw_policy/policy"; then
+    fail "firewall deny replaces the allow rule" "$(cat "$fw_policy/policy")"
+  else
+    pass "firewall deny replaces the allow rule"
+  fi
+
+  reset_policy
+  run "$firewall_bin" rm github.com
+  expect_status "firewall rm succeeds" 0
+  if grep -q "github.com" "$fw_policy/policy"; then
+    fail "firewall rm drops the rule" "$(cat "$fw_policy/policy")"
+  else
+    pass "firewall rm drops the rule"
+  fi
+
+  run "$firewall_bin" rm nothing.example.com
+  expect_status "firewall rm reports an unknown rule" 1
+
+  # reset restores the declared policy rather than emptying it.
+  run "$firewall_bin" reset
+  expect_status "firewall reset succeeds" 0
+  if grep -qxF "allow_domains github.com" "$fw_policy/policy"; then
+    pass "firewall reset restores the baseline"
+  else
+    fail "firewall reset restores the baseline" "$(cat "$fw_policy/policy")"
+  fi
+
+  run "$firewall_bin" allow "not a domain"
+  expect_status "firewall rejects an unclassifiable entry" 1
+  expect_out    "firewall says what it could not classify" "not a domain or address"
+
+  run "$firewall_bin" allow
+  expect_status "firewall allow needs an entry" 1
+
+  run "$firewall_bin" bogus
+  expect_status "firewall rejects an unknown verb" 1
+
+
+  # An invalid policy must never be installed, whatever produced it.
+  printf 'allow_ips 10.0.0.0/8\n' > "$fw_policy/policy"
+  cp "$fw_policy/policy" "$fw_policy/policy.base"
+  printf 'garbage line\n' > "$fw_policy/policy.base"
+  run "$firewall_bin" reset
+  expect_status "an invalid policy is refused" 1
+  expect_out    "and says so" "refusing to install an invalid policy"
+  if grep -qxF "allow_ips 10.0.0.0/8" "$fw_policy/policy"; then
+    pass "the policy in force is left untouched"
+  else
+    fail "the policy in force is left untouched" "$(cat "$fw_policy/policy")"
+  fi
+  if [[ -e "$fw_policy/.policy.new" ]]; then
+    fail "no half-written policy is left behind" "$fw_policy/.policy.new exists"
+  else
+    pass "no half-written policy is left behind"
+  fi
+
+  # --help must be recognised before the verb is consumed, and must not go
+  # looking for a sandbox.
+  fixture_reset
+  run "$firewall_bin" --help
+  expect_status  "firewall --help exits 0" 0
+  expect_out     "firewall --help prints usage" "agent-sandbox-firewall show"
+  expect_no_argv "firewall --help touches no container" "ps"
+
+  run "$firewall_bin"
+  expect_status "firewall with no verb exits 1" 1
+else
+  printf 'skip     firewall tests (no proxy binary given)\n'
+fi
+
+# ── purge ───────────────────────────────────────────────────────────────────
+# The point of the rework: a live session survives it, and orphans do not.
+
+fixture_reset
+fixture_set running "agent-sandbox-live-1"
+fixture_set all "agent-sandbox-live-1" "agent-sandbox-dead-2"
+fixture_set "status.exited" "agent-sandbox-dead-2"
+fixture_set forwarders "agent-sandbox-fwd-ghost-9000"
+fixture_set "labels.agent-sandbox-fwd-ghost-9000" "agent-sandbox.target=ghost"
+fixture_set sidecars "agent-sandbox-sidecar-orphan"
+fixture_set "labels.agent-sandbox-sidecar-orphan" "agent-sandbox.target=ghost"
+
+run "$purge_bin" --dry-run
+expect_status  "purge --dry-run succeeds" 0
+expect_out     "purge keeps a running sandbox" "Running sandboxes (kept"
+expect_out     "purge names the running sandbox" "agent-sandbox-live-1"
+expect_out     "purge finds the orphaned forwarder" "agent-sandbox-fwd-ghost-9000"
+expect_out     "purge finds the orphaned sidecar" "agent-sandbox-sidecar-orphan"
+expect_out     "purge says it would remove" "would remove"
+expect_no_argv "purge --dry-run removes nothing" "rm -f"
+expect_no_argv "purge --dry-run removes no image" "rmi"
+
+run "$purge_bin" --force
+expect_status "purge --force succeeds" 0
+if grep -qF "rm -f agent-sandbox-fwd-ghost-9000" <<< "$argv"; then
+  pass "purge removes the orphaned forwarder"
+else
+  fail "purge removes the orphaned forwarder" "$argv"
+fi
+if grep -qF "rm -f agent-sandbox-live-1" <<< "$argv"; then
+  fail "purge does not remove a running sandbox" "$argv"
+else
+  pass "purge does not remove a running sandbox"
+fi
+
+run "$purge_bin" --all --force
+if grep -qF "rm -f agent-sandbox-live-1" <<< "$argv"; then
+  pass "purge --all removes a running sandbox"
+else
+  fail "purge --all removes a running sandbox" "$argv"
+fi
+
+# `network rm -f` is what used to cut a live session's network out from under it.
+if grep -qF "network rm -f" <<< "$argv"; then
+  fail "purge never force-removes a network" "$argv"
+else
+  pass "purge never force-removes a network"
+fi
+
+run "$purge_bin" --nope
+expect_status "purge rejects an unknown flag" 1
+
+# ── error output goes to stderr ─────────────────────────────────────────────
+
+status=0
+FIXTURE="$tmp/fixture" ARGV_LOG="$tmp/argv" PATH="$tmp/bin:$PATH" \
+  "$net_bin" --nope 2>/dev/null 1>"$tmp/stdout" || status=$?
+if [[ -s "$tmp/stdout" ]]; then
+  fail "net writes errors to stderr, not stdout" "$(cat "$tmp/stdout")"
+else
+  pass "net writes errors to stderr, not stdout"
+fi
+
+if [[ "$failures" -gt 0 ]]; then
+  printf '\n%s test(s) failed\n' "$failures" >&2
+  exit 1
+fi
+
+printf '\nall ctl-args tests passed\n'

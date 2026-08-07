@@ -2,10 +2,18 @@
 
 //! Forward proxy for the agent-sandbox sidecar.
 //!
-//! Usage: agent-sandbox-proxy ALLOW_DOMAINS DENY_DOMAINS ALLOW_IPS DENY_IPS [LOG_PATH]
+//! Usage: agent-sandbox-proxy [--policy FILE] [--log FILE] [--listen ADDR]
+//!                            [--allow-domains LIST] [--deny-domains LIST]
+//!                            [--allow-ips LIST] [--deny-ips LIST]
+//!                            [--check-policy FILE]
 //!
-//! The four policy arguments are comma-separated; an empty LOG_PATH (or none)
-//! disables connection metering.
+//! Policy comes from a file (one `KEY VALUE` per line, see `parse_policy`) or
+//! from the inline lists, never both.  Anything wrong with it exits 2 before the
+//! listener binds, so a policy the operator got wrong cannot degrade into a
+//! weaker one that appears to work.
+//!
+//! `--log` appends newline-delimited JSON, one object per connection event,
+//! rendered by agent-sandbox-network-summary.
 
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -13,7 +21,8 @@ use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,9 +53,16 @@ const READY_PROBE_HOST: &str = "cloudflare.com:443";
 const BUF_SIZE: usize = 64 * 1024;
 const HEAD_MAX: usize = 8192;
 const DNS_CACHE_MAX: usize = 512;
+/// How often the policy file is checked for changes.
+const POLICY_POLL: Duration = Duration::from_secs(1);
 
 // ── Policy ──────────────────────────────────────────────────────────────────
 
+/// `default_allow` is derived, never supplied: an allow list makes the policy
+/// deny-by-default, deny lists alone leave it allow-by-default.  Constructing
+/// this struct only through `new`/`parse_policy` is what stops a caller (in
+/// particular a reload) from recomputing the lists and forgetting the mode.
+#[derive(Debug)]
 struct ProxyConfig {
     allow_domains: Vec<String>,
     deny_domains: Vec<String>,
@@ -55,19 +71,164 @@ struct ProxyConfig {
     default_allow: bool,
 }
 
-fn parse_csv(s: &str) -> Vec<String> {
-    s.split(',')
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect()
+impl ProxyConfig {
+    fn new(
+        allow_domains: Vec<String>,
+        deny_domains: Vec<String>,
+        allow_ips: Vec<IpNet>,
+        deny_ips: Vec<IpNet>,
+        default_override: Option<bool>,
+    ) -> ProxyConfig {
+        let default_allow = default_override
+            .unwrap_or_else(|| allow_domains.is_empty() && allow_ips.is_empty());
+        ProxyConfig {
+            allow_domains,
+            deny_domains,
+            allow_ips,
+            deny_ips,
+            default_allow,
+        }
+    }
+
+    /// One line per rule, for the startup log and for `--check-policy`.
+    fn describe(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for d in &self.allow_domains {
+            out.push(format!("allow_domains {}", d));
+        }
+        for d in &self.deny_domains {
+            out.push(format!("deny_domains {}", d));
+        }
+        for n in &self.allow_ips {
+            out.push(format!("allow_ips {}", n));
+        }
+        for n in &self.deny_ips {
+            out.push(format!("deny_ips {}", n));
+        }
+        out.push(format!(
+            "default {}",
+            if self.default_allow { "allow" } else { "deny" }
+        ));
+        out
+    }
 }
 
-fn parse_csv_ips(s: &str) -> Vec<IpNet> {
-    s.split(',')
-        .map(|s| s.trim())
+/// Split on commas *and* whitespace.  Only commas are produced by anything that
+/// calls this, but a space-separated list used to arrive here and collapse into
+/// one unparseable token, silently emptying the list -- and an empty allow list
+/// means allow-everything.  Accepting both costs nothing and removes the trap.
+fn split_list(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| c == ',' || c.is_whitespace())
         .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<IpNet>().ok())
-        .collect()
+}
+
+fn parse_csv(s: &str) -> Vec<String> {
+    split_list(s).map(|s| s.to_ascii_lowercase()).collect()
+}
+
+/// Accept both a CIDR block and a bare address, the latter as a host route.
+///
+/// `IpNet` alone rejects "8.8.8.8" for want of a prefix, while the AGENTS.md
+/// parser accepts it (Python's ip_network treats it as /32).  That disagreement
+/// used to be invisible, because unparseable entries were dropped rather than
+/// reported: a deny_ips entry written as a bare address silently did nothing.
+fn parse_net(s: &str) -> Result<IpNet, String> {
+    if let Ok(net) = s.parse::<IpNet>() {
+        return Ok(net);
+    }
+    match s.parse::<IpAddr>() {
+        Ok(ip) => Ok(IpNet::from(ip)),
+        Err(e) => Err(format!(
+            "{:?} is not an IP address or CIDR block: {}",
+            s, e
+        )),
+    }
+}
+
+/// Unparseable entries are an error, never a silent omission: dropping one turns
+/// a policy the operator wrote into a weaker one nobody asked for.
+fn parse_csv_ips(s: &str) -> Result<Vec<IpNet>, String> {
+    split_list(s).map(parse_net).collect()
+}
+
+/// Parse the policy file written by the launcher (and edited by
+/// `agent-sandbox-ctl firewall`).
+///
+/// One `KEY VALUE` pair per line, `#` comments and blank lines ignored:
+///
+/// ```text
+/// allow_domains github.com
+/// allow_ips 10.0.0.0/8
+/// default deny
+/// ```
+///
+/// A value containing whitespace is rejected rather than split.  That is the
+/// whole point of the format: the previous wire format packed a list into one
+/// space-separated argument, and every consumer disagreed about how to take it
+/// apart.  Rejecting the shape means the old encoding cannot silently reappear.
+fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
+    let mut allow_domains = Vec::new();
+    let mut deny_domains = Vec::new();
+    let mut allow_ips = Vec::new();
+    let mut deny_ips = Vec::new();
+    let mut default_override = None;
+
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lineno = i + 1;
+        let (key, value) = line
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| format!("{}: {:?} is not KEY VALUE", lineno, line))?;
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(format!("{}: {} has no value", lineno, key));
+        }
+        if value.split_whitespace().count() > 1 {
+            return Err(format!(
+                "{}: {}: {:?} contains whitespace; write one entry per line",
+                lineno, key, value
+            ));
+        }
+
+        match key {
+            "allow_domains" => allow_domains.push(value.to_ascii_lowercase()),
+            "deny_domains" => deny_domains.push(value.to_ascii_lowercase()),
+            "allow_ips" => allow_ips
+                .push(parse_net(value).map_err(|e| format!("{}: allow_ips: {}", lineno, e))?),
+            "deny_ips" => deny_ips
+                .push(parse_net(value).map_err(|e| format!("{}: deny_ips: {}", lineno, e))?),
+            "default" => {
+                default_override = Some(match value {
+                    "allow" => true,
+                    "deny" => false,
+                    other => {
+                        return Err(format!(
+                            "{}: default: expected 'allow' or 'deny', got {:?}",
+                            lineno, other
+                        ))
+                    }
+                })
+            }
+            other => return Err(format!("{}: unknown key {:?}", lineno, other)),
+        }
+    }
+
+    Ok(ProxyConfig::new(
+        allow_domains,
+        deny_domains,
+        allow_ips,
+        deny_ips,
+        default_override,
+    ))
+}
+
+fn load_policy(path: &str) -> Result<ProxyConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read policy {}: {}", path, e))?;
+    parse_policy(&text).map_err(|e| format!("{}:{}", path, e))
 }
 
 /// Both arguments must already be lowercase.
@@ -177,6 +338,16 @@ impl Resolver {
         }
     }
 
+    /// Drop every cached lookup.  Called on a policy change: cached *addresses*
+    /// are checked against the current deny list, so a stale entry could carry a
+    /// newly-denied address for up to DNS_TTL.  Costs one re-resolve per live
+    /// host, which refills within a second.
+    fn clear(&self) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
+    }
+
     /// Resolve, retrying until at least `RETRY_WINDOW` has elapsed (longer if
     /// `retry_until` extends past that).  Only successes are cached — caching a
     /// failure would pin an outage in place for `DNS_TTL`.
@@ -228,11 +399,25 @@ impl Resolver {
 
 // ── Metering ────────────────────────────────────────────────────────────────
 
-/// One JSON line per finished connection, consumed by the launcher to render
-/// the `--meter-network` summary.  Cheap enough to leave on: a few hundred
-/// bytes per connection, versus the full-payload packet capture it replaces.
+/// One JSON line per connection event, consumed by `agent-sandbox-network-summary`
+/// to render the `--meter-network` summary and the `agent-sandbox-ctl net` live
+/// view.  Cheap enough to leave on: a few hundred bytes per connection, versus
+/// the full-payload packet capture it replaces.
+///
+/// A connection that is allowed writes two lines: `"ev":"open"` when the tunnel
+/// is established and `"ev":"close"` when it ends, correlated by `id`.  Without
+/// the open line a long-lived tunnel is invisible for as long as it lives, which
+/// is precisely the traffic worth watching.  Connections rejected before that
+/// point write only their terminal line, with no `ev` and no `id`: they resolve
+/// within milliseconds, so a paired open would double every error row without
+/// adding anything.
 struct MetricsLog {
     file: Mutex<File>,
+    /// Process start, in epoch seconds.  Ids embed it so two proxies appending
+    /// to the same log cannot mint colliding ids — a correlation id that
+    /// silently aliases is worse than none.
+    boot: u64,
+    next_id: AtomicU64,
 }
 
 /// Trim the boilerplate std prepends to resolver errors so the summary stays
@@ -264,11 +449,21 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// Whole seconds since the epoch, or 0 if the clock is before it.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 impl MetricsLog {
     fn open(path: &str) -> Option<Arc<MetricsLog>> {
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(f) => Some(Arc::new(MetricsLog {
                 file: Mutex::new(f),
+                boot: now_secs(),
+                next_id: AtomicU64::new(1),
             })),
             Err(e) => {
                 eprintln!("proxy: cannot open metrics log {}: {}", path, e);
@@ -277,36 +472,84 @@ impl MetricsLog {
         }
     }
 
-    fn record(&self, host: &str, port: u16, verdict: &str, err: Option<&str>, up: u64, down: u64, ms: u128) {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut line = format!(
-            "{{\"ts\":{},\"host\":\"{}\",\"port\":{},\"verdict\":\"{}\",\"up\":{},\"down\":{},\"ms\":{}",
-            ts,
+    fn write_line(&self, line: &str) {
+        if let Ok(mut f) = self.file.lock() {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    fn next_id(&self) -> String {
+        format!("{}-{}", self.boot, self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Marks a policy change in the connection log, so `ctl net -f` shows it
+    /// interleaved with the connections it affected.
+    fn policy_event(&self) {
+        self.write_line(&format!(
+            "{{\"ev\":\"policy\",\"ts\":{}}}\n",
+            now_secs()
+        ));
+    }
+
+    /// A connection has been established and is now pumping bytes.
+    fn open_event(&self, id: &str, host: &str, port: u16) {
+        self.write_line(&format!(
+            "{{\"ev\":\"open\",\"id\":\"{}\",\"ts\":{},\"host\":\"{}\",\"port\":{}}}\n",
+            id,
+            now_secs(),
+            json_escape(host),
+            port
+        ));
+    }
+
+    /// A connection has reached a terminal state.  `id` is `Some` only for
+    /// connections that announced themselves with `open_event`; with `None` the
+    /// line is byte-for-byte what earlier versions wrote.
+    fn record(
+        &self,
+        id: Option<&str>,
+        host: &str,
+        port: u16,
+        verdict: &str,
+        err: Option<&str>,
+        up: u64,
+        down: u64,
+        ms: u128,
+    ) {
+        let mut line = String::new();
+        if let Some(id) = id {
+            line.push_str(&format!("{{\"ev\":\"close\",\"id\":\"{}\",", id));
+        } else {
+            line.push('{');
+        }
+        line.push_str(&format!(
+            "\"ts\":{},\"host\":\"{}\",\"port\":{},\"verdict\":\"{}\",\"up\":{},\"down\":{},\"ms\":{}",
+            now_secs(),
             json_escape(host),
             port,
             verdict,
             up,
             down,
             ms
-        );
+        ));
         if let Some(e) = err {
             line.push_str(&format!(",\"err\":\"{}\"", e));
         }
         line.push_str("}\n");
 
-        if let Ok(mut f) = self.file.lock() {
-            let _ = f.write_all(line.as_bytes());
-        }
+        self.write_line(&line);
     }
 }
 
 // ── Connection handling ─────────────────────────────────────────────────────
 
 struct Shared {
-    config: ProxyConfig,
+    /// `RwLock<Arc<_>>` rather than `RwLock<ProxyConfig>`: a handler clones the
+    /// Arc and releases the lock immediately, instead of holding a read guard
+    /// across `resolve`, which can block for `RETRY_WINDOW`.  Each connection
+    /// then evaluates one immutable snapshot for its whole life, so a reload can
+    /// never split a decision in half.
+    config: RwLock<Arc<ProxyConfig>>,
     resolver: Resolver,
     metrics: Option<Arc<MetricsLog>>,
     /// Instant until which the resolve/connect paths keep retrying.
@@ -314,10 +557,54 @@ struct Shared {
 }
 
 impl Shared {
-    fn record(&self, host: &str, port: u16, verdict: &str, err: Option<&str>, up: u64, down: u64, ms: u128) {
-        if let Some(m) = &self.metrics {
-            m.record(host, port, verdict, err, up, down, ms);
+    /// A snapshot of the policy.  Poisoning is degraded into "use the value
+    /// anyway" rather than a panic: a handler thread dying on a lock is a worse
+    /// outcome than acting on a config someone else was mid-swap on.
+    fn config(&self) -> Arc<ProxyConfig> {
+        Arc::clone(&self.config.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Install a new policy.  The DNS cache goes with it: the name check runs
+    /// before resolution so it is unaffected, but `is_denied_address` is
+    /// evaluated against *cached* addresses, and a stale set would let a
+    /// just-denied address through for up to DNS_TTL.
+    fn replace_config(&self, config: ProxyConfig) {
+        eprintln!("proxy: policy reloaded");
+        for line in config.describe() {
+            eprintln!("proxy:   {}", line);
         }
+        if let Ok(mut slot) = self.config.write() {
+            *slot = Arc::new(config);
+        }
+        self.resolver.clear();
+        if let Some(m) = &self.metrics {
+            m.policy_event();
+        }
+    }
+
+    fn record(
+        &self,
+        id: Option<&str>,
+        host: &str,
+        port: u16,
+        verdict: &str,
+        err: Option<&str>,
+        up: u64,
+        down: u64,
+        ms: u128,
+    ) {
+        if let Some(m) = &self.metrics {
+            m.record(id, host, port, verdict, err, up, down, ms);
+        }
+    }
+
+    /// Announce an established connection, returning the id to close it with.
+    /// `None` when metering is off, which makes the close path a no-op too.
+    fn open_event(&self, host: &str, port: u16) -> Option<String> {
+        let m = self.metrics.as_ref()?;
+        let id = m.next_id();
+        m.open_event(&id, host, port);
+        Some(id)
     }
 }
 
@@ -450,10 +737,15 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         return;
     }
 
-    if !shared.config.is_allowed(&host) {
+    // One snapshot for this connection's lifetime.  Taken after the head is
+    // parsed so a reload landing mid-handshake cannot make the name check and the
+    // resolved-address check disagree.
+    let cfg = shared.config();
+
+    if !cfg.is_allowed(&host) {
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{}", host, port);
-        shared.record(&host, port, "deny", None, 0, 0, started.elapsed().as_millis());
+        shared.record(None, &host, port, "deny", None, 0, 0, started.elapsed().as_millis());
         return;
     }
 
@@ -464,6 +756,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             eprintln!("proxy: dns failure {}:{}: {}", host, port, e);
             let detail = format!("dns: {}", short_err(&e));
             shared.record(
+                None,
                 &host,
                 port,
                 "error",
@@ -479,10 +772,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     // The policy check above ran on the name.  Re-check what it actually
     // resolves to, so a denied address cannot be reached via an allowed (or
     // merely unlisted) hostname.
-    if let Some(bad) = addrs.iter().find(|a| shared.config.is_denied_address(a.ip())) {
+    if let Some(bad) = addrs.iter().find(|a| cfg.is_denied_address(a.ip())) {
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} (resolves to denied address {})", host, port, bad.ip());
-        shared.record(&host, port, "deny", Some("address"), 0, 0, started.elapsed().as_millis());
+        shared.record(None, &host, port, "deny", Some("address"), 0, 0, started.elapsed().as_millis());
         return;
     }
 
@@ -493,6 +786,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             eprintln!("proxy: connect failure {}:{}: {}", host, port, e);
             let detail = format!("connect: {}", short_err(&e));
             shared.record(
+                None,
                 &host,
                 port,
                 "error",
@@ -543,17 +837,84 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         (Ok(c), Ok(r)) => (c, r),
         _ => {
             eprintln!("proxy: cannot duplicate sockets for {}:{}", host, port);
-            shared.record(&host, port, "error", Some("fd"), 0, 0, started.elapsed().as_millis());
+            shared.record(None, &host, port, "error", Some("fd"), 0, 0, started.elapsed().as_millis());
             return;
         }
     };
+
+    // Announced only once the connection can no longer fail synchronously, so
+    // every open is followed by exactly one close.
+    let id = shared.open_event(&host, port);
 
     // One direction inline: two threads per connection instead of three.
     let upstream = thread::spawn(move || pump(client_read, remote_write));
     let down = pump(remote_sock, client_sock);
     let up = head_up + upstream.join().unwrap_or(0);
 
-    shared.record(&host, port, "allow", None, up, down, started.elapsed().as_millis());
+    shared.record(
+        id.as_deref(),
+        &host,
+        port,
+        "allow",
+        None,
+        up,
+        down,
+        started.elapsed().as_millis(),
+    );
+}
+
+/// Identity of a policy file, for change detection.
+///
+/// Size as well as mtime, because a filesystem with one-second timestamps plus a
+/// same-second rewrite could otherwise go unnoticed; `None` for absent, so a file
+/// appearing or disappearing counts as a change too.
+fn policy_stamp(path: &str) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Apply the policy file once.  Returns whether the running policy changed.
+///
+/// A rejected or vanished policy keeps the one already in force: the alternative
+/// is falling back to a config nobody wrote, which is how an empty allow list --
+/// meaning allow everything -- would sneak in.
+fn reload_once(path: &str, shared: &Shared) -> bool {
+    if policy_stamp(path).is_none() {
+        eprintln!(
+            "proxy: policy {} is gone; keeping the policy already in force",
+            path
+        );
+        return false;
+    }
+    match load_policy(path) {
+        Ok(config) => {
+            shared.replace_config(config);
+            true
+        }
+        Err(e) => {
+            eprintln!("proxy: policy rejected, keeping the previous one: {}", e);
+            false
+        }
+    }
+}
+
+/// Reload the policy whenever the file changes.
+///
+/// Polling rather than inotify or a signal: `forbid(unsafe_code)` rules out a
+/// hand-rolled handler, `signal_hook` would be the crate's only dependency, and
+/// one `stat` a second is free.  A second is also below the threshold where a
+/// human running `firewall allow` and immediately retrying would notice.
+fn watch_policy(path: String, shared: Arc<Shared>) {
+    let mut current = policy_stamp(&path);
+    loop {
+        thread::sleep(POLICY_POLL);
+        let stamp = policy_stamp(&path);
+        if stamp == current {
+            continue;
+        }
+        current = stamp;
+        reload_once(&path, &shared);
+    }
 }
 
 /// Block until the sidecar's network can actually resolve a name.
@@ -593,32 +954,155 @@ fn wait_for_egress() {
     );
 }
 
+const USAGE: &str = "\
+Usage: agent-sandbox-proxy [OPTIONS]
+
+  --policy FILE          read the policy from FILE (see parse_policy)
+  --check-policy FILE    validate FILE, print the rules it yields, exit
+  --log FILE             append one JSON line per connection event
+  --listen ADDR          listen address (default 0.0.0.0:8888)
+  --allow-domains LIST   comma-separated; mutually exclusive with --policy
+  --deny-domains LIST
+  --allow-ips LIST
+  --deny-ips LIST
+";
+
+/// Exit codes: 2 for anything wrong with the policy, so the sidecar and the
+/// launcher can tell a bad policy from a failure to start.
+fn fail(msg: &str) -> ! {
+    eprintln!("proxy: {}", msg);
+    std::process::exit(2);
+}
+
+struct Options {
+    policy: String,
+    log: String,
+    listen: String,
+    allow_domains: String,
+    deny_domains: String,
+    allow_ips: String,
+    deny_ips: String,
+}
+
+fn parse_args(args: &[String]) -> (Options, Option<String>) {
+    let mut o = Options {
+        policy: String::new(),
+        log: String::new(),
+        listen: "0.0.0.0:8888".to_string(),
+        allow_domains: String::new(),
+        deny_domains: String::new(),
+        allow_ips: String::new(),
+        deny_ips: String::new(),
+    };
+    let mut check = None;
+    let mut i = 1;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let mut value = || {
+            i += 1;
+            match args.get(i) {
+                Some(v) => v.clone(),
+                None => fail(&format!("{} needs a value", flag)),
+            }
+        };
+        match flag {
+            "--policy" => o.policy = value(),
+            "--check-policy" => check = Some(value()),
+            "--log" => o.log = value(),
+            "--listen" => o.listen = value(),
+            "--allow-domains" => o.allow_domains = value(),
+            "--deny-domains" => o.deny_domains = value(),
+            "--allow-ips" => o.allow_ips = value(),
+            "--deny-ips" => o.deny_ips = value(),
+            "-h" | "--help" => {
+                print!("{}", USAGE);
+                std::process::exit(0);
+            }
+            other => fail(&format!("unknown option {:?}\n{}", other, USAGE)),
+        }
+        i += 1;
+    }
+    (o, check)
+}
+
+/// Build the initial policy.  `--policy` and the inline lists are mutually
+/// exclusive rather than one falling back to the other: a fallback means a failed
+/// load can quietly become an empty policy, which is allow-everything.
+fn initial_config(o: &Options) -> ProxyConfig {
+    let inline = [
+        &o.allow_domains,
+        &o.deny_domains,
+        &o.allow_ips,
+        &o.deny_ips,
+    ]
+    .iter()
+    .any(|s| !s.is_empty());
+
+    if !o.policy.is_empty() {
+        if inline {
+            fail("--policy and --allow-domains/--deny-domains/--allow-ips/--deny-ips are mutually exclusive");
+        }
+        match load_policy(&o.policy) {
+            Ok(c) => c,
+            Err(e) => fail(&e),
+        }
+    } else {
+        let allow_ips = match parse_csv_ips(&o.allow_ips) {
+            Ok(v) => v,
+            Err(e) => fail(&format!("--allow-ips: {}", e)),
+        };
+        let deny_ips = match parse_csv_ips(&o.deny_ips) {
+            Ok(v) => v,
+            Err(e) => fail(&format!("--deny-ips: {}", e)),
+        };
+        ProxyConfig::new(
+            parse_csv(&o.allow_domains),
+            parse_csv(&o.deny_domains),
+            allow_ips,
+            deny_ips,
+            None,
+        )
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
+    let (opts, check) = parse_args(&args);
 
-    let allow_domains = parse_csv(arg(1));
-    let deny_domains = parse_csv(arg(2));
-    let allow_ips = parse_csv_ips(arg(3));
-    let deny_ips = parse_csv_ips(arg(4));
-    let log_path = arg(5);
+    // Validation mode: the host runs this to vet a policy before installing it,
+    // so an invalid policy can never reach a running proxy.
+    if let Some(path) = check {
+        match load_policy(&path) {
+            Ok(config) => {
+                for line in config.describe() {
+                    println!("{}", line);
+                }
+                std::process::exit(0);
+            }
+            Err(e) => fail(&e),
+        }
+    }
 
-    // An allow list makes the policy deny-by-default; deny lists alone leave it
-    // allow-by-default.
-    let default_allow = allow_domains.is_empty() && allow_ips.is_empty();
+    // Before anything observable: a policy the operator got wrong must stop the
+    // proxy here, not produce a weaker policy that looks like it started fine.
+    let config = initial_config(&opts);
+    eprintln!("proxy: policy");
+    for line in config.describe() {
+        eprintln!("proxy:   {}", line);
+    }
 
-    let metrics = if log_path.is_empty() {
+    let metrics = if opts.log.is_empty() {
         None
     } else {
-        MetricsLog::open(log_path)
+        MetricsLog::open(&opts.log)
     };
 
     // Bind before probing egress so a port clash fails immediately rather than
     // after the readiness wait.
-    let listener = match TcpListener::bind("0.0.0.0:8888") {
+    let listener = match TcpListener::bind(&opts.listen) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("proxy: cannot bind 0.0.0.0:8888: {}", e);
+            eprintln!("proxy: cannot bind {}: {}", opts.listen, e);
             std::process::exit(1);
         }
     };
@@ -628,19 +1112,30 @@ fn main() {
     // Started after the egress probe so the grace covers the window right after
     // readiness, which is when the agent's first requests land.
     let shared = Arc::new(Shared {
-        config: ProxyConfig {
-            allow_domains,
-            deny_domains,
-            allow_ips,
-            deny_ips,
-            default_allow,
-        },
+        config: RwLock::new(Arc::new(config)),
         resolver: Resolver::new(),
         metrics,
         startup_until: Instant::now() + STARTUP_GRACE,
     });
 
-    if let Ok(mut f) = File::create("/sidecar_shared/ready") {
+    // Only a file-backed policy can change under us; the inline lists are fixed
+    // for the process's life.
+    if !opts.policy.is_empty() {
+        let path = opts.policy.clone();
+        let watched = Arc::clone(&shared);
+        if thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || watch_policy(path, watched))
+            .is_err()
+        {
+            eprintln!("proxy: cannot spawn the policy watcher; policy changes will not apply");
+        }
+    }
+
+    // The sidecar gates its own readiness on this, installs the blackhole routes
+    // and only then tells the launcher the sandbox may start -- so the routes are
+    // in place before any traffic can exist.
+    if let Ok(mut f) = File::create("/sidecar_shared/proxy-ready") {
         let _ = f.write_all(b"ready\n");
     }
 
@@ -670,16 +1165,13 @@ mod tests {
     use super::*;
 
     fn cfg(allow_d: &str, deny_d: &str, allow_i: &str, deny_i: &str) -> ProxyConfig {
-        let allow_domains = parse_csv(allow_d);
-        let allow_ips = parse_csv_ips(allow_i);
-        let default_allow = allow_domains.is_empty() && allow_ips.is_empty();
-        ProxyConfig {
-            allow_domains,
-            deny_domains: parse_csv(deny_d),
-            allow_ips,
-            deny_ips: parse_csv_ips(deny_i),
-            default_allow,
-        }
+        ProxyConfig::new(
+            parse_csv(allow_d),
+            parse_csv(deny_d),
+            parse_csv_ips(allow_i).expect("test allow_ips"),
+            parse_csv_ips(deny_i).expect("test deny_ips"),
+            None,
+        )
     }
 
     #[test]
@@ -804,5 +1296,247 @@ mod tests {
     fn json_escaping_covers_quotes_and_controls() {
         assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
         assert_eq!(json_escape("a\nb"), "a\\nb");
+    }
+
+    /// Write to a scratch log, return the lines it ended up with.
+    fn metrics_lines(name: &str, f: impl FnOnce(&MetricsLog)) -> Vec<String> {
+        let path = std::env::temp_dir().join(format!("agent-sandbox-metrics-{}.jsonl", name));
+        let _ = std::fs::remove_file(&path);
+        let log = MetricsLog::open(path.to_str().unwrap()).expect("open metrics log");
+        f(&log);
+        let body = std::fs::read_to_string(&path).expect("read metrics log");
+        let _ = std::fs::remove_file(&path);
+        body.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn open_and_close_share_one_id() {
+        let mut id = String::new();
+        let lines = metrics_lines("open-close", |log| {
+            id = log.next_id();
+            log.open_event(&id, "example.com", 443);
+            log.record(Some(&id), "example.com", 443, "allow", None, 10, 20, 5);
+        });
+        assert_eq!(lines.len(), 2, "expected an open and a close: {:?}", lines);
+        assert!(lines[0].contains("\"ev\":\"open\""), "{}", lines[0]);
+        assert!(lines[1].contains("\"ev\":\"close\""), "{}", lines[1]);
+        let needle = format!("\"id\":\"{}\"", id);
+        assert!(lines[0].contains(&needle), "{}", lines[0]);
+        assert!(lines[1].contains(&needle), "{}", lines[1]);
+        // The close carries the accounting; the open cannot, since it has not
+        // happened yet.
+        assert!(lines[1].contains("\"up\":10"), "{}", lines[1]);
+        assert!(!lines[0].contains("\"up\""), "{}", lines[0]);
+    }
+
+    /// The summary treats a row without `ev` as a completed connection, and the
+    /// launcher greps these lines for a verdict, so an id-less record has to stay
+    /// exactly what it always was.
+    #[test]
+    fn record_without_an_id_carries_no_event_fields() {
+        let lines = metrics_lines("no-id", |log| {
+            log.record(None, "example.com", 443, "deny", None, 0, 0, 1);
+        });
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("{\"ts\":"), "{}", lines[0]);
+        assert!(!lines[0].contains("\"ev\""), "{}", lines[0]);
+        assert!(!lines[0].contains("\"id\""), "{}", lines[0]);
+        assert!(lines[0].contains("\"verdict\":\"deny\""), "{}", lines[0]);
+    }
+
+    // ── policy parsing ──────────────────────────────────────────────────────
+    // The launcher used to hand these lists over space-separated while this side
+    // split on commas, so anything past the first entry was silently discarded --
+    // and an emptied allow list means allow-everything.  These pin both halves.
+
+    #[test]
+    fn lists_split_on_commas_and_whitespace() {
+        assert_eq!(parse_csv("a.example.com,b.example.com").len(), 2);
+        assert_eq!(parse_csv("a.example.com b.example.com").len(), 2);
+        assert_eq!(
+            parse_csv_ips("10.0.0.0/8 192.168.1.0/24").expect("spaces"),
+            parse_csv_ips("10.0.0.0/8,192.168.1.0/24").expect("commas")
+        );
+        assert_eq!(parse_csv_ips("10.0.0.0/8 192.168.1.0/24").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_unparseable_ip_is_an_error_not_an_empty_list() {
+        assert!(parse_csv_ips("garbage").is_err());
+        assert!(parse_csv_ips("10.0.0.0/8,garbage").is_err());
+    }
+
+    #[test]
+    fn a_bare_address_is_a_host_route() {
+        // The AGENTS.md parser accepts these (python ip_network calls it /32) and
+        // IpNet on its own does not, so they used to be dropped in silence.
+        let config = parse_policy("deny_ips 8.8.8.8\ndeny_ips 2001:db8::1\n").unwrap();
+        assert_eq!(config.deny_ips.len(), 2);
+        assert!(config.is_denied_address("8.8.8.8".parse().unwrap()));
+        assert!(!config.is_denied_address("8.8.4.4".parse().unwrap()));
+        assert!(config.is_denied_address("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn policy_file_carries_every_entry() {
+        let config = parse_policy(
+            "# comment\n\
+             \n\
+             allow_domains github.com\n\
+             allow_domains *.githubusercontent.com\n\
+             deny_domains telemetry.example.com\n\
+             allow_ips 10.0.0.0/8\n\
+             allow_ips 192.168.1.0/24\n\
+             deny_ips 10.1.0.0/24\n",
+        )
+        .expect("policy");
+        assert_eq!(config.allow_domains.len(), 2);
+        assert_eq!(config.deny_domains.len(), 1);
+        assert_eq!(config.allow_ips.len(), 2);
+        assert_eq!(config.deny_ips.len(), 1);
+        assert!(!config.default_allow, "an allow list means deny by default");
+    }
+
+    #[test]
+    fn policy_rejects_the_old_space_separated_encoding() {
+        // Exactly what the launcher used to pass as one argument.
+        let err = parse_policy("allow_ips 10.0.0.0/8 192.168.1.0/24\n").unwrap_err();
+        assert!(err.contains("whitespace"), "{}", err);
+    }
+
+    #[test]
+    fn policy_rejects_unknown_keys_and_bad_values() {
+        assert!(parse_policy("allow_domians github.com\n").is_err());
+        assert!(parse_policy("allow_ips not-an-ip\n").is_err());
+        assert!(parse_policy("default maybe\n").is_err());
+        assert!(parse_policy("allow_domains\n").is_err());
+    }
+
+    #[test]
+    fn policy_errors_name_the_line() {
+        let err = parse_policy("allow_domains ok.example.com\nallow_ips nope\n").unwrap_err();
+        assert!(err.starts_with("2:"), "{}", err);
+    }
+
+    #[test]
+    fn explicit_default_overrides_the_derivation() {
+        // Deny lists alone would normally leave the policy allow-by-default.
+        let config = parse_policy("deny_domains bad.example.com\ndefault deny\n").unwrap();
+        assert!(!config.default_allow);
+        assert!(!config.is_allowed("anything.example.com"));
+
+        // And the other direction: an allow list with an explicit allow default.
+        let config = parse_policy("allow_domains good.example.com\ndefault allow\n").unwrap();
+        assert!(config.default_allow);
+        assert!(config.is_allowed("anything.example.com"));
+    }
+
+    #[test]
+    fn describe_round_trips_through_parse_policy() {
+        // `firewall show` and the startup log render policy with describe(), and
+        // the host writes policy files; the two formats must not diverge.
+        let original = parse_policy(
+            "allow_domains github.com\ndeny_domains bad.example.com\n\
+             allow_ips 10.0.0.0/8\ndeny_ips 10.1.0.0/24\n",
+        )
+        .unwrap();
+        let reparsed = parse_policy(&original.describe().join("\n")).unwrap();
+        assert_eq!(original.describe(), reparsed.describe());
+    }
+
+    #[test]
+    fn an_empty_policy_allows_everything() {
+        // Documented behaviour, not an accident: --firewall with no rules is a
+        // metering-only proxy.  The launcher says so at startup.
+        let config = parse_policy("# nothing here\n").unwrap();
+        assert!(config.default_allow);
+    }
+
+    // ── reload ──────────────────────────────────────────────────────────────
+
+    fn shared_with(policy: &str) -> Shared {
+        Shared {
+            config: RwLock::new(Arc::new(parse_policy(policy).expect("initial policy"))),
+            resolver: Resolver::new(),
+            metrics: None,
+            startup_until: Instant::now(),
+        }
+    }
+
+    fn policy_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("agent-sandbox-policy-{}", name))
+    }
+
+    #[test]
+    fn a_reload_carries_the_derived_default() {
+        // The trap this guards: default_allow is derived from the lists, so a
+        // reload that rebuilds the lists but keeps the old mode turns a fresh
+        // allow-list policy into allow-everything.  Deny-only starts
+        // allow-by-default, so the flip has to be observable.
+        let shared = shared_with("deny_domains bad.example.com\n");
+        assert!(shared.config().is_allowed("anything.example.com"));
+
+        let path = policy_path("reload-default");
+        std::fs::write(&path, "allow_ips 10.0.0.0/8\nallow_ips 192.168.1.0/24\n").unwrap();
+        assert!(reload_once(path.to_str().unwrap(), &shared));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !shared.config().is_allowed("anything.example.com"),
+            "an allow list must make the reloaded policy deny-by-default"
+        );
+    }
+
+    #[test]
+    fn a_rejected_reload_keeps_the_previous_policy() {
+        let shared = shared_with("allow_domains github.com\n");
+        let path = policy_path("reload-rejected");
+
+        std::fs::write(&path, "allow_ips 10.0.0.0/8 192.168.1.0/24\n").unwrap();
+        assert!(!reload_once(path.to_str().unwrap(), &shared));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(shared.config().is_allowed("github.com"));
+        assert!(!shared.config().is_allowed("elsewhere.example.com"));
+    }
+
+    #[test]
+    fn a_vanished_policy_keeps_the_previous_one() {
+        // Deleting the file must not read as "no rules": that would be a silent
+        // widening to allow-everything.
+        let shared = shared_with("allow_domains github.com\n");
+        assert!(!reload_once(
+            policy_path("definitely-absent").to_str().unwrap(),
+            &shared
+        ));
+        assert!(!shared.config().is_allowed("elsewhere.example.com"));
+    }
+
+    #[test]
+    fn a_reload_widens_and_narrows() {
+        let shared = shared_with("allow_domains github.com\n");
+        let path = policy_path("reload-widen");
+
+        std::fs::write(&path, "allow_domains github.com\nallow_domains api.openai.com\n").unwrap();
+        assert!(reload_once(path.to_str().unwrap(), &shared));
+        assert!(shared.config().is_allowed("api.openai.com"));
+
+        std::fs::write(&path, "allow_domains github.com\n").unwrap();
+        assert!(reload_once(path.to_str().unwrap(), &shared));
+        assert!(!shared.config().is_allowed("api.openai.com"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ids_are_unique_and_carry_the_boot_stamp() {
+        let lines = metrics_lines("unique-ids", |log| {
+            let a = log.next_id();
+            let b = log.next_id();
+            assert_ne!(a, b);
+            assert!(a.starts_with(&format!("{}-", log.boot)), "{}", a);
+            log.open_event(&a, "a.example.com", 443);
+            log.open_event(&b, "b.example.com", 443);
+        });
+        assert_eq!(lines.len(), 2);
     }
 }

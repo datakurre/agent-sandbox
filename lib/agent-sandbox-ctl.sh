@@ -1,22 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cmd="${1:-}"
-if [[ -z "$cmd" ]]; then
+usage() {
   echo "Usage: agent-sandbox-ctl <command> [args...]"
   echo "Commands:"
-  echo "  load   Load the agent-sandbox image"
-  echo "  purge  Purge old agent-sandbox containers"
-  echo "  port   Manage port forwarding"
-  echo "  list   List active sandboxes"
+  printf '  %-9s%s\n' load     "Load the agent-sandbox image"
+  printf '  %-9s%s\n' list     "List sandboxes and their proxy mode"
+  printf '  %-9s%s\n' status   "Summarise one running sandbox"
+  printf '  %-9s%s\n' firewall "Show or change the firewall policy of a running sandbox"
+  printf '  %-9s%s\n' net      "Show network metering for a running sandbox"
+  printf '  %-9s%s\n' logs     "Show the proxy log for a running sandbox"
+  printf '  %-9s%s\n' port     "Manage port forwarding"
+  printf '  %-9s%s\n' purge    "Reclaim leftover containers, networks and directories"
+}
+
+cmd="${1:-}"
+if [[ -z "$cmd" ]]; then
+  usage >&2
   exit 1
 fi
 shift
 
 case "$cmd" in
-  load)  exec agent-sandbox-load "$@" ;;
-  purge) exec agent-sandbox-purge "$@" ;;
-  port)  exec agent-sandbox-port "$@" ;;
-  list)  exec agent-sandbox-list "$@" ;;
-  *)     echo "agent-sandbox-ctl: unknown command: $cmd" >&2; exit 1 ;;
+  load)        exec agent-sandbox-load "$@" ;;   # "$@" so `load --help` does not import the image
+  purge)       exec agent-sandbox-purge "$@" ;;
+  port)        exec agent-sandbox-port "$@" ;;
+  list)        exec agent-sandbox-list "$@" ;;
+  status)      exec agent-sandbox-status "$@" ;;
+  firewall|fw) exec agent-sandbox-firewall "$@" ;;
+  net|network) exec agent-sandbox-net "$@" ;;
+  logs|log)    exec agent-sandbox-logs "$@" ;;
+  -h|--help|help) usage ;;
+  *)           echo "agent-sandbox-ctl: unknown command: $cmd" >&2; usage >&2; exit 1 ;;
 esac

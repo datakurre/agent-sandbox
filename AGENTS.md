@@ -3,10 +3,11 @@
 ## Project overview
 
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
-("agent-sandbox") together with a launcher binary (`agent-sandbox`), a
-loader utility (`agent-sandbox-ctl load`), and a purge utility (`agent-sandbox-ctl purge`).
+("agent-sandbox") together with a launcher binary (`agent-sandbox`) and a
+management multiplexer (`agent-sandbox-ctl`, with the subcommands `load`,
+`list`, `status`, `net`, `logs`, `firewall`, `port` and `purge`).
 
-- **default.nix** – single Nix module; builds the image and the three scripts.
+- **default.nix** – single Nix module; builds the image and every host script.
 - **agents.nix** – agent catalog (command + persisted state paths per agent).
 - **flake.nix**  – flake entry point; exposes `packages.<system>.default` and
   `apps.<system>.default`.
@@ -15,7 +16,7 @@ loader utility (`agent-sandbox-ctl load`), and a purge utility (`agent-sandbox-c
 
 ### Image (`image` attr in `default.nix`)
 
-Built with `pkgs.dockerTools.buildImage`.  All tools are baked into a
+Built with `pkgs.dockerTools.streamLayeredImage`.  All tools are baked into a
 `buildEnv` and registered in the Nix store database so `nix` / `devenv` / Nix
 builtins inside the container work without re-substituting store paths.
 
@@ -59,6 +60,58 @@ A bash script that wraps `podman run`.  Call flow:
 
 `podman load < ${image}`
 
+### Proxy sidecar (`--firewall` / `--meter-network`)
+
+Either flag makes the launcher start a second container from the same image,
+running `agent-sandbox-sidecar`, and put the sandbox on a `podman network create
+--internal` network with no route off-host.  The sidecar is dual-homed on that
+network and on `bridge`, so it is the sandbox's only path to the internet, and the
+sandbox gets `HTTP_PROXY`/`HTTPS_PROXY` pointing at it.
+
+The proxy itself is Rust (`proxy/src/main.rs`, `ipnet` its only dependency): a
+thread-per-connection HTTP forward proxy handling `CONNECT` and absolute-form
+requests.  Policy decisions happen once per connection, before the byte pumps
+start; an established tunnel is never re-evaluated.
+
+Three directories, and which side can see them is the design:
+
+| Path | Mounted into | Contents |
+| --- | --- | --- |
+| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base` |
+| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `connections.jsonl` |
+| (host temp dirs) | — | removed by the launcher's exit trap |
+
+Neither is mounted into the sandbox. That is deliberate and load-bearing: the
+agent must not be able to widen the firewall that contains it, nor rewrite the
+log of what it did. Changing policy is therefore a host-side operation
+(`agent-sandbox-ctl firewall`), which is why the old in-container
+`agent-sandbox-allow` was deleted rather than repaired.
+
+**Policy format.** One `KEY VALUE` per line (`allow_domains`, `deny_domains`,
+`allow_ips`, `deny_ips`, `default`).  A value containing whitespace is a hard
+error.  This replaced four differently-encoded arguments -- allow_domains as argv
+words, the rest as space-joined env vars, all parsed as CSV -- where every entry
+past the first was silently dropped, and an emptied allow list means allowing
+everything.  One entry per line means any fixture with two entries exercises the
+case that used to break.
+
+`agent-sandbox-proxy --check-policy FILE` is the single reference validator:
+`parse_agents.py` writes the file, the proxy reads it, the host-side `firewall`
+command vets its own writes with the same binary, and `checks.firewall-policy`
+tests the whole chain.  There is no second implementation to drift.
+
+**Startup ordering** matters and is why there are two readiness markers: the
+proxy validates policy, probes egress and writes `proxy-ready`; the sidecar then
+installs the `deny_ips` blackhole routes and writes `ready`; only then does the
+launcher start the sandbox.  So routes are in place before any traffic can exist,
+and a bad policy exits 2 before touching the kernel table.
+
+**Runtime changes.** The proxy polls the policy file's `(mtime, size)` once a
+second and swaps an `Arc<ProxyConfig>` under an `RwLock`, clearing the DNS cache
+with it; the sidecar reconciles the blackhole routes against the kernel on the
+same interval.  A rejected or vanished policy keeps the one already in force.
+New connections see the change within a second; established ones do not.
+
 ## How to add a new integration
 
 1. Add a `want_{name}=1` toggle after the existing toggles (see integration toggles).
@@ -68,6 +121,12 @@ A bash script that wraps `podman run`.  Call flow:
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
 5. Update the usage comment.
 6. Test: `nix flake check`
+
+Note what `nix flake check` cannot cover: podman does not run in a Nix build, so
+nothing that starts a container is tested there.  `checks.ctl-args` drives the
+`ctl` scripts against a stub podman, and `lib/smoke-firewall.sh` is the hand-run
+procedure for the rest (`bash lib/smoke-firewall.sh`, needs a real podman and
+network egress).
 
 ## How to add a new agent
 

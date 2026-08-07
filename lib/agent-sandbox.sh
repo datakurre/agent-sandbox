@@ -92,6 +92,7 @@ Integrations (use --X to enable, --no-X to disable):
   --selinux         $([[ "$want_selinux" == "1" ]] && echo "[on ]" || echo "[off]") Applies SELinux shared relabeling (:z) to writable binds.
   --firewall        $([[ "$want_firewall" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S) traffic through a domain-filtering proxy (blocks direct internet access).
   --meter-network   $([[ "$want_meter_network" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S) traffic through a proxy to capture a post-run summary (blocks direct internet access).
+                         Either flag also enables 'agent-sandbox-ctl net' for the running sandbox.
 
 Ports:
   --port [HOST:]CONTAINER[/PROTO]          Publish a port, repeatable.
@@ -489,6 +490,37 @@ if [[ "$want_ports" == "1" && -f "$PWD/AGENTS.md" ]]; then
   done <<< "$declared"
 fi
 
+# Publishing a port and running a proxy are mutually exclusive, because the two
+# network topologies contradict each other.  The shared network below is a normal
+# NAT bridge, and the sandbox would be attached to it *as well as* the proxy's
+# --internal network -- giving it a route to the internet that does not pass
+# through the proxy at all.  The firewall would still filter what went through
+# it, and everything else would simply go around.
+#
+# Checked here: after the [ports] block is parsed, so a declaration that yields
+# nothing is not treated as a request, and before any network is created, so the
+# refusal leaves nothing behind.
+if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
+  proxy_flag="--firewall"
+  [[ "$want_firewall" == "1" ]] || proxy_flag="--meter-network"
+
+  conflict=""
+  if [[ ${#published[@]} -gt 0 ]]; then
+    conflict="a published port (${published[0]})"
+  elif [[ "$want_ports_dynamic" == "1" ]]; then
+    conflict="--ports-dynamic"
+  fi
+
+  if [[ -n "$conflict" ]]; then
+    echo "agent-sandbox: $proxy_flag cannot be combined with $conflict." >&2
+    echo "               A published port puts the sandbox on the shared bridge network," >&2
+    echo "               which routes to the internet around the proxy, so the policy" >&2
+    echo "               would only be advisory." >&2
+    echo "               Drop the port, or drop $proxy_flag." >&2
+    exit 1
+  fi
+fi
+
 # A shared network is what makes `agent-sandbox-ctl port add` possible later:
 # podman cannot add a binding to a running container, so a sidecar has to
 # reach this one by name.  Created lazily so that a launch with no ports at
@@ -512,92 +544,25 @@ fi
 passwd_tmp=$(mktemp)
 group_tmp=$(mktemp)
 
-# Render the --meter-network report from the proxy's connection log: one JSON
-# object per connection (see proxy/src/main.rs), aggregated per host.  Hosts are
-# ranked by volume and the tail is collapsed so a long session cannot flood the
-# terminal.
-render_network_summary() {
-  local log="$1"
-  if [[ ! -s "$log" ]]; then
-    printf '\n=== Network Summary ===\n(no connections recorded)\n'
-    return
-  fi
-  jq -rs '
-    def human:
-      if . < 1024 then "\(.) B"
-      elif . < 1048576 then "\(. / 1024 * 10 | round / 10) KiB"
-      elif . < 1073741824 then "\(. / 1048576 * 10 | round / 10) MiB"
-      else "\(. / 1073741824 * 10 | round / 10) GiB"
-      end;
-    def dur:
-      if . < 60 then "\(.)s"
-      elif . < 3600 then "\(. / 60 | floor)m \(. % 60)s"
-      else "\(. / 3600 | floor)h \(. % 3600 / 60 | floor)m"
-      end;
-    def pad($n): tostring | . + (if length < $n then " " * ($n - length) else "" end);
-    def lpad($n): tostring | (if length < $n then " " * ($n - length) else "" end) + .;
-    def clip($n): if length > $n then .[0:($n - 1)] + "…" else . end;
-
-    . as $all
-    | ($all | map(select(.verdict == "allow"))) as $ok
-    | ($all | map(select(.verdict == "deny")) | group_by(.host)
-        | map({host: .[0].host, conns: length}) | sort_by(-.conns)) as $den
-    | ($all | map(select(.verdict == "error"))
-        | group_by([.host, (.err // "?")])
-        | map({host: .[0].host, conns: length, err: (.[0].err // "?")})
-        | sort_by(-.conns)) as $fail
-    | ($ok | group_by(.host)
-        | map({host: .[0].host, conns: length,
-               up: (map(.up) | add), down: (map(.down) | add)})
-        | sort_by(-(.up + .down))) as $hosts
-    | ($hosts[0:15]) as $shown
-    | ($hosts[15:]) as $rest
-    | ([20] + (($shown + $den + $fail) | map(.host | length)) | max) as $w0
-    | (if $w0 > 40 then 40 else $w0 end) as $w
-    | (($all | map(.ts) | max) - ($all | map(.ts) | min)) as $span
-    | ($ok | map(.up) | add // 0) as $tup
-    | ($ok | map(.down) | add // 0) as $tdown
-    | [ "",
-        "=== Network Summary ===  \($span | dur) · \($all | length) connection\(if ($all | length) == 1 then "" else "s" end)"
-          + (if ($ok | length) > 0 then " · \($tdown | human) in / \($tup | human) out" else "" end) ]
-      + (if ($shown | length) > 0 then [""] else [] end)
-      + (if ($shown | length) > 0 then
-          ["  " + ("HOST" | pad($w)) + ("CONNS" | lpad(7))
-                + ("SENT" | lpad(11)) + ("RECV" | lpad(11))]
-          + ($shown | map("  " + (.host | clip($w) | pad($w)) + (.conns | lpad(7))
-                              + (.up | human | lpad(11)) + (.down | human | lpad(11))))
-          + (if ($rest | length) > 0 then
-              ["  " + ("… and \($rest | length) more hosts" | clip($w) | pad($w))
-                    + (($rest | map(.conns) | add) | lpad(7))
-                    + (($rest | map(.up) | add) | human | lpad(11))
-                    + (($rest | map(.down) | add) | human | lpad(11))]
-             else [] end)
-         else [] end)
-      + (if ($den | length) > 0 then
-          ["", "  ── denied " + ("─" * ($w + 19))]
-          + ($den | map("  " + (.host | clip($w) | pad($w)) + (.conns | lpad(7))))
-         else [] end)
-      + (if ($fail | length) > 0 then
-          ["", "  ── failed " + ("─" * ($w + 19))]
-          + ($fail | map("  " + (.host | clip($w) | pad($w)) + (.conns | lpad(7))
-                              + "  (" + .err + ")"))
-         else [] end)
-      + (if ($ok | length) == 0 and ($fail | length) > 0 then
-          ["", "  Nothing got through. The sidecar could not reach the network;",
-               "  see the proxy log:  podman logs <sidecar>"]
-         else [] end)
-      + [""]
-    | .[]
-  ' "$log" 2>/dev/null ||
-    printf '\n=== Network Summary ===\n(could not parse %s)\n' "$log"
-}
+# Declared before the trap is installed: it fires on any signal, including one
+# that arrives between here and the sidecar block below, and under nounset an
+# unset variable would abort the trap partway through cleaning up.
+sidecar_id=""
+sidecar_shared=""
+sidecar_policy=""
 
 cleanup() {
   rm -f "$passwd_tmp" "$group_tmp"
-  if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
+  if [[ -n "$sidecar_id" ]]; then
     podman stop -t 1 "$sidecar_id" >/dev/null 2>&1 || true
+    # Not --rm: a sidecar that exits before signalling readiness has to stay
+    # around long enough for `podman logs` to say why.
+    podman rm -f "$sidecar_id" >/dev/null 2>&1 || true
+
     if [[ "$want_meter_network" == "1" ]]; then
-      render_network_summary "$sidecar_shared/connections.jsonl"
+      # || true: this runs inside the EXIT trap under errexit, and the rm -rf
+      # below still has to happen even if the report cannot be rendered.
+      agent-sandbox-network-summary "$sidecar_shared/connections.jsonl" || true
       # The rm -rf below would take the per-connection timings with it, and
       # those are what distinguish "failed instantly" from "burned the whole
       # retry window".  Keep the log whenever anything went wrong.
@@ -609,8 +574,18 @@ cleanup() {
       fi
     fi
 
-    podman network rm "$sidecar_id" >/dev/null 2>&1 || true
-    rm -rf "$sidecar_shared"
+    # podman tears a --rm container down asynchronously after `stop` returns, so
+    # a single attempt here loses the race often enough to leak one --internal
+    # network per session -- and each of those holds a subnet from the rootless
+    # pool until `agent-sandbox-ctl purge` reclaims it.
+    for _ in $(seq 1 20); do
+      podman network rm "$sidecar_id" >/dev/null 2>&1 && break
+      podman network exists "$sidecar_id" 2>/dev/null || break
+      sleep 0.25
+    done
+
+    [[ -n "$sidecar_shared" ]] && rm -rf "$sidecar_shared"
+    [[ -n "$sidecar_policy" ]] && rm -rf "$sidecar_policy"
   fi
 }
 trap cleanup EXIT
@@ -627,18 +602,36 @@ container_name="agent-sandbox-${workspace_slug:0:32}-$$"
 # ── Sidecar Proxy & Metering ────────────────────────────────────────────────
 if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   sidecar_id="agent-sandbox-sidecar-$(head -c 12 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)"
-  sidecar_shared=$(mktemp -d)
+  # Identifiable templates, so `agent-sandbox-ctl purge` can recognise the dirs
+  # left behind by a launcher that was killed before its trap could run.
+  sidecar_shared=$(mktemp -d -t "agent-sandbox-sidecar-XXXXXXXX")
+  sidecar_policy=$(mktemp -d -t "agent-sandbox-policy-XXXXXXXX")
   podman network create --internal "$sidecar_id" >/dev/null 2>&1 || true
 
-  proxy_domains=()
-  proxy_allow_ips=()
-  proxy_deny_ips=()
-  proxy_deny_domains=()
+  # The policy file is the single channel by which policy reaches the proxy.  It
+  # replaced four separately-encoded arguments, where a space-separated list met a
+  # comma-separated parser and every entry past the first was silently dropped --
+  # which for an allow list means allowing everything.
+  #
+  # Written into a directory mounted ro into the sidecar and NOT into the sandbox:
+  # the agent must not be able to widen the firewall that contains it.
+  : > "$sidecar_policy/policy"
   if [[ "$want_firewall" == "1" && -f "$PWD/AGENTS.md" ]]; then
-    read -ra proxy_domains <<< "$(agent-sandbox-parse-agents --proxy-domains "$PWD/AGENTS.md" 2>/dev/null || true)"
-    read -ra proxy_allow_ips <<< "$(agent-sandbox-parse-agents --proxy-allow-ips "$PWD/AGENTS.md" 2>/dev/null || true)"
-    read -ra proxy_deny_ips <<< "$(agent-sandbox-parse-agents --proxy-deny-ips "$PWD/AGENTS.md" 2>/dev/null || true)"
-    read -ra proxy_deny_domains <<< "$(agent-sandbox-parse-agents --proxy-deny-domains "$PWD/AGENTS.md" 2>/dev/null || true)"
+    # Strict, like the [ports] block above: a policy the operator got wrong must
+    # not silently become no policy at all.
+    if ! agent-sandbox-parse-agents --proxy-policy "$PWD/AGENTS.md" \
+         > "$sidecar_policy/policy"; then
+      echo "agent-sandbox: refusing to launch on an invalid [proxy] block (use --no-firewall to skip)." >&2
+      exit 1
+    fi
+  fi
+  # Kept pristine so `agent-sandbox-ctl firewall reset` has something to restore
+  # and `firewall show` can tell declared rules from ones added at runtime.
+  cp "$sidecar_policy/policy" "$sidecar_policy/policy.base"
+
+  if [[ "$want_firewall" == "1" ]] && ! grep -q '^allow_' "$sidecar_policy/policy"; then
+    echo "agent-sandbox: --firewall is active with no allow rules, so every host is allowed." >&2
+    echo "               Declare allow_domains/allow_ips in a [proxy] block to restrict it." >&2
   fi
 
   # NET_ADMIN backs the blackhole routes installed for deny_ips.  Metering used
@@ -672,28 +665,44 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     sidecar_selinux=("--security-opt" "label=disable")
   fi
 
-  podman run -d --rm --name "$sidecar_id" \
+  # Not --rm: the cleanup trap removes it, so a sidecar that dies early is still
+  # around for `podman logs` to explain itself.
+  #
+  # Labelled like every other container the project creates: without this the
+  # sidecar could only be found by guessing at its random name, which is why
+  # nothing could report on the firewall or reach the proxy's log.  target= points
+  # back at the sandbox, mirroring the port forwarders.
+  podman run -d --name "$sidecar_id" \
+    --label "agent-sandbox.role=proxy" \
+    --label "agent-sandbox.target=$container_name" \
+    --label "agent-sandbox.workspace=$PWD" \
     --network bridge --network "$sidecar_id" \
     "${sidecar_dns_args[@]}" \
     "${sidecar_selinux[@]}" \
     "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:$rw_mount_opts" \
-    -e "METER_NETWORK=$want_meter_network" \
+    -v "$sidecar_policy:/sidecar_policy:ro" \
     -e "FIREWALL=$want_firewall" \
-    -e "PROXY_ALLOW_IPS=${proxy_allow_ips[*]:-}" \
-    -e "PROXY_DENY_IPS=${proxy_deny_ips[*]:-}" \
-    -e "PROXY_DENY_DOMAINS=${proxy_deny_domains[*]:-}" \
-    "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar "${proxy_domains[@]}" >/dev/null 2>&1
+    "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar >/dev/null 2>&1
 
-  # Wait for the proxy to signal readiness via the shared volume.  The proxy
-  # only writes that marker once it can actually resolve names (see
-  # wait_for_egress in proxy/src/main.rs), so this has to outlast its own
-  # READY_TIMEOUT -- cutting it short would start the agent against a proxy that
-  # cannot reach anything yet, which is exactly the race this fixes.
+  # Wait for the sidecar to signal readiness via the shared volume.  It writes
+  # that marker only after the proxy can resolve names (see wait_for_egress in
+  # proxy/src/main.rs) and after the blackhole routes are installed, so this has
+  # to outlast the proxy's own READY_TIMEOUT -- cutting it short would start the
+  # agent against a proxy that cannot reach anything yet, which is exactly the
+  # race this fixes.
   sidecar_ready=0
   for _ in $(seq 1 350); do
     if [[ -f "$sidecar_shared/ready" ]]; then
       sidecar_ready=1
       break
+    fi
+    # A rejected policy exits the proxy immediately; waiting out the full 35s
+    # would bury the reason under a timeout that suggests a network problem.
+    if ! podman container inspect --format '{{.State.Running}}' "$sidecar_id" 2>/dev/null \
+         | grep -qx true; then
+      echo "agent-sandbox: the proxy sidecar exited before signalling readiness:" >&2
+      podman logs "$sidecar_id" 2>&1 | sed 's/^/               /' >&2
+      exit 1
     fi
     sleep 0.1
   done
@@ -703,12 +712,28 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   fi
 
   network_args+=(--network "$sidecar_id")
-  mounts+=("-v" "$sidecar_shared:/sidecar_shared:$rw_mount_opts")
+  # /sidecar_shared is deliberately NOT mounted into the sandbox.  It used to be,
+  # for the sake of agent-sandbox-allow (now gone), and since the sandbox runs
+  # --userns=keep-id it had write access to connections.jsonl -- so the agent
+  # could truncate or forge the log of its own network activity.  Nothing inside
+  # needs the directory: the readiness marker is read by the launcher on the host,
+  # and `agent-sandbox-ctl net` reads the log through the sidecar.
   env_args+=("-e" "HTTP_PROXY=http://$sidecar_id:8888" "-e" "HTTPS_PROXY=http://$sidecar_id:8888")
 fi
 
 env_args+=("-e" "TERM=${TERM:-xterm-256color}")
 [[ -n "${COLORTERM:-}" ]] && env_args+=("-e" "COLORTERM=$COLORTERM")
+
+# Recorded as a label so `agent-sandbox-ctl list` can show it and `port add` can
+# refuse to weaken it.  Always set, including "off": an absent label is
+# indistinguishable from a container created before this existed, which would
+# make the column ambiguous exactly when it matters.
+proxy_mode=off
+if [[ "$want_firewall" == "1" ]]; then
+  proxy_mode=firewall
+elif [[ "$want_meter_network" == "1" ]]; then
+  proxy_mode=meter
+fi
 
 # Only allocate a TTY when there is one to allocate, so piped and CI
 # invocations (agent-sandbox -- bash -c '…' | tee log) still work.
@@ -728,6 +753,7 @@ podman run \
   --name "$container_name" \
   --label "agent-sandbox.role=sandbox" \
   --label "agent-sandbox.workspace=$PWD" \
+  --label "agent-sandbox.proxy=$proxy_mode" \
   --workdir "$workspace_dir" \
   -e HOME=/home/user \
   -v "$passwd_tmp:/etc/passwd:ro" \
