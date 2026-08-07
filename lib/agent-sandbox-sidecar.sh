@@ -44,8 +44,9 @@ else
   proxy_pid=$!
 fi
 
-# Wait for proxy to signal readiness via the shared volume.
-for _ in $(seq 1 50); do
+# Wait for proxy to signal readiness via the shared volume.  The proxy gates
+# that marker on a working name lookup, so allow for its full READY_TIMEOUT.
+for _ in $(seq 1 350); do
   [[ -f /sidecar_shared/ready ]] && break
   sleep 0.1
 done

@@ -542,7 +542,8 @@ render_network_summary() {
     | ($all | map(select(.verdict == "allow"))) as $ok
     | ($all | map(select(.verdict == "deny")) | group_by(.host)
         | map({host: .[0].host, conns: length}) | sort_by(-.conns)) as $den
-    | ($all | map(select(.verdict == "error")) | group_by(.host)
+    | ($all | map(select(.verdict == "error"))
+        | group_by([.host, (.err // "?")])
         | map({host: .[0].host, conns: length, err: (.[0].err // "?")})
         | sort_by(-.conns)) as $fail
     | ($ok | group_by(.host)
@@ -557,8 +558,9 @@ render_network_summary() {
     | ($ok | map(.up) | add // 0) as $tup
     | ($ok | map(.down) | add // 0) as $tdown
     | [ "",
-        "=== Network Summary ===  \($span | dur) · \($all | length) connection\(if ($all | length) == 1 then "" else "s" end) · \($tdown | human) in / \($tup | human) out",
-        "" ]
+        "=== Network Summary ===  \($span | dur) · \($all | length) connection\(if ($all | length) == 1 then "" else "s" end)"
+          + (if ($ok | length) > 0 then " · \($tdown | human) in / \($tup | human) out" else "" end) ]
+      + (if ($shown | length) > 0 then [""] else [] end)
       + (if ($shown | length) > 0 then
           ["  " + ("HOST" | pad($w)) + ("CONNS" | lpad(7))
                 + ("SENT" | lpad(11)) + ("RECV" | lpad(11))]
@@ -580,6 +582,10 @@ render_network_summary() {
           + ($fail | map("  " + (.host | clip($w) | pad($w)) + (.conns | lpad(7))
                               + "  (" + .err + ")"))
          else [] end)
+      + (if ($ok | length) == 0 and ($fail | length) > 0 then
+          ["", "  Nothing got through. The sidecar could not reach the network;",
+               "  see the proxy log:  podman logs <sidecar>"]
+         else [] end)
       + [""]
     | .[]
   ' "$log" 2>/dev/null ||
@@ -592,6 +598,15 @@ cleanup() {
     podman stop -t 1 "$sidecar_id" >/dev/null 2>&1 || true
     if [[ "$want_meter_network" == "1" ]]; then
       render_network_summary "$sidecar_shared/connections.jsonl"
+      # The rm -rf below would take the per-connection timings with it, and
+      # those are what distinguish "failed instantly" from "burned the whole
+      # retry window".  Keep the log whenever anything went wrong.
+      if grep -q '"verdict":"\(deny\|error\)"' "$sidecar_shared/connections.jsonl" 2>/dev/null; then
+        saved_log="${TMPDIR:-/tmp}/agent-sandbox-connections-$$.jsonl"
+        if cp "$sidecar_shared/connections.jsonl" "$saved_log" 2>/dev/null; then
+          printf '  connection log kept at %s\n\n' "$saved_log"
+        fi
+      fi
     fi
 
     podman network rm "$sidecar_id" >/dev/null 2>&1 || true
@@ -669,11 +684,23 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     -e "PROXY_DENY_DOMAINS=${proxy_deny_domains[*]:-}" \
     "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar "${proxy_domains[@]}" >/dev/null 2>&1
 
-  # Wait for the proxy to signal readiness via the shared volume.
-  for _ in $(seq 1 50); do
-    [[ -f "$sidecar_shared/ready" ]] && break
+  # Wait for the proxy to signal readiness via the shared volume.  The proxy
+  # only writes that marker once it can actually resolve names (see
+  # wait_for_egress in proxy/src/main.rs), so this has to outlast its own
+  # READY_TIMEOUT -- cutting it short would start the agent against a proxy that
+  # cannot reach anything yet, which is exactly the race this fixes.
+  sidecar_ready=0
+  for _ in $(seq 1 350); do
+    if [[ -f "$sidecar_shared/ready" ]]; then
+      sidecar_ready=1
+      break
+    fi
     sleep 0.1
   done
+  if [[ "$sidecar_ready" != "1" ]]; then
+    echo "agent-sandbox: warning: proxy did not signal readiness in 35s" >&2
+    echo "               (continuing; check: podman logs $sidecar_id)" >&2
+  fi
 
   network_args+=(--network "$sidecar_id")
   mounts+=("-v" "$sidecar_shared:/sidecar_shared:$rw_mount_opts")

@@ -11,7 +11,7 @@ use ipnet::IpNet;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,10 +26,21 @@ const IO_TICK: Duration = Duration::from_secs(300);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DNS_TTL: Duration = Duration::from_secs(60);
-/// How long after process start the resolve/connect paths keep retrying.  The
-/// sidecar's network is not always up the instant the proxy binds, so early
-/// connections absorb the race; steady-state connections must not pay for it.
+/// Retry floor applied to *every* resolve and connect.  The sidecar's network
+/// can wobble well after the proxy binds, so this must not be scoped to
+/// startup: doing that turned a transient blip into a hard 502 and made
+/// launches flicker.  Successful lookups are cached for `DNS_TTL`, so a host
+/// pays this at most once a minute.
+const RETRY_WINDOW: Duration = Duration::from_millis(1000);
+/// How long after process start the resolve/connect paths keep retrying, on
+/// top of `RETRY_WINDOW`.
 const STARTUP_GRACE: Duration = Duration::from_secs(10);
+/// How long `wait_for_egress` blocks before giving up and starting anyway.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Name resolved to decide the sidecar's network is actually usable.  Only
+/// resolved, never connected to, so this stays policy-neutral under
+/// `--firewall`.
+const READY_PROBE_HOST: &str = "cloudflare.com:443";
 const BUF_SIZE: usize = 64 * 1024;
 const HEAD_MAX: usize = 8192;
 const DNS_CACHE_MAX: usize = 512;
@@ -166,40 +177,52 @@ impl Resolver {
         }
     }
 
-    fn resolve(&self, host: &str, port: u16, retry_until: Instant) -> Vec<SocketAddr> {
+    /// Resolve, retrying until at least `RETRY_WINDOW` has elapsed (longer if
+    /// `retry_until` extends past that).  Only successes are cached — caching a
+    /// failure would pin an outage in place for `DNS_TTL`.
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        retry_until: Instant,
+    ) -> Result<Vec<SocketAddr>, io::Error> {
         let key = format!("{}:{}", host, port);
 
         if let Ok(cache) = self.cache.lock() {
             if let Some((addrs, cached_at)) = cache.get(&key) {
                 if cached_at.elapsed() < DNS_TTL {
-                    return addrs.clone();
+                    return Ok(addrs.clone());
                 }
             }
         }
 
-        let mut addrs: Vec<SocketAddr> = Vec::new();
+        let deadline = (Instant::now() + RETRY_WINDOW).max(retry_until);
+        let mut last_err;
         loop {
-            if let Ok(found) = key.to_socket_addrs() {
-                addrs = found.collect();
-                if !addrs.is_empty() {
-                    break;
+            match key.to_socket_addrs() {
+                Ok(found) => {
+                    let addrs: Vec<SocketAddr> = found.collect();
+                    if !addrs.is_empty() {
+                        if let Ok(mut cache) = self.cache.lock() {
+                            if cache.len() >= DNS_CACHE_MAX {
+                                cache.clear();
+                            }
+                            cache.insert(key, (addrs.clone(), Instant::now()));
+                        }
+                        return Ok(addrs);
+                    }
+                    last_err = io::Error::new(
+                        ErrorKind::NotFound,
+                        "resolver returned no addresses",
+                    );
                 }
+                Err(e) => last_err = e,
             }
-            if Instant::now() >= retry_until {
-                break;
+            if Instant::now() >= deadline {
+                return Err(last_err);
             }
             thread::sleep(Duration::from_millis(100));
         }
-
-        if !addrs.is_empty() {
-            if let Ok(mut cache) = self.cache.lock() {
-                if cache.len() >= DNS_CACHE_MAX {
-                    cache.clear();
-                }
-                cache.insert(key, (addrs.clone(), Instant::now()));
-            }
-        }
-        addrs
     }
 }
 
@@ -210,6 +233,19 @@ impl Resolver {
 /// bytes per connection, versus the full-payload packet capture it replaces.
 struct MetricsLog {
     file: Mutex<File>,
+}
+
+/// Trim the boilerplate std prepends to resolver errors so the summary stays
+/// readable: "failed to lookup address information: Temporary failure in name
+/// resolution" carries one useful clause.
+fn short_err(e: &io::Error) -> String {
+    let s = e.to_string();
+    match s.split_once(": ") {
+        Some((head, tail)) if head.starts_with("failed to lookup address information") => {
+            tail.to_string()
+        }
+        _ => s,
+    }
 }
 
 fn json_escape(s: &str) -> String {
@@ -341,15 +377,21 @@ fn read_head(sock: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
     }
 }
 
-fn connect_any(addrs: &[SocketAddr], retry_until: Instant) -> Option<TcpStream> {
+/// Connect to the first address that answers, retrying for at least
+/// `RETRY_WINDOW` so a momentarily unreachable network does not become a 502.
+fn connect_any(addrs: &[SocketAddr], retry_until: Instant) -> Result<TcpStream, io::Error> {
+    let deadline = (Instant::now() + RETRY_WINDOW).max(retry_until);
+    let mut last_err =
+        io::Error::new(ErrorKind::InvalidInput, "no addresses to connect to");
     loop {
         for addr in addrs {
-            if let Ok(s) = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
-                return Some(s);
+            match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+                Ok(s) => return Ok(s),
+                Err(e) => last_err = e,
             }
         }
-        if Instant::now() >= retry_until {
-            return None;
+        if Instant::now() >= deadline {
+            return Err(last_err);
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -415,13 +457,24 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         return;
     }
 
-    let addrs = shared.resolver.resolve(&host, port, shared.startup_until);
-    if addrs.is_empty() {
-        let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-        eprintln!("proxy: dns failure {}:{}", host, port);
-        shared.record(&host, port, "error", Some("dns"), 0, 0, started.elapsed().as_millis());
-        return;
-    }
+    let addrs = match shared.resolver.resolve(&host, port, shared.startup_until) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            eprintln!("proxy: dns failure {}:{}: {}", host, port, e);
+            let detail = format!("dns: {}", short_err(&e));
+            shared.record(
+                &host,
+                port,
+                "error",
+                Some(&detail),
+                0,
+                0,
+                started.elapsed().as_millis(),
+            );
+            return;
+        }
+    };
 
     // The policy check above ran on the name.  Re-check what it actually
     // resolves to, so a denied address cannot be reached via an allowed (or
@@ -434,11 +487,20 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     }
 
     let mut remote_sock = match connect_any(&addrs, shared.startup_until) {
-        Some(s) => s,
-        None => {
+        Ok(s) => s,
+        Err(e) => {
             let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-            eprintln!("proxy: connect failure {}:{}", host, port);
-            shared.record(&host, port, "error", Some("connect"), 0, 0, started.elapsed().as_millis());
+            eprintln!("proxy: connect failure {}:{}: {}", host, port, e);
+            let detail = format!("connect: {}", short_err(&e));
+            shared.record(
+                &host,
+                port,
+                "error",
+                Some(&detail),
+                0,
+                0,
+                started.elapsed().as_millis(),
+            );
             return;
         }
     };
@@ -494,6 +556,43 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     shared.record(&host, port, "allow", None, up, down, started.elapsed().as_millis());
 }
 
+/// Block until the sidecar's network can actually resolve a name.
+///
+/// Binding a listener proves nothing about egress: podman is still wiring up
+/// the bridge and internal networks when the proxy starts, and signalling
+/// readiness at bind time let the launcher start the agent against a proxy that
+/// could not yet reach anything — an instant 502 on the agent's first request.
+///
+/// Resolution only, never a connection: a DNS query goes to the configured
+/// resolver and reaches no third-party host, so this stays policy-neutral under
+/// `--firewall`, where dialling out would be egress the allow list never
+/// authorised.
+///
+/// Never fatal.  If egress does not come up we start anyway and say so, because
+/// a degraded launch beats a hung one.
+fn wait_for_egress() {
+    let started = Instant::now();
+    let mut last_err = String::new();
+    while started.elapsed() < READY_TIMEOUT {
+        match READY_PROBE_HOST.to_socket_addrs() {
+            Ok(mut addrs) => {
+                if addrs.next().is_some() {
+                    eprintln!("proxy: egress ready after {:?}", started.elapsed());
+                    return;
+                }
+                last_err = "resolver returned no addresses".to_string();
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!(
+        "proxy: WARNING egress not ready after {:?} ({}); starting anyway",
+        started.elapsed(),
+        last_err
+    );
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
@@ -514,6 +613,20 @@ fn main() {
         MetricsLog::open(log_path)
     };
 
+    // Bind before probing egress so a port clash fails immediately rather than
+    // after the readiness wait.
+    let listener = match TcpListener::bind("0.0.0.0:8888") {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("proxy: cannot bind 0.0.0.0:8888: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    wait_for_egress();
+
+    // Started after the egress probe so the grace covers the window right after
+    // readiness, which is when the agent's first requests land.
     let shared = Arc::new(Shared {
         config: ProxyConfig {
             allow_domains,
@@ -526,14 +639,6 @@ fn main() {
         metrics,
         startup_until: Instant::now() + STARTUP_GRACE,
     });
-
-    let listener = match TcpListener::bind("0.0.0.0:8888") {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("proxy: cannot bind 0.0.0.0:8888: {}", e);
-            std::process::exit(1);
-        }
-    };
 
     if let Ok(mut f) = File::create("/sidecar_shared/ready") {
         let _ = f.write_all(b"ready\n");
@@ -650,6 +755,49 @@ mod tests {
         let c = cfg("", "", "10.1.0.0/24", "10.0.0.0/8");
         assert!(!c.is_denied_address("10.1.0.5".parse().unwrap()));
         assert!(c.is_denied_address("10.2.0.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolve_failure_reports_the_underlying_error() {
+        // A bare `dns` verdict is useless for diagnosis; the resolver's own
+        // message has to survive.
+        let r = Resolver::new();
+        let err = r
+            .resolve("no-such-host.invalid", 80, Instant::now())
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "resolver error must carry a message"
+        );
+    }
+
+    #[test]
+    fn resolve_retries_for_at_least_the_retry_window() {
+        // Regression: this used to be scoped to the startup grace, so in steady
+        // state a failure got exactly one attempt and a blip became a 502.
+        // `retry_until` in the past must not shorten the floor.
+        let r = Resolver::new();
+        let started = Instant::now();
+        let _ = r.resolve("no-such-host.invalid", 80, Instant::now() - Duration::from_secs(60));
+        assert!(
+            started.elapsed() >= RETRY_WINDOW,
+            "expected retries for at least {:?}, gave up after {:?}",
+            RETRY_WINDOW,
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn connect_failure_reports_the_underlying_error() {
+        // Port 9 (discard) on a reserved-documentation address: nothing answers.
+        let addr: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let err = connect_any(&[addr], Instant::now()).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn connect_with_no_addresses_is_an_error_not_a_panic() {
+        assert!(connect_any(&[], Instant::now()).is_err());
     }
 
     #[test]
