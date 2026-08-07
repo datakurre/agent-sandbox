@@ -57,6 +57,10 @@ compose agent-sandbox-load   agent-sandbox-load.sh
 compose agent-sandbox-firewall agent-sandbox-resolve.sh agent-sandbox-firewall.sh
 compose agent-sandbox-purge  agent-sandbox-purge.sh
 purge_bin="$tmp/bin/agent-sandbox-purge"
+# Standalone: list reads its labels with `podman inspect` rather than composing
+# the resolve helper.
+compose agent-sandbox-list   agent-sandbox-list.sh
+list_bin="$tmp/bin/agent-sandbox-list"
 # net shells out to the renderer, so it has to be on PATH like the rest.
 compose agent-sandbox-network-summary agent-sandbox-network-summary.sh
 firewall_bin="$tmp/bin/agent-sandbox-firewall"
@@ -88,26 +92,38 @@ fixture() { [[ -f "$f/$1" ]] && cat "$f/$1" || true; }
 
 case "$1" in
   ps)
-    all=0; labels=(); want_name=""; want_status=""
+    all=0; labels=(); want_name=""; want_status=""; want_row=0
     for a in "$@"; do
       case "$a" in
         -a|--all) all=1 ;;
         label=*)  labels+=("${a#label=}") ;;
         name=*)   want_name="${a#name=}" ;;
         status=*) want_status="${a#status=}" ;;
+        # The multi-column row format agent-sandbox-list asks for, as opposed to
+        # the bare '{{.Names}}' every other caller uses.
+        *'{{.ID}}'*) want_row=1 ;;
       esac
     done
+
+    emit() { # name
+      if [[ "$want_row" == 1 ]]; then
+        printf '%s\t%s\t%s\n' "id-$1" "$1" "Up 2 minutes"
+      else
+        printf '%s\n' "$1"
+      fi
+    }
     src=running
     [[ "$all" == 1 && -f "$f/all" ]] && src=all
     # A status filter selects from its own fixture, so "exited" does not silently
     # match everything.
     [[ -n "$want_status" ]] && src="status.$want_status"
 
-    role=""; target=""
+    role=""; target=""; workspace=""
     for l in ${labels[@]+"${labels[@]}"}; do
       case "$l" in
-        agent-sandbox.role=*)   role="${l#agent-sandbox.role=}" ;;
-        agent-sandbox.target=*) target="${l#agent-sandbox.target=}" ;;
+        agent-sandbox.role=*)      role="${l#agent-sandbox.role=}" ;;
+        agent-sandbox.target=*)    target="${l#agent-sandbox.target=}" ;;
+        agent-sandbox.workspace=*) workspace="${l#agent-sandbox.workspace=}" ;;
       esac
     done
 
@@ -122,7 +138,7 @@ case "$1" in
             # podman's name filter is a regex; ^...$ anchors are common here.
             [[ "$n" =~ ${want_name} ]] || continue
           fi
-          printf '%s\n' "$n"
+          emit "$n"
         done < <(fixture forwarders)
         ;;
       proxy)
@@ -131,10 +147,18 @@ case "$1" in
           if [[ -n "$target" ]]; then
             [[ "$(fixture "labels.$n" | sed -n 's/^agent-sandbox\.target=//p')" == "$target" ]] || continue
           fi
-          printf '%s\n' "$n"
+          emit "$n"
         done < <(fixture sidecars)
         ;;
-      *) fixture "$src" ;;
+      *)
+        while IFS= read -r n; do
+          [[ -n "$n" ]] || continue
+          if [[ -n "$workspace" ]]; then
+            [[ "$(fixture "labels.$n" | sed -n 's/^agent-sandbox\.workspace=//p')" == "$workspace" ]] || continue
+          fi
+          emit "$n"
+        done < <(fixture "$src")
+        ;;
     esac
     ;;
   inspect)
@@ -553,6 +577,73 @@ fi
 
 run "$purge_bin" --nope
 expect_status "purge rejects an unknown flag" 1
+
+# ── list ────────────────────────────────────────────────────────────────────
+#
+# The stub cannot reproduce podman's template engine, so these cover selection
+# and the label columns, not the format string itself -- the two template bugs
+# this command shipped with are only reproducible against a real podman.
+
+fixture_reset
+fixture_set running "agent-sandbox-here-1" "agent-sandbox-elsewhere-1"
+fixture_set all "agent-sandbox-here-1" "agent-sandbox-elsewhere-1" "agent-sandbox-old-1"
+fixture_set "labels.agent-sandbox-here-1" \
+  "agent-sandbox.proxy=firewall" "agent-sandbox.workspace=$PWD"
+fixture_set "labels.agent-sandbox-elsewhere-1" \
+  "agent-sandbox.proxy=meter" "agent-sandbox.workspace=/somewhere/else"
+
+run "$list_bin"
+expect_status "list succeeds" 0
+expect_out    "list heads the workspace" "Agent-sandbox containers for $PWD"
+expect_out    "list names the local sandbox" "agent-sandbox-here-1"
+expect_out    "list shows the proxy label" "firewall"
+expect_out    "list shows the workspace label" "$PWD"
+if grep -qF "agent-sandbox-elsewhere-1" <<< "$output"; then
+  fail "list hides sandboxes from another workspace" "$output"
+else
+  pass "list hides sandboxes from another workspace"
+fi
+
+run "$list_bin" --all
+expect_status "list --all succeeds" 0
+expect_out    "list --all spans workspaces" "agent-sandbox-elsewhere-1"
+expect_out    "list --all shows the other proxy mode" "meter"
+if grep -qF -- "-a" <<< "$argv"; then
+  pass "list --all asks podman for stopped containers"
+else
+  fail "list --all asks podman for stopped containers" "$argv"
+fi
+
+# A sandbox predating the proxy label must not shift the workspace column.
+run "$list_bin" --all
+if grep -qE 'agent-sandbox-old-1 +Up 2 minutes *$' <<< "$output"; then
+  pass "list tolerates a container with no labels"
+else
+  fail "list tolerates a container with no labels" "$output"
+fi
+
+fixture_set sidecars "agent-sandbox-proxy-agent-sandbox-here-1"
+fixture_set forwarders "agent-sandbox-fwd-agent-sandbox-here-1-8080"
+fixture_set "labels.agent-sandbox-proxy-agent-sandbox-here-1" \
+  "agent-sandbox.target=agent-sandbox-here-1"
+fixture_set "labels.agent-sandbox-fwd-agent-sandbox-here-1-8080" \
+  "agent-sandbox.target=agent-sandbox-here-1"
+
+run "$list_bin" --roles
+expect_status "list --roles succeeds" 0
+expect_out    "list --roles lists the sidecar" "agent-sandbox-proxy-agent-sandbox-here-1"
+expect_out    "list --roles lists the forwarder" "agent-sandbox-fwd-agent-sandbox-here-1-8080"
+expect_out    "list --roles shows the target label" "TARGET"
+
+run "$list_bin" --help
+expect_status "list --help exits 0" 0
+expect_out    "list --help prints usage" "agent-sandbox-list"
+
+run "$list_bin" --nope
+expect_status "list rejects an unknown flag" 1
+
+run "$list_bin" extra
+expect_status "list rejects a positional" 1
 
 # ── error output goes to stderr ─────────────────────────────────────────────
 

@@ -378,7 +378,11 @@ let
   # line that existed only to keep shellcheck quiet about the unused one.
   listScript = pkgs.writeShellApplication {
     name = "agent-sandbox-list";
-    runtimeInputs = with pkgs; [ podman ];
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+      util-linux # column, for the table alignment podman's `table` cannot do
+    ];
     text = scriptBody ./lib/agent-sandbox-list.sh;
   };
 
@@ -554,6 +558,10 @@ let
             coreutils
             gnugrep
             gnused
+            # The tests run the composed lib/ scripts rather than the built ones,
+            # so whatever a script would find through runtimeInputs has to be
+            # here too -- `column`, for agent-sandbox-list.
+            util-linux
           ];
         }
         ''
