@@ -64,9 +64,29 @@ A bash script that wraps `podman run`.  Call flow:
 
 Either flag makes the launcher start a second container from the same image,
 running `agent-sandbox-sidecar`, and put the sandbox on a `podman network create
---internal` network with no route off-host.  The sidecar is dual-homed on that
-network and on `bridge`, so it is the sandbox's only path to the internet, and the
-sandbox gets `HTTP_PROXY`/`HTTPS_PROXY` pointing at it.
+--internal --disable-dns` network with no route off-host.  The sidecar is
+dual-homed on that network and on `bridge`, so it is the sandbox's only path to
+the internet, and the sandbox gets `HTTP_PROXY`/`HTTPS_PROXY` pointing at its
+**address**.
+
+**`--disable-dns` is load-bearing.**  Podman routes a container's whole resolver
+through aardvark-dns as soon as *any* of its networks has `dns_enabled` --
+`podman-run(1)`, under `--dns`: "passing a custom network whose `dns_enabled` is
+set to `true` to `--network` will result in `/etc/resolv.conf` only referring to
+the aardvark-dns server".  And aardvark has refused to serve `--internal`
+networks since 1.11.0 ("Do not allow 'internal' networks to access DNS"), so the
+sidecar's only nameserver would answer NXDOMAIN to every external name: every
+request 502s with `dns: Name or service not known`.  Passing `--dns` does not
+help, because those servers are demoted to an aardvark upstream that aardvark
+then declines to use -- which is why that fix looked right and did nothing.  This
+has now been diagnosed three times; with DNS off on both of the sidecar's
+networks there is no aardvark in the path and `--dns` lands in `resolv.conf`
+verbatim.
+
+The corollary is that `HTTP_PROXY` names an IP, not the sidecar's container name:
+without aardvark there is nothing to resolve that name.  That also retires a race
+nothing ever gated on -- the readiness handshake never proved aardvark had
+published the sidecar's record before the sandbox started.
 
 The proxy itself is Rust (`proxy/src/main.rs`, `ipnet` its only dependency): a
 thread-per-connection HTTP forward proxy handling `CONNECT` and absolute-form
@@ -78,7 +98,7 @@ Three directories, and which side can see them is the design:
 | Path | Mounted into | Contents |
 | --- | --- | --- |
 | `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base` |
-| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `connections.jsonl` |
+| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `connections.jsonl` |
 | (host temp dirs) | — | removed by the launcher's exit trap |
 
 Neither is mounted into the sandbox. That is deliberate and load-bearing: the
@@ -105,6 +125,12 @@ proxy validates policy, probes egress and writes `proxy-ready`; the sidecar then
 installs the `deny_ips` blackhole routes and writes `ready`; only then does the
 launcher start the sandbox.  So routes are in place before any traffic can exist,
 and a bad policy exits 2 before touching the kernel table.
+
+The egress probe is never fatal -- a degraded launch beats a hung one -- but it
+is no longer silent: when it gives up it writes `egress-degraded` with the
+resolver's own error, and the launcher prints that on the terminal.  Without it
+the session looks healthy for 30 seconds and then 502s, which is exactly how the
+aardvark problem above stayed hidden.
 
 **Runtime changes.** The proxy polls the policy file's `(mtime, size)` once a
 second and swaps an `Arc<ProxyConfig>` under an `RwLock`, clearing the DNS cache

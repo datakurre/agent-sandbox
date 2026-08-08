@@ -17,6 +17,12 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"; podman rm -f "$sandbox" >/dev/null 2>&1' EXIT
 sandbox=""
 
+# Baselines for the teardown checks below.  A sandbox that was already running
+# when this started owns a session network and a policy directory of its own, and
+# counting those as leaks is the same mistake as adopting its container.
+nets_before=$(podman network ls --filter "name=^agent-sandbox-sidecar-" --format '{{.Name}}' | wc -l)
+dirs_before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'agent-sandbox-policy-*' 2>/dev/null | wc -l)
+
 failures=0
 pass() { printf 'ok       %s\n' "$1"; }
 fail() { printf 'FAIL     %s\n' "$1"; printf '%s\n' "${2:-}" | sed 's/^/           /'; failures=$((failures + 1)); }
@@ -42,8 +48,17 @@ cd "$tmp/work" || exit 1
 agent-sandbox --firewall --no-workspace -- sleep 600 >"$tmp/launch.log" 2>&1 &
 launcher=$!
 
+# Filtered by workspace, not just by role.  Taking the first sandbox podman
+# happened to list meant that running this script while any other sandbox was up
+# -- including the one you are reading this from -- silently tested that
+# container instead: no proxy, so half the checks failed and the two that pass
+# without a firewall passed for the wrong reason.  Then teardown `podman rm -f`'d
+# it.  $tmp is a fresh mktemp dir, so this label matches exactly one container,
+# and it is always the one this run launched.
 for _ in $(seq 1 60); do
-  sandbox=$(podman ps --filter "label=agent-sandbox.role=sandbox" --format '{{.Names}}' | head -n 1)
+  sandbox=$(podman ps --filter "label=agent-sandbox.role=sandbox" \
+                      --filter "label=agent-sandbox.workspace=$tmp/work" \
+                      --format '{{.Names}}' | head -n 1)
   [[ -n "$sandbox" ]] && break
   kill -0 "$launcher" 2>/dev/null || break
   sleep 1
@@ -75,6 +90,64 @@ if grep -q "default *deny" <<< "$rules"; then
   pass "an allow list means deny by default"
 else
   fail "an allow list means deny by default" "$rules"
+fi
+
+# ── the proxy's resolution path ──────────────────────────────────────────────
+#
+# Regression guard for the third round of the same bug.  Podman routes a
+# container's entire resolver through aardvark-dns as soon as *one* of its
+# networks has dns_enabled -- podman-run(1) under --dns -- and aardvark has
+# refused to forward for --internal networks since 1.11.0.  The sidecar's only
+# nameserver then answers NXDOMAIN to every external name and every request
+# comes back 502 ("dns: Name or service not known").  The launcher creates the
+# network --disable-dns to keep aardvark out of the path; assert it stayed out,
+# because the symptom otherwise only shows up as a failed fetch further down and
+# reads like an unrelated network problem.
+#
+# The launcher uses one identifier for both the sidecar container and its
+# internal network, so this name addresses either.
+sidecar=$(podman ps --filter "label=agent-sandbox.role=proxy" \
+                    --filter "label=agent-sandbox.target=$sandbox" \
+                    --format '{{.Names}}' | head -n 1)
+
+if [[ -z "$sidecar" ]]; then
+  fail "the proxy sidecar was found" "no container labelled target=$sandbox"
+else
+  pass "the proxy sidecar was found ($sidecar)"
+
+  if [[ "$(podman network inspect "$sidecar" --format '{{.DNSEnabled}}' 2>/dev/null)" == "false" ]]; then
+    pass "the internal network has DNS disabled"
+  else
+    fail "the internal network has DNS disabled" \
+      "aardvark-dns will not forward for an --internal network, so the proxy resolves nothing"
+  fi
+
+  # aardvark-dns answers on the network's gateway address; the sidecar's
+  # resolv.conf must name a real resolver instead.
+  resolv=$(podman exec "$sidecar" cat /etc/resolv.conf 2>/dev/null)
+  gateways=()
+  mapfile -t gateways < <(podman network inspect "$sidecar" \
+    --format '{{range .Subnets}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null)
+  aardvark=""
+  for gw in ${gateways[@]+"${gateways[@]}"}; do
+    [[ -n "$gw" ]] || continue
+    grep -qE "^[[:space:]]*nameserver[[:space:]]+${gw}[[:space:]]*$" <<< "$resolv" && aardvark="$gw"
+  done
+  if [[ -n "$aardvark" ]]; then
+    fail "the proxy does not resolve through aardvark-dns" \
+      "resolv.conf points at the internal gateway $aardvark:"$'\n'"$resolv"
+  else
+    pass "the proxy does not resolve through aardvark-dns"
+  fi
+
+  # Written only when wait_for_egress gives up, which is the degraded launch the
+  # launcher now warns about.  A healthy session must not have one.
+  if podman exec "$sidecar" test -e /sidecar_shared/egress-degraded 2>/dev/null; then
+    fail "the proxy proved egress at startup" \
+      "$(podman exec "$sidecar" cat /sidecar_shared/egress-degraded 2>/dev/null)"
+  else
+    pass "the proxy proved egress at startup"
+  fi
 fi
 
 # ── enforcement ──────────────────────────────────────────────────────────────
@@ -191,17 +264,18 @@ wait "$launcher" 2>/dev/null
 sandbox=""
 
 leftover_nets=$(podman network ls --filter "name=^agent-sandbox-sidecar-" --format '{{.Name}}' | wc -l)
-if [[ "$leftover_nets" -eq 0 ]]; then
+if [[ "$leftover_nets" -le "$nets_before" ]]; then
   pass "no session network is leaked"
 else
-  fail "no session network is leaked" "$leftover_nets left; agent-sandbox-ctl purge reclaims them"
+  fail "no session network is leaked" \
+    "$((leftover_nets - nets_before)) left; agent-sandbox-ctl purge reclaims them"
 fi
 
 leftover_dirs=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'agent-sandbox-policy-*' 2>/dev/null | wc -l)
-if [[ "$leftover_dirs" -eq 0 ]]; then
+if [[ "$leftover_dirs" -le "$dirs_before" ]]; then
   pass "no policy directory is leaked"
 else
-  fail "no policy directory is leaked" "$leftover_dirs left"
+  fail "no policy directory is leaked" "$((leftover_dirs - dirs_before)) left"
 fi
 
 if [[ "$failures" -gt 0 ]]; then

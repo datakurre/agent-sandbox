@@ -50,6 +50,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// resolved, never connected to, so this stays policy-neutral under
 /// `--firewall`.
 const READY_PROBE_HOST: &str = "cloudflare.com:443";
+/// Written by the proxy, read by the sidecar's readiness gate on the host.
+const PROXY_READY: &str = "/sidecar_shared/proxy-ready";
+/// Written only when `wait_for_egress` gives up, and carrying why.
+const EGRESS_DEGRADED: &str = "/sidecar_shared/egress-degraded";
 const BUF_SIZE: usize = 64 * 1024;
 const HEAD_MAX: usize = 8192;
 const DNS_CACHE_MAX: usize = 512;
@@ -931,6 +935,11 @@ fn watch_policy(path: String, shared: Arc<Shared>) {
 ///
 /// Never fatal.  If egress does not come up we start anyway and say so, because
 /// a degraded launch beats a hung one.
+///
+/// "Say so" used to mean stderr only, which the launcher does not read: the
+/// session looked healthy until the agent's first request came back 502.  The
+/// reason is now also left in `EGRESS_DEGRADED` for the launcher to surface on
+/// the terminal the person is actually looking at.
 fn wait_for_egress() {
     let started = Instant::now();
     let mut last_err = String::new();
@@ -943,7 +952,7 @@ fn wait_for_egress() {
                 }
                 last_err = "resolver returned no addresses".to_string();
             }
-            Err(e) => last_err = e.to_string(),
+            Err(e) => last_err = short_err(&e),
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -952,6 +961,13 @@ fn wait_for_egress() {
         started.elapsed(),
         last_err
     );
+    if let Ok(mut f) = File::create(EGRESS_DEGRADED) {
+        let _ = writeln!(
+            f,
+            "{} did not resolve within {:?}: {}",
+            READY_PROBE_HOST, READY_TIMEOUT, last_err
+        );
+    }
 }
 
 const USAGE: &str = "\
@@ -1135,7 +1151,7 @@ fn main() {
     // The sidecar gates its own readiness on this, installs the blackhole routes
     // and only then tells the launcher the sandbox may start -- so the routes are
     // in place before any traffic can exist.
-    if let Ok(mut f) = File::create("/sidecar_shared/proxy-ready") {
+    if let Ok(mut f) = File::create(PROXY_READY) {
         let _ = f.write_all(b"ready\n");
     }
 

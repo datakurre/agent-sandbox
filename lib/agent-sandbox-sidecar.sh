@@ -106,8 +106,12 @@ sync_blackholes() {
   done
 }
 
-# Rely entirely on Podman's /etc/resolv.conf configuration instead of trying to
-# strip it.
+# Nothing to do about DNS here, and that is now true by construction rather than
+# by hope.  The launcher creates the internal network --disable-dns, so podman
+# writes the host's real nameservers into /etc/resolv.conf instead of pointing it
+# at an aardvark-dns that refuses to forward for --internal networks.  Two
+# earlier versions of this file rewrote resolv.conf by hand to work around that;
+# both were guessing at a configuration the launcher can simply ask for.
 
 proxy_args=(--log "$metrics_log")
 if [[ "${FIREWALL:-0}" == "1" ]]; then

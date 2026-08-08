@@ -606,7 +606,31 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   # left behind by a launcher that was killed before its trap could run.
   sidecar_shared=$(mktemp -d -t "agent-sandbox-sidecar-XXXXXXXX")
   sidecar_policy=$(mktemp -d -t "agent-sandbox-policy-XXXXXXXX")
-  podman network create --internal "$sidecar_id" >/dev/null 2>&1 || true
+  # --disable-dns is load-bearing, not tidiness.  Podman routes a container's
+  # whole resolver through aardvark-dns as soon as *any* of its networks has
+  # dns_enabled -- podman-run(1), under --dns: "passing a custom network whose
+  # dns_enabled is set to true to --network will result in /etc/resolv.conf only
+  # referring to the aardvark-dns server".  And aardvark has refused to forward
+  # for --internal networks since 1.11.0 ("Do not allow 'internal' networks to
+  # access DNS"), so the sidecar's only nameserver would be one that answers
+  # NXDOMAIN to every external name.  That is the "dns: Name or service not
+  # known" 502, and it is why the --dns servers below were inert: they were
+  # demoted to an aardvark upstream that aardvark then declined to use.
+  #
+  # With DNS off on both of the sidecar's networks there is no aardvark in the
+  # path at all and --dns lands in resolv.conf verbatim.  The cost is that the
+  # sandbox can no longer resolve the sidecar by container name, which is why
+  # HTTP_PROXY is addressed by IP further down.
+  #
+  # Not `|| true`: the known failure is a rootless subnet pool exhausted by
+  # leaked networks, and swallowing it just moves the error to `podman run`,
+  # where it reads as an unrelated problem.
+  if ! podman network create --internal --disable-dns "$sidecar_id" >/dev/null; then
+    echo "agent-sandbox: could not create the sidecar network $sidecar_id" >&2
+    echo "               (leaked networks exhaust the rootless subnet pool:" >&2
+    echo "                reclaim them with 'agent-sandbox-ctl purge')" >&2
+    exit 1
+  fi
 
   # The policy file is the single channel by which policy reaches the proxy.  It
   # replaced four separately-encoded arguments, where a space-separated list met a
@@ -638,24 +662,52 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   # to also need NET_RAW for packet capture; it is now accounted by the proxy.
   sidecar_caps=("--cap-add=NET_ADMIN")
 
-  # The sidecar is on both bridge (external) and the internal network.
-  # Podman's aardvark-dns injects the internal network's DNS server into
-  # /etc/resolv.conf, but --internal blocks its upstream forwarding.
-  # Override with the host's nameservers so the proxy can resolve external names.
-  # Skip loopback (127.*) and link-local (169.254.*) addresses since they are
-  # not reachable from inside the container's network namespace.
-  sidecar_dns_args=()
-  while IFS= read -r ns; do
-    if [[ "$ns" =~ ^nameserver[[:space:]]+([^[:space:]]+) ]]; then
-      local_ns="${BASH_REMATCH[1]}"
-      [[ "$local_ns" =~ ^127\. || "$local_ns" =~ ^169\.254\. ]] && continue
-      sidecar_dns_args+=(--dns "$local_ns")
-    fi
-  done < /etc/resolv.conf
-  # Fallback to public DNS if no usable host nameservers found.
-  if [[ ${#sidecar_dns_args[@]} -eq 0 ]]; then
-    sidecar_dns_args=(--dns 8.8.8.8 --dns 1.1.1.1)
+  # Nameservers for the sidecar, read from the host.  With DNS disabled on both
+  # of its networks (see --disable-dns above) these land in the container's
+  # /etc/resolv.conf verbatim and are queried directly, rather than becoming an
+  # upstream for an aardvark that would refuse to use it.
+  #
+  # Only bare IP literals survive the filter.  A scoped address -- "fe80::1%eth0",
+  # which RA-configured hosts do write -- is rejected by podman, and a rejected
+  # --dns takes the whole sidecar down.  Loopback and link-local entries are
+  # dropped for a different reason: they name a resolver on the *host's* stack,
+  # which is not reachable from the container's netns.
+  usable_nameservers() { # FILE
+    [[ -r "$1" ]] || return 0
+    local line candidate lower
+    # `|| [[ -n "$line" ]]` so a file with no trailing newline does not lose its
+    # last entry -- silently dropping a nameserver is how this whole area got
+    # its reputation.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" =~ ^[[:space:]]*nameserver[[:space:]]+([^[:space:]]+) ]] || continue
+      candidate="${BASH_REMATCH[1]}"
+      lower="${candidate,,}"
+      case "$lower" in
+        127.*|169.254.*|::1|fe80:*|*%*) continue ;;
+      esac
+      [[ "$candidate" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$candidate" =~ ^[0-9A-Fa-f:]+$ ]] \
+        || continue
+      printf '%s\n' "$candidate"
+    done < "$1"
+  }
+
+  sidecar_nameservers=()
+  mapfile -t sidecar_nameservers < <(usable_nameservers /etc/resolv.conf)
+  # systemd-resolved publishes 127.0.0.53 as the only nameserver, which the
+  # filter above correctly discards.  Its own file carries the real upstreams;
+  # using them keeps split-horizon and corporate names resolving instead of
+  # quietly defecting to a public resolver.
+  if [[ ${#sidecar_nameservers[@]} -eq 0 ]]; then
+    mapfile -t sidecar_nameservers < <(usable_nameservers /run/systemd/resolve/resolv.conf)
   fi
+  if [[ ${#sidecar_nameservers[@]} -eq 0 ]]; then
+    sidecar_nameservers=(8.8.8.8 1.1.1.1)
+  fi
+
+  sidecar_dns_args=()
+  for sidecar_ns in "${sidecar_nameservers[@]}"; do
+    sidecar_dns_args+=(--dns "$sidecar_ns")
+  done
 
   # The sidecar is our infrastructure container, not the sandboxed agent code.
   # Disable SELinux labeling so it can write the readiness marker and the
@@ -672,7 +724,11 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   # sidecar could only be found by guessing at its random name, which is why
   # nothing could report on the firewall or reach the proxy's log.  target= points
   # back at the sandbox, mirroring the port forwarders.
-  podman run -d --name "$sidecar_id" \
+  # stdout is just the container id, so it goes to /dev/null -- but stderr does
+  # not.  Under errexit a silenced failure here aborted the launcher with no
+  # output whatsoever, which is the worst possible way to learn that a --dns
+  # value or a mount was rejected.
+  if ! podman run -d --name "$sidecar_id" \
     --label "agent-sandbox.role=proxy" \
     --label "agent-sandbox.target=$container_name" \
     --label "agent-sandbox.workspace=$PWD" \
@@ -682,7 +738,10 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:$rw_mount_opts" \
     -v "$sidecar_policy:/sidecar_policy:ro" \
     -e "FIREWALL=$want_firewall" \
-    "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar >/dev/null 2>&1
+    "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar >/dev/null; then
+    echo "agent-sandbox: could not start the proxy sidecar" >&2
+    exit 1
+  fi
 
   # Wait for the sidecar to signal readiness via the shared volume.  It writes
   # that marker only after the proxy can resolve names (see wait_for_egress in
@@ -711,6 +770,16 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     echo "               (continuing; check: podman logs $sidecar_id)" >&2
   fi
 
+  # The proxy starts even when it could not prove egress -- a degraded launch
+  # beats a hung one -- but that used to be visible only in the sidecar's log,
+  # so the session looked healthy right up until the first request came back
+  # 502.  Say it here, where the person who ran the command is looking.
+  if [[ -s "$sidecar_shared/egress-degraded" ]]; then
+    echo "agent-sandbox: warning: the proxy could not resolve names at startup" >&2
+    sed 's/^/               /' "$sidecar_shared/egress-degraded" >&2
+    echo "               (continuing; requests may fail. Full log: agent-sandbox-ctl logs)" >&2
+  fi
+
   network_args+=(--network "$sidecar_id")
   # /sidecar_shared is deliberately NOT mounted into the sandbox.  It used to be,
   # for the sake of agent-sandbox-allow (now gone), and since the sandbox runs
@@ -718,7 +787,29 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   # could truncate or forge the log of its own network activity.  Nothing inside
   # needs the directory: the readiness marker is read by the launcher on the host,
   # and `agent-sandbox-ctl net` reads the log through the sidecar.
-  env_args+=("-e" "HTTP_PROXY=http://$sidecar_id:8888" "-e" "HTTPS_PROXY=http://$sidecar_id:8888")
+  #
+  # By address, not by name.  The internal network is --disable-dns (see the
+  # network create above), so there is no aardvark to resolve the sidecar's
+  # container name -- and even when there was, nothing in the readiness
+  # handshake proved aardvark had published the record before the sandbox
+  # started, which is one more startup race that simply stops existing here.
+  sidecar_ip=""
+  for _ in $(seq 1 20); do
+    # `container inspect`, not plain `inspect`: the network carries the same
+    # name, and which one a bare inspect resolves to is podman's business.
+    sidecar_ip=$(podman container inspect --format \
+      "{{(index .NetworkSettings.Networks \"$sidecar_id\").IPAddress}}" \
+      "$sidecar_id" 2>/dev/null) || sidecar_ip=""
+    [[ -n "$sidecar_ip" ]] && break
+    sleep 0.1
+  done
+  if [[ -z "$sidecar_ip" ]]; then
+    echo "agent-sandbox: the proxy sidecar has no address on $sidecar_id" >&2
+    echo "               (check: podman logs $sidecar_id)" >&2
+    exit 1
+  fi
+
+  env_args+=("-e" "HTTP_PROXY=http://$sidecar_ip:8888" "-e" "HTTPS_PROXY=http://$sidecar_ip:8888")
 fi
 
 env_args+=("-e" "TERM=${TERM:-xterm-256color}")
