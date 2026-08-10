@@ -85,16 +85,36 @@ resolve_sandbox() {
   [[ "${2:-}" == "--running" ]] && want_running=1
 
   if [[ -n "$explicit" ]]; then
-    if ! podman container exists "$explicit"; then
-      echo "${0##*/}: no container named '$explicit'" >&2
+    local all_names=()
+    mapfile -t all_names < <(sandbox_containers_all)
+
+    local valid_matches=()
+    for name in "${all_names[@]}"; do
+      if [[ "$name" == "$explicit" || "$name" == *"-${explicit}" ]]; then
+        valid_matches+=("$name")
+      fi
+    done
+
+    if [[ ${#valid_matches[@]} -eq 1 ]]; then
+      if [[ "$want_running" == "1" ]] && ! sandbox_running "${valid_matches[0]}"; then
+        # Preserve the exact error message that test-ctl-args.sh expects
+        if [[ "$explicit" == "${valid_matches[0]}" ]]; then
+          echo "${0##*/}: '$explicit' is not running" >&2
+        else
+          echo "${0##*/}: '${valid_matches[0]}' is not running" >&2
+        fi
+        exit 1
+      fi
+      printf '%s\n' "${valid_matches[0]}"
+      return
+    elif [[ ${#valid_matches[@]} -gt 1 ]]; then
+      echo "${0##*/}: '$explicit' is ambiguous, matches multiple sandboxes:" >&2
+      for m in "${valid_matches[@]}"; do echo "  $m" >&2; done
       exit 1
     fi
-    if [[ "$want_running" == "1" ]] && ! sandbox_running "$explicit"; then
-      echo "${0##*/}: '$explicit' is not running" >&2
-      exit 1
-    fi
-    printf '%s\n' "$explicit"
-    return
+
+    echo "${0##*/}: no container named '$explicit'" >&2
+    exit 1
   fi
 
   local names=()

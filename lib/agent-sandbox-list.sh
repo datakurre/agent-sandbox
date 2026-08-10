@@ -52,9 +52,16 @@ list_sandboxes() { # ps-args...
   printf 'CONTAINER ID\tNAMES\tSTATUS\tPROXY\tWORKSPACE\n'
   podman ps "$@" --format "$row_format" |
     while IFS=$'\t' read -r id name status; do
-      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$name" "$status" \
+      local ws
+      ws="$(container_label "$name" agent-sandbox.workspace)"
+      local ws_base
+      ws_base="$(basename "$ws")"
+      local slug="${ws_base//[^A-Za-z0-9_.-]/-}"
+      local prefix="agent-sandbox-${slug:0:32}-"
+      local short_name="${name#"$prefix"}"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$short_name" "$status" \
         "$(container_label "$name" agent-sandbox.proxy)" \
-        "$(container_label "$name" agent-sandbox.workspace)"
+        "$ws"
     done
 }
 

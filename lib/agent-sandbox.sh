@@ -597,7 +597,12 @@ printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
 # network/PID relationships.
 workspace_slug=$(basename "$PWD")
 workspace_slug="${workspace_slug//[^A-Za-z0-9_.-]/-}"
-container_name="agent-sandbox-${workspace_slug:0:32}-$$"
+
+ADJ=(autumn hidden bitter misty silent empty dry dark summer icy delicate quiet white cool spring winter patient twilight dawn crimson wispy weathered blue billowing broken cold damp falling frosty green long late lingering bold little morning muddy old red rough still small sparkling throbbing shy wandering withered wild black young holy solitary fragrant aged snowy proud floral restless divine polished ancient purple lively nameless)
+NOUN=(waterfall river breeze moon rain wind sea morning snow lake sunset pine shadow leaf dawn glitter forest hill cloud meadow sun glade bird brook butterfly bush dew dust field fire flower firefly feather grass haze mountain night pond darkness snowflake silence sound sky shape surf thunder violet water wildflower wave water resonance sun wood dream cherry tree fog frost voice paper frog smoke star)
+wordlist_id="${ADJ[$((RANDOM % ${#ADJ[@]}))]}-${NOUN[$((RANDOM % ${#NOUN[@]}))]}-$((RANDOM % 10000))"
+
+container_name="agent-sandbox-${workspace_slug:0:32}-${wordlist_id}"
 
 # ── Sidecar Proxy & Metering ────────────────────────────────────────────────
 if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then

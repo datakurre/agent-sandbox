@@ -423,6 +423,16 @@ let
     text = sandboxResolve + scriptBody ./lib/agent-sandbox-logs.sh;
   };
 
+  attachScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-attach";
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+      gnugrep
+    ];
+    text = sandboxResolve + scriptBody ./lib/agent-sandbox-attach.sh;
+  };
+
   # proxyScript in runtimeInputs so the host validates a policy with the very
   # binary that will enforce it -- one implementation, no drift.
   firewallScript = pkgs.writeShellApplication {
@@ -470,6 +480,7 @@ let
       netScript
       statusScript
       logsScript
+      attachScript
       firewallScript
     ];
     text = scriptBody ./lib/agent-sandbox-ctl.sh;
@@ -589,6 +600,7 @@ let
         netScript
         statusScript
         logsScript
+        attachScript
         firewallScript
         networkSummary
         gnupgScan
@@ -620,6 +632,7 @@ pkgs.symlinkJoin {
       netScript
       statusScript
       logsScript
+      attachScript
       firewallScript
       networkSummary
       ;

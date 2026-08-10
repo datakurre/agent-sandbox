@@ -11,6 +11,7 @@ usage() {
   printf '  %-9s%s\n' net      "Show network metering for a running sandbox"
   printf '  %-9s%s\n' logs     "Show the proxy log for a running sandbox"
   printf '  %-9s%s\n' port     "Manage port forwarding"
+  printf '  %-9s%s\n' attach   "Attach to a running sandbox and exec a command"
   printf '  %-9s%s\n' purge    "Reclaim leftover containers, networks and directories"
 }
 
@@ -26,6 +27,7 @@ case "$cmd" in
   purge)       exec agent-sandbox-purge "$@" ;;
   port)        exec agent-sandbox-port "$@" ;;
   list)        exec agent-sandbox-list "$@" ;;
+  attach)      exec agent-sandbox-attach "$@" ;;
   status)      exec agent-sandbox-status "$@" ;;
   firewall|fw) exec agent-sandbox-firewall "$@" ;;
   net|network) exec agent-sandbox-net "$@" ;;
