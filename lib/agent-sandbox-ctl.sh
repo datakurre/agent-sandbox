@@ -17,6 +17,8 @@ usage() {
 
 cmd="${1:-}"
 if [[ -z "$cmd" ]]; then
+  agent-sandbox-list
+  echo
   usage >&2
   exit 1
 fi
