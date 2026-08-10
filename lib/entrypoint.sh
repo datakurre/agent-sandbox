@@ -88,6 +88,13 @@ Host *
 SSH_CONFIG
     chmod 600 ~/.ssh/config
   fi
+
+  # Node's core http/https and built-in fetch (undici) ignore HTTP_PROXY /
+  # HTTPS_PROXY unless explicitly told to honor them (Node >= 24). This also
+  # covers the bundled Node-based agent CLIs, which all run under the same
+  # runtime. An operator's own explicit setting still wins.
+  : "${NODE_USE_ENV_PROXY:=1}"
+  export NODE_USE_ENV_PROXY
 fi
 
 exec "$@"

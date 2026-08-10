@@ -513,6 +513,20 @@ let
           touch "$out"
         '';
 
+    entrypoint =
+      pkgs.runCommand "agent-sandbox-entrypoint-tests"
+        {
+          nativeBuildInputs = with pkgs; [
+            bash
+            coreutils
+            gnugrep
+          ];
+        }
+        ''
+          bash ${./lib/test-entrypoint.sh} ${entrypoint}
+          touch "$out"
+        '';
+
     shellcheck = pkgs.runCommand "agent-sandbox-shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
       shellcheck --shell=bash ${./lib}/*.sh
       touch "$out"

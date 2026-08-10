@@ -37,7 +37,12 @@ Key layers:
 2. Sets up `known_hosts` for common git forges to avoid first-time connection prompts.
 3. When `AGENT_SANDBOX_GPG_AGENT=1`, symlinks the forwarded host gpg-agent
    socket into `~/.gnupg/S.gpg-agent`.
-4. When `HTTP_PROXY` is set, dynamically generates `~/.ssh/config` to route all SSH traffic through the proxy.
+4. When `HTTP_PROXY` is set, compensates for tools that don't honor it on
+   their own: dynamically generates `~/.ssh/config` to route SSH through the
+   proxy, and sets `NODE_USE_ENV_PROXY=1` so Node's core `http`/`https` and
+   built-in `fetch` (undici) stop dialing out directly — this also covers
+   the bundled Node-based agent CLIs, which share Node's runtime. An
+   operator's own explicit `NODE_USE_ENV_PROXY` setting is left alone.
 5. `exec "$@"`.
 
 ### Launcher (`agent-sandbox`)
