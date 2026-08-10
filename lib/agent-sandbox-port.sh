@@ -18,8 +18,8 @@
 usage() {
   cat <<'USAGE'
 agent-sandbox-port ls
-agent-sandbox-port add [--sandbox NAME] [HOST:]CONTAINER[/PROTO]
-agent-sandbox-port rm  [--sandbox NAME] (HOST | --all)
+agent-sandbox-port add [SANDBOX] [--sandbox NAME] [HOST:]CONTAINER[/PROTO]
+agent-sandbox-port rm  [SANDBOX] [--sandbox NAME] (HOST | --all)
 
   ls    show running sandboxes and the ports forwarded into them
   add   start a forwarder for one port
@@ -248,24 +248,45 @@ done
 
 case "$action" in
   ls|list)
-    [[ ${#positional[@]} -eq 0 ]] || {
-      echo "agent-sandbox-port: ls takes no arguments" >&2; usage >&2; exit 1
-    }
+    if [[ ${#positional[@]} -eq 1 ]]; then
+      if [[ -n "$sandbox_name" ]]; then
+         echo "agent-sandbox-port: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+      fi
+      sandbox_name="${positional[0]}"
+    elif [[ ${#positional[@]} -gt 1 ]]; then
+      echo "agent-sandbox-port: ls takes at most one argument (the sandbox)" >&2; usage >&2; exit 1
+    fi
     cmd_ls "$sandbox_name"
     ;;
   add)
-    [[ ${#positional[@]} -eq 1 ]] || {
-      echo "agent-sandbox-port: add needs exactly one port spec" >&2; usage >&2; exit 1
-    }
-    cmd_add "$(resolve_sandbox "$sandbox_name" --running)" "${positional[0]}"
+    if [[ ${#positional[@]} -eq 2 ]]; then
+      if [[ -n "$sandbox_name" ]]; then
+         echo "agent-sandbox-port: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+      fi
+      sandbox_name="${positional[0]}"
+      spec="${positional[1]}"
+    elif [[ ${#positional[@]} -eq 1 ]]; then
+      spec="${positional[0]}"
+    else
+      echo "agent-sandbox-port: add needs a port spec, and optionally a sandbox" >&2; usage >&2; exit 1
+    fi
+    cmd_add "$(resolve_sandbox "$sandbox_name" --running)" "$spec"
     ;;
   rm|remove)
-    [[ ${#positional[@]} -eq 1 ]] || {
+    if [[ ${#positional[@]} -eq 2 ]]; then
+      if [[ -n "$sandbox_name" ]]; then
+         echo "agent-sandbox-port: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+      fi
+      sandbox_name="${positional[0]}"
+      target="${positional[1]}"
+    elif [[ ${#positional[@]} -eq 1 ]]; then
+      target="${positional[0]}"
+    else
       echo "agent-sandbox-port: rm needs a host port or --all" >&2; usage >&2; exit 1
-    }
+    fi
     # Deliberately not --running: a forwarder outlives its sandbox, and clearing
     # one up is exactly the case where the sandbox has already exited.
-    cmd_rm "$(resolve_sandbox "$sandbox_name")" "${positional[0]}"
+    cmd_rm "$(resolve_sandbox "$sandbox_name")" "$target"
     ;;
   -h|--help)
     usage

@@ -19,7 +19,7 @@ log_path=/sidecar_shared/connections.jsonl
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-net [-f|--follow] [--sandbox NAME]
+agent-sandbox-net [-f|--follow] [SANDBOX] [--sandbox NAME]
 
   (no flags)   print the network summary for the sandbox as it stands now
   -f, --follow stream connections as the proxy records them, until Ctrl-C
@@ -70,7 +70,13 @@ while [[ $# -gt 0 ]]; do
     --sandbox=*) sandbox_name="${1#--sandbox=}" ;;
     -h|--help)   usage; exit 0 ;;
     -*)          echo "${0##*/}: unknown option: $1" >&2; usage >&2; exit 1 ;;
-    *)           echo "${0##*/}: unexpected argument: $1" >&2; usage >&2; exit 1 ;;
+    *)
+       if [[ -z "$sandbox_name" ]]; then
+         sandbox_name="$1"
+       else
+         echo "${0##*/}: unexpected argument: $1" >&2; usage >&2; exit 1
+       fi
+       ;;
   esac
   shift
 done

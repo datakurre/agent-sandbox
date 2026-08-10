@@ -313,9 +313,9 @@ fixture_set running "agent-sandbox-repo-1"
 fixture_set forwarders "agent-sandbox-fwd-ghost-9000"
 fixture_set "labels.agent-sandbox-fwd-ghost-9000" "agent-sandbox.target=ghost"
 
-run "$port_bin" ls 8080
-expect_status "port ls rejects a stray positional" 1
-expect_out    "port ls says why" "ls takes no arguments"
+run "$port_bin" ls 8080 8081
+expect_status "port ls rejects two positionals" 1
+expect_out    "port ls says why" "ls takes at most one argument"
 
 run "$port_bin" ls
 expect_status "port ls succeeds" 0
@@ -337,8 +337,8 @@ expect_out    "net says --sandbox needs a name" "--sandbox needs a name"
 run "$net_bin" --nope
 expect_status "net rejects an unknown flag" 1
 
-run "$net_bin" stray
-expect_status "net rejects a positional" 1
+run "$net_bin" stray extra
+expect_status "net rejects a second positional" 1
 
 # The metering log lives only in the sidecar now, so that the sandbox cannot
 # rewrite the record of its own traffic.
@@ -410,8 +410,12 @@ expect_out    "status counts traffic" "1 connection(s), 1 denied"
 expect_out    "status counts what is in flight" "in flight"
 expect_out    "status points at the detail commands" "agent-sandbox-ctl net"
 
-run "$status_bin" stray
-expect_status "status rejects a positional" 1
+run "$status_bin" stray extra
+expect_status "status rejects a second positional" 1
+
+run "$status_bin" agent-sandbox-repo-1
+expect_status "status accepts sandbox as positional" 0
+expect_out    "status names the sandbox"  "agent-sandbox-repo-1"
 
 # ── firewall ────────────────────────────────────────────────────────────────
 

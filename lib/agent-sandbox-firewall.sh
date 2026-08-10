@@ -13,11 +13,11 @@
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-firewall show  [--sandbox NAME]
-agent-sandbox-firewall allow [--sandbox NAME] ENTRY...
-agent-sandbox-firewall deny  [--sandbox NAME] ENTRY...
-agent-sandbox-firewall rm    [--sandbox NAME] ENTRY...
-agent-sandbox-firewall reset [--sandbox NAME]
+agent-sandbox-firewall show  [SANDBOX] [--sandbox NAME]
+agent-sandbox-firewall allow [SANDBOX] [--sandbox NAME] ENTRY...
+agent-sandbox-firewall deny  [SANDBOX] [--sandbox NAME] ENTRY...
+agent-sandbox-firewall rm    [SANDBOX] [--sandbox NAME] ENTRY...
+agent-sandbox-firewall reset [SANDBOX] [--sandbox NAME]
 
   show    the rules in force, and which came from AGENTS.md
   allow   permit a domain or IP, from now on
@@ -148,9 +148,15 @@ need_entries() {
 
 case "$action" in
   show|ls|list)
-    [[ ${#entries[@]} -eq 0 ]] || {
-      echo "${0##*/}: show takes no arguments" >&2; exit 1
-    }
+    if [[ ${#entries[@]} -eq 1 ]]; then
+      if [[ -n "$sandbox_name" ]]; then
+         echo "${0##*/}: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+      fi
+      sandbox_name="${entries[0]}"
+      entries=()
+    elif [[ ${#entries[@]} -gt 1 ]]; then
+      echo "${0##*/}: show takes at most one argument (the sandbox)" >&2; exit 1
+    fi
     printf '%s\n' "$sandbox"
     printf '  policy      %s\n' "$policy"
 
@@ -195,6 +201,12 @@ case "$action" in
     ;;
 
   allow|deny)
+    if [[ -z "$sandbox_name" && ${#entries[@]} -gt 0 ]]; then
+      if sandbox_running "${entries[0]}"; then
+        sandbox_name="${entries[0]}"
+        entries=("${entries[@]:1}")
+      fi
+    fi
     need_entries
     list_prefix="allow"
     [[ "$action" == "deny" ]] && list_prefix="deny"
@@ -228,6 +240,12 @@ case "$action" in
     ;;
 
   rm|remove)
+    if [[ -z "$sandbox_name" && ${#entries[@]} -gt 0 ]]; then
+      if sandbox_running "${entries[0]}"; then
+        sandbox_name="${entries[0]}"
+        entries=("${entries[@]:1}")
+      fi
+    fi
     need_entries
     filter_out_entries "$policy" "${entries[@]}" > "$policy_dir/.policy.next"
 
@@ -244,9 +262,15 @@ case "$action" in
     ;;
 
   reset)
-    [[ ${#entries[@]} -eq 0 ]] || {
-      echo "${0##*/}: reset takes no arguments" >&2; exit 1
-    }
+    if [[ ${#entries[@]} -eq 1 ]]; then
+      if [[ -n "$sandbox_name" ]]; then
+         echo "${0##*/}: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+      fi
+      sandbox_name="${entries[0]}"
+      entries=()
+    elif [[ ${#entries[@]} -gt 1 ]]; then
+      echo "${0##*/}: reset takes at most one argument (the sandbox)" >&2; exit 1
+    fi
     if [[ ! -f "$base" ]]; then
       echo "${0##*/}: no baseline policy to restore" >&2
       exit 1

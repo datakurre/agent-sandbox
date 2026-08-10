@@ -12,7 +12,7 @@
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-logs [-f|--follow] [--tail N] [--sandbox NAME]
+agent-sandbox-logs [-f|--follow] [--tail N] [SANDBOX] [--sandbox NAME]
 
 Shows the proxy sidecar's log for a sandbox.
 
@@ -44,7 +44,13 @@ while [[ $# -gt 0 ]]; do
     --sandbox=*) sandbox_name="${1#--sandbox=}" ;;
     -h|--help)   usage; exit 0 ;;
     -*)          echo "${0##*/}: unknown option: $1" >&2; usage >&2; exit 1 ;;
-    *)           echo "${0##*/}: unexpected argument: $1" >&2; usage >&2; exit 1 ;;
+    *)
+       if [[ -z "$sandbox_name" ]]; then
+         sandbox_name="$1"
+       else
+         echo "${0##*/}: unexpected argument: $1" >&2; usage >&2; exit 1
+       fi
+       ;;
   esac
   shift
 done
