@@ -15,9 +15,11 @@ if ! podman image exists "$AGENT_SANDBOX_IMAGE" 2>/dev/null; then
 fi
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-# On by default: things the agent needs to be useful in a normal git workflow.
-# Off by default: things that widen the sandbox boundary (podman socket,
-# on-disk gpg secrets) or that only some hosts want (selinux relabelling).
+# Everything is off by default, including the integrations an agent needs to be
+# useful in a normal git workflow.  Nothing pierces the sandbox boundary unless
+# it was asked for, at the cost of a bare launcher doing very little: downstream
+# tooling is expected to bake in its own defaults with wrapProgram --add-flags,
+# which the user can still override because the last flag wins (see README).
 want_ssh=0
 want_git=0
 want_gpg=0
