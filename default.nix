@@ -363,6 +363,15 @@ let
     text = preamble + sandboxResolve + scriptBody ./lib/agent-sandbox-port.sh;
   };
 
+  mountScript = pkgs.writeShellApplication {
+    name = "agent-sandbox-mount";
+    runtimeInputs = with pkgs; [
+      podman
+      coreutils
+    ];
+    text = preamble + sandboxResolve + scriptBody ./lib/agent-sandbox-mount.sh;
+  };
+
   purgeScript = pkgs.writeShellApplication {
     name = "agent-sandbox-purge";
     runtimeInputs = with pkgs; [
@@ -475,6 +484,7 @@ let
     runtimeInputs = [
       loadScript
       portScript
+      mountScript
       purgeScript
       listScript
       netScript
@@ -608,6 +618,7 @@ let
       paths = [
         launcher
         portScript
+        mountScript
         purgeScript
         listScript
         ctlScript
@@ -640,6 +651,7 @@ pkgs.symlinkJoin {
       launcher
       loadScript
       portScript
+      mountScript
       purgeScript
       listScript
       ctlScript

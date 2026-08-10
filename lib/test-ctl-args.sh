@@ -50,6 +50,7 @@ compose() { # name source...
 }
 
 compose agent-sandbox-port   agent-sandbox-resolve.sh agent-sandbox-port.sh
+compose agent-sandbox-mount  agent-sandbox-resolve.sh agent-sandbox-mount.sh
 compose agent-sandbox-net    agent-sandbox-resolve.sh agent-sandbox-net.sh
 compose agent-sandbox-logs   agent-sandbox-resolve.sh agent-sandbox-logs.sh
 compose agent-sandbox-status agent-sandbox-resolve.sh agent-sandbox-status.sh
@@ -73,6 +74,7 @@ net_bin="$tmp/bin/agent-sandbox-net"
 logs_bin="$tmp/bin/agent-sandbox-logs"
 status_bin="$tmp/bin/agent-sandbox-status"
 load_bin="$tmp/bin/agent-sandbox-load"
+mount_bin="$tmp/bin/agent-sandbox-mount"
 
 failures=0
 
@@ -320,6 +322,20 @@ expect_out    "port ls says why" "ls takes at most one argument"
 run "$port_bin" ls
 expect_status "port ls succeeds" 0
 expect_out    "port ls reports orphaned forwarders" "orphaned forwarders"
+
+# ── mount ───────────────────────────────────────────────────────────────────
+
+run "$mount_bin" --sandbox s1 1 2 3
+expect_status "mount rejects --sandbox and 3 positionals" 1
+expect_out    "mount says why" "cannot specify both --sandbox and a positional sandbox name"
+
+run "$mount_bin" 1 2 3 4
+expect_status "mount rejects 4 positionals" 1
+expect_out    "mount says why" "expected [SANDBOX] HOST_PATH CONTAINER_PATH"
+
+run "$mount_bin" --sandbox agent-sandbox-plain-1 /does-not-exist /container/path
+expect_status "mount rejects missing host path" 1
+expect_out    "mount says why" "does not exist or is not a directory"
 
 # ── net argument handling ───────────────────────────────────────────────────
 

@@ -12,6 +12,7 @@ usage() {
   printf '  %-9s%s\n' logs     "Show the proxy log for a running sandbox"
   printf '  %-9s%s\n' port     "Manage port forwarding"
   printf '  %-9s%s\n' attach   "Attach to a running sandbox and exec a command"
+  printf '  %-9s%s\n' mount    "Bind-mount a host directory into a running sandbox"
   printf '  %-9s%s\n' purge    "Reclaim leftover containers, networks and directories"
 }
 
@@ -28,6 +29,7 @@ case "$cmd" in
   load)        exec agent-sandbox-load "$@" ;;   # "$@" so `load --help` does not import the image
   purge)       exec agent-sandbox-purge "$@" ;;
   port)        exec agent-sandbox-port "$@" ;;
+  mount)       exec agent-sandbox-mount "$@" ;;
   list)        exec agent-sandbox-list "$@" ;;
   attach)      exec agent-sandbox-attach "$@" ;;
   status)      exec agent-sandbox-status "$@" ;;
