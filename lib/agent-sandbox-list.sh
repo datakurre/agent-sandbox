@@ -49,7 +49,7 @@ container_label() { # container key
 row_format=$'{{.ID}}\t{{.Names}}\t{{.Status}}'
 
 list_sandboxes() { # ps-args...
-  printf 'CONTAINER ID\tNAMES\tSTATUS\tPROXY\tWORKSPACE\n'
+  printf 'CONTAINER ID\tNAMES\tSTATUS\tPROXY\tWORKSPACE\tCOMMAND\n'
   podman ps "$@" --format "$row_format" |
     while IFS=$'\t' read -r id name status; do
       local ws
@@ -59,9 +59,16 @@ list_sandboxes() { # ps-args...
       local slug="${ws_base//[^A-Za-z0-9_.-]/-}"
       local prefix="agent-sandbox-${slug:0:32}-"
       local short_name="${name#"$prefix"}"
-      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$short_name" "$status" \
+      local cmd
+      cmd="$(container_label "$name" agent-sandbox.command)"
+      if [[ -z "$cmd" ]]; then
+        cmd="$(podman inspect --format '{{range .Config.Cmd}}{{.}} {{end}}' "$name" 2>/dev/null || true)"
+        cmd="${cmd% }"
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$short_name" "$status" \
         "$(container_label "$name" agent-sandbox.proxy)" \
-        "$ws"
+        "$ws" \
+        "$cmd"
     done
 }
 

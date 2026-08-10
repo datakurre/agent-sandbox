@@ -850,6 +850,7 @@ podman run \
   --label "agent-sandbox.role=sandbox" \
   --label "agent-sandbox.workspace=$PWD" \
   --label "agent-sandbox.proxy=$proxy_mode" \
+  --label "agent-sandbox.command=${cmd_args[*]}" \
   --workdir "$workspace_dir" \
   -e HOME=/home/user \
   -v "$passwd_tmp:/etc/passwd:ro" \
