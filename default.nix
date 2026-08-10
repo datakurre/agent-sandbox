@@ -294,7 +294,7 @@ let
     };
   };
 
-  # The launcher mounts host /nix over the image store by default, so image
+  # Under --nix the launcher mounts host /nix over the image store, so image
   # referenced paths must stay rooted in this package closure as well.
   imageStorePaths = pkgs.writeTextDir "share/agent-sandbox/image-store-paths" (
     lib.concatMapStringsSep "\n" toString (
