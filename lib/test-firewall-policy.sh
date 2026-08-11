@@ -50,6 +50,7 @@ allow_domains = ["github.com", "*.githubusercontent.com"]
 deny_domains = ["telemetry.example.com", "ads.example.com"]
 allow_ips = ["10.0.0.0/8", "192.168.1.0/24"]
 deny_ips = ["10.1.0.0/24", "8.8.8.8"]
+allow_ports = ["443", "8000-8100"]
 ```
 EOF
 
@@ -65,7 +66,9 @@ deny_domains ads.example.com
 allow_ips 10.0.0.0/8
 allow_ips 192.168.1.0/24
 deny_ips 10.1.0.0/24
-deny_ips 8.8.8.8'
+deny_ips 8.8.8.8
+allow_ports 443
+allow_ports 8000-8100'
 
 if [[ "$(grep -v '^#' <<< "$policy")" == "$expected" ]]; then
   pass "parser emits one entry per line"
@@ -87,7 +90,9 @@ for want in \
   "allow_ips 10.0.0.0/8" \
   "allow_ips 192.168.1.0/24" \
   "deny_ips 10.1.0.0/24" \
-  "deny_ips 8.8.8.8"
+  "deny_ips 8.8.8.8" \
+  "allow_ports 443" \
+  "allow_ports 8000-8100"
 do
   expect_contains "proxy keeps '$want'" "$want" "$rules"
 done
@@ -178,6 +183,34 @@ fi
 expect_contains "blackhole covers the first entry"  "blackhole 10.1.0.0/24" "$dry"
 expect_contains "blackhole covers the second entry" "blackhole 8.8.8.8"     "$dry"
 expect_contains "the proxy is given the policy file" "--policy" "$dry"
+
+# ── 7. --meter-network (no FIREWALL) still gets a policy ────────────────────
+# The baseline private/loopback deny list only protects meter-only sessions if
+# the sidecar always hands the proxy a --policy, not only when --firewall was
+# requested.  FIREWALL is deliberately left unset here to simulate that mode.
+
+dry_metering=$(AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
+               AGENT_SANDBOX_SIDECAR_POLICY="$tmp/policy" \
+               bash "$sidecar")
+expect_contains "the proxy is given a policy under --meter-network too" \
+  "--policy" "$dry_metering"
+
+# ── 8. dry-run never binds a real address ────────────────────────────────────
+# There is no interface to inspect outside a container, and no real bind
+# happens under dry-run either, so --listen must not appear -- with or without
+# SIDECAR_SUBNET set, since a real launch always sets it but dry-run must not
+# depend on that to stay usable in a nix build (no podman, no network ns).
+
+dry_listen=$(FIREWALL=1 \
+             AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
+             AGENT_SANDBOX_SIDECAR_POLICY="$tmp/policy" \
+             SIDECAR_SUBNET="10.89.0.0/24" \
+             bash "$sidecar")
+if grep -qF -- "--listen" <<< "$dry_listen"; then
+  fail "dry-run does not pass --listen" "$dry_listen"
+else
+  pass "dry-run does not pass --listen"
+fi
 
 if [[ "$failures" -gt 0 ]]; then
   printf '\n%s test(s) failed\n' "$failures" >&2

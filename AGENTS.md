@@ -113,8 +113,8 @@ log of what it did. Changing policy is therefore a host-side operation
 `agent-sandbox-allow` was deleted rather than repaired.
 
 **Policy format.** One `KEY VALUE` per line (`allow_domains`, `deny_domains`,
-`allow_ips`, `deny_ips`, `default`).  A value containing whitespace is a hard
-error.  This replaced four differently-encoded arguments -- allow_domains as argv
+`allow_ips`, `deny_ips`, `allow_ports`, `default`).  A value containing whitespace
+is a hard error.  This replaced four differently-encoded arguments -- allow_domains as argv
 words, the rest as space-joined env vars, all parsed as CSV -- where every entry
 past the first was silently dropped, and an emptied allow list means allowing
 everything.  One entry per line means any fixture with two entries exercises the
@@ -124,6 +124,22 @@ case that used to break.
 `parse_agents.py` writes the file, the proxy reads it, the host-side `firewall`
 command vets its own writes with the same binary, and `checks.firewall-policy`
 tests the whole chain.  There is no second implementation to drift.
+
+The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
+CGNAT, ULA) to every policy it writes, in both `--firewall` and `--meter-network`.
+The sidecar sits on the default bridge as well as the sandbox's internal network,
+so without it a policy with no rules -- which is exactly what metering runs -- could
+be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
+ordinary `deny_ips` entries rather than compiling it into the proxy means one
+list, visible in `firewall show`, restored by `reset`, and mirrored into the
+kernel blackhole routes by the same `sync_blackholes` that handles user rules.
+An `allow_ips` entry of equal or greater specificity overrides one of them; that
+is why `is_denied_address` breaks prefix ties toward allow.
+
+Because the sidecar is on that bridge, the proxy binds only the address it holds
+on the internal network, selected by subnet membership from `SIDECAR_SUBNET`
+rather than by interface name -- podman's eth0/eth1 assignment follows the order
+of the `--network` flags and is not something to depend on.
 
 **Startup ordering** matters and is why there are two readiness markers: the
 proxy validates policy, probes egress and writes `proxy-ready`; the sidecar then

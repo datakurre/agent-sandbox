@@ -94,19 +94,22 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
 - `--podman`: Forwards the host rootless Podman socket (sibling containers).
 - `--selinux`: Applies SELinux shared relabeling (`:z`) to writable binds.
 - `--firewall`: Isolates the container from the internet and routes HTTP(S) and SSH traffic through a domain-filtering proxy based on the `[proxy]` block in `AGENTS.md`. Other traffic is blocked.
-  - The `[proxy]` block supports `allow_domains`, `deny_domains`, `allow_ips`, and `deny_ips`.
+  - The `[proxy]` block supports `allow_domains`, `deny_domains`, `allow_ips`, `deny_ips`
+    and `allow_ports`.
   - **Default Policy**: 
     - If you provide any allow list (`allow_domains` or `allow_ips`), the default policy becomes **deny all**.
     - If you only provide deny lists (`deny_domains` or `deny_ips`), the default policy is **allow all**.
+    - `allow_ports` does **not** flip the default on its own — only `allow_domains` and `allow_ips` do. It restricts which ports are reachable, not which hosts.
   - **Simultaneous Allow & Deny (Most Specific Wins)**: You can specify both allow and deny rules at the same time. When a target matches both, the **more specific rule wins**:
     - For domains, the longer pattern wins (e.g., an explicit rule for `api.github.com` overrides a wildcard rule for `*.github.com`).
     - For IPs, the longer CIDR prefix wins (e.g., `10.1.0.0/24` overrides `10.0.0.0/8`).
-  - **Wildcards**: Wildcards are supported for domains (e.g., `*.github.com`). Note that a strict domain like `github.com` only matches that exact domain and **does not** match subdomains like `status.github.com`. To match both, you must specify both `github.com` and `*.github.com`. This applies to both allow and deny domain rules.
+  - **Wildcards**: Wildcards are supported for domains (e.g., `*.github.com`). A strict domain like `github.com` matches that exact domain and **does not** match subdomains like `status.github.com`. A wildcard matches both the subdomains and the apex, so `*.github.com` alone covers `github.com` as well — which also means a deny rule written `*.github.com` blocks the apex. This applies to both allow and deny domain rules.
   - Domain matching is case-insensitive. When an allow and a deny rule match with equal specificity, allow wins.
   - Hostnames are also checked against `deny_ips` *after* resolution, so a denied address cannot be reached through an allowed name.
   - `default = "allow"` or `default = "deny"` overrides the derived default explicitly.
   - An invalid `[proxy]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote.
-  - `--firewall` with no allow rules allows every host — it is then a metering proxy. The launcher says so at startup, and `agent-sandbox-ctl firewall show` reports `default allow`.
+  - `--firewall` with no allow rules allows every *public* host on every port — it is then a metering proxy. Private and loopback ranges stay refused regardless (see below). The launcher says so at startup, and `agent-sandbox-ctl firewall show` reports `default allow`.
+  - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
   - **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around. `agent-sandbox-ctl port add` refuses a proxied sandbox for the same reason.
 - `--meter-network`: Isolates the container from the internet, routes HTTP(S) and SSH traffic through a proxy, and prints a post-run summary of it. Other traffic is blocked.
   - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
@@ -135,6 +138,61 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
   - The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--meter-network` additionally prints the summary when the session ends, and keeps the log at `$TMPDIR/agent-sandbox-connections-<pid>.jsonl` if anything was denied or failed. `agent-sandbox-network-summary <log>` re-renders a kept log.
   - Neither the policy nor the log is reachable from inside the sandbox, so the agent can neither widen its own firewall nor edit the record of its traffic.
 
+### What the policy covers
+
+The containment itself is separate from the policy: the sandbox gets a single interface on
+an internal network with no route off it, so the proxy is the only reachable destination and
+an agent that ignores `HTTP_PROXY` simply fails. Everything below is the *policy* applied at
+the proxy, which used to have gaps — see [`TODO-firewall.md`](./TODO-firewall.md) for the
+history and the two that remain.
+
+Rules match on host **and** port, though the port half only engages once the policy is
+deny-by-default. Whenever you declare `allow_domains` or `allow_ips`, `allow_ports` defaults
+to `80,443,22` — enough for web and git-over-SSH — and anything else has to be named:
+
+```toml
+[proxy]
+allow_domains = ["github.com", "*.github.com"]
+allow_ports = ["443", "8000-8100"]
+```
+
+An allow-by-default policy (deny rules only, or `--meter-network`, which runs no rules of
+your own) leaves ports unrestricted unless you write `allow_ports` yourself. Denials say
+which half refused, so an allowed host on an unlisted port is distinguishable from a host
+that was never allowed:
+
+```
+proxy: deny github.com:8443 (port not in allow_ports; add `allow_ports 8443`)
+```
+
+Private and loopback destinations are refused by default in every mode — `--firewall` or
+`--meter-network`, with or without any rule of your own — whether they are named directly
+or reached through a hostname that resolves to one:
+`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`,
+`100.64.0.0/10`, `0.0.0.0/8`, `fc00::/7`, `fe80::/10` and `::1/128`. The sidecar itself still sits
+on the host's default bridge network as well as the sandbox's internal one — that is how it
+gets `HTTP_PROXY`-reachable and keeps a working resolver — so without this baseline the proxy
+could otherwise be asked to reach your host and your LAN on the sandbox's behalf. It also
+binds only its address on the sandbox's internal network for accepting connections, not that
+bridge, so another container of the same user cannot use it as an open proxy either. Allow a
+range back explicitly when you need it:
+
+```toml
+[proxy]
+allow_ips = ["10.0.0.0/8"]   # corporate git over the VPN
+```
+
+Hostnames are normalised before matching, so a trailing dot (`github.com.`) and an
+IPv4-mapped IPv6 literal (`[::ffff:10.0.0.1]`) match the same rules as their plain forms.
+Deny lists are therefore enforcing rather than advisory, in every mode.
+
+Two limits remain by design. The proxy does not decrypt TLS, so it cannot see which host a
+tunnel talks to after `CONNECT` — allowing a host that is itself a relay, a CDN with open
+forwarding, or a service with an SSRF bug grants everything reachable behind it. And egress
+is `CONNECT`-only: UDP, QUIC/HTTP3, ICMP and raw TCP have no path out at all, which is why
+some tools need `HTTP_PROXY` honoured explicitly (`NODE_USE_ENV_PROXY=1` is set for Node) and
+why SSH is rewritten through a generated `ProxyCommand`.
+
 ### Changing the firewall mid-session
 
 ```console
@@ -144,15 +202,29 @@ agent-sandbox-myrepo-4213
   default     deny  (only the rules below are reachable)
   allow_domains github.com                         AGENTS.md
   allow_ips     10.0.0.0/8                         AGENTS.md
+  deny_ips      127.0.0.0/8                        AGENTS.md
+  deny_ips      169.254.0.0/16                     AGENTS.md
+  …
 
 $ agent-sandbox-ctl firewall allow api.openai.com
   allowed     api.openai.com                    domains
   reloading   the proxy applies this within a second
+
+$ agent-sandbox-ctl firewall allow 8443
+  allowed     8443                              ports
+  reloading   the proxy applies this within a second
 ```
+
+`allow` infers what kind of entry you gave it — domain, address or port — and prints back
+what it decided. Ports have no deny form, since `allow_ports` is a global restriction rather
+than something scoped to a host, so `firewall deny 8443` is refused. The baseline private and
+loopback ranges appear in `show` as ordinary `deny_ips` rules; they are currently attributed
+to `AGENTS.md` even though the launcher writes them, which is cosmetic and tracked in
+[`TODO-firewall.md`](./TODO-firewall.md).
 
 Changes take effect for new connections within a second. Connections already established keep running: the proxy checks policy when a connection opens and does not re-check it afterwards, so tightening a rule does not cut a tunnel that is already up — end the session for that. `firewall show` says how many are open when it matters.
 
-`reset` restores the `[proxy]` policy from `AGENTS.md` rather than emptying the rules, since an empty policy allows everything.
+`reset` restores the `[proxy]` policy from `AGENTS.md` rather than emptying the rules, since an empty policy allows everything. The baseline denials are part of what it restores, so a reset cannot drop them either.
 - `--ports`: Honors `[ports]` declarations from `AGENTS.md`.
 - `--ports-dynamic`: Allows `agent-sandbox-ctl port add` post-launch.
 - `--ports-any-interface`: Permits port binds outside of loopback interfaces.

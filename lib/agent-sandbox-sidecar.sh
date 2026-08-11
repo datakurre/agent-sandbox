@@ -114,15 +114,53 @@ sync_blackholes() {
 # both were guessing at a configuration the launcher can simply ask for.
 
 proxy_args=(--log "$metrics_log")
-if [[ "${FIREWALL:-0}" == "1" ]]; then
-  if [[ ! -f "$policy_file" ]]; then
-    echo "sidecar: --firewall was requested but $policy_file is missing" >&2
+# Unconditional, in both --firewall and --meter-network: the launcher always
+# writes at least the baseline private/loopback deny list to this file (see
+# agent-sandbox.sh), so a proxy that never reads it would run the baseline-less
+# empty config it used to under metering alone, and be usable as an SSRF pivot
+# onto the host and its LAN.
+if [[ ! -f "$policy_file" ]]; then
+  echo "sidecar: $policy_file is missing" >&2
+  exit 1
+fi
+proxy_args+=(--policy "$policy_file")
+
+# Bind only the address the sidecar has on its internal network, not every
+# interface: the sidecar is also on the default podman bridge (for
+# HTTP_PROXY/DNS plumbing the launcher needs), and a proxy listening on
+# 0.0.0.0 would be reachable there too, by any other container of the same
+# user.  Picked by subnet membership, not by interface name/order -- the
+# launcher passes `--network bridge --network "$sidecar_id"`, and which one
+# podman assigns as eth0 is not something to depend on.
+#
+# Skipped under dry-run: there is no real interface to inspect outside a
+# container, and no bind actually happens there anyway.
+sidecar_listen=""
+if [[ "${AGENT_SANDBOX_SIDECAR_DRY_RUN:-0}" != "1" ]]; then
+  if [[ -z "${SIDECAR_SUBNET:-}" ]]; then
+    echo "sidecar: SIDECAR_SUBNET is not set; refusing to bind on all interfaces" >&2
     exit 1
   fi
-  proxy_args+=(--policy "$policy_file")
+  sidecar_listen=$(run_ip -o -4 addr show scope global \
+    | awk '{print $4}' \
+    | python3 -c '
+import ipaddress, sys
+subnet = ipaddress.ip_network(sys.argv[1])
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    ip = ipaddress.ip_interface(line).ip
+    if ip in subnet:
+        print(ip)
+        break
+' "$SIDECAR_SUBNET")
+  if [[ -z "$sidecar_listen" ]]; then
+    echo "sidecar: no local address falls inside $SIDECAR_SUBNET" >&2
+    exit 1
+  fi
+  proxy_args+=(--listen "$sidecar_listen:8888")
 fi
-# Metering only: no policy at all, so the proxy allows everything and just
-# accounts it.
 
 if [[ "${AGENT_SANDBOX_SIDECAR_DRY_RUN:-0}" == "1" ]]; then
   run_proxy "${proxy_args[@]}"
