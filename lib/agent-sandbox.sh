@@ -639,6 +639,17 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     exit 1
   fi
 
+  # The sidecar is also on the default bridge (below), so the proxy binding
+  # 0.0.0.0 would be reachable from any other container of the same user on
+  # that network.  Handing the sidecar its own internal-network subnet lets it
+  # bind only the address it has there instead -- see agent-sandbox-sidecar.sh.
+  sidecar_subnet=$(podman network inspect "$sidecar_id" \
+    --format '{{(index .Subnets 0).Subnet}}' 2>/dev/null) || sidecar_subnet=""
+  if [[ -z "$sidecar_subnet" ]]; then
+    echo "agent-sandbox: could not determine the subnet of $sidecar_id" >&2
+    exit 1
+  fi
+
   # The policy file is the single channel by which policy reaches the proxy.  It
   # replaced four separately-encoded arguments, where a space-separated list met a
   # comma-separated parser and every entry past the first was silently dropped --
@@ -656,13 +667,36 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
       exit 1
     fi
   fi
+
+  # Refused in every mode -- --firewall or --meter-network, with or without any
+  # user rule -- so a proxy with no rules (or deny-only rules) cannot be used to
+  # reach the host or its LAN.  The sidecar sits on the default bridge alongside
+  # the proxy; the sandbox has no route there at all, but it can ask the proxy
+  # to go there on its behalf.  Written as ordinary deny_ips entries into the
+  # same file the proxy reads and the sidecar mirrors into kernel blackhole
+  # routes (sync_blackholes), so this is the only place this list is written
+  # down.  An allow_ips entry of equal or greater specificity overrides one of
+  # these -- see is_allowed_ip/is_denied_address in proxy/src/main.rs.
+  baseline_deny_ips=(
+    127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+    169.254.0.0/16 100.64.0.0/10 0.0.0.0/8 fc00::/7 fe80::/10
+  )
+  for cidr in "${baseline_deny_ips[@]}"; do
+    printf 'deny_ips %s\n' "$cidr" >> "$sidecar_policy/policy"
+  done
+
   # Kept pristine so `agent-sandbox-ctl firewall reset` has something to restore
   # and `firewall show` can tell declared rules from ones added at runtime.
+  # The baseline above is included, so a reset cannot lose it either.
   cp "$sidecar_policy/policy" "$sidecar_policy/policy.base"
 
-  if [[ "$want_firewall" == "1" ]] && ! grep -q '^allow_' "$sidecar_policy/policy"; then
-    echo "agent-sandbox: --firewall is active with no allow rules, so every host is allowed." >&2
-    echo "               Declare allow_domains/allow_ips in a [proxy] block to restrict it." >&2
+  # (domains|ips) only: allow_ports alone does not make the policy
+  # deny-by-default -- only allow_domains/allow_ips do, and in the branch
+  # below allow_ports is unrestricted too, not the 80/443/22 default.
+  if [[ "$want_firewall" == "1" ]] && ! grep -qE '^allow_(domains|ips) ' "$sidecar_policy/policy"; then
+    echo "agent-sandbox: --firewall is active with no allow rules, so every host is allowed" >&2
+    echo "               on every port. Declare allow_domains/allow_ips (and optionally" >&2
+    echo "               allow_ports) in a [proxy] block to restrict it." >&2
   fi
 
   # NET_ADMIN backs the blackhole routes installed for deny_ips.  Metering used
@@ -745,6 +779,7 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:$rw_mount_opts" \
     -v "$sidecar_policy:/sidecar_policy:ro" \
     -e "FIREWALL=$want_firewall" \
+    -e "SIDECAR_SUBNET=$sidecar_subnet" \
     "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar >/dev/null; then
     echo "agent-sandbox: could not start the proxy sidecar" >&2
     exit 1
@@ -800,6 +835,11 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   # container name -- and even when there was, nothing in the readiness
   # handshake proved aardvark had published the record before the sandbox
   # started, which is one more startup race that simply stops existing here.
+  #
+  # This necessarily agrees with the address the proxy itself binds to inside
+  # the sidecar (agent-sandbox-sidecar.sh selects one from $sidecar_subnet on
+  # the same interface), since both are just two ways of reading the one IP
+  # podman assigned the container on $sidecar_id.
   sidecar_ip=""
   for _ in $(seq 1 20); do
     # `container inspect`, not plain `inspect`: the network carries the same

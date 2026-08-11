@@ -308,6 +308,31 @@ class TestProxyDenyIpsParsing(unittest.TestCase):
             parse_proxy_deny_ips(text)
 
 
+class TestProxyAllowPortsParsing(unittest.TestCase):
+    def test_valid_ports(self):
+        text = block('[proxy]\nallow_ports = ["443", "8000-8100"]')
+        from parse_agents import parse_proxy_allow_ports
+        self.assertEqual(parse_proxy_allow_ports(text), ["443", "8000-8100"])
+
+    def test_empty_list(self):
+        text = block("[proxy]\nallow_ports = []")
+        from parse_agents import parse_proxy_allow_ports
+        self.assertEqual(parse_proxy_allow_ports(text), [])
+
+    def test_invalid_port_rejected(self):
+        from parse_agents import parse_proxy_allow_ports, ConfigError
+        for bad in ("70000", "abc", "100-50", "0"):
+            text = block(f'[proxy]\nallow_ports = ["{bad}"]')
+            with self.assertRaisesRegex(ConfigError, "not a port or port range|out of range"):
+                parse_proxy_allow_ports(text)
+
+    def test_non_string_rejected(self):
+        text = block("[proxy]\nallow_ports = [443]")
+        from parse_agents import parse_proxy_allow_ports, ConfigError
+        with self.assertRaisesRegex(ConfigError, "must be strings"):
+            parse_proxy_allow_ports(text)
+
+
 class TestProxyDenyDomainsParsing(unittest.TestCase):
     def test_valid_domains(self):
         text = block('[proxy]\ndeny_domains = ["github.com", "api.example.org"]')
@@ -362,6 +387,7 @@ class TestProxyPolicyFile(unittest.TestCase):
             'deny_domains = ["telemetry.example.com", "ads.example.com"]\n'
             'allow_ips = ["10.0.0.0/8", "192.168.1.0/24"]\n'
             'deny_ips = ["10.1.0.0/24", "8.8.8.8"]\n'
+            'allow_ports = ["443", "8000-8100"]\n'
         )
         self.assertEqual(
             text.splitlines()[1:],
@@ -374,6 +400,8 @@ class TestProxyPolicyFile(unittest.TestCase):
                 "allow_ips 192.168.1.0/24",
                 "deny_ips 10.1.0.0/24",
                 "deny_ips 8.8.8.8",
+                "allow_ports 443",
+                "allow_ports 8000-8100",
             ],
         )
 

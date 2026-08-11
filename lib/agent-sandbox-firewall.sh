@@ -25,8 +25,10 @@ agent-sandbox-firewall reset [SANDBOX] [--sandbox NAME]
   rm      drop an entry from both lists
   reset   discard runtime changes and restore the AGENTS.md policy
 
-ENTRY is a domain (github.com, *.github.com) or an address or CIDR block
-(10.0.0.0/8, 8.8.8.8); which one is inferred and printed back.
+ENTRY is a domain (github.com, *.github.com), an address or CIDR block
+(10.0.0.0/8, 8.8.8.8), or a port or port range (443, 8000-8100); which one is
+inferred and printed back.  Ports are not scoped to a host and have no deny
+form -- allow_ports is a global restriction, so "deny" refuses a port entry.
 
 Changes apply to new connections within a second.  Connections already
 established are not re-checked -- end the session to cut those.
@@ -70,6 +72,8 @@ classify() {
   if [[ "$entry" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] \
      || [[ "$entry" == *:* ]]; then
     printf 'ips\n'
+  elif [[ "$entry" =~ ^[0-9]{1,5}(-[0-9]{1,5})?$ ]]; then
+    printf 'ports\n'
   elif [[ "$entry" =~ ^(\*\.)?[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$ ]]; then
     printf 'domains\n'
   else
@@ -160,7 +164,9 @@ case "$action" in
     printf '%s\n' "$sandbox"
     printf '  policy      %s\n' "$policy"
 
-    if grep -q '^allow_' "$policy" 2>/dev/null; then
+    # (domains|ips) only: allow_ports alone does not make the policy
+    # deny-by-default -- only allow_domains/allow_ips do.
+    if grep -qE '^allow_(domains|ips) ' "$policy" 2>/dev/null; then
       printf '  default     deny  (only the rules below are reachable)\n'
     else
       printf '  default     allow  (no allow rules declared, so every host is reachable)\n'

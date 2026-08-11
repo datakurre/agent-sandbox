@@ -37,6 +37,7 @@ allow_domains = ["example.com", "*.example.com"]
 deny_domains = ["blocked.example.org", "also-blocked.example.org"]
 allow_ips = ["10.0.0.0/8", "192.168.0.0/16"]
 deny_ips = ["203.0.113.0/24", "198.51.100.7"]
+allow_ports = ["443"]
 ```
 EOF
 
@@ -77,7 +78,8 @@ for want in \
   "example.com" "*.example.com" \
   "blocked.example.org" "also-blocked.example.org" \
   "10.0.0.0/8" "192.168.0.0/16" \
-  "203.0.113.0/24" "198.51.100.7"
+  "203.0.113.0/24" "198.51.100.7" \
+  "443"
 do
   if grep -qF -- "$want" <<< "$rules"; then
     pass "policy carries $want"
@@ -148,6 +150,22 @@ else
   else
     pass "the proxy proved egress at startup"
   fi
+
+  # The proxy must bind only its internal-network address, not the default
+  # bridge it also sits on -- otherwise any other container of the same user
+  # on that bridge could use it as an open proxy under this sandbox's policy.
+  bridge_ip=$(podman container inspect "$sidecar" \
+    --format '{{(index .NetworkSettings.Networks "bridge").IPAddress}}' 2>/dev/null)
+  if [[ -z "$bridge_ip" ]]; then
+    fail "the proxy is not reachable on the default bridge" \
+      "could not determine the sidecar's bridge-network address"
+  elif podman run --rm --network bridge "$AGENT_SANDBOX_IMAGE" \
+         curl -sS -o /dev/null -m 5 "http://$bridge_ip:8888" >/dev/null 2>&1; then
+    fail "the proxy is not reachable on the default bridge" \
+      "a sibling container on the bridge reached $bridge_ip:8888"
+  else
+    pass "the proxy is not reachable on the default bridge"
+  fi
 fi
 
 # ── enforcement ──────────────────────────────────────────────────────────────
@@ -158,6 +176,15 @@ if in_sandbox curl -sS -o /dev/null -m 20 https://example.com; then
   pass "an allowed host is reachable"
 else
   fail "an allowed host is reachable" "$(agent-sandbox-ctl logs --sandbox "$sandbox" | tail -5)"
+fi
+
+# A trailing-dot FQDN is the same host to any resolver; the policy must treat
+# it the same as the plain form instead of letting it slip past matching.
+if in_sandbox curl -sS -o /dev/null -m 20 "https://example.com."; then
+  pass "a trailing-dot form of an allowed host is reachable"
+else
+  fail "a trailing-dot form of an allowed host is reachable" \
+    "$(agent-sandbox-ctl logs --sandbox "$sandbox" | tail -5)"
 fi
 
 if in_sandbox curl -sS -o /dev/null -m 20 https://nixos.org 2>/dev/null; then
@@ -173,6 +200,13 @@ if in_sandbox curl -sS -o /dev/null -m 10 http://198.51.100.7 2>/dev/null; then
   fail "a denied bare address is refused" "198.51.100.7 was reachable"
 else
   pass "a denied bare address is refused"
+fi
+
+# allow_ports = ["443"]: the host is allowed, but plain HTTP on 80 is not.
+if in_sandbox curl -sS -o /dev/null -m 10 http://example.com 2>/dev/null; then
+  fail "a non-allowed port on an allowed host is refused" "example.com:80 was reachable"
+else
+  pass "a non-allowed port on an allowed host is refused"
 fi
 
 # ── runtime policy change ────────────────────────────────────────────────────
@@ -226,6 +260,48 @@ else
   else
     fail "port add refuses a firewalled sandbox" "$(cat "$tmp/err")"
   fi
+fi
+
+# ── baseline private/loopback deny under --meter-network ─────────────────────
+# --meter-network runs no user policy at all, which used to mean the proxy ran
+# with a fully empty config (allow-everything, no deny_ips) and could be used
+# to reach the host's own bridge network.  The baseline deny list must close
+# that regardless of any user rule.
+
+mkdir -p "$tmp/meter"
+(cd "$tmp/meter" && agent-sandbox --meter-network --no-workspace -- sleep 300 \
+   >"$tmp/meter-launch.log" 2>&1 &)
+
+meter_sandbox=""
+for _ in $(seq 1 60); do
+  meter_sandbox=$(podman ps --filter "label=agent-sandbox.role=sandbox" \
+                            --filter "label=agent-sandbox.workspace=$tmp/meter" \
+                            --format '{{.Names}}' | head -n 1)
+  [[ -n "$meter_sandbox" ]] && break
+  sleep 1
+done
+
+if [[ -z "$meter_sandbox" ]]; then
+  fail "the --meter-network sandbox started" "$(cat "$tmp/meter-launch.log")"
+else
+  pass "the --meter-network sandbox started ($meter_sandbox)"
+
+  meter_sidecar=$(podman ps --filter "label=agent-sandbox.role=proxy" \
+                            --filter "label=agent-sandbox.target=$meter_sandbox" \
+                            --format '{{.Names}}' | head -n 1)
+  bridge_gw=$(podman network inspect bridge \
+    --format '{{(index .Subnets 0).Gateway}}' 2>/dev/null)
+
+  if [[ -z "$meter_sidecar" || -z "$bridge_gw" ]]; then
+    fail "the bridge gateway is refused under --meter-network" \
+      "could not resolve sidecar ($meter_sidecar) or bridge gateway ($bridge_gw)"
+  elif podman exec "$meter_sandbox" curl -sS -o /dev/null -m 10 "http://$bridge_gw" 2>/dev/null; then
+    fail "the bridge gateway is refused under --meter-network" "$bridge_gw was reachable"
+  else
+    pass "the bridge gateway is refused under --meter-network"
+  fi
+
+  podman rm -f "$meter_sandbox" >/dev/null 2>&1
 fi
 
 # ── refusals at launch ───────────────────────────────────────────────────────
