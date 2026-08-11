@@ -346,28 +346,50 @@ run "$port_bin" export one two
 expect_status "port export rejects two positionals" 1
 expect_out    "port export says why" "export takes at most one argument"
 
-# ── mount ───────────────────────────────────────────────────────────────────
+# ── mounts ──────────────────────────────────────────────────────────────────
+
+run "$mount_bin" ls one two
+expect_status "mounts ls rejects two positionals" 1
+expect_out    "mounts ls says why" "ls takes at most one argument"
+
+run "$mount_bin" add only-one
+expect_status "mounts add rejects one positional" 1
+expect_out    "mounts add says why" "add needs HOST_PATH CONTAINER_PATH"
+
+run "$mount_bin" rm
+expect_status "mounts rm rejects empty input" 1
+expect_out    "mounts rm says why" "rm needs CONTAINER_PATH"
 
 run "$mount_bin" --sandbox s1 1 2 3
-expect_status "mount rejects --sandbox and 3 positionals" 1
-expect_out    "mount says why" "cannot specify both --sandbox and a positional sandbox name"
+expect_status "mounts add rejects --sandbox and 3 positionals" 1
+expect_out    "mounts add says why" "cannot specify both --sandbox and a positional sandbox name"
 
 run "$mount_bin" 1 2 3 4
-expect_status "mount rejects 4 positionals" 1
-expect_out    "mount says why" "expected [SANDBOX] HOST_PATH CONTAINER_PATH"
+expect_status "mounts legacy add rejects 4 positionals" 1
+expect_out    "mounts legacy add says why" "expected [SANDBOX] HOST_PATH CONTAINER_PATH"
 
 run "$mount_bin" --sandbox agent-sandbox-plain-1 /does-not-exist /container/path
-expect_status "mount rejects missing host path" 1
-expect_out    "mount says why" "does not exist or is not a directory"
+expect_status "mounts add rejects missing host path" 1
+expect_out    "mounts add says why" "does not exist or is not a directory"
 
-# ── mount export ────────────────────────────────────────────────────────────
+tmp_mount_src="$tmp/mount-src"
+mkdir -p "$tmp_mount_src"
+run "$mount_bin" add --sandbox agent-sandbox-repo-1 "$tmp_mount_src" /container/path
+expect_status "mounts add succeeds" 0
+expect_out    "mounts add confirms mount" "Mounted"
+
+run "$mount_bin" rm --sandbox agent-sandbox-repo-1 /container/path
+expect_status "mounts rm succeeds" 0
+expect_out    "mounts rm confirms unmount" "Unmounted"
+
+# ── mounts export ───────────────────────────────────────────────────────────
 
 run "$mount_bin" export
-expect_status "mount export succeeds" 0
+expect_status "mounts export succeeds" 0
 
 run "$mount_bin" export one two
-expect_status "mount export rejects two positionals" 1
-expect_out    "mount export says why" "export takes at most one argument"
+expect_status "mounts export rejects two positionals" 1
+expect_out    "mounts export says why" "export takes at most one argument"
 
 # ── net argument handling ───────────────────────────────────────────────────
 

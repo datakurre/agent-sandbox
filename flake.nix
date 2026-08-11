@@ -54,7 +54,7 @@
         in
         {
           default = { type = "app"; program = "${package}/bin/agent-sandbox"; meta = { description = "Sandboxed AI coding environment via podman"; }; };
-          ctl = { type = "app"; program = "${package}/bin/agent-sandbox-ctl"; meta = { description = "agent-sandbox utility for caching images and configuring sandbox ports"; }; };
+          ctl = { type = "app"; program = "${package}/bin/agent-sandbox-ctl"; meta = { description = "agent-sandbox utility for managing running sandboxes"; }; };
         }
       );
 

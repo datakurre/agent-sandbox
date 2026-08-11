@@ -17,10 +17,10 @@
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-port ls
-agent-sandbox-port add    [SANDBOX] [--sandbox NAME] [HOST:]CONTAINER[/PROTO]
-agent-sandbox-port rm     [SANDBOX] [--sandbox NAME] (HOST | --all)
-agent-sandbox-port export [SANDBOX] [--sandbox NAME]
+agent-sandbox-ctl ports ls
+agent-sandbox-ctl ports add    [SANDBOX] [--sandbox NAME] [HOST:]CONTAINER[/PROTO]
+agent-sandbox-ctl ports rm     [SANDBOX] [--sandbox NAME] (HOST | --all)
+agent-sandbox-ctl ports export [SANDBOX] [--sandbox NAME]
 
   ls      show running sandboxes and the ports forwarded into them
   add     start a forwarder for one port
@@ -121,7 +121,7 @@ cmd_add() {
   fi
   case "$mode" in
     proxy)
-      echo "agent-sandbox-port: '$sandbox' was launched with a proxy ($mode)." >&2
+      echo "agent-sandbox-ctl ports: '$sandbox' was launched with a proxy ($mode)." >&2
       echo "                    Joining it to the $AGENT_SANDBOX_NETWORK network would give it" >&2
       echo "                    egress that does not pass through the proxy." >&2
       echo "                    Relaunch it without --proxy to forward ports." >&2
@@ -142,15 +142,15 @@ cmd_add() {
   fi
 
   if [[ ! "$host" =~ ^[0-9]+$ || ! "$container" =~ ^[0-9]+$ ]]; then
-    echo "agent-sandbox-port: expected [HOST:]CONTAINER[/PROTO], got '$2'" >&2
+    echo "agent-sandbox-ctl ports: expected [HOST:]CONTAINER[/PROTO], got '$2'" >&2
     exit 1
   fi
   if (( host < 1 || host > 65535 || container < 1 || container > 65535 )); then
-    echo "agent-sandbox-port: ports must be within 1-65535" >&2
+    echo "agent-sandbox-ctl ports: ports must be within 1-65535" >&2
     exit 1
   fi
   if [[ "$proto" != tcp && "$proto" != udp ]]; then
-    echo "agent-sandbox-port: protocol must be tcp or udp" >&2
+    echo "agent-sandbox-ctl ports: protocol must be tcp or udp" >&2
     exit 1
   fi
 
@@ -163,7 +163,7 @@ cmd_add() {
   if ! podman inspect --format '{{json .NetworkSettings.Networks}}' "$sandbox" \
        | grep -q "\"$AGENT_SANDBOX_NETWORK\""; then
     if ! podman network connect "$AGENT_SANDBOX_NETWORK" "$sandbox" 2>/dev/null; then
-      echo "agent-sandbox-port: '$sandbox' is not on the $AGENT_SANDBOX_NETWORK network" >&2
+      echo "agent-sandbox-ctl ports: '$sandbox' is not on the $AGENT_SANDBOX_NETWORK network" >&2
       echo "                    and cannot be joined to it while running." >&2
       echo "                    Relaunch it with: agent-sandbox --ports-dynamic" >&2
       exit 1
@@ -184,7 +184,7 @@ cmd_add() {
                        --filter "name=^agent-sandbox-fwd-.*-${host}\$" \
                        --format '{{.Names}}' 2>/dev/null | head -n 1)
   if [[ -n "$clash" ]]; then
-    echo "agent-sandbox-port: host port $host is already forwarded ($clash)" >&2
+    echo "agent-sandbox-ctl ports: host port $host is already forwarded ($clash)" >&2
     exit 1
   fi
 
@@ -217,7 +217,7 @@ cmd_rm() {
   done
 
   if [[ "$removed" -eq 0 ]]; then
-    echo "agent-sandbox-port: nothing to remove" >&2
+    echo "agent-sandbox-ctl ports: nothing to remove" >&2
     exit 1
   fi
 }
@@ -277,12 +277,12 @@ while [[ $# -gt 0 ]]; do
     -h|--help) usage; exit 0 ;;
     --sandbox)
       shift
-      [[ $# -gt 0 ]] || { echo "agent-sandbox-port: --sandbox needs a name" >&2; exit 1; }
+      [[ $# -gt 0 ]] || { echo "agent-sandbox-ctl ports: --sandbox needs a name" >&2; exit 1; }
       sandbox_name="$1"
       ;;
     --sandbox=*) sandbox_name="${1#--sandbox=}" ;;
     --all)       positional+=("--all") ;;
-    -*)          echo "agent-sandbox-port: unknown flag '$1'" >&2; exit 1 ;;
+    -*)          echo "agent-sandbox-ctl ports: unknown flag '$1'" >&2; exit 1 ;;
     *)           positional+=("$1") ;;
   esac
   shift
@@ -292,39 +292,39 @@ case "$action" in
   ls|list)
     if [[ ${#positional[@]} -eq 1 ]]; then
       if [[ -n "$sandbox_name" ]]; then
-         echo "agent-sandbox-port: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+         echo "agent-sandbox-ctl ports: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
       fi
       sandbox_name="${positional[0]}"
     elif [[ ${#positional[@]} -gt 1 ]]; then
-      echo "agent-sandbox-port: ls takes at most one argument (the sandbox)" >&2; usage >&2; exit 1
+      echo "agent-sandbox-ctl ports: ls takes at most one argument (the sandbox)" >&2; usage >&2; exit 1
     fi
     cmd_ls "$sandbox_name"
     ;;
   add)
     if [[ ${#positional[@]} -eq 2 ]]; then
       if [[ -n "$sandbox_name" ]]; then
-         echo "agent-sandbox-port: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+         echo "agent-sandbox-ctl ports: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
       fi
       sandbox_name="${positional[0]}"
       spec="${positional[1]}"
     elif [[ ${#positional[@]} -eq 1 ]]; then
       spec="${positional[0]}"
     else
-      echo "agent-sandbox-port: add needs a port spec, and optionally a sandbox" >&2; usage >&2; exit 1
+      echo "agent-sandbox-ctl ports: add needs a port spec, and optionally a sandbox" >&2; usage >&2; exit 1
     fi
     cmd_add "$(resolve_sandbox "$sandbox_name" --running)" "$spec"
     ;;
   rm|remove)
     if [[ ${#positional[@]} -eq 2 ]]; then
       if [[ -n "$sandbox_name" ]]; then
-         echo "agent-sandbox-port: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+         echo "agent-sandbox-ctl ports: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
       fi
       sandbox_name="${positional[0]}"
       target="${positional[1]}"
     elif [[ ${#positional[@]} -eq 1 ]]; then
       target="${positional[0]}"
     else
-      echo "agent-sandbox-port: rm needs a host port or --all" >&2; usage >&2; exit 1
+      echo "agent-sandbox-ctl ports: rm needs a host port or --all" >&2; usage >&2; exit 1
     fi
     # Deliberately not --running: a forwarder outlives its sandbox, and clearing
     # one up is exactly the case where the sandbox has already exited.
@@ -333,11 +333,11 @@ case "$action" in
   export)
     if [[ ${#positional[@]} -eq 1 ]]; then
       if [[ -n "$sandbox_name" ]]; then
-         echo "agent-sandbox-port: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+         echo "agent-sandbox-ctl ports: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
       fi
       sandbox_name="${positional[0]}"
     elif [[ ${#positional[@]} -gt 1 ]]; then
-      echo "agent-sandbox-port: export takes at most one argument (the sandbox)" >&2; usage >&2; exit 1
+      echo "agent-sandbox-ctl ports: export takes at most one argument (the sandbox)" >&2; usage >&2; exit 1
     fi
     cmd_export "$(resolve_sandbox "$sandbox_name" --running)"
     ;;
@@ -345,7 +345,7 @@ case "$action" in
     usage
     ;;
   *)
-    echo "agent-sandbox-port: unknown command '$action'" >&2
+    echo "agent-sandbox-ctl ports: unknown command '$action'" >&2
     usage >&2
     exit 1
     ;;

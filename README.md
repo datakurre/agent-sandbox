@@ -119,7 +119,7 @@ Every flag in the table below has a corresponding `--no-flag` option (e.g., `--n
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
 | Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces `AGENTS.md`'s `[proxy]` policy if present (deny-by-default once any allow rule exists, otherwise allow-by-default), and prints a post-run traffic summary. See details below. |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
-| Ports & mounts | `--ports-dynamic` | Allows `agent-sandbox-ctl port add` post-launch. |
+| Ports & mounts | `--ports-dynamic` | Allows `agent-sandbox-ctl ports add` post-launch. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
@@ -165,7 +165,7 @@ readiness does not depend on host relabeling flags.
 
 Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar and the port forwarders stay ordinary containers, so `--proxy` and every `agent-sandbox-ctl` subcommand that works by label are unaffected.
 
-- `agent-sandbox-ctl attach` and `agent-sandbox-ctl mount` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `--podman-args -v ... --`.
+- `agent-sandbox-ctl attach` and `agent-sandbox-ctl mounts` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `--podman-args -v ... --`.
 - `--podman` is refused under `--krun`; `--privileged` and `--selinux` are accepted with a warning that they are unverified against a guest.
 
 #### `--proxy` details
@@ -187,7 +187,7 @@ and `allow_ports`.
 - An invalid `[proxy]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote.
 - `--proxy` with no `AGENTS.md` or no allow rules in it allows every *public* host on every port — it is then a metering proxy. Private and loopback ranges stay refused regardless (see below). The launcher says so at startup, and `agent-sandbox-ctl proxy show` reports `default allow`.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
-- **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around. `agent-sandbox-ctl port add` refuses a proxied sandbox for the same reason.
+- **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around. `agent-sandbox-ctl ports add` refuses a proxied sandbox for the same reason.
 - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
 - The traffic summary ranks hosts by volume, collapses the tail beyond 15 hosts, and lists denied and failed connections separately:
 

@@ -298,13 +298,13 @@ else
   fi
 
   mkdir -p "$tmp/late"
-  if agent-sandbox-ctl mount --sandbox "$vm" "$tmp/late" /mnt/late >"$tmp/mnt.log" 2>&1; then
-    fail "ctl mount refuses a krun sandbox" \
+  if agent-sandbox-ctl mounts --sandbox "$vm" "$tmp/late" /mnt/late >"$tmp/mnt.log" 2>&1; then
+    fail "ctl mounts refuses a krun sandbox" \
       "it reported success -- the nsenter bind landed in the VMM and the guest saw nothing"
   elif grep -q 'no effect' "$tmp/mnt.log"; then
-    pass "ctl mount refuses a krun sandbox"
+    pass "ctl mounts refuses a krun sandbox"
   else
-    fail "ctl mount refuses a krun sandbox" "$(cat "$tmp/mnt.log")"
+    fail "ctl mounts refuses a krun sandbox" "$(cat "$tmp/mnt.log")"
   fi
 
   # ctl status and net read the sidecar and the labels, never the sandbox, so

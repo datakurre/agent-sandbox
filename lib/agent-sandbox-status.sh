@@ -3,11 +3,11 @@
 #
 # Deliberately an index, not a report: counts and names only, each line ending in
 # the command that shows the detail.  `net` renders traffic, `proxy show`
-# renders the policy, `port ls` renders the forwards; if this printed those
+# renders the policy, `ports ls` renders the forwards; if this printed those
 # lists too there would be three commands disagreeing about the same thing.
 #
 # AGENTS.md TOML for a running sandbox is not printed here: `proxy export`,
-# `port export` and `mount export` each print their own section, since each is
+# `ports export` and `mounts export` each print their own section, since each is
 # already the command that owns that piece of state.
 
 usage() {
@@ -69,7 +69,7 @@ esac
 # An absent label means a launcher that predates it, which could only have
 # started an ordinary container.
 case "$(sandbox_runtime "$sandbox")" in
-  krun) row runtime "krun  (microVM; no attach, no mount)" ;;
+  krun) row runtime "krun  (microVM; no attach, no mounts)" ;;
   *)    row runtime "crun" ;;
 esac
 
@@ -134,7 +134,7 @@ forwarded=$(podman ps --filter "label=agent-sandbox.role=port-forward" \
 if [[ -n "${published// /}" || "$forwarded" -gt 0 ]]; then
   detail="${published:-}"
   [[ "$forwarded" -gt 0 ]] && detail+="($forwarded forwarder(s))"
-  row ports "$detail        agent-sandbox-ctl port ls"
+  row ports "$detail        agent-sandbox-ctl ports ls"
 else
-  row ports "none published        agent-sandbox-ctl port add"
+  row ports "none published        agent-sandbox-ctl ports add"
 fi

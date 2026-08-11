@@ -293,7 +293,7 @@ for cmd in status net logs; do
   fi
 done
 
-if agent-sandbox-ctl port add --sandbox "$sandbox" 18080 2>"$tmp/err"; then
+if agent-sandbox-ctl ports add --sandbox "$sandbox" 18080 2>"$tmp/err"; then
   fail "port add refuses a proxied sandbox" "it succeeded"
 else
   if grep -q "does not pass through the proxy" "$tmp/err"; then

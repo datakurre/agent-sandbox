@@ -108,12 +108,12 @@ Integrations (use --X to enable, --no-X to disable):
                          Also enables 'agent-sandbox-ctl net' for the running sandbox.
   --krun            $([[ "$want_krun" == "1" ]] && echo "[on ]" || echo "[off]") Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
                          Adds a guest-kernel boundary inside the existing container boundary.
-                         'agent-sandbox-ctl attach' and 'ctl mount' do not work against a krun sandbox.
+                         'agent-sandbox-ctl attach' and 'ctl mounts' do not work against a krun sandbox.
 
 Ports:
   --port [HOST:]CONTAINER[/PROTO]          Publish a port, repeatable.
   --ports / --no-ports               $([[ "$want_ports" == "1" ]] && echo "[on ]" || echo "[off]") Honors [ports] declarations from AGENTS.md.
-  --ports-dynamic                          Allows \`agent-sandbox-ctl port add\` post-launch.
+  --ports-dynamic                          Allows \`agent-sandbox-ctl ports add\` post-launch.
   --ports-any-interface                    Permits port binds outside of loopback interfaces.
 
 Mounts:
@@ -681,7 +681,7 @@ if [[ "$want_proxy" == "1" ]]; then
   fi
 fi
 
-# A shared network is what makes `agent-sandbox-ctl port add` possible later:
+# A shared network is what makes `agent-sandbox-ctl ports add` possible later:
 # podman cannot add a binding to a running container, so a sidecar has to
 # reach this one by name.  Created lazily so that a launch with no ports at
 # all keeps podman's default rootless networking untouched.
@@ -756,7 +756,7 @@ printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
 chmod 644 "$passwd_tmp" "$group_tmp"
 
 # Include the hashed workspace path and the launcher PID in the container name so
-# agent-sandbox-ctl port and agent-sandbox-ctl purge find sandboxes without guessing
+# agent-sandbox-ctl ports and agent-sandbox-ctl purge find sandboxes without guessing
 # network/PID relationships.
 workspace_slug=$(basename "$PWD")
 workspace_slug="${workspace_slug//[^A-Za-z0-9_.-]/-}"
@@ -1079,7 +1079,7 @@ if [[ "$want_proxy" == "1" ]]; then
   proxy_mode=proxy
 fi
 
-# Likewise always recorded, for the same reason: `ctl attach` and `ctl mount`
+# Likewise always recorded, for the same reason: `ctl attach` and `ctl mounts`
 # have to refuse against a krun sandbox, and the label is their only way to know.
 # Resources go in as OCI annotations, which is the only channel crun's libkrun
 # handler reads them from.
