@@ -12,7 +12,7 @@
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-status [SANDBOX] [--sandbox NAME]
+agent-sandbox-status [WORD] [--sandbox WORD]
 
 Summarises one running sandbox: workspace, proxy mode, policy and traffic
 counts, and published ports.  Each line names the command that shows more.
@@ -54,7 +54,7 @@ sidecar=$(sidecar_for_sandbox "$sandbox")
 
 row() { printf '  %-12s%s\n' "$1" "$2"; }
 
-printf '%s\n' "$sandbox"
+printf '%s\n' "$(sandbox_word "$sandbox")"
 row workspace "$workspace_dir"
 row uptime    "$(podman ps --filter "name=^${sandbox}\$" --format '{{.Status}}' 2>/dev/null)"
 

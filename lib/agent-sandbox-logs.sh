@@ -12,7 +12,7 @@
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-logs [-f|--follow] [--tail N] [SANDBOX] [--sandbox NAME]
+agent-sandbox-logs [-f|--follow] [--tail N] [WORD] [--sandbox WORD]
 
 Shows the proxy sidecar's log for a sandbox.
 

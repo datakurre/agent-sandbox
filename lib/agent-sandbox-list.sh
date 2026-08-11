@@ -22,6 +22,12 @@ USAGE
 list_all=0
 show_roles=0
 
+# Sandbox names end in a single-word session selector.
+sandbox_word() {
+  local sandbox="$1"
+  printf '%s\n' "${sandbox##*-}"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -a|--all)  list_all=1 ;;
@@ -54,11 +60,8 @@ list_sandboxes() { # ps-args...
     while IFS=$'\t' read -r id name status; do
       local ws
       ws="$(container_label "$name" agent-sandbox.workspace)"
-      local ws_base
-      ws_base="$(basename "$ws")"
-      local slug="${ws_base//[^A-Za-z0-9_.-]/-}"
-      local prefix="agent-sandbox-${slug:0:32}-"
-      local short_name="${name#"$prefix"}"
+      local short_name
+      short_name="$(sandbox_word "$name")"
       local cmd
       cmd="$(container_label "$name" agent-sandbox.command)"
       if [[ -z "$cmd" ]]; then

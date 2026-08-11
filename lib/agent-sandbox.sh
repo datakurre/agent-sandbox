@@ -755,17 +755,40 @@ printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
 # which otherwise surfaces as ssh/git failing to resolve "who am I".
 chmod 644 "$passwd_tmp" "$group_tmp"
 
-# Include the hashed workspace path and the launcher PID in the container name so
-# agent-sandbox-ctl ports and agent-sandbox-ctl purge find sandboxes without guessing
-# network/PID relationships.
+# Include the workspace path and a short random word in the container name so
+# agent-sandbox-ctl can identify sandboxes without guessing network/PID
+# relationships. The word is the user-facing selector accepted by ctl.
 workspace_slug=$(basename "$PWD")
 workspace_slug="${workspace_slug//[^A-Za-z0-9_.-]/-}"
 
-ADJ=(autumn hidden bitter misty silent empty dry dark summer icy delicate quiet white cool spring winter patient twilight dawn crimson wispy weathered blue billowing broken cold damp falling frosty green long late lingering bold little morning muddy old red rough still small sparkling throbbing shy wandering withered wild black young holy solitary fragrant aged snowy proud floral restless divine polished ancient purple lively nameless)
-NOUN=(waterfall river breeze moon rain wind sea morning snow lake sunset pine shadow leaf dawn glitter forest hill cloud meadow sun glade bird brook butterfly bush dew dust field fire flower firefly feather grass haze mountain night pond darkness snowflake silence sound sky shape surf thunder violet water wildflower wave water resonance sun wood dream cherry tree fog frost voice paper frog smoke star)
-wordlist_id="${ADJ[$((RANDOM % ${#ADJ[@]}))]}-${NOUN[$((RANDOM % ${#NOUN[@]}))]}-$((RANDOM % 10000))"
+# A short word is easier to read and copy than a numeric identifier. Keep the
+# pool deliberately larger than the usual number of concurrent sandboxes.
+session_words=(autumn hidden bitter misty silent empty dry dark summer icy delicate quiet white cool spring winter patient twilight dawn crimson wispy weathered blue billowing broken cold damp falling frosty green long late lingering bold little morning muddy old red rough still small sparkling throbbing shy wandering withered wild black young holy solitary fragrant aged snowy proud floral restless divine polished ancient purple lively nameless)
+existing_sandbox_names=()
+mapfile -t existing_sandbox_names < <(
+  podman ps -a --filter "label=agent-sandbox.role=sandbox" --format '{{.Names}}' 2>/dev/null || true
+)
+session_word=""
+for _ in $(seq 1 100); do
+  candidate_word="${session_words[$((RANDOM % ${#session_words[@]}))]}"
+  candidate_used=0
+  for existing_name in "${existing_sandbox_names[@]}"; do
+    if [[ "$existing_name" == *-"$candidate_word" ]]; then
+      candidate_used=1
+      break
+    fi
+  done
+  if [[ "$candidate_used" == "0" ]]; then
+    session_word="$candidate_word"
+    break
+  fi
+done
+if [[ -z "$session_word" ]]; then
+  echo "agent-sandbox: could not allocate a unique session word" >&2
+  exit 1
+fi
 
-container_name="agent-sandbox-${workspace_slug:0:32}-${wordlist_id}"
+container_name="agent-sandbox-${workspace_slug:0:32}-${session_word}"
 
 # ── Sidecar Proxy & Metering ────────────────────────────────────────────────
 if [[ "$want_proxy" == "1" ]]; then

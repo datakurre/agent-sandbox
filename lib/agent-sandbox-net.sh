@@ -19,7 +19,7 @@ log_path=/sidecar_shared/connections.jsonl
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-net [-f|--follow] [SANDBOX] [--sandbox NAME]
+agent-sandbox-net [-f|--follow] [WORD] [--sandbox WORD]
 
   (no flags)   print the network summary for the sandbox as it stands now
   -f, --follow stream connections as the proxy records them, until Ctrl-C

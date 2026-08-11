@@ -3,12 +3,12 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-attach [ID] [-- CMD...]
+agent-sandbox-attach [WORD] [-- CMD...]
 
 Executes an interactive command inside a running sandbox.
 If no command is provided, starts an interactive bash shell.
 
-  ID      The short name or full container name of the sandbox.
+   WORD    The session word or full container name of the sandbox.
           If omitted, acts on the current workspace's sandbox.
   CMD     The command to execute (default: bash).
 USAGE

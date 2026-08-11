@@ -7,17 +7,17 @@ prog="agent-sandbox-ctl mounts"
 
 usage() {
   cat <<USAGE
-$prog ls     [SANDBOX] [--sandbox NAME]
-$prog add    [SANDBOX] [--sandbox NAME] HOST_PATH CONTAINER_PATH
-$prog rm     [SANDBOX] [--sandbox NAME] CONTAINER_PATH
-$prog export [SANDBOX] [--sandbox NAME]
+$prog ls     [WORD] [--sandbox WORD]
+$prog add    [WORD] [--sandbox WORD] HOST_PATH CONTAINER_PATH
+$prog rm     [WORD] [--sandbox WORD] CONTAINER_PATH
+$prog export [WORD] [--sandbox WORD]
 
   ls      show non-baseline bind mounts of running sandboxes
   add     bind-mount a host directory into a running sandbox
   rm      unmount a container path from a running sandbox
   export  print the [mounts] section of a running sandbox as AGENTS.md TOML
 
-Compatibility: \`agent-sandbox-ctl mount [SANDBOX] HOST_PATH CONTAINER_PATH\`
+Compatibility: \`agent-sandbox-ctl mount [WORD] HOST_PATH CONTAINER_PATH\`
 still works as an alias of \`$prog add ...\`.
 USAGE
 }

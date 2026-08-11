@@ -297,7 +297,7 @@ why SSH is rewritten through a generated `ProxyCommand`.
 
 ```console
 $ agent-sandbox-ctl proxy show
-agent-sandbox-myrepo-4213
+silent
   policy      /tmp/agent-sandbox-policy-Xf3a91cD/policy
   default     deny  (only the rules below are reachable)
   allow_domains github.com                         AGENTS.md
@@ -352,17 +352,33 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | --- | --- |
 | `load` | build the image and import it into podman |
 | `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows sidecars and forwarders |
-| `status [--sandbox N]` | one screen per sandbox, pointing at the commands below |
-| `net [-f]` | connection summary, or a live feed |
-| `logs [-f]` | the proxy sidecar's log |
-| `proxy show\|allow\|deny\|rm\|reset\|export` | read and change the policy of a running sandbox; `export` prints its `[proxy]` section as AGENTS.md TOML |
-| `port ls\|add\|rm\|export` | publish a port after launch (needs `--ports-dynamic`, and no proxy); `export` prints its `[ports]` section as AGENTS.md TOML |
-| `mount HOST_PATH CONTAINER_PATH` | bind-mount a host directory into a running sandbox |
-| `mount export` | print the `[mounts]` section of a running sandbox as AGENTS.md TOML |
+| `status [WORD] [--sandbox WORD]` | one screen per sandbox, pointing at the commands below |
+| `net [-f] [WORD] [--sandbox WORD]` | connection summary, or a live feed |
+| `logs [-f] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
+| `proxy show\|allow\|deny\|rm\|reset\|export [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[proxy]` section as AGENTS.md TOML |
+| `ports ls\|add\|rm\|export [WORD] [--sandbox WORD]` | publish a port after launch (needs `--ports-dynamic`, and no proxy); `export` prints its `[ports]` section as AGENTS.md TOML |
+| `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox |
+| `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |
 | `purge [--all] [-n]` | reclaim leftovers; running sandboxes are kept unless `--all` |
 
-Each takes `--sandbox NAME`, which may be omitted when only one sandbox is
-running or when exactly one matches the current directory.
+New sandboxes are shown by a single session word, such as `silent`. Use that
+word with any targetable command, either positionally or as `--sandbox silent`.
+The full Podman name remains internal. If the same word is present on more than
+one sandbox, the command refuses to guess and prints the matching workspaces and
+full names. The word may be omitted when only one sandbox is running or when
+exactly one matches the current directory.
+
+For example:
+
+```console
+$ agent-sandbox-ctl status silent
+$ agent-sandbox-ctl net --sandbox silent
+$ agent-sandbox-ctl logs silent
+$ agent-sandbox-ctl proxy show --sandbox silent
+$ agent-sandbox-ctl ports ls silent
+$ agent-sandbox-ctl mounts ls --sandbox silent
+$ agent-sandbox-ctl attach silent -- bash
+```
 
 `purge` defaults to leftovers only: exited sandboxes, forwarders and sidecars
 whose sandbox is gone, per-session networks nothing is attached to, and temp

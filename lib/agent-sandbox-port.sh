@@ -18,9 +18,9 @@
 usage() {
   cat <<'USAGE'
 agent-sandbox-ctl ports ls
-agent-sandbox-ctl ports add    [SANDBOX] [--sandbox NAME] [HOST:]CONTAINER[/PROTO]
-agent-sandbox-ctl ports rm     [SANDBOX] [--sandbox NAME] (HOST | --all)
-agent-sandbox-ctl ports export [SANDBOX] [--sandbox NAME]
+agent-sandbox-ctl ports add    [WORD] [--sandbox WORD] [HOST:]CONTAINER[/PROTO]
+agent-sandbox-ctl ports rm     [WORD] [--sandbox WORD] (HOST | --all)
+agent-sandbox-ctl ports export [WORD] [--sandbox WORD]
 
   ls      show running sandboxes and the ports forwarded into them
   add     start a forwarder for one port

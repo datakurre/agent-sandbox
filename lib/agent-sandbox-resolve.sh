@@ -31,6 +31,12 @@ sandbox_running() {
   podman ps --format '{{.Names}}' | grep -qxF "$1"
 }
 
+# Sandboxes end in a single-word session selector.
+sandbox_word() {
+  local sandbox="$1"
+  printf '%s\n' "${sandbox##*-}"
+}
+
 # proxy | off, and empty for a container predating the label.
 # Not every consumer of this shared helper calls every function.
 # shellcheck disable=SC2329
@@ -136,7 +142,10 @@ resolve_sandbox() {
       return
     elif [[ ${#valid_matches[@]} -gt 1 ]]; then
       echo "${0##*/}: '$explicit' is ambiguous, matches multiple sandboxes:" >&2
-      for m in "${valid_matches[@]}"; do echo "  $m" >&2; done
+      for m in "${valid_matches[@]}"; do
+        printf '  %s\t%s\n' "$(sandbox_word "$m")" "$(sandbox_workspace "$m")" >&2
+        printf '    full name: %s\n' "$m" >&2
+      done
       exit 1
     fi
 

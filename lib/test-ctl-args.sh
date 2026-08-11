@@ -478,7 +478,7 @@ fixture_set "mount.agent-sandbox-sidecar-abc123.sidecar_shared" "$tmp/shared"
 
 run "$status_bin"
 expect_status "status succeeds" 0
-expect_out    "status names the sandbox"  "agent-sandbox-repo-1"
+expect_out    "status names the sandbox"  "1"
 expect_out    "status reports proxy mode" "on  (agent-sandbox-sidecar-abc123)"
 expect_out    "status counts the policy rules" "2 rule(s), default deny"
 expect_out    "status counts traffic" "1 connection(s), 1 denied"
@@ -490,7 +490,33 @@ expect_status "status rejects a second positional" 1
 
 run "$status_bin" agent-sandbox-repo-1
 expect_status "status accepts sandbox as positional" 0
-expect_out    "status names the sandbox"  "agent-sandbox-repo-1"
+expect_out    "status names the sandbox"  "1"
+
+# New sandboxes expose only their session word to users. Resolution
+# must still pass the full Podman name to every operation.
+fixture_reset
+fixture_set running "agent-sandbox-repo-silent"
+fixture_set all "agent-sandbox-repo-silent"
+fixture_set "labels.agent-sandbox-repo-silent" \
+  "agent-sandbox.workspace=$PWD" "agent-sandbox.proxy=off"
+run "$status_bin" silent
+expect_status "status accepts a session word" 0
+expect_out    "status displays the session word" "silent"
+if grep -qF "name=^agent-sandbox-repo-silent\$" <<< "$argv"; then
+  pass "status resolves the word to the full container name"
+else
+  fail "status resolves the word to the full container name" "$argv"
+fi
+
+fixture_reset
+fixture_set running "agent-sandbox-repo-silent" "agent-sandbox-other-silent"
+fixture_set all "agent-sandbox-repo-silent" "agent-sandbox-other-silent"
+fixture_set "labels.agent-sandbox-repo-silent" "agent-sandbox.workspace=$PWD"
+fixture_set "labels.agent-sandbox-other-silent" "agent-sandbox.workspace=/other"
+run "$status_bin" --sandbox silent
+expect_status "duplicate session words are rejected" 1
+expect_out    "duplicate session words explain the ambiguity" "is ambiguous"
+expect_out    "duplicate session words list full names" "agent-sandbox-other-silent"
 
 # ── firewall ────────────────────────────────────────────────────────────────
 
@@ -703,7 +729,7 @@ fixture_set "labels.agent-sandbox-elsewhere-1" \
 run "$list_bin"
 expect_status "list succeeds" 0
 expect_out    "list heads the workspace" "Agent-sandbox containers for $PWD"
-expect_out    "list names the local sandbox" "agent-sandbox-here-1"
+expect_out    "list names the local sandbox" "1"
 expect_out    "list shows the proxy label" "proxy"
 expect_out    "list shows the workspace label" "$PWD"
 if grep -qF "agent-sandbox-elsewhere-1" <<< "$output"; then
@@ -727,7 +753,7 @@ fi
 # than that label can only have been started by a launcher that had no --krun,
 # so "crun" is a fact about it rather than a guess.
 run "$list_bin" --all
-if grep -qE 'agent-sandbox-old-1 +Up 2 minutes +crun *$' <<< "$output"; then
+if grep -qE '1 +Up 2 minutes +crun *$' <<< "$output"; then
   pass "list tolerates a container with no labels"
 else
   fail "list tolerates a container with no labels" "$output"
@@ -756,6 +782,19 @@ expect_status "list rejects an unknown flag" 1
 run "$list_bin" extra
 expect_status "list rejects a positional" 1
 
+fixture_reset
+fixture_set running "agent-sandbox-here-silent"
+fixture_set "labels.agent-sandbox-here-silent" \
+  "agent-sandbox.proxy=off" "agent-sandbox.workspace=$PWD"
+run "$list_bin"
+expect_status "list succeeds with a session word sandbox" 0
+expect_out    "list shows only the session word" "silent"
+if grep -qE 'id-agent-sandbox-here-silent +silent +Up' <<< "$output"; then
+  pass "list puts only the session word in the names column"
+else
+  fail "list puts only the session word in the names column" "$output"
+fi
+
 # ── merged --gpg flags ───────────────────────────────────────────────────────
 
 fixture_reset
@@ -767,6 +806,11 @@ mkdir -p "$gpg_run"
 
 run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" -- true
 expect_status "default launch forces commit.gpgsign=false" 0
+if grep -qE -- '--name agent-sandbox-[A-Za-z0-9_.-]+-[a-z]+' <<< "$argv"; then
+  pass "launcher names new sandboxes with a session word"
+else
+  fail "launcher names new sandboxes with a session word" "$argv"
+fi
 if grep -qF "GIT_CONFIG_KEY_0=commit.gpgsign" <<< "$argv"; then
   pass "default launch passes commit.gpgsign=false override"
 else
