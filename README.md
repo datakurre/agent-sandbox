@@ -138,6 +138,25 @@ no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
 relabeling (`:z`) to built-in writable binds. User-provided `-v` options are
 preserved exactly as supplied.
 
+`--selinux` relabels the *file* a socket is mounted as, but that alone is not
+enough for `--ssh`: connecting to a forwarded `SSH_AUTH_SOCK` (including a
+gpg-agent SSH socket) is a separate `unix_stream_socket connectto` check
+between the container's process context and the *listening agent's* context —
+typically `unconfined_t` for a user's own `ssh-agent`/`gpg-agent` — and
+default policy denies that regardless of the file's label, to stop containers
+reaching arbitrary host IPC sockets. If `ssh`/`ssh-add` inside the sandbox
+reports `Permission denied` right after finding the socket (as opposed to "no
+such user" or "could not open a connection"), confirm with
+`sudo ausearch -m avc -ts recent | grep connectto` and, if it names your agent
+socket, allow it host-wide with:
+
+```
+sudo setsebool -P container_connect_any 1
+```
+
+This is a persistent, host-wide SELinux policy change, so it is not something
+`agent-sandbox` can or should apply on your behalf.
+
 The proxy sidecar is treated as infrastructure: it always runs with SELinux
 labeling disabled for `/sidecar_policy` and `/sidecar_shared` so proxy
 readiness does not depend on host relabeling flags.
