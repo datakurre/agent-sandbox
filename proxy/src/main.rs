@@ -48,7 +48,7 @@ const STARTUP_GRACE: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Name resolved to decide the sidecar's network is actually usable.  Only
 /// resolved, never connected to, so this stays policy-neutral under
-/// `--firewall`.
+/// `--proxy`.
 const READY_PROBE_HOST: &str = "cloudflare.com:443";
 /// Written by the proxy, read by the sidecar's readiness gate on the host.
 const PROXY_READY: &str = "/sidecar_shared/proxy-ready";
@@ -242,7 +242,7 @@ fn parse_csv_ports(s: &str) -> Result<Vec<PortRange>, String> {
 }
 
 /// Parse the policy file written by the launcher (and edited by
-/// `agent-sandbox-ctl firewall`).
+/// `agent-sandbox-ctl proxy`).
 ///
 /// One `KEY VALUE` pair per line, `#` comments and blank lines ignored:
 ///
@@ -582,7 +582,7 @@ impl Resolver {
 // ── Metering ────────────────────────────────────────────────────────────────
 
 /// One JSON line per connection event, consumed by `agent-sandbox-network-summary`
-/// to render the `--meter-network` summary and the `agent-sandbox-ctl net` live
+/// to render the `--proxy` summary and the `agent-sandbox-ctl net` live
 /// view.  Cheap enough to leave on: a few hundred bytes per connection, versus
 /// the full-payload packet capture it replaces.
 ///
@@ -1104,7 +1104,7 @@ fn reload_once(path: &str, shared: &Shared) -> bool {
 /// Polling rather than inotify or a signal: `forbid(unsafe_code)` rules out a
 /// hand-rolled handler, `signal_hook` would be the crate's only dependency, and
 /// one `stat` a second is free.  A second is also below the threshold where a
-/// human running `firewall allow` and immediately retrying would notice.
+/// human running `proxy allow` and immediately retrying would notice.
 fn watch_policy(path: String, shared: Arc<Shared>) {
     let mut current = policy_stamp(&path);
     loop {
@@ -1127,7 +1127,7 @@ fn watch_policy(path: String, shared: Arc<Shared>) {
 ///
 /// Resolution only, never a connection: a DNS query goes to the configured
 /// resolver and reaches no third-party host, so this stays policy-neutral under
-/// `--firewall`, where dialling out would be egress the allow list never
+/// `--proxy`, where dialling out would be egress the allow list never
 /// authorised.
 ///
 /// Never fatal.  If egress does not come up we start anyway and say so, because
@@ -1751,7 +1751,7 @@ mod tests {
 
     #[test]
     fn describe_round_trips_through_parse_policy() {
-        // `firewall show` and the startup log render policy with describe(), and
+        // `proxy show` and the startup log render policy with describe(), and
         // the host writes policy files; the two formats must not diverge.
         let original = parse_policy(
             "allow_domains github.com\ndeny_domains bad.example.com\n\
@@ -1764,7 +1764,7 @@ mod tests {
 
     #[test]
     fn an_empty_policy_allows_everything() {
-        // Documented behaviour, not an accident: --firewall with no rules is a
+        // Documented behaviour, not an accident: --proxy with no rules is a
         // metering-only proxy.  The launcher says so at startup.
         let config = parse_policy("# nothing here\n").unwrap();
         assert!(config.default_allow);

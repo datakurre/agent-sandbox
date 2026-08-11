@@ -115,8 +115,7 @@ Every flag in the table below has a corresponding `--no-flag` option (e.g., `--n
 | Container runtime | `--krun` | Runs the sandbox as a KVM microVM with its own kernel, using `podman --runtime krun`. See details below and [Trust model](#trust-model). |
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
-| Network & firewall | `--firewall` | Isolates the container from the internet and routes HTTP(S)/SSH through a domain-filtering, deny-by-default proxy. See details below. |
-| Network & firewall | `--meter-network` | Same proxy, but allow-by-default and prints a post-run traffic summary. See details below. |
+| Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces `AGENTS.md`'s `[proxy]` policy if present (deny-by-default once any allow rule exists, otherwise allow-by-default), and prints a post-run traffic summary. See details below. |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-dynamic` | Allows `agent-sandbox-ctl port add` post-launch. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
@@ -163,12 +162,12 @@ readiness does not depend on host relabeling flags.
 
 #### `--krun` details
 
-Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar and the port forwarders stay ordinary containers, so `--firewall`, `--meter-network` and every `agent-sandbox-ctl` subcommand that works by label are unaffected.
+Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar and the port forwarders stay ordinary containers, so `--proxy` and every `agent-sandbox-ctl` subcommand that works by label are unaffected.
 
 - `agent-sandbox-ctl attach` and `agent-sandbox-ctl mount` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `-v`.
 - `--podman` is refused under `--krun`; `--privileged` and `--selinux` are accepted with a warning that they are unverified against a guest.
 
-#### `--firewall` details
+#### `--proxy` details
 
 The `[proxy]` block supports `allow_domains`, `deny_domains`, `allow_ips`, `deny_ips`
 and `allow_ports`.
@@ -185,14 +184,11 @@ and `allow_ports`.
 - Hostnames are also checked against `deny_ips` *after* resolution, so a denied address cannot be reached through an allowed name.
 - `default = "allow"` or `default = "deny"` overrides the derived default explicitly.
 - An invalid `[proxy]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote.
-- `--firewall` with no allow rules allows every *public* host on every port — it is then a metering proxy. Private and loopback ranges stay refused regardless (see below). The launcher says so at startup, and `agent-sandbox-ctl proxy show` reports `default allow`.
+- `--proxy` with no `AGENTS.md` or no allow rules in it allows every *public* host on every port — it is then a metering proxy. Private and loopback ranges stay refused regardless (see below). The launcher says so at startup, and `agent-sandbox-ctl proxy show` reports `default allow`.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
 - **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around. `agent-sandbox-ctl port add` refuses a proxied sandbox for the same reason.
-
-#### `--meter-network` details
-
 - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
-- The summary ranks hosts by volume, collapses the tail beyond 15 hosts, and lists denied and failed connections separately:
+- The traffic summary ranks hosts by volume, collapses the tail beyond 15 hosts, and lists denied and failed connections separately:
 
   ```
   === Network Summary ===  2m 6s · 87 connections · 24.9 MiB in / 362.9 KiB out
@@ -209,14 +205,14 @@ and `allow_ports`.
     proxy.example.com          1  (dns)
   ```
 
-Either proxy flag also makes these available while the sandbox runs:
+`--proxy` also makes these available while the sandbox runs:
 
 - `agent-sandbox-ctl status` — one screen: proxy mode, rule and traffic counts, ports.
 - `agent-sandbox-ctl net` / `net -f` — the summary above for the session so far, or a live feed.
 - `agent-sandbox-ctl logs [-f]` — the proxy's own log: the policy it started with, and every denial as it happens.
 - `agent-sandbox-ctl proxy show|allow|deny|rm|reset|export` — read and change the policy of a **running** sandbox.
 - A connection record is written when it *closes*, plus one when it opens, so a long-lived HTTPS tunnel appears as `in flight` under `── still open ──` rather than as traffic. Individual requests inside a tunnel are never visible; the proxy does not decrypt it.
-- The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--meter-network` additionally prints the summary when the session ends, and keeps the log at `$TMPDIR/agent-sandbox-connections-<pid>.jsonl` if anything was denied or failed. `agent-sandbox-network-summary <log>` re-renders a kept log.
+- The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--proxy` additionally prints the summary when the session ends, and keeps the log at `$TMPDIR/agent-sandbox-connections-<pid>.jsonl` if anything was denied or failed. `agent-sandbox-network-summary <log>` re-renders a kept log.
 - Neither the policy nor the log is reachable from inside the sandbox, so the agent can neither widen its own firewall nor edit the record of its traffic.
 
 <details>
@@ -239,7 +235,7 @@ allow_domains = ["github.com", "*.github.com"]
 allow_ports = ["443", "8000-8100"]
 ```
 
-An allow-by-default policy (deny rules only, or `--meter-network`, which runs no rules of
+An allow-by-default policy (deny rules only, or `--proxy` with no `[proxy]` block of
 your own) leaves ports unrestricted unless you write `allow_ports` yourself. Denials say
 which half refused, so an allowed host on an unlisted port is distinguishable from a host
 that was never allowed:
@@ -248,8 +244,8 @@ that was never allowed:
 proxy: deny github.com:8443 (port not in allow_ports; add `allow_ports 8443`)
 ```
 
-Private and loopback destinations are refused by default in every mode — `--firewall` or
-`--meter-network`, with or without any rule of your own — whether they are named directly
+Private and loopback destinations are refused by default under `--proxy`,
+with or without any rule of your own — whether they are named directly
 or reached through a hostname that resolves to one:
 `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`,
 `100.64.0.0/10`, `0.0.0.0/8`, `fc00::/7`, `fe80::/10` and `::1/128`. The sidecar itself still sits
@@ -296,7 +292,7 @@ why SSH is rewritten through a generated `ProxyCommand`.
 
 </details>
 
-### Changing the firewall mid-session
+### Changing the proxy policy mid-session
 
 ```console
 $ agent-sandbox-ctl proxy show

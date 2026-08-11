@@ -68,9 +68,9 @@ A bash script that wraps `podman run`.  Call flow:
 
 `podman load < ${image}`
 
-### Proxy sidecar (`--firewall` / `--meter-network`)
+### Proxy sidecar (`--proxy`)
 
-Either flag makes the launcher start a second container from the same image,
+`--proxy` makes the launcher start a second container from the same image,
 running `agent-sandbox-sidecar`, and put the sandbox on a `podman network create
 --internal --disable-dns` network with no route off-host.  The sidecar is
 dual-homed on that network and on `bridge`, so it is the sandbox's only path to
@@ -129,9 +129,9 @@ command vets its own writes with the same binary, and `checks.firewall-policy`
 tests the whole chain.  There is no second implementation to drift.
 
 The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
-CGNAT, ULA) to every policy it writes, in both `--firewall` and `--meter-network`.
+CGNAT, ULA) to every policy it writes, under `--proxy`.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
-so without it a policy with no rules -- which is exactly what metering runs -- could
+so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
 ordinary `deny_ips` entries rather than compiling it into the proxy means one
 list, visible in `proxy show`, restored by `reset`, and mirrored into the

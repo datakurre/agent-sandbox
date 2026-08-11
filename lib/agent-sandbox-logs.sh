@@ -20,7 +20,7 @@ Shows the proxy sidecar's log for a sandbox.
   --tail N       show only the last N lines (default: all)
 
 With one sandbox running, --sandbox may be omitted.  Requires the sandbox to
-have been launched with --firewall or --meter-network.
+have been launched with --proxy.
 USAGE
 }
 

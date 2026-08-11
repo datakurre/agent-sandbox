@@ -120,11 +120,11 @@ cmd_add() {
     fi
   fi
   case "$mode" in
-    firewall|meter|proxy)
+    proxy)
       echo "agent-sandbox-port: '$sandbox' was launched with a proxy ($mode)." >&2
       echo "                    Joining it to the $AGENT_SANDBOX_NETWORK network would give it" >&2
       echo "                    egress that does not pass through the proxy." >&2
-      echo "                    Relaunch it without --firewall/--meter-network to forward ports." >&2
+      echo "                    Relaunch it without --proxy to forward ports." >&2
       exit 1
       ;;
   esac

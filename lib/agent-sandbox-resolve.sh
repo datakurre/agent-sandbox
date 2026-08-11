@@ -31,7 +31,7 @@ sandbox_running() {
   podman ps --format '{{.Names}}' | grep -qxF "$1"
 }
 
-# firewall | meter | off, and empty for a container predating the label.
+# proxy | off, and empty for a container predating the label.
 # Not every consumer of this shared helper calls every function.
 # shellcheck disable=SC2329
 sandbox_proxy_mode() {
@@ -95,8 +95,7 @@ require_sidecar() {
   sidecar=$(sidecar_for_sandbox "$sandbox")
   if [[ -z "$sidecar" ]]; then
     echo "${0##*/}: '$sandbox' is running without a proxy." >&2
-    echo "               Relaunch it with:  agent-sandbox --firewall" >&2
-    echo "               (or --meter-network, to account traffic without filtering)" >&2
+    echo "               Relaunch it with:  agent-sandbox --proxy" >&2
     exit 1
   fi
   printf '%s\n' "$sidecar"

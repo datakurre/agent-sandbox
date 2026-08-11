@@ -47,12 +47,12 @@ allow_ports = ["443"]
 ```
 EOF
 
-echo "=== launching a --firewall sandbox in $tmp/work ==="
+echo "=== launching a --proxy sandbox in $tmp/work ==="
 cd "$tmp/work" || exit 1
 
 # Background, so the checks can run against it; the launcher stays in the
 # foreground of its own shell.
-agent-sandbox --firewall --no-workspace -- sleep 600 >"$tmp/launch.log" 2>&1 &
+agent-sandbox --proxy --no-workspace -- sleep 600 >"$tmp/launch.log" 2>&1 &
 launcher=$!
 
 # Filtered by workspace, not just by role.  Taking the first sandbox podman
@@ -294,23 +294,23 @@ for cmd in status net logs; do
 done
 
 if agent-sandbox-ctl port add --sandbox "$sandbox" 18080 2>"$tmp/err"; then
-  fail "port add refuses a firewalled sandbox" "it succeeded"
+  fail "port add refuses a proxied sandbox" "it succeeded"
 else
   if grep -q "does not pass through the proxy" "$tmp/err"; then
-    pass "port add refuses a firewalled sandbox"
+    pass "port add refuses a proxied sandbox"
   else
-    fail "port add refuses a firewalled sandbox" "$(cat "$tmp/err")"
+    fail "port add refuses a proxied sandbox" "$(cat "$tmp/err")"
   fi
 fi
 
-# ── baseline private/loopback deny under --meter-network ─────────────────────
-# --meter-network runs no user policy at all, which used to mean the proxy ran
-# with a fully empty config (allow-everything, no deny_ips) and could be used
-# to reach the host's own bridge network.  The baseline deny list must close
-# that regardless of any user rule.
+# ── baseline private/loopback deny with no AGENTS.md policy ──────────────────
+# --proxy with no AGENTS.md [proxy] block runs no user policy at all, which
+# used to mean the proxy ran with a fully empty config (allow-everything, no
+# deny_ips) and could be used to reach the host's own bridge network.  The
+# baseline deny list must close that regardless of any user rule.
 
 mkdir -p "$tmp/meter"
-(cd "$tmp/meter" && agent-sandbox --meter-network --no-workspace -- sleep 300 \
+(cd "$tmp/meter" && agent-sandbox --proxy --no-workspace -- sleep 300 \
    >"$tmp/meter-launch.log" 2>&1 &)
 
 meter_sandbox=""
@@ -323,9 +323,9 @@ for _ in $(seq 1 60); do
 done
 
 if [[ -z "$meter_sandbox" ]]; then
-  fail "the --meter-network sandbox started" "$(cat "$tmp/meter-launch.log")"
+  fail "the --proxy sandbox with no [proxy] block started" "$(cat "$tmp/meter-launch.log")"
 else
-  pass "the --meter-network sandbox started ($meter_sandbox)"
+  pass "the --proxy sandbox with no [proxy] block started ($meter_sandbox)"
 
   meter_sidecar=$(podman ps --filter "label=agent-sandbox.role=proxy" \
                             --filter "label=agent-sandbox.target=$meter_sandbox" \
@@ -334,12 +334,12 @@ else
     --format '{{(index .Subnets 0).Gateway}}' 2>/dev/null)
 
   if [[ -z "$meter_sidecar" || -z "$bridge_gw" ]]; then
-    fail "the bridge gateway is refused under --meter-network" \
+    fail "the bridge gateway is refused with no [proxy] block" \
       "could not resolve sidecar ($meter_sidecar) or bridge gateway ($bridge_gw)"
   elif podman exec "$meter_sandbox" curl -sS -o /dev/null -m 10 "http://$bridge_gw" 2>/dev/null; then
-    fail "the bridge gateway is refused under --meter-network" "$bridge_gw was reachable"
+    fail "the bridge gateway is refused with no [proxy] block" "$bridge_gw was reachable"
   else
-    pass "the bridge gateway is refused under --meter-network"
+    pass "the bridge gateway is refused with no [proxy] block"
   fi
 
   podman rm -f "$meter_sandbox" >/dev/null 2>&1
@@ -369,7 +369,7 @@ deny_ips = ["$dns_deny"]
 \`\`\`
 EOF
 
-  (cd "$tmp/dns" && agent-sandbox --firewall --no-workspace -- sleep 300 \
+  (cd "$tmp/dns" && agent-sandbox --proxy --no-workspace -- sleep 300 \
      >"$tmp/dns-launch.log" 2>&1 &)
 
   dns_sandbox=""
@@ -400,13 +400,13 @@ fi
 
 # ── refusals at launch ───────────────────────────────────────────────────────
 
-if agent-sandbox --firewall --port 18081 --no-workspace -- true >"$tmp/err" 2>&1; then
-  fail "--firewall with a port is refused" "it launched"
+if agent-sandbox --proxy --port 18081 --no-workspace -- true >"$tmp/err" 2>&1; then
+  fail "--proxy with a port is refused" "it launched"
 else
   if grep -q "cannot be combined" "$tmp/err"; then
-    pass "--firewall with a port is refused"
+    pass "--proxy with a port is refused"
   else
-    fail "--firewall with a port is refused" "$(cat "$tmp/err")"
+    fail "--proxy with a port is refused" "$(cat "$tmp/err")"
   fi
 fi
 
@@ -417,7 +417,7 @@ cat > "$tmp/bad/AGENTS.md" <<'EOF'
 allow_domians = ["example.com"]
 ```
 EOF
-if (cd "$tmp/bad" && agent-sandbox --firewall --no-workspace -- true >"$tmp/err" 2>&1); then
+if (cd "$tmp/bad" && agent-sandbox --proxy --no-workspace -- true >"$tmp/err" 2>&1); then
   fail "a misspelled [proxy] key refuses the launch" "it launched"
 else
   if grep -q "invalid \[proxy\] block" "$tmp/err"; then

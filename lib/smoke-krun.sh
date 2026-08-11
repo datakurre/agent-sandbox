@@ -217,14 +217,14 @@ allow_ports = ["443"]
 ```
 EOF
 
-if agent-sandbox --krun --firewall --no-workspace \
+if agent-sandbox --krun --proxy --no-workspace \
      -- curl -sS -o /dev/null -m 25 https://example.com >"$tmp/allow.log" 2>&1; then
   pass "an allowed host is reachable from the guest"
 else
   fail "an allowed host is reachable from the guest" "$(cat "$tmp/allow.log")"
 fi
 
-if agent-sandbox --krun --firewall --no-workspace \
+if agent-sandbox --krun --proxy --no-workspace \
      -- curl -sS -o /dev/null -m 25 https://nixos.org >"$tmp/deny.log" 2>&1; then
   fail "a host outside the allow list is refused" \
     "nixos.org was reachable from inside the guest -- TSI may be disabled (check for a netdev)"
@@ -235,7 +235,7 @@ fi
 # Not merely filtered: with TSI and an --internal network there should be no
 # default route at all, so the failure mode is "no route" rather than "proxy
 # said no".  This is what makes the policy enforcing rather than advisory.
-routes=$(agent-sandbox --krun --firewall --no-workspace \
+routes=$(agent-sandbox --krun --proxy --no-workspace \
            -- sh -c 'ip route show default 2>/dev/null || true' 2>/dev/null | tr -d '\r')
 if [[ -z "${routes// /}" ]]; then
   pass "the guest has no default route"
@@ -246,7 +246,7 @@ fi
 # The policy directory is mounted into the sidecar only.  virtio-fs serves the
 # container's mount tree wholesale, so it is worth confirming that did not
 # quietly widen what the agent can read.
-if agent-sandbox --krun --firewall --no-workspace \
+if agent-sandbox --krun --proxy --no-workspace \
      -- sh -c 'test -e /sidecar_policy' >/dev/null 2>&1; then
   fail "the policy directory is invisible to the guest" "/sidecar_policy exists inside the guest"
 else

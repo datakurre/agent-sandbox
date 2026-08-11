@@ -36,8 +36,7 @@ want_ports_any_interface=0
 want_mounts=0
 want_agent_mounts_mode="auto"   # auto | all | none | list
 agent_mounts_list=()
-want_firewall=0
-want_meter_network=0
+want_proxy=0
 want_krun=0
 # Tracked separately from the podman_args passthrough, because --krun warns on it.
 want_privileged=0
@@ -107,9 +106,8 @@ Integrations (use --X to enable, --no-X to disable):
   --nix             $([[ "$want_nix" == "1" ]] && echo "[on ]" || echo "[off]") Mounts the host /nix/store for native Nix execution.
   --podman          $([[ "$want_podman" == "1" ]] && echo "[on ]" || echo "[off]") Forwards the host rootless Podman socket (sibling containers).
   --selinux         $([[ "$want_selinux" == "1" ]] && echo "[on ]" || echo "[off]") Applies SELinux shared relabeling (:z) to writable binds.
-  --firewall        $([[ "$want_firewall" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S) traffic through a domain-filtering proxy (blocks direct internet access).
-  --meter-network   $([[ "$want_meter_network" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S) traffic through a proxy to capture a post-run summary (blocks direct internet access).
-                         Either flag also enables 'agent-sandbox-ctl net' for the running sandbox.
+  --proxy           $([[ "$want_proxy" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S)/SSH through a proxy, enforcing AGENTS.md's [proxy] policy if present (blocks direct internet access).
+                         Also enables 'agent-sandbox-ctl net' for the running sandbox.
   --krun            $([[ "$want_krun" == "1" ]] && echo "[on ]" || echo "[off]") Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
                          Adds a guest-kernel boundary inside the existing container boundary.
                          'agent-sandbox-ctl attach' and 'ctl mount' do not work against a krun sandbox.
@@ -282,10 +280,8 @@ while [[ $# -gt 0 ]]; do
         }
       done
       ;;
-    --firewall)         want_firewall=1 ;;
-    --no-firewall)      want_firewall=0 ;;
-    --meter-network)    want_meter_network=1 ;;
-    --no-meter-network) want_meter_network=0 ;;
+    --proxy)            want_proxy=1 ;;
+    --no-proxy)         want_proxy=0 ;;
     --port)
       shift
       [[ $# -gt 0 ]] || { echo "agent-sandbox: --port needs an argument" >&2; exit 1; }
@@ -362,7 +358,7 @@ fi
 # ── --krun preflight ────────────────────────────────────────────────────────
 # Checked here: after parsing, so the flags are final, and before anything is
 # created -- no temp dirs, no network, no relabel -- so a refusal leaves nothing
-# behind.  Same discipline as the --firewall/--port conflict check further down.
+# behind.  Same discipline as the --proxy/--port conflict check further down.
 #
 # Ordered cheapest and most portable first.  The /dev/kvm probe is last because
 # it is the one check that depends on the machine rather than on the arguments,
@@ -675,10 +671,7 @@ fi
 # Checked here: after the [ports] block is parsed, so a declaration that yields
 # nothing is not treated as a request, and before any network is created, so the
 # refusal leaves nothing behind.
-if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
-  proxy_flag="--firewall"
-  [[ "$want_firewall" == "1" ]] || proxy_flag="--meter-network"
-
+if [[ "$want_proxy" == "1" ]]; then
   conflict=""
   if [[ ${#published[@]} -gt 0 ]]; then
     conflict="a published port (${published[0]})"
@@ -687,11 +680,11 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   fi
 
   if [[ -n "$conflict" ]]; then
-    echo "agent-sandbox: $proxy_flag cannot be combined with $conflict." >&2
+    echo "agent-sandbox: --proxy cannot be combined with $conflict." >&2
     echo "               A published port puts the sandbox on the shared bridge network," >&2
     echo "               which routes to the internet around the proxy, so the policy" >&2
     echo "               would only be advisory." >&2
-    echo "               Drop the port, or drop $proxy_flag." >&2
+    echo "               Drop the port, or drop --proxy." >&2
     exit 1
   fi
 fi
@@ -734,18 +727,16 @@ cleanup() {
     # around long enough for `podman logs` to say why.
     podman rm -f "$sidecar_id" >/dev/null 2>&1 || true
 
-    if [[ "$want_meter_network" == "1" ]]; then
-      # || true: this runs inside the EXIT trap under errexit, and the rm -rf
-      # below still has to happen even if the report cannot be rendered.
-      agent-sandbox-network-summary "$sidecar_shared/connections.jsonl" || true
-      # The rm -rf below would take the per-connection timings with it, and
-      # those are what distinguish "failed instantly" from "burned the whole
-      # retry window".  Keep the log whenever anything went wrong.
-      if grep -q '"verdict":"\(deny\|error\)"' "$sidecar_shared/connections.jsonl" 2>/dev/null; then
-        saved_log="${TMPDIR:-/tmp}/agent-sandbox-connections-$$.jsonl"
-        if cp "$sidecar_shared/connections.jsonl" "$saved_log" 2>/dev/null; then
-          printf '  connection log kept at %s\n\n' "$saved_log"
-        fi
+    # || true: this runs inside the EXIT trap under errexit, and the rm -rf
+    # below still has to happen even if the report cannot be rendered.
+    agent-sandbox-network-summary "$sidecar_shared/connections.jsonl" || true
+    # The rm -rf below would take the per-connection timings with it, and
+    # those are what distinguish "failed instantly" from "burned the whole
+    # retry window".  Keep the log whenever anything went wrong.
+    if grep -q '"verdict":"\(deny\|error\)"' "$sidecar_shared/connections.jsonl" 2>/dev/null; then
+      saved_log="${TMPDIR:-/tmp}/agent-sandbox-connections-$$.jsonl"
+      if cp "$sidecar_shared/connections.jsonl" "$saved_log" 2>/dev/null; then
+        printf '  connection log kept at %s\n\n' "$saved_log"
       fi
     fi
 
@@ -785,7 +776,7 @@ wordlist_id="${ADJ[$((RANDOM % ${#ADJ[@]}))]}-${NOUN[$((RANDOM % ${#NOUN[@]}))]}
 container_name="agent-sandbox-${workspace_slug:0:32}-${wordlist_id}"
 
 # ── Sidecar Proxy & Metering ────────────────────────────────────────────────
-if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
+if [[ "$want_proxy" == "1" ]]; then
   sidecar_id="agent-sandbox-sidecar-$(head -c 12 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)"
   # Identifiable templates, so `agent-sandbox-ctl purge` can recognise the dirs
   # left behind by a launcher that was killed before its trap could run.
@@ -836,17 +827,17 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   # Written into a directory mounted ro into the sidecar and NOT into the sandbox:
   # the agent must not be able to widen the firewall that contains it.
   : > "$sidecar_policy/policy"
-  if [[ "$want_firewall" == "1" && -f "$PWD/AGENTS.md" ]]; then
+  if [[ -f "$PWD/AGENTS.md" ]]; then
     # Strict, like the [ports] block above: a policy the operator got wrong must
     # not silently become no policy at all.
     if ! agent-sandbox-parse-agents --proxy-policy "$PWD/AGENTS.md" \
          > "$sidecar_policy/policy"; then
-      echo "agent-sandbox: refusing to launch on an invalid [proxy] block (use --no-firewall to skip)." >&2
+      echo "agent-sandbox: refusing to launch on an invalid [proxy] block (use --no-proxy to skip)." >&2
       exit 1
     fi
   fi
 
-  # Refused in every mode -- --firewall or --meter-network, with or without any
+  # Refused in every mode -- --proxy, with or without any
   # user rule -- so a proxy with no rules (or deny-only rules) cannot be used to
   # reach the host or its LAN.  The sidecar sits on the default bridge alongside
   # the proxy; the sandbox has no route there at all, but it can ask the proxy
@@ -875,8 +866,8 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   # (domains|ips) only: allow_ports alone does not make the policy
   # deny-by-default -- only allow_domains/allow_ips do, and in the branch
   # below allow_ports is unrestricted too, not the 80/443/22 default.
-  if [[ "$want_firewall" == "1" ]] && ! grep -qE '^allow_(domains|ips) ' "$sidecar_policy/policy"; then
-    echo "agent-sandbox: --firewall is active with no allow rules, so every host is allowed" >&2
+  if ! grep -qE '^allow_(domains|ips) ' "$sidecar_policy/policy"; then
+    echo "agent-sandbox: --proxy is active with no allow rules, so every host is allowed" >&2
     echo "               on every port. Declare allow_domains/allow_ips (and optionally" >&2
     echo "               allow_ports) in a [proxy] block to restrict it." >&2
   fi
@@ -988,7 +979,7 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   #
   # Labelled like every other container the project creates: without this the
   # sidecar could only be found by guessing at its random name, which is why
-  # nothing could report on the firewall or reach the proxy's log.  target= points
+  # nothing could report on the proxy or reach its log.  target= points
   # back at the sandbox, mirroring the port forwarders.
   # stdout is just the container id, so it goes to /dev/null -- but stderr does
   # not.  Under errexit a silenced failure here aborted the launcher with no
@@ -1004,7 +995,6 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:$rw_mount_opts" \
     -v "$sidecar_policy:/sidecar_policy:ro" \
     -e "AGENT_SANDBOX_SKIP_NIX_INIT=1" \
-    -e "FIREWALL=$want_firewall" \
     -e "SIDECAR_SUBNET=$sidecar_subnet" \
     "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar >/dev/null; then
     echo "agent-sandbox: could not start the proxy sidecar" >&2
@@ -1093,10 +1083,8 @@ env_args+=("-e" "TERM=${TERM:-xterm-256color}")
 # indistinguishable from a container created before this existed, which would
 # make the column ambiguous exactly when it matters.
 proxy_mode=off
-if [[ "$want_firewall" == "1" ]]; then
-  proxy_mode=firewall
-elif [[ "$want_meter_network" == "1" ]]; then
-  proxy_mode=meter
+if [[ "$want_proxy" == "1" ]]; then
+  proxy_mode=proxy
 fi
 
 # Likewise always recorded, for the same reason: `ctl attach` and `ctl mount`

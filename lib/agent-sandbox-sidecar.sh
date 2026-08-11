@@ -34,11 +34,10 @@ policy_file=/sidecar_policy/policy
 # packets instead would write a second full copy of every transferred byte to
 # disk, which is what made throughput degrade as a session went on.
 #
-# Written whenever a proxy runs, not only under --meter-network, so that
-# `agent-sandbox-ctl net` can report on a --firewall session too -- which is
-# where "why was this blocked?" actually gets asked.  A few hundred bytes per
-# connection into a directory the launcher removes at exit.  --meter-network
-# decides only whether the summary is printed when the session ends.
+# Written whenever a proxy runs, so `agent-sandbox-ctl net` can report on any
+# --proxy session -- which is where "why was this blocked?" actually gets
+# asked.  A few hundred bytes per connection into a directory the launcher
+# removes at exit.
 metrics_log=/sidecar_shared/connections.jsonl
 
 # Exemption routes carry a proto of their own so they can be enumerated and
@@ -247,11 +246,10 @@ sync_routes() {
 # both were guessing at a configuration the launcher can simply ask for.
 
 proxy_args=(--log "$metrics_log")
-# Unconditional, in both --firewall and --meter-network: the launcher always
-# writes at least the baseline private/loopback deny list to this file (see
-# agent-sandbox.sh), so a proxy that never reads it would run the baseline-less
-# empty config it used to under metering alone, and be usable as an SSRF pivot
-# onto the host and its LAN.
+# Unconditional under --proxy: the launcher always writes at least the
+# baseline private/loopback deny list to this file (see agent-sandbox.sh), so
+# a proxy that never reads it would run an empty config and be usable as an
+# SSRF pivot onto the host and its LAN.
 if [[ ! -f "$policy_file" ]]; then
   echo "sidecar: $policy_file is missing" >&2
   exit 1

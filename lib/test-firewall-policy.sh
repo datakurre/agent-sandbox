@@ -267,16 +267,16 @@ else
     "found $exemptions"$'\n'"$dry_routes"
 fi
 
-# ── 7. --meter-network (no FIREWALL) still gets a policy ────────────────────
-# The baseline private/loopback deny list only protects meter-only sessions if
-# the sidecar always hands the proxy a --policy, not only when --firewall was
-# requested.  FIREWALL is deliberately left unset here to simulate that mode.
+# ── 7. --proxy still gets a policy ───────────────────────────────────────────
+# The baseline private/loopback deny list only protects sessions with no
+# AGENTS.md [proxy] block if the sidecar always hands the proxy a --policy,
+# unconditionally.
 
 dry_metering=$(AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
                AGENT_SANDBOX_SIDECAR_POLICY="$tmp/policy" \
                AGENT_SANDBOX_SIDECAR_RESOLV_CONF="$tmp/resolv-empty.conf" \
                bash "$sidecar")
-expect_contains "the proxy is given a policy under --meter-network too" \
+expect_contains "the proxy is given a policy under --proxy too" \
   "--policy" "$dry_metering"
 
 # ── 8. dry-run never binds a real address ────────────────────────────────────
@@ -285,8 +285,7 @@ expect_contains "the proxy is given a policy under --meter-network too" \
 # SIDECAR_SUBNET set, since a real launch always sets it but dry-run must not
 # depend on that to stay usable in a nix build (no podman, no network ns).
 
-dry_listen=$(FIREWALL=1 \
-             AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
+dry_listen=$(AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
              AGENT_SANDBOX_SIDECAR_RESOLV_CONF="$tmp/resolv-empty.conf" \
              AGENT_SANDBOX_SIDECAR_POLICY="$tmp/policy" \
              SIDECAR_SUBNET="10.89.0.0/24" \

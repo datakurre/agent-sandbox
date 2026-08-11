@@ -15,7 +15,7 @@ agent-sandbox-list [-a|--all] [--roles]
   -a, --all    every sandbox, any workspace, including stopped ones
   --roles      also list the proxy sidecars and port forwarders
 
-The PROXY column is the launch mode: firewall, meter, or off.
+The PROXY column is the launch mode: proxy or off.
 USAGE
 }
 

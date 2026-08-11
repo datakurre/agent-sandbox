@@ -60,10 +60,10 @@ row uptime    "$(podman ps --filter "name=^${sandbox}\$" --format '{{.Status}}' 
 
 mode=$(sandbox_proxy_mode "$sandbox")
 case "$mode" in
-  firewall|meter) row proxy "$mode  ($sidecar)" ;;
-  off)            row proxy "off  (direct network access)" ;;
+  proxy) row proxy "on  ($sidecar)" ;;
+  off)   row proxy "off  (direct network access)" ;;
   # Pre-dates the label: fall back to whether a sidecar is actually there.
-  *)              row proxy "$([[ -n "$sidecar" ]] && echo "on  ($sidecar)" || echo unknown)" ;;
+  *)     row proxy "$([[ -n "$sidecar" ]] && echo "on  ($sidecar)" || echo unknown)" ;;
 esac
 
 # An absent label means a launcher that predates it, which could only have
@@ -91,7 +91,7 @@ if [[ -n "$sidecar" ]]; then
     if grep -q '^default ' "$policy_dir/policy" 2>/dev/null; then
       default=$(awk '$1 == "default" { print $2 }' "$policy_dir/policy" | tail -n 1)
     fi
-    row firewall "${rules:-0} rule(s), default $default        agent-sandbox-ctl proxy show"
+    row policy "${rules:-0} rule(s), default $default        agent-sandbox-ctl proxy show"
   fi
 
   # ── traffic ───────────────────────────────────────────────────────────────

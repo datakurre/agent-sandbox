@@ -294,25 +294,20 @@ run "$port_bin" add --sandbox agent-sandbox-repo-1 8080
 expect_status "port add refuses a stopped sandbox" 1
 expect_out    "port add says why" "is not running"
 
-# ── port add must not weaken a firewalled sandbox ───────────────────────────
+# ── port add must not weaken a proxied sandbox ──────────────────────────────
 # The important half of this is the argv assertion: refusing is only useful if it
 # happens before podman is asked to create or join a network.
 
 fixture_reset
 fixture_set running "agent-sandbox-fw-1"
-fixture_set "labels.agent-sandbox-fw-1" "agent-sandbox.proxy=firewall"
+fixture_set "labels.agent-sandbox-fw-1" "agent-sandbox.proxy=proxy"
 
 run "$port_bin" add --sandbox agent-sandbox-fw-1 8080
-expect_status  "port add refuses a firewalled sandbox" 1
+expect_status  "port add refuses a proxied sandbox" 1
 expect_out     "port add explains the egress risk" "does not pass through the proxy"
 expect_no_argv "port add creates no network" "network create"
 expect_no_argv "port add joins no network" "network connect"
 expect_no_argv "port add starts no forwarder" "run --detach"
-
-# Metering has the same topology, so the same refusal.
-fixture_set "labels.agent-sandbox-fw-1" "agent-sandbox.proxy=meter"
-run "$port_bin" add --sandbox agent-sandbox-fw-1 8080
-expect_status "port add refuses a metered sandbox" 1
 
 # A sandbox from before the label still has the shared mount to give it away.
 fixture_set "labels.agent-sandbox-fw-1" "agent-sandbox.proxy="
@@ -428,7 +423,7 @@ expect_no_argv "logs does not try to read a log" "logs"
 
 fixture_set sidecars "agent-sandbox-sidecar-abc123"
 fixture_set "labels.agent-sandbox-sidecar-abc123" "agent-sandbox.target=agent-sandbox-repo-1"
-fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=firewall"
+fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=proxy"
 
 run "$logs_bin"
 expect_status "logs finds the sidecar by label" 0
@@ -457,7 +452,7 @@ fixture_set "mount.agent-sandbox-sidecar-abc123.sidecar_shared" "$tmp/shared"
 run "$status_bin"
 expect_status "status succeeds" 0
 expect_out    "status names the sandbox"  "agent-sandbox-repo-1"
-expect_out    "status reports proxy mode" "firewall"
+expect_out    "status reports proxy mode" "on  (agent-sandbox-sidecar-abc123)"
 expect_out    "status counts the policy rules" "2 rule(s), default deny"
 expect_out    "status counts traffic" "1 connection(s), 1 denied"
 expect_out    "status counts what is in flight" "in flight"
@@ -475,7 +470,7 @@ expect_out    "status names the sandbox"  "agent-sandbox-repo-1"
 if [[ -n "$proxy_bin" ]]; then
   fixture_reset
   fixture_set running "agent-sandbox-repo-1"
-  fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=firewall"
+  fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=proxy"
   fixture_set sidecars "agent-sandbox-sidecar-abc123"
   fixture_set "labels.agent-sandbox-sidecar-abc123" "agent-sandbox.target=agent-sandbox-repo-1"
 
@@ -584,7 +579,7 @@ if [[ -n "$proxy_bin" ]]; then
 
   fixture_reset
   fixture_set running "agent-sandbox-repo-1"
-  fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=firewall"
+  fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=proxy"
   fixture_set sidecars "agent-sandbox-sidecar-abc123"
   fixture_set "labels.agent-sandbox-sidecar-abc123" "agent-sandbox.target=agent-sandbox-repo-1"
 
@@ -674,15 +669,15 @@ fixture_reset
 fixture_set running "agent-sandbox-here-1" "agent-sandbox-elsewhere-1"
 fixture_set all "agent-sandbox-here-1" "agent-sandbox-elsewhere-1" "agent-sandbox-old-1"
 fixture_set "labels.agent-sandbox-here-1" \
-  "agent-sandbox.proxy=firewall" "agent-sandbox.workspace=$PWD"
+  "agent-sandbox.proxy=proxy" "agent-sandbox.workspace=$PWD"
 fixture_set "labels.agent-sandbox-elsewhere-1" \
-  "agent-sandbox.proxy=meter" "agent-sandbox.workspace=/somewhere/else"
+  "agent-sandbox.proxy=off" "agent-sandbox.workspace=/somewhere/else"
 
 run "$list_bin"
 expect_status "list succeeds" 0
 expect_out    "list heads the workspace" "Agent-sandbox containers for $PWD"
 expect_out    "list names the local sandbox" "agent-sandbox-here-1"
-expect_out    "list shows the proxy label" "firewall"
+expect_out    "list shows the proxy label" "proxy"
 expect_out    "list shows the workspace label" "$PWD"
 if grep -qF "agent-sandbox-elsewhere-1" <<< "$output"; then
   fail "list hides sandboxes from another workspace" "$output"
@@ -693,7 +688,7 @@ fi
 run "$list_bin" --all
 expect_status "list --all succeeds" 0
 expect_out    "list --all spans workspaces" "agent-sandbox-elsewhere-1"
-expect_out    "list --all shows the other proxy mode" "meter"
+expect_out    "list --all shows the other proxy mode" "off"
 if grep -qF -- "-a" <<< "$argv"; then
   pass "list --all asks podman for stopped containers"
 else

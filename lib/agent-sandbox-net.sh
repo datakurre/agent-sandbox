@@ -28,7 +28,7 @@ agent-sandbox-net [-f|--follow] [SANDBOX] [--sandbox NAME]
 With one sandbox running, --sandbox may be omitted.  With several, it is
 required unless the current directory matches exactly one sandbox workspace.
 
-Requires the sandbox to have been launched with --meter-network or --firewall;
+Requires the sandbox to have been launched with --proxy;
 without a proxy there is nothing to meter.
 USAGE
 }
