@@ -280,13 +280,13 @@ expect_no_argv "load typo does not import the image" "load"
 fixture_reset
 fixture_set running
 fixture_set all "agent-sandbox-repo-1"
-fixture_set forwarders "agent-sandbox-fwd-agent-sandbox-repo-1-8080"
-fixture_set "labels.agent-sandbox-fwd-agent-sandbox-repo-1-8080" \
+fixture_set forwarders "agent-sandbox-fwd-repo-1-8080"
+fixture_set "labels.agent-sandbox-fwd-repo-1-8080" \
   "agent-sandbox.target=agent-sandbox-repo-1"
 
 run "$port_bin" rm --sandbox agent-sandbox-repo-1 8080
 expect_status "port rm works on a stopped sandbox" 0
-expect_out    "port rm removes the forwarder" "removed agent-sandbox-fwd-agent-sandbox-repo-1-8080"
+expect_out    "port rm removes the forwarder" "removed agent-sandbox-fwd-repo-1-8080"
 
 # ── port add requires a RUNNING sandbox ─────────────────────────────────────
 
@@ -321,6 +321,11 @@ fixture_set running "agent-sandbox-plain-1"
 fixture_set "labels.agent-sandbox-plain-1" "agent-sandbox.proxy=off"
 run "$port_bin" add --sandbox agent-sandbox-plain-1 8080
 expect_status "port add still works without a proxy" 0
+if grep -qF -- "--name agent-sandbox-fwd-plain-1-8080" <<< "$argv"; then
+  pass "port add does not duplicate the sandbox prefix"
+else
+  fail "port add does not duplicate the sandbox prefix" "$argv"
+fi
 
 # ── port ls ─────────────────────────────────────────────────────────────────
 
@@ -729,16 +734,16 @@ else
 fi
 
 fixture_set sidecars "agent-sandbox-proxy-agent-sandbox-here-1"
-fixture_set forwarders "agent-sandbox-fwd-agent-sandbox-here-1-8080"
+fixture_set forwarders "agent-sandbox-fwd-here-1-8080"
 fixture_set "labels.agent-sandbox-proxy-agent-sandbox-here-1" \
   "agent-sandbox.target=agent-sandbox-here-1"
-fixture_set "labels.agent-sandbox-fwd-agent-sandbox-here-1-8080" \
+fixture_set "labels.agent-sandbox-fwd-here-1-8080" \
   "agent-sandbox.target=agent-sandbox-here-1"
 
 run "$list_bin" --roles
 expect_status "list --roles succeeds" 0
 expect_out    "list --roles lists the sidecar" "agent-sandbox-proxy-agent-sandbox-here-1"
-expect_out    "list --roles lists the forwarder" "agent-sandbox-fwd-agent-sandbox-here-1-8080"
+expect_out    "list --roles lists the forwarder" "agent-sandbox-fwd-here-1-8080"
 expect_out    "list --roles shows the target label" "TARGET"
 
 run "$list_bin" --help

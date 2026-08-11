@@ -179,7 +179,10 @@ cmd_add() {
   # Match any forwarder on this host port, not just this sandbox's: the name
   # embeds the sandbox, so a per-sandbox check lets a second sandbox get as far
   # as a raw podman bind error.
-  local name="agent-sandbox-fwd-${sandbox}-${host}" clash
+  # The sandbox name already carries the agent-sandbox- prefix. Keep one
+  # prefix for the forwarder role, but do not repeat it in the target portion.
+  local target_name="${sandbox#agent-sandbox-}"
+  local name="agent-sandbox-fwd-${target_name}-${host}" clash
   clash=$(podman ps -a --filter "label=agent-sandbox.role=port-forward" \
                        --filter "name=^agent-sandbox-fwd-.*-${host}\$" \
                        --format '{{.Names}}' 2>/dev/null | head -n 1)
@@ -204,12 +207,13 @@ cmd_add() {
 
 cmd_rm() {
   local sandbox="$1" target="$2"
+  local target_name="${sandbox#agent-sandbox-}"
   local forwarders=() forwarder removed=0
   mapfile -t forwarders < <(forwarder_containers "$sandbox")
 
   for forwarder in "${forwarders[@]}"; do
     [[ -n "$forwarder" ]] || continue
-    if [[ "$target" == "--all" || "$forwarder" == "agent-sandbox-fwd-${sandbox}-${target}" ]]; then
+    if [[ "$target" == "--all" || "$forwarder" == "agent-sandbox-fwd-${target_name}-${target}" ]]; then
       podman rm -f "$forwarder" > /dev/null
       echo "removed $forwarder"
       removed=$((removed + 1))
