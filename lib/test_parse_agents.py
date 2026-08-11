@@ -455,3 +455,42 @@ class TestProxyPolicyFile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestMounts(unittest.TestCase):
+    def test_string_value(self):
+        from parse_agents import parse_mounts
+        text = block('[mounts]\n"data" = "/workspace/data"')
+        self.assertEqual(parse_mounts(text), ["data:/workspace/data"])
+
+    def test_dict_value(self):
+        from parse_agents import parse_mounts
+        text = block('[mounts]\n"config.json" = { destination = "/etc/config", options = ["ro"] }')
+        self.assertEqual(parse_mounts(text), ["config.json:/etc/config:ro"])
+
+    def test_dict_value_with_multiple_options(self):
+        from parse_agents import parse_mounts
+        text = block('[mounts]\n"config.json" = { destination = "/etc/config", options = ["ro", "z"] }')
+        self.assertEqual(parse_mounts(text), ["config.json:/etc/config:ro,z"])
+
+    def test_dict_value_with_string_options(self):
+        from parse_agents import parse_mounts
+        text = block('[mounts]\n"config.json" = { destination = "/etc/config", options = "ro,z" }')
+        self.assertEqual(parse_mounts(text), ["config.json:/etc/config:ro,z"])
+
+    def test_missing_destination(self):
+        from parse_agents import parse_mounts, ConfigError
+        text = block('[mounts]\n"data" = { options = ["ro"] }')
+        with self.assertRaisesRegex(ConfigError, "missing required field 'destination'"):
+            parse_mounts(text)
+
+    def test_unknown_field(self):
+        from parse_agents import parse_mounts, ConfigError
+        text = block('[mounts]\n"data" = { destination = "/data", source = "data" }')
+        with self.assertRaisesRegex(ConfigError, "unknown field"):
+            parse_mounts(text)
+
+    def test_not_a_table(self):
+        from parse_agents import parse_mounts, ConfigError
+        text = block('mounts = 3')
+        with self.assertRaisesRegex(ConfigError, r"\[mounts\] must be a table"):
+            parse_mounts(text)

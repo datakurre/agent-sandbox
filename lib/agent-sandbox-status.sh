@@ -8,15 +8,17 @@
 
 usage() {
   cat <<'USAGE'
-agent-sandbox-status [SANDBOX] [--sandbox NAME]
+agent-sandbox-status [SANDBOX] [--sandbox NAME] [--export]
 
 Summarises one running sandbox: workspace, proxy mode, policy and traffic
 counts, and published ports.  Each line names the command that shows more.
+With --export, prints the configuration in AGENTS.md TOML format instead.
 
 With one sandbox running, --sandbox may be omitted.
 USAGE
 }
 
+export_toml=0
 sandbox_name=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,6 +28,7 @@ while [[ $# -gt 0 ]]; do
       sandbox_name="$1"
       ;;
     --sandbox=*) sandbox_name="${1#--sandbox=}" ;;
+    --export)    export_toml=1 ;;
     -h|--help)   usage; exit 0 ;;
     -*)          echo "${0##*/}: unknown option: $1" >&2; usage >&2; exit 1 ;;
     *)
@@ -45,15 +48,121 @@ if [[ -n "$sandbox_name" && ! "$sandbox_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
 fi
 
 sandbox=$(resolve_sandbox "$sandbox_name" --running)
+workspace_dir=$(sandbox_workspace "$sandbox")
+sidecar=$(sidecar_for_sandbox "$sandbox")
+
+if [[ "$export_toml" == "1" ]]; then
+  echo '```toml agent-sandbox'
+
+  # ── Proxy ───────────────────────────────────────────────────────────────────
+  if [[ -n "$sidecar" ]]; then
+    policy_dir=$(sidecar_mount "$sidecar" /sidecar_policy)
+    if [[ -n "$policy_dir" && -r "$policy_dir/policy" ]]; then
+      proxy_toml=$(awk '
+        $1 ~ /^(allow_domains|deny_domains|allow_ips|deny_ips|allow_ports)$/ {
+          list[$1] = list[$1] "\"" $2 "\", "
+        }
+        $1 == "default" { def = $2 }
+        END {
+          for (k in list) {
+            val = list[k]
+            sub(/, $/, "", val)
+            print k " = [" val "]"
+          }
+          if (def != "") print "default = \"" def "\""
+        }
+      ' "$policy_dir/policy")
+      
+      if [[ -n "$proxy_toml" ]]; then
+        echo "[proxy]"
+        echo "$proxy_toml"
+        echo ""
+      fi
+    fi
+  fi
+
+  # ── Ports ───────────────────────────────────────────────────────────────────
+  declare -A ports
+  port_idx=1
+  add_ports() {
+    local output="$1"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      if [[ "$line" =~ ^([0-9]+)/([a-z]+)[[:space:]]*-[^:]*:[^0-9]*([0-9.]+|\[.*\]):([0-9]+)$ ]]; then
+        local container="${BASH_REMATCH[1]}"
+        local proto="${BASH_REMATCH[2]}"
+        local bind="${BASH_REMATCH[3]}"
+        local host="${BASH_REMATCH[4]}"
+        ports["port_$port_idx"]="container = $container, host = $host, bind = \"$bind\", protocol = \"$proto\""
+        ((port_idx++))
+      fi
+    done <<< "$output"
+  }
+  add_ports "$(podman port "$sandbox" 2>/dev/null || true)"
+  forwarders=$(podman ps --filter "label=agent-sandbox.role=port-forward" \
+                         --filter "label=agent-sandbox.target=$sandbox" \
+                         --format '{{.Names}}' 2>/dev/null || true)
+  for fwd in $forwarders; do
+    add_ports "$(podman port "$fwd" 2>/dev/null || true)"
+  done
+
+  if [[ ${#ports[@]} -gt 0 ]]; then
+    echo "[ports]"
+    for k in "${!ports[@]}"; do
+      echo "$k = { ${ports[$k]} }"
+    done
+    echo ""
+  fi
+
+  # ── Mounts ──────────────────────────────────────────────────────────────────
+  mounts_toml=$(podman inspect --format '{{json .Mounts}}' "$sandbox" 2>/dev/null | jq -r --arg ws "$workspace_dir" '
+    .[] | select(.Type == "bind") |
+    select(.Destination != "/workspace") |
+    select(.Destination != "/home/user/.local/share/devenv") |
+    select(.Destination | test("^/home/user/.(local|config|cache)/") | not) |
+    select(.Destination | test("^/home/user/.(gitconfig|gnupg|ssh)") | not) |
+    select(.Destination | test("^/run/") | not) |
+    select(.Destination | test("^/sidecar_") | not) |
+    select(.Destination | test("^/nix") | not) |
+    select(.Destination | test("^/etc/") | not) |
+    .Source as $src | .Destination as $dst | .Options as $opts |
+    (
+      if ($src | startswith($ws + "/")) then
+        "." + ($src | ltrimstr($ws))
+      elif ($src == $ws) then
+        "."
+      else
+        $src
+      end
+    ) as $rel_src |
+    (
+      if ($opts | index("ro")) then
+        "\"" + $rel_src + "\" = { destination = \"" + $dst + "\", options = \"ro\" }"
+      elif ($opts | index("z")) then
+        "\"" + $rel_src + "\" = { destination = \"" + $dst + "\", options = \"z\" }"
+      else
+        "\"" + $rel_src + "\" = \"" + $dst + "\""
+      end
+    )
+  ' || true)
+
+  if [[ -n "$mounts_toml" ]]; then
+    echo "[mounts]"
+    echo "$mounts_toml"
+    echo ""
+  fi
+
+  echo '```'
+  exit 0
+fi
 
 row() { printf '  %-12s%s\n' "$1" "$2"; }
 
 printf '%s\n' "$sandbox"
-row workspace "$(sandbox_workspace "$sandbox")"
+row workspace "$workspace_dir"
 row uptime    "$(podman ps --filter "name=^${sandbox}\$" --format '{{.Status}}' 2>/dev/null)"
 
 mode=$(sandbox_proxy_mode "$sandbox")
-sidecar=$(sidecar_for_sandbox "$sandbox")
 case "$mode" in
   firewall|meter) row proxy "$mode  ($sidecar)" ;;
   off)            row proxy "off  (direct network access)" ;;

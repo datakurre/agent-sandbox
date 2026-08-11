@@ -36,16 +36,16 @@ To launch `opencode`, use `agent-sandbox opencode`. This launches it inside the 
 the current working directory mounted at `/workspace` and every integration
 enabled. If the current directory contains a `devenv.nix`, opencode is started
 through a devenv shell (`devenv shell -- opencode .`) so project dependencies
-are loaded automatically. Running `agent-sandbox` with no arguments prints the help menu.
+are loaded automatically. Running `agent-sandbox` with no arguments launches an interactive `bash` shell with all agents and their state directories fully available.
 
 ### Override the container command
 
 Everything after the `--` sentinel replaces the default command:
 
 ```sh
-agent-sandbox -- bash                            # interactive shell
+agent-sandbox                                    # interactive shell (all agents available)
 agent-sandbox -- bash -c "nix build .# && echo done"
-agent-sandbox opencode -- devenv shell           # devenv shell with opencode mounts
+agent-sandbox opencode -- devenv shell           # devenv shell with opencode default cmd replaced
 ```
 
 ### Pass podman flags
@@ -228,6 +228,7 @@ Changes take effect for new connections within a second. Connections already est
 - `--ports`: Honors `[ports]` declarations from `AGENTS.md`.
 - `--ports-dynamic`: Allows `agent-sandbox-ctl port add` post-launch.
 - `--ports-any-interface`: Permits port binds outside of loopback interfaces.
+- `--mounts`: Honors `[mounts]` declarations from `AGENTS.md`.
 
 You can use `--port [HOST:]CONTAINER[/PROTO]` to publish a port.
 
@@ -251,9 +252,8 @@ agent-sandbox copilot                            # github-copilot-cli (copilot),
 agent-sandbox antigravity                        # antigravity-cli (agy), everything on
 agent-sandbox opencode --no-workspace            # no CWD mount
 agent-sandbox opencode --selinux                 # enable :z on built-in writable binds
-agent-sandbox -- bash                            # interactive bash without agent-specific mounts
-agent-sandbox opencode -- bash                   # interactive bash with opencode configs mounted
-agent-sandbox opencode -- devenv shell           # devenv shell with opencode configs mounted
+agent-sandbox                                    # interactive bash (all agents available)
+agent-sandbox opencode -- devenv shell           # devenv shell replacing opencode cmd
 agent-sandbox --privileged opencode              # nested podman inside container
 ```
 
@@ -265,7 +265,7 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | --- | --- |
 | `load` | build the image and import it into podman |
 | `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows sidecars and forwarders |
-| `status [--sandbox N]` | one screen per sandbox, pointing at the commands below |
+| `status [--export] [--sandbox N]` | one screen per sandbox, pointing at the commands below. With `--export`, prints configuration as AGENTS.md TOML |
 | `net [-f]` | connection summary, or a live feed |
 | `logs [-f]` | the proxy sidecar's log |
 | `firewall show\|allow\|deny\|rm\|reset` | read and change the policy of a running sandbox |

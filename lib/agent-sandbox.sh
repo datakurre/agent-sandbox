@@ -33,6 +33,7 @@ want_selinux=0
 want_ports=0
 want_ports_dynamic=0
 want_ports_any_interface=0
+want_mounts=0
 want_firewall=0
 want_meter_network=0
 
@@ -70,7 +71,7 @@ Runs an AI coding agent inside a rootless podman container.
 Use flags to opt-in to integrations like mounting the current directory,
 forwarding SSH, or exposing Git identity.
 
-  agent-sandbox                      prints this help
+  agent-sandbox                      launch interactive bash (all agents available)
   agent-sandbox opencode             launch opencode with its specific mounts
   agent-sandbox --podman opencode    launch opencode with podman enabled
   agent-sandbox opencode -- bash     launch bash with opencode mounts
@@ -103,6 +104,7 @@ Ports:
   --ports-any-interface                    Permits port binds outside of loopback interfaces.
 
 Mounts:
+  --mounts / --no-mounts             $([[ "$want_mounts" == "1" ]] && echo "[on ]" || echo "[off]") Honors [mounts] declarations from AGENTS.md.
   -v SOURCE[:DEST[:OPTS]]   relative SOURCE resolves against \$PWD; relative
                             DEST is placed under /workspace; "." means
                             /workspace itself
@@ -237,6 +239,8 @@ while [[ $# -gt 0 ]]; do
     --ports-dynamic)    want_ports_dynamic=1 ;;
     --no-ports-dynamic) want_ports_dynamic=0 ;;
     --ports-any-interface) want_ports_any_interface=1 ;;
+    --mounts)           want_mounts=1 ;;
+    --no-mounts)        want_mounts=0 ;;
     --firewall)         want_firewall=1 ;;
     --no-firewall)      want_firewall=0 ;;
     --meter-network)    want_meter_network=1 ;;
@@ -293,9 +297,13 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ "$want_help" == "1" ]] || [[ -z "$agent" && ${#cmd_args[@]} -eq 0 ]]; then
+if [[ "$want_help" == "1" ]]; then
   usage
   exit 0
+fi
+
+if [[ -z "$agent" && ${#cmd_args[@]} -eq 0 ]]; then
+  cmd_args=(bash)
 fi
 
 rw_mount_opts="rw"
@@ -336,20 +344,20 @@ else
 fi
 
 # ── Agent state ─────────────────────────────────────────────────────────────
-# Only the selected agent's paths are mounted, so we avoid creating host-side
-# state directories for tools that never run.
-if [[ -n "$agent" ]]; then
+# All agentic tools are on the PATH in the image, so mount state for all of them
+# so any tool can be invoked interactively.
+for a in "${agent_names[@]}"; do
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
     mount_rw "$HOME/$rel" "/home/user/$rel"
-  done < <(jq -r '.[]' <<< "${agent_state_json[$agent]}")
+  done < <(jq -r '.[]' <<< "${agent_state_json[$a]}")
 
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
     [[ -s "$HOME/$rel" ]] || printf '{}\n' > "$HOME/$rel"
     mounts+=("-v" "$HOME/$rel:/home/user/$rel:$rw_mount_opts")
-  done < <(jq -r '.[]' <<< "${agent_state_files_json[$agent]}")
-fi
+  done < <(jq -r '.[]' <<< "${agent_state_files_json[$a]}")
+done
 
 # ── SSH ─────────────────────────────────────────────────────────────────────
 
@@ -490,6 +498,17 @@ if [[ "$want_ports" == "1" && -f "$PWD/AGENTS.md" ]]; then
     publish_args+=("-p" "$triple")
     published+=("$triple")
   done <<< "$declared"
+fi
+
+if [[ "$want_mounts" == "1" && -f "$PWD/AGENTS.md" ]]; then
+  if ! declared_mounts=$(agent-sandbox-parse-agents --mounts "$PWD/AGENTS.md"); then
+    echo "agent-sandbox: refusing to launch on an invalid [mounts] block (use --no-mounts to skip)." >&2
+    exit 1
+  fi
+  while IFS= read -r spec; do
+    [[ -n "$spec" ]] || continue
+    mounts+=("-v" "$(expand_v "$spec")")
+  done <<< "$declared_mounts"
 fi
 
 # Publishing a port and running a proxy are mutually exclusive, because the two

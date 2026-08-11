@@ -330,6 +330,55 @@ def parse_ports(
     return list(mappings.values())
 
 
+def parse_mounts(text: str) -> list[str]:
+    specs: list[str] = []
+    for body in iter_tagged_blocks(text):
+        try:
+            block = tomllib.loads(body)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"malformed TOML in agent-sandbox block: {exc}") from exc
+
+        mounts = block.get("mounts")
+        if mounts is None:
+            continue
+        if not isinstance(mounts, dict):
+            raise ConfigError("[mounts] must be a table")
+
+        for src, value in mounts.items():
+            if isinstance(value, str):
+                dest = value
+                opts = ""
+            elif isinstance(value, dict):
+                dest = value.get("destination")
+                if dest is None:
+                    raise ConfigError(f"mounts.{src}: missing required field 'destination'")
+                if not isinstance(dest, str):
+                    raise ConfigError(f"mounts.{src}.destination: expected a string")
+                
+                opts = value.get("options", "")
+                if not isinstance(opts, str):
+                    if isinstance(opts, list):
+                        for o in opts:
+                            if not isinstance(o, str):
+                                raise ConfigError(f"mounts.{src}.options: expected a string or list of strings")
+                        opts = ",".join(opts)
+                    else:
+                        raise ConfigError(f"mounts.{src}.options: expected a string or list of strings")
+                
+                unknown = set(value) - {"destination", "options"}
+                if unknown:
+                    raise ConfigError(f"mounts.{src}: unknown field(s) {', '.join(sorted(unknown))}")
+            else:
+                raise ConfigError(f"mounts.{src}: expected a string or table")
+            
+            spec = f"{src}:{dest}"
+            if opts:
+                spec += f":{opts}"
+            specs.append(spec)
+            
+    return specs
+
+
 def allocate(mapping: Mapping) -> Mapping:
     """Resolve `host = 0` to a concrete free port.
 
@@ -370,6 +419,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="emit the [proxy] policy file the proxy reads, instead of port mappings",
     )
+    parser.add_argument(
+        "--mounts",
+        action="store_true",
+        help="emit -v volume specs instead of port mappings",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -388,6 +442,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"agent-sandbox: {args.path}: {exc}", file=sys.stderr)
             return 1
         sys.stdout.write(format_proxy_policy(policy, args.path))
+        return 0
+
+    if args.mounts:
+        try:
+            mounts = parse_mounts(text)
+        except ConfigError as exc:
+            print(f"agent-sandbox: {args.path}: {exc}", file=sys.stderr)
+            return 1
+        for spec in mounts:
+            print(spec)
         return 0
 
     try:
