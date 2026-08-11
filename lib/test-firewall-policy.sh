@@ -39,6 +39,15 @@ expect_contains() {
   fi
 }
 
+expect_absent() {
+  local label="$1" unwanted="$2" have="$3"
+  if grep -qF -- "$unwanted" <<< "$have"; then
+    fail "$label" "present but should not be: $unwanted"$'\n'"$have"
+  else
+    pass "$label"
+  fi
+}
+
 # ── the fixture ─────────────────────────────────────────────────────────────
 
 cat > "$tmp/AGENTS.md" <<'EOF'
@@ -169,9 +178,15 @@ fi
 # Same class of bug on the kernel-route side: these used to come from a
 # space-separated env var that only worked by accident for a single entry.
 
+# An empty resolv.conf keeps this section about deny_ips alone; the nameserver
+# exemptions get their own section below.  Pinned rather than left to the build
+# sandbox's /etc/resolv.conf, which is not something to assert against.
+: > "$tmp/resolv-empty.conf"
+
 dry=$(FIREWALL=1 \
       AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
       AGENT_SANDBOX_SIDECAR_POLICY="$tmp/policy" \
+      AGENT_SANDBOX_SIDECAR_RESOLV_CONF="$tmp/resolv-empty.conf" \
       bash "$sidecar")
 
 routes=$(grep -c 'route add blackhole' <<< "$dry" || true)
@@ -184,6 +199,74 @@ expect_contains "blackhole covers the first entry"  "blackhole 10.1.0.0/24" "$dr
 expect_contains "blackhole covers the second entry" "blackhole 8.8.8.8"     "$dry"
 expect_contains "the proxy is given the policy file" "--policy" "$dry"
 
+# ── 6b. the routes mirror is_denied_address, not deny_ips alone ──────────────
+# The kernel's longest-prefix match is the same rule the proxy applies, so
+# allow_ips has to reach the routing table too.  It did not, and a re-allowed
+# range was permitted by the proxy and then dropped by the route -- including
+# the README's own `allow_ips = ["10.0.0.0/8"]` against the baseline deny.
+#
+# The nameservers are exempt whatever the policy says.  Without that, a deny_ips
+# covering the sidecar's resolver blackholes name resolution itself and every
+# request fails -- and the egress probe cannot catch it, because it runs before
+# these routes exist.
+
+cat > "$tmp/resolv-fixture.conf" <<'EOF'
+search example.test
+nameserver 130.234.16.20
+nameserver 130.234.16.10
+options single-request-reopen
+EOF
+
+cat > "$tmp/policy-routes" <<'EOF'
+allow_ips 10.0.0.0/8
+allow_ips 10.1.0.0/16
+allow_ips 0.0.0.0/0
+deny_ips 130.234.0.0/16
+deny_ips 8.8.8.8/32
+deny_ips 10.0.0.0/8
+deny_ips 192.168.0.0/16
+EOF
+
+dry_routes=$(FIREWALL=1 \
+             AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
+             AGENT_SANDBOX_SIDECAR_POLICY="$tmp/policy-routes" \
+             AGENT_SANDBOX_SIDECAR_RESOLV_CONF="$tmp/resolv-fixture.conf" \
+             bash "$sidecar")
+
+expect_contains "the first nameserver is exempted from the deny covering it" \
+  "route add 130.234.16.20 via" "$dry_routes"
+expect_contains "the second nameserver is exempted too" \
+  "route add 130.234.16.10 via" "$dry_routes"
+expect_contains "the range covering the nameservers is still blackholed" \
+  "blackhole 130.234.0.0/16" "$dry_routes"
+
+expect_absent "an allow_ips of equal prefix suppresses the blackhole" \
+  "blackhole 10.0.0.0/8" "$dry_routes"
+expect_contains "and gets a route of its own instead" \
+  "route add 10.0.0.0/8 via" "$dry_routes"
+expect_contains "a longer allow_ips is routed over a shorter deny" \
+  "route add 10.1.0.0/16 via" "$dry_routes"
+expect_contains "a deny with no matching allow is untouched" \
+  "blackhole 192.168.0.0/16" "$dry_routes"
+
+# `ip route show` prints a host route without its /32, so installing one with it
+# would never match what is read back and would be re-added on every pass.
+expect_contains "a /32 deny is installed in the form the kernel reports" \
+  "blackhole 8.8.8.8" "$dry_routes"
+expect_absent "and not with the suffix the policy wrote" \
+  "blackhole 8.8.8.8/32" "$dry_routes"
+
+expect_absent "an allow_ips default route is refused a route of its own" \
+  "route add 0.0.0.0/0" "$dry_routes"
+
+exemptions=$(grep -c 'proto 200' <<< "$dry_routes" || true)
+if [[ "$exemptions" == 4 ]]; then
+  pass "exactly the four expected exemptions are installed"
+else
+  fail "exactly the four expected exemptions are installed" \
+    "found $exemptions"$'\n'"$dry_routes"
+fi
+
 # ── 7. --meter-network (no FIREWALL) still gets a policy ────────────────────
 # The baseline private/loopback deny list only protects meter-only sessions if
 # the sidecar always hands the proxy a --policy, not only when --firewall was
@@ -191,6 +274,7 @@ expect_contains "the proxy is given the policy file" "--policy" "$dry"
 
 dry_metering=$(AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
                AGENT_SANDBOX_SIDECAR_POLICY="$tmp/policy" \
+               AGENT_SANDBOX_SIDECAR_RESOLV_CONF="$tmp/resolv-empty.conf" \
                bash "$sidecar")
 expect_contains "the proxy is given a policy under --meter-network too" \
   "--policy" "$dry_metering"
@@ -203,6 +287,7 @@ expect_contains "the proxy is given a policy under --meter-network too" \
 
 dry_listen=$(FIREWALL=1 \
              AGENT_SANDBOX_SIDECAR_DRY_RUN=1 \
+             AGENT_SANDBOX_SIDECAR_RESOLV_CONF="$tmp/resolv-empty.conf" \
              AGENT_SANDBOX_SIDECAR_POLICY="$tmp/policy" \
              SIDECAR_SUBNET="10.89.0.0/24" \
              bash "$sidecar")

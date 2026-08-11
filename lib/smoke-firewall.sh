@@ -148,6 +148,41 @@ else
     pass "the proxy does not resolve through aardvark-dns"
   fi
 
+  # Every nameserver the sidecar resolves against carries an exemption route, so
+  # that a deny_ips range covering it -- the baseline's own 192.168.0.0/16 covers
+  # a great many home resolvers -- cannot blackhole name resolution itself.  The
+  # egress probe runs before these routes exist and so cannot catch it; this is
+  # the check that can.
+  sidecar_ns=()
+  mapfile -t sidecar_ns < <(awk '/^[[:space:]]*nameserver/ { print $2 }' <<< "$resolv")
+  if [[ ${#sidecar_ns[@]} -eq 0 ]]; then
+    fail "the sidecar has a nameserver at all" "$resolv"
+  else
+    exempt_routes=$(podman exec "$sidecar" ip -o route show proto 200 2>/dev/null || true)
+    missing=()
+    for ns in "${sidecar_ns[@]}"; do
+      grep -qE "^${ns}[[:space:]]" <<< "$exempt_routes" || missing+=("$ns")
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+      pass "every nameserver has an exemption route"
+    else
+      fail "every nameserver has an exemption route" \
+        "no route for: ${missing[*]}"$'\n'"$exempt_routes"
+    fi
+  fi
+
+  # The host's search list travels with its nameservers, or an unqualified name
+  # that resolves on the host resolves to nothing here.
+  host_search=$(awk '/^[[:space:]]*search/ { print $2 }' /etc/resolv.conf 2>/dev/null | head -n 1)
+  if [[ -z "$host_search" ]]; then
+    pass "the host declares no search domain (nothing to carry)"
+  elif grep -qE "^[[:space:]]*search[[:space:]].*(^|[[:space:]])${host_search}([[:space:]]|\$)" <<< "$resolv"; then
+    pass "the host's search domain reached the sidecar"
+  else
+    fail "the host's search domain reached the sidecar" \
+      "wanted $host_search in:"$'\n'"$resolv"
+  fi
+
   # Written only when wait_for_egress gives up, which is the degraded launch the
   # launcher now warns about.  A healthy session must not have one.
   if podman exec "$sidecar" test -e /sidecar_shared/egress-degraded 2>/dev/null; then
@@ -308,6 +343,59 @@ else
   fi
 
   podman rm -f "$meter_sandbox" >/dev/null 2>&1
+fi
+
+# ── a deny_ips covering the sidecar's own resolver ───────────────────────────
+# The failure this exists for: resolution happens in the sidecar, by libc, well
+# outside the proxy's policy path, so a deny_ips range that happens to contain
+# the resolver used to blackhole DNS itself.  Every request then failed, not
+# only the ones aimed at the denied range, and nothing said so -- the egress
+# probe had already passed, because it runs before the routes are installed.
+#
+# The range is derived from the resolver the first sidecar actually got, so this
+# reproduces the shape rather than assuming any particular network.
+
+dns_ns="${sidecar_ns[0]:-}"
+if [[ ! "$dns_ns" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+  pass "skipped: the sidecar's resolver ${dns_ns:-(none)} is not an IPv4 literal"
+else
+  dns_deny="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.0.0/16"
+  mkdir -p "$tmp/dns"
+  cat > "$tmp/dns/AGENTS.md" <<EOF
+\`\`\`toml agent-sandbox
+[proxy]
+allow_domains = ["example.com", "*.example.com"]
+deny_ips = ["$dns_deny"]
+\`\`\`
+EOF
+
+  (cd "$tmp/dns" && agent-sandbox --firewall --no-workspace -- sleep 300 \
+     >"$tmp/dns-launch.log" 2>&1 &)
+
+  dns_sandbox=""
+  for _ in $(seq 1 60); do
+    dns_sandbox=$(podman ps --filter "label=agent-sandbox.role=sandbox" \
+                            --filter "label=agent-sandbox.workspace=$tmp/dns" \
+                            --format '{{.Names}}' | head -n 1)
+    [[ -n "$dns_sandbox" ]] && break
+    sleep 1
+  done
+
+  if [[ -z "$dns_sandbox" ]]; then
+    fail "the sandbox started with its resolver inside a deny_ips range" \
+      "$(cat "$tmp/dns-launch.log")"
+  else
+    pass "the sandbox started with its resolver inside a deny_ips range ($dns_deny)"
+
+    if podman exec "$dns_sandbox" curl -sS -o /dev/null -m 20 https://example.com 2>/dev/null; then
+      pass "an allowed host still resolves with the resolver's range denied"
+    else
+      fail "an allowed host still resolves with the resolver's range denied" \
+        "$(agent-sandbox-ctl logs --sandbox "$dns_sandbox" 2>/dev/null | tail -5)"
+    fi
+
+    podman rm -f "$dns_sandbox" >/dev/null 2>&1
+  fi
 fi
 
 # ── refusals at launch ───────────────────────────────────────────────────────

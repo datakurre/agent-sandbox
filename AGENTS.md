@@ -132,9 +132,28 @@ so without it a policy with no rules -- which is exactly what metering runs -- c
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
 ordinary `deny_ips` entries rather than compiling it into the proxy means one
 list, visible in `firewall show`, restored by `reset`, and mirrored into the
-kernel blackhole routes by the same `sync_blackholes` that handles user rules.
+kernel routes by the same `sync_routes` that handles user rules.
 An `allow_ips` entry of equal or greater specificity overrides one of them; that
 is why `is_denied_address` breaks prefix ties toward allow.
+
+`sync_routes` mirrors that whole rule, not `deny_ips` alone.  The kernel's
+longest-prefix match *is* the specificity comparison the proxy makes, so every
+`allow_ips` entry gets a route via the default gateway and beats a shorter
+blackhole by itself; the one case a routing table cannot express is the
+equal-prefix tie, there being room for a single route per prefix, and that is
+handled by not installing the blackhole at all.  Until it did this, a re-allowed
+range -- including the README's own `allow_ips = ["10.0.0.0/8"]` against the
+baseline -- was permitted by the proxy and then dropped on the floor by the
+route, with `firewall show` reporting the rule as in force.
+
+The sidecar's nameservers, read from its own `/etc/resolv.conf`, are exempted
+unconditionally.  Resolution happens in the sidecar via libc, before any rule is
+consulted, so a `deny_ips` range containing the resolver blackholes DNS itself
+and fails every request rather than only the ones aimed at that range -- and the
+baseline's `192.168.0.0/16` does exactly that to a home router.  This is not a
+way out: the sandbox has no route into this netns, its only egress is CONNECT to
+the proxy, and `is_denied_address` still runs over every resolved address, so a
+CONNECT aimed at the resolver stays refused.
 
 Because the sidecar is on that bridge, the proxy binds only the address it holds
 on the internal network, selected by subnet membership from `SIDECAR_SUBNET`
@@ -143,9 +162,17 @@ of the `--network` flags and is not something to depend on.
 
 **Startup ordering** matters and is why there are two readiness markers: the
 proxy validates policy, probes egress and writes `proxy-ready`; the sidecar then
-installs the `deny_ips` blackhole routes and writes `ready`; only then does the
-launcher start the sandbox.  So routes are in place before any traffic can exist,
-and a bad policy exits 2 before touching the kernel table.
+installs the routes and writes `ready`; only then does the launcher start the
+sandbox.  So routes are in place before any traffic can exist, and a bad policy
+exits 2 before touching the kernel table.
+
+The corollary is that the probe runs *before* the routes exist and so cannot
+catch a policy that blackholes the sidecar's own resolver: it proves egress,
+`sync_routes` then breaks it, and the session 502s with a clean startup behind
+it.  That is why the nameserver exemption above is unconditional rather than a
+reaction to a failed probe.  Reordering the markers would not help either --
+proving egress after the routes are installed would only turn a silent failure
+into a degraded launch, when the routes can simply be right.
 
 The egress probe is never fatal -- a degraded launch beats a hung one -- but it
 is no longer silent: when it gives up it writes `egress-degraded` with the

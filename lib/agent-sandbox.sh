@@ -820,7 +820,7 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   # the proxy; the sandbox has no route there at all, but it can ask the proxy
   # to go there on its behalf.  Written as ordinary deny_ips entries into the
   # same file the proxy reads and the sidecar mirrors into kernel blackhole
-  # routes (sync_blackholes), so this is the only place this list is written
+  # routes (sync_routes), so this is the only place this list is written
   # down.  An allow_ips entry of equal or greater specificity overrides one of
   # these -- see is_allowed_ip/is_denied_address in proxy/src/main.rs.
   baseline_deny_ips=(
@@ -882,23 +882,69 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     done < "$1"
   }
 
+  # `search` (and its legacy `domain` spelling) from the same file, so an
+  # unqualified name that resolves on the host resolves in the sidecar too.
+  # Carrying the nameservers without them leaves a split-horizon setup half
+  # configured: the resolver knows the internal zone, the query never names it,
+  # and the proxy answers 502 for a host the operator can reach.
+  #
+  # Same conservative shape as above -- podman rejecting a value takes the whole
+  # sidecar down, and a search domain is worth less than a working session.
+  usable_search() { # FILE
+    [[ -r "$1" ]] || return 0
+    local line word
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" =~ ^[[:space:]]*(search|domain)[[:space:]]+(.*) ]] || continue
+      for word in ${BASH_REMATCH[2]}; do
+        [[ "$word" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || continue
+        printf '%s\n' "$word"
+      done
+    done < "$1"
+  }
+
+  usable_dns_options() { # FILE
+    [[ -r "$1" ]] || return 0
+    local line word
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" =~ ^[[:space:]]*options[[:space:]]+(.*) ]] || continue
+      for word in ${BASH_REMATCH[1]}; do
+        [[ "$word" =~ ^[a-z0-9-]+(:[0-9]+)?$ ]] || continue
+        printf '%s\n' "$word"
+      done
+    done < "$1"
+  }
+
   sidecar_nameservers=()
-  mapfile -t sidecar_nameservers < <(usable_nameservers /etc/resolv.conf)
+  sidecar_resolv=/etc/resolv.conf
+  mapfile -t sidecar_nameservers < <(usable_nameservers "$sidecar_resolv")
   # systemd-resolved publishes 127.0.0.53 as the only nameserver, which the
   # filter above correctly discards.  Its own file carries the real upstreams;
   # using them keeps split-horizon and corporate names resolving instead of
   # quietly defecting to a public resolver.
   if [[ ${#sidecar_nameservers[@]} -eq 0 ]]; then
-    mapfile -t sidecar_nameservers < <(usable_nameservers /run/systemd/resolve/resolv.conf)
+    sidecar_resolv=/run/systemd/resolve/resolv.conf
+    mapfile -t sidecar_nameservers < <(usable_nameservers "$sidecar_resolv")
   fi
+  # Nothing on the host was usable.  The search list goes with it: a public
+  # resolver cannot answer for an internal zone, so carrying the suffixes would
+  # only add failed lookups to every name.
   if [[ ${#sidecar_nameservers[@]} -eq 0 ]]; then
     sidecar_nameservers=(8.8.8.8 1.1.1.1)
+    sidecar_resolv=""
   fi
 
   sidecar_dns_args=()
   for sidecar_ns in "${sidecar_nameservers[@]}"; do
     sidecar_dns_args+=(--dns "$sidecar_ns")
   done
+  if [[ -n "$sidecar_resolv" ]]; then
+    while read -r sidecar_search; do
+      sidecar_dns_args+=(--dns-search "$sidecar_search")
+    done < <(usable_search "$sidecar_resolv")
+    while read -r sidecar_dns_option; do
+      sidecar_dns_args+=(--dns-option "$sidecar_dns_option")
+    done < <(usable_dns_options "$sidecar_resolv")
+  fi
 
   # The sidecar is infrastructure, not agent workload. Keep its policy/log
   # mounts SELinux-safe by default regardless of --selinux so readiness does not
