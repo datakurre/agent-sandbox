@@ -124,7 +124,7 @@ let
     ++ podmanStack
     # No agent-sandbox-allow: policy now lives on a volume the sandbox cannot
     # see, so widening the firewall is a host-side operation
-    # (agent-sandbox-ctl firewall allow) by design.
+    # (agent-sandbox-ctl proxy allow) by design.
     ++ [ dockerAlias sidecarScript proxyScript ];
 
   tools = baseTools ++ agentTools;
@@ -380,6 +380,7 @@ let
     runtimeInputs = with pkgs; [
       podman
       coreutils
+      jq
     ];
     text = preamble + sandboxResolve + scriptBody ./lib/agent-sandbox-mount.sh;
   };
@@ -430,7 +431,6 @@ let
       coreutils
       gnugrep
       gawk
-      jq
     ];
     text = sandboxResolve + scriptBody ./lib/agent-sandbox-status.sh;
   };
@@ -608,8 +608,10 @@ let
             gnused
             # The tests run the composed lib/ scripts rather than the built ones,
             # so whatever a script would find through runtimeInputs has to be
-            # here too -- `column`, for agent-sandbox-list.
+            # here too -- `column`, for agent-sandbox-list, and `jq`, for
+            # agent-sandbox-mount's export subcommand.
             util-linux
+            jq
           ];
         }
         ''

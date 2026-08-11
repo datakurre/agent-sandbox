@@ -18,12 +18,14 @@
 usage() {
   cat <<'USAGE'
 agent-sandbox-port ls
-agent-sandbox-port add [SANDBOX] [--sandbox NAME] [HOST:]CONTAINER[/PROTO]
-agent-sandbox-port rm  [SANDBOX] [--sandbox NAME] (HOST | --all)
+agent-sandbox-port add    [SANDBOX] [--sandbox NAME] [HOST:]CONTAINER[/PROTO]
+agent-sandbox-port rm     [SANDBOX] [--sandbox NAME] (HOST | --all)
+agent-sandbox-port export [SANDBOX] [--sandbox NAME]
 
-  ls    show running sandboxes and the ports forwarded into them
-  add   start a forwarder for one port
-  rm    stop forwarders
+  ls      show running sandboxes and the ports forwarded into them
+  add     start a forwarder for one port
+  rm      stop forwarders
+  export  print the [ports] section of a running sandbox as AGENTS.md TOML
 
 With one sandbox running, --sandbox may be omitted.  With several, it is
 required unless the current directory matches exactly one sandbox workspace.
@@ -220,6 +222,46 @@ cmd_rm() {
   fi
 }
 
+cmd_export() {
+  local sandbox="$1"
+  local ports_lines=() port_idx=1
+
+  add_ports() {
+    local output="$1"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      if [[ "$line" =~ ^([0-9]+)/([a-z]+)[[:space:]]*-[^:]*:[^0-9]*([0-9.]+|\[.*\]):([0-9]+)$ ]]; then
+        local container="${BASH_REMATCH[1]}"
+        local proto="${BASH_REMATCH[2]}"
+        local bind="${BASH_REMATCH[3]}"
+        local host="${BASH_REMATCH[4]}"
+        ports_lines+=("port_$port_idx = { container = $container, host = $host, bind = \"$bind\", protocol = \"$proto\" }")
+        ((port_idx++))
+      fi
+    done <<< "$output"
+  }
+
+  add_ports "$(podman port "$sandbox" 2>/dev/null || true)"
+  local forwarders
+  forwarders=$(podman ps --filter "label=agent-sandbox.role=port-forward" \
+                         --filter "label=agent-sandbox.target=$sandbox" \
+                         --format '{{.Names}}' 2>/dev/null || true)
+  local fwd
+  for fwd in $forwarders; do
+    add_ports "$(podman port "$fwd" 2>/dev/null || true)"
+  done
+
+  if [[ ${#ports_lines[@]} -gt 0 ]]; then
+    echo '```toml agent-sandbox'
+    echo "[ports]"
+    local line
+    for line in "${ports_lines[@]}"; do
+      echo "$line"
+    done
+    echo '```'
+  fi
+}
+
 # ── Argument parsing ────────────────────────────────────────────────────────
 
 [[ $# -gt 0 ]] || { usage; exit 1; }
@@ -287,6 +329,17 @@ case "$action" in
     # Deliberately not --running: a forwarder outlives its sandbox, and clearing
     # one up is exactly the case where the sandbox has already exited.
     cmd_rm "$(resolve_sandbox "$sandbox_name")" "$target"
+    ;;
+  export)
+    if [[ ${#positional[@]} -eq 1 ]]; then
+      if [[ -n "$sandbox_name" ]]; then
+         echo "agent-sandbox-port: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+      fi
+      sandbox_name="${positional[0]}"
+    elif [[ ${#positional[@]} -gt 1 ]]; then
+      echo "agent-sandbox-port: export takes at most one argument (the sandbox)" >&2; usage >&2; exit 1
+    fi
+    cmd_export "$(resolve_sandbox "$sandbox_name" --running)"
     ;;
   -h|--help)
     usage

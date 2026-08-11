@@ -7,7 +7,7 @@ usage() {
   printf '  %-9s%s\n' load     "Load the agent-sandbox image"
   printf '  %-9s%s\n' list     "List sandboxes and their proxy mode"
   printf '  %-9s%s\n' status   "Summarise one running sandbox"
-  printf '  %-9s%s\n' firewall "Show or change the firewall policy of a running sandbox"
+  printf '  %-9s%s\n' proxy    "Show or change the proxy policy of a running sandbox"
   printf '  %-9s%s\n' net      "Show network metering for a running sandbox"
   printf '  %-9s%s\n' logs     "Show the proxy log for a running sandbox"
   printf '  %-9s%s\n' port     "Manage port forwarding"
@@ -33,7 +33,7 @@ case "$cmd" in
   list)        exec agent-sandbox-list "$@" ;;
   attach)      exec agent-sandbox-attach "$@" ;;
   status)      exec agent-sandbox-status "$@" ;;
-  firewall|fw) exec agent-sandbox-firewall "$@" ;;
+  proxy|fw)    exec agent-sandbox-firewall "$@" ;;
   net|network) exec agent-sandbox-net "$@" ;;
   logs|log)    exec agent-sandbox-logs "$@" ;;
   -h|--help|help) usage ;;

@@ -5,7 +5,7 @@
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
 ("agent-sandbox") together with a launcher binary (`agent-sandbox`) and a
 management multiplexer (`agent-sandbox-ctl`, with the subcommands `load`,
-`list`, `status`, `net`, `logs`, `firewall`, `port` and `purge`).
+`list`, `status`, `net`, `logs`, `proxy`, `port` and `purge`).
 
 - **default.nix** – single Nix module; builds the image and every host script.
 - **agents.nix** – agent catalog (command + persisted state paths per agent).
@@ -112,7 +112,7 @@ Three directories, and which side can see them is the design:
 Neither is mounted into the sandbox. That is deliberate and load-bearing: the
 agent must not be able to widen the firewall that contains it, nor rewrite the
 log of what it did. Changing policy is therefore a host-side operation
-(`agent-sandbox-ctl firewall`), which is why the old in-container
+(`agent-sandbox-ctl proxy`), which is why the old in-container
 `agent-sandbox-allow` was deleted rather than repaired.
 
 **Policy format.** One `KEY VALUE` per line (`allow_domains`, `deny_domains`,
@@ -124,7 +124,7 @@ everything.  One entry per line means any fixture with two entries exercises the
 case that used to break.
 
 `agent-sandbox-proxy --check-policy FILE` is the single reference validator:
-`parse_agents.py` writes the file, the proxy reads it, the host-side `firewall`
+`parse_agents.py` writes the file, the proxy reads it, the host-side `proxy`
 command vets its own writes with the same binary, and `checks.firewall-policy`
 tests the whole chain.  There is no second implementation to drift.
 
@@ -134,7 +134,7 @@ The sidecar sits on the default bridge as well as the sandbox's internal network
 so without it a policy with no rules -- which is exactly what metering runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
 ordinary `deny_ips` entries rather than compiling it into the proxy means one
-list, visible in `firewall show`, restored by `reset`, and mirrored into the
+list, visible in `proxy show`, restored by `reset`, and mirrored into the
 kernel routes by the same `sync_routes` that handles user rules.
 An `allow_ips` entry of equal or greater specificity overrides one of them; that
 is why `is_denied_address` breaks prefix ties toward allow.
@@ -147,7 +147,7 @@ equal-prefix tie, there being room for a single route per prefix, and that is
 handled by not installing the blackhole at all.  Until it did this, a re-allowed
 range -- including the README's own `allow_ips = ["10.0.0.0/8"]` against the
 baseline -- was permitted by the proxy and then dropped on the floor by the
-route, with `firewall show` reporting the rule as in force.
+route, with `proxy show` reporting the rule as in force.
 
 The sidecar's nameservers, read from its own `/etc/resolv.conf`, are exempted
 unconditionally.  Resolution happens in the sidecar via libc, before any rule is

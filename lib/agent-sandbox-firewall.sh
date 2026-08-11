@@ -11,19 +11,24 @@
 # read a half-written or invalid policy.  The proxy notices the change within a
 # second; nothing here has to talk to it.
 
+prog="agent-sandbox-ctl proxy"
+
 usage() {
-  cat <<'USAGE'
-agent-sandbox-firewall show  [SANDBOX] [--sandbox NAME]
-agent-sandbox-firewall allow [SANDBOX] [--sandbox NAME] ENTRY...
-agent-sandbox-firewall deny  [SANDBOX] [--sandbox NAME] ENTRY...
-agent-sandbox-firewall rm    [SANDBOX] [--sandbox NAME] ENTRY...
-agent-sandbox-firewall reset [SANDBOX] [--sandbox NAME]
+  cat <<USAGE
+$prog show   [SANDBOX] [--sandbox NAME]
+$prog allow  [SANDBOX] [--sandbox NAME] ENTRY...
+$prog deny   [SANDBOX] [--sandbox NAME] ENTRY...
+$prog rm     [SANDBOX] [--sandbox NAME] ENTRY...
+$prog reset  [SANDBOX] [--sandbox NAME]
+$prog export [SANDBOX] [--sandbox NAME]
 
   show    the rules in force, and which came from AGENTS.md
   allow   permit a domain or IP, from now on
   deny    block a domain or IP, from now on
   rm      drop an entry from both lists
   reset   discard runtime changes and restore the AGENTS.md policy
+  export  print the [proxy] section as AGENTS.md TOML, omitting the baseline
+          private/loopback denials every sandbox gets regardless of policy
 
 ENTRY is a domain (github.com, *.github.com), an address or CIDR block
 (10.0.0.0/8, 8.8.8.8), or a port or port range (443, 8000-8100); which one is
@@ -49,19 +54,19 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --sandbox)
       shift
-      [[ $# -gt 0 ]] || { echo "${0##*/}: --sandbox needs a name" >&2; exit 1; }
+      [[ $# -gt 0 ]] || { echo "$prog: --sandbox needs a name" >&2; exit 1; }
       sandbox_name="$1"
       ;;
     --sandbox=*) sandbox_name="${1#--sandbox=}" ;;
     -h|--help)   usage; exit 0 ;;
-    -*)          echo "${0##*/}: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    -*)          echo "$prog: unknown option: $1" >&2; usage >&2; exit 1 ;;
     *)           entries+=("$1") ;;
   esac
   shift
 done
 
 if [[ -n "$sandbox_name" && ! "$sandbox_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-  echo "${0##*/}: invalid sandbox name: $sandbox_name" >&2
+  echo "$prog: invalid sandbox name: $sandbox_name" >&2
   exit 1
 fi
 
@@ -93,7 +98,7 @@ install_policy() {
   cat > "$dir/.policy.new"
   if ! agent-sandbox-proxy --check-policy "$dir/.policy.new" >/dev/null; then
     rm -f "$dir/.policy.new"
-    echo "${0##*/}: refusing to install an invalid policy" >&2
+    echo "$prog: refusing to install an invalid policy" >&2
     exit 1
   fi
   mv "$dir/.policy.new" "$dir/policy"
@@ -104,7 +109,7 @@ sidecar=$(require_sidecar "$sandbox")
 
 policy_dir=$(sidecar_mount "$sidecar" /sidecar_policy)
 if [[ -z "$policy_dir" || ! -d "$policy_dir" ]]; then
-  echo "${0##*/}: cannot find the policy directory of $sidecar" >&2
+  echo "$prog: cannot find the policy directory of $sidecar" >&2
   echo "               (it was launched by an older agent-sandbox)" >&2
   exit 1
 fi
@@ -144,7 +149,7 @@ filter_out_entries() {
 
 need_entries() {
   if [[ ${#entries[@]} -eq 0 ]]; then
-    echo "${0##*/}: $action needs at least one domain or address" >&2
+    echo "$prog: $action needs at least one domain or address" >&2
     usage >&2
     exit 1
   fi
@@ -154,12 +159,12 @@ case "$action" in
   show|ls|list)
     if [[ ${#entries[@]} -eq 1 ]]; then
       if [[ -n "$sandbox_name" ]]; then
-         echo "${0##*/}: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+         echo "$prog: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
       fi
       sandbox_name="${entries[0]}"
       entries=()
     elif [[ ${#entries[@]} -gt 1 ]]; then
-      echo "${0##*/}: show takes at most one argument (the sandbox)" >&2; exit 1
+      echo "$prog: show takes at most one argument (the sandbox)" >&2; exit 1
     fi
     printf '%s\n' "$sandbox"
     printf '  policy      %s\n' "$policy"
@@ -220,7 +225,7 @@ case "$action" in
     added=()
     for entry in "${entries[@]}"; do
       if ! kind=$(classify "$entry"); then
-        echo "${0##*/}: not a domain or address: $entry" >&2
+        echo "$prog: not a domain or address: $entry" >&2
         exit 1
       fi
       added+=("${list_prefix}_${kind} $entry")
@@ -257,7 +262,7 @@ case "$action" in
 
     if [[ "$FILTERED_COUNT" -eq 0 ]]; then
       rm -f "$policy_dir/.policy.next"
-      echo "${0##*/}: no rule matches: ${entries[*]}" >&2
+      echo "$prog: no rule matches: ${entries[*]}" >&2
       exit 1
     fi
 
@@ -270,15 +275,15 @@ case "$action" in
   reset)
     if [[ ${#entries[@]} -eq 1 ]]; then
       if [[ -n "$sandbox_name" ]]; then
-         echo "${0##*/}: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+         echo "$prog: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
       fi
       sandbox_name="${entries[0]}"
       entries=()
     elif [[ ${#entries[@]} -gt 1 ]]; then
-      echo "${0##*/}: reset takes at most one argument (the sandbox)" >&2; exit 1
+      echo "$prog: reset takes at most one argument (the sandbox)" >&2; exit 1
     fi
     if [[ ! -f "$base" ]]; then
-      echo "${0##*/}: no baseline policy to restore" >&2
+      echo "$prog: no baseline policy to restore" >&2
       exit 1
     fi
     # Restores the declared policy rather than emptying it: an empty policy is
@@ -288,8 +293,54 @@ case "$action" in
     printf '  %-12s%s\n' restored "the [proxy] policy from AGENTS.md"
     ;;
 
+  export)
+    if [[ ${#entries[@]} -eq 1 ]]; then
+      if [[ -n "$sandbox_name" ]]; then
+         echo "$prog: cannot specify both --sandbox and a positional sandbox name" >&2; exit 1
+      fi
+      sandbox_name="${entries[0]}"
+      entries=()
+    elif [[ ${#entries[@]} -gt 1 ]]; then
+      echo "$prog: export takes at most one argument (the sandbox)" >&2; exit 1
+    fi
+
+    # Baseline entries (always enforced regardless of AGENTS.md) are omitted
+    # from the export so the output round-trips cleanly.  Falls back to
+    # /dev/null when the sidecar predates policy.baseline.
+    baseline_file="${policy_dir}/policy.baseline"
+    [[ -f "$baseline_file" ]] || baseline_file="/dev/null"
+    proxy_toml=$(awk -v baseline="$baseline_file" '
+      BEGIN {
+        while ((getline line < baseline) > 0) {
+          split(line, a, " "); skip[a[1]" "a[2]] = 1
+        }
+        close(baseline)
+      }
+      $1 ~ /^(allow_domains|deny_domains|allow_ips|deny_ips|allow_ports)$/ {
+        if (!skip[$1" "$2])
+          list[$1] = list[$1] "\"" $2 "\", "
+      }
+      $1 == "default" { def = $2 }
+      END {
+        for (k in list) {
+          val = list[k]
+          sub(/, $/, "", val)
+          print k " = [" val "]"
+        }
+        if (def != "") print "default = \"" def "\""
+      }
+    ' "$policy")
+
+    if [[ -n "$proxy_toml" ]]; then
+      echo '```toml agent-sandbox'
+      echo "[proxy]"
+      echo "$proxy_toml"
+      echo '```'
+    fi
+    ;;
+
   *)
-    echo "${0##*/}: unknown command '$action'" >&2
+    echo "$prog: unknown command '$action'" >&2
     usage >&2
     exit 1
     ;;

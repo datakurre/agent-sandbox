@@ -6,14 +6,89 @@
 usage() {
   cat <<'USAGE'
 agent-sandbox-ctl mount [SANDBOX] HOST_PATH CONTAINER_PATH
+agent-sandbox-ctl mount export [SANDBOX] [--sandbox NAME]
 
 Mount a directory from the host into a running sandbox.
 If the sandbox was started with --selinux, the host directory will be
 relabeled appropriately.
+
+export prints the [mounts] section of a running sandbox as AGENTS.md TOML,
+omitting the built-in mounts every sandbox gets (workspace, dotfiles, nix, ...).
 USAGE
 }
 
 [[ $# -gt 0 ]] || { usage; exit 1; }
+
+if [[ "$1" == "export" ]]; then
+  shift
+  sandbox_name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --sandbox)
+        shift
+        [[ $# -gt 0 ]] || { echo "agent-sandbox-mount: --sandbox needs a name" >&2; exit 1; }
+        sandbox_name="$1"
+        ;;
+      --sandbox=*) sandbox_name="${1#--sandbox=}" ;;
+      -*)          echo "agent-sandbox-mount: unknown flag '$1'" >&2; exit 1 ;;
+      *)
+        if [[ -z "$sandbox_name" ]]; then
+          sandbox_name="$1"
+        else
+          echo "agent-sandbox-mount: export takes at most one argument (the sandbox)" >&2; exit 1
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  sandbox="$(resolve_sandbox "$sandbox_name" --running)"
+  workspace_dir=$(sandbox_workspace "$sandbox")
+
+  # The same destinations every launch mounts in (workspace, dotfiles, nix,
+  # the sidecar directories) are excluded here, the same way status omits the
+  # baseline deny_ips from a `proxy export`: they are not something AGENTS.md
+  # declared, so round-tripping them into a new config would be redundant.
+  mounts_toml=$(podman inspect --format '{{json .Mounts}}' "$sandbox" 2>/dev/null | jq -r --arg ws "$workspace_dir" '
+    .[] | select(.Type == "bind") |
+    select(.Destination != "/workspace") |
+    select(.Destination != "/home/user/.local/share/devenv") |
+    select(.Destination | test("^/home/user/.(local|config|cache)/") | not) |
+    select(.Destination | test("^/home/user/.(gitconfig|gnupg|ssh)") | not) |
+    select(.Destination | test("^/run/") | not) |
+    select(.Destination | test("^/sidecar_") | not) |
+    select(.Destination | test("^/nix") | not) |
+    select(.Destination | test("^/etc/") | not) |
+    .Source as $src | .Destination as $dst | .Options as $opts |
+    (
+      if ($src | startswith($ws + "/")) then
+        "." + ($src | ltrimstr($ws))
+      elif ($src == $ws) then
+        "."
+      else
+        $src
+      end
+    ) as $rel_src |
+    (
+      if ($opts | index("ro")) then
+        "\"" + $rel_src + "\" = { destination = \"" + $dst + "\", options = \"ro\" }"
+      elif ($opts | index("z")) then
+        "\"" + $rel_src + "\" = { destination = \"" + $dst + "\", options = \"z\" }"
+      else
+        "\"" + $rel_src + "\" = \"" + $dst + "\""
+      end
+    )
+  ' || true)
+
+  if [[ -n "$mounts_toml" ]]; then
+    echo '```toml agent-sandbox'
+    echo "[mounts]"
+    echo "$mounts_toml"
+    echo '```'
+  fi
+  exit 0
+fi
 
 sandbox_name=""
 positional=()

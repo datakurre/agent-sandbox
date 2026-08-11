@@ -79,7 +79,7 @@ pass "the sandbox started ($sandbox)"
 
 # ── the policy actually reached the proxy ────────────────────────────────────
 
-rules=$(agent-sandbox-ctl firewall show --sandbox "$sandbox")
+rules=$(agent-sandbox-ctl proxy show --sandbox "$sandbox")
 for want in \
   "example.com" "*.example.com" \
   "blocked.example.org" "also-blocked.example.org" \
@@ -252,7 +252,7 @@ fi
 
 # ── runtime policy change ────────────────────────────────────────────────────
 
-agent-sandbox-ctl firewall allow --sandbox "$sandbox" nixos.org >/dev/null
+agent-sandbox-ctl proxy allow --sandbox "$sandbox" nixos.org >/dev/null
 sleep 2   # the proxy polls the policy once a second
 
 if in_sandbox curl -sS -o /dev/null -m 20 https://nixos.org; then
@@ -262,7 +262,7 @@ else
     "$(agent-sandbox-ctl logs --sandbox "$sandbox" | tail -8)"
 fi
 
-agent-sandbox-ctl firewall rm --sandbox "$sandbox" nixos.org >/dev/null
+agent-sandbox-ctl proxy rm --sandbox "$sandbox" nixos.org >/dev/null
 sleep 2
 if in_sandbox curl -sS -o /dev/null -m 20 https://nixos.org 2>/dev/null; then
   fail "firewall rm takes effect without a restart" "nixos.org still reachable"

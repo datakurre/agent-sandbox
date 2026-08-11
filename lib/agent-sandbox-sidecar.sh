@@ -324,7 +324,7 @@ sync_routes
 # Tells the launcher the sandbox may start.
 printf 'ready\n' > /sidecar_shared/ready
 
-# The policy can change while the session runs (agent-sandbox-ctl firewall), and
+# The policy can change while the session runs (agent-sandbox-ctl proxy), and
 # the proxy reloads it on its own; these routes have to follow.  Same interval,
 # and cheap: one `ip route show` per second.
 while kill -0 "$proxy_pid" 2>/dev/null; do

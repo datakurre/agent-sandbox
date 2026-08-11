@@ -342,6 +342,15 @@ run "$port_bin" ls
 expect_status "port ls succeeds" 0
 expect_out    "port ls reports orphaned forwarders" "orphaned forwarders"
 
+# ── port export ─────────────────────────────────────────────────────────────
+
+run "$port_bin" export
+expect_status "port export succeeds" 0
+
+run "$port_bin" export one two
+expect_status "port export rejects two positionals" 1
+expect_out    "port export says why" "export takes at most one argument"
+
 # ── mount ───────────────────────────────────────────────────────────────────
 
 run "$mount_bin" --sandbox s1 1 2 3
@@ -355,6 +364,15 @@ expect_out    "mount says why" "expected [SANDBOX] HOST_PATH CONTAINER_PATH"
 run "$mount_bin" --sandbox agent-sandbox-plain-1 /does-not-exist /container/path
 expect_status "mount rejects missing host path" 1
 expect_out    "mount says why" "does not exist or is not a directory"
+
+# ── mount export ────────────────────────────────────────────────────────────
+
+run "$mount_bin" export
+expect_status "mount export succeeds" 0
+
+run "$mount_bin" export one two
+expect_status "mount export rejects two positionals" 1
+expect_out    "mount export says why" "export takes at most one argument"
 
 # ── net argument handling ───────────────────────────────────────────────────
 
@@ -556,11 +574,40 @@ if [[ -n "$proxy_bin" ]]; then
   fixture_reset
   run "$firewall_bin" --help
   expect_status  "firewall --help exits 0" 0
-  expect_out     "firewall --help prints usage" "agent-sandbox-firewall show"
+  expect_out     "firewall --help prints usage" "agent-sandbox-ctl proxy show"
   expect_no_argv "firewall --help touches no container" "ps"
 
   run "$firewall_bin"
   expect_status "firewall with no verb exits 1" 1
+
+  # ── firewall export (agent-sandbox-ctl proxy export) ───────────────────────
+
+  fixture_reset
+  fixture_set running "agent-sandbox-repo-1"
+  fixture_set "labels.agent-sandbox-repo-1" "agent-sandbox.proxy=firewall"
+  fixture_set sidecars "agent-sandbox-sidecar-abc123"
+  fixture_set "labels.agent-sandbox-sidecar-abc123" "agent-sandbox.target=agent-sandbox-repo-1"
+
+  fw_policy="$tmp/fwpolicy-export"
+  mkdir -p "$fw_policy"
+  fixture_set "mount.agent-sandbox-sidecar-abc123.sidecar_policy" "$fw_policy"
+  printf 'allow_domains github.com\ndeny_ips 127.0.0.0/8\n' > "$fw_policy/policy"
+  printf 'deny_ips 127.0.0.0/8\n' > "$fw_policy/policy.baseline"
+
+  run "$firewall_bin" export
+  expect_status "firewall export succeeds" 0
+  expect_out    "firewall export fences the block" '```toml agent-sandbox'
+  expect_out    "firewall export names the section" "[proxy]"
+  expect_out    "firewall export carries a declared rule" "github.com"
+  if grep -qF "127.0.0.0" <<< "$output"; then
+    fail "firewall export omits the baseline deny_ips" "$output"
+  else
+    pass "firewall export omits the baseline deny_ips"
+  fi
+
+  run "$firewall_bin" export one two
+  expect_status "firewall export rejects two positionals" 1
+  expect_out    "firewall export says why" "export takes at most one argument"
 else
   printf 'skip     firewall tests (no proxy binary given)\n'
 fi

@@ -185,7 +185,7 @@ and `allow_ports`.
 - Hostnames are also checked against `deny_ips` *after* resolution, so a denied address cannot be reached through an allowed name.
 - `default = "allow"` or `default = "deny"` overrides the derived default explicitly.
 - An invalid `[proxy]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote.
-- `--firewall` with no allow rules allows every *public* host on every port — it is then a metering proxy. Private and loopback ranges stay refused regardless (see below). The launcher says so at startup, and `agent-sandbox-ctl firewall show` reports `default allow`.
+- `--firewall` with no allow rules allows every *public* host on every port — it is then a metering proxy. Private and loopback ranges stay refused regardless (see below). The launcher says so at startup, and `agent-sandbox-ctl proxy show` reports `default allow`.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
 - **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around. `agent-sandbox-ctl port add` refuses a proxied sandbox for the same reason.
 
@@ -214,7 +214,7 @@ Either proxy flag also makes these available while the sandbox runs:
 - `agent-sandbox-ctl status` — one screen: proxy mode, rule and traffic counts, ports.
 - `agent-sandbox-ctl net` / `net -f` — the summary above for the session so far, or a live feed.
 - `agent-sandbox-ctl logs [-f]` — the proxy's own log: the policy it started with, and every denial as it happens.
-- `agent-sandbox-ctl firewall show|allow|deny|rm|reset` — read and change the policy of a **running** sandbox.
+- `agent-sandbox-ctl proxy show|allow|deny|rm|reset|export` — read and change the policy of a **running** sandbox.
 - A connection record is written when it *closes*, plus one when it opens, so a long-lived HTTPS tunnel appears as `in flight` under `── still open ──` rather than as traffic. Individual requests inside a tunnel are never visible; the proxy does not decrypt it.
 - The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--meter-network` additionally prints the summary when the session ends, and keeps the log at `$TMPDIR/agent-sandbox-connections-<pid>.jsonl` if anything was denied or failed. `agent-sandbox-network-summary <log>` re-renders a kept log.
 - Neither the policy nor the log is reachable from inside the sandbox, so the agent can neither widen its own firewall nor edit the record of its traffic.
@@ -299,7 +299,7 @@ why SSH is rewritten through a generated `ProxyCommand`.
 ### Changing the firewall mid-session
 
 ```console
-$ agent-sandbox-ctl firewall show
+$ agent-sandbox-ctl proxy show
 agent-sandbox-myrepo-4213
   policy      /tmp/agent-sandbox-policy-Xf3a91cD/policy
   default     deny  (only the rules below are reachable)
@@ -309,27 +309,27 @@ agent-sandbox-myrepo-4213
   deny_ips      169.254.0.0/16                     AGENTS.md
   …
 
-$ agent-sandbox-ctl firewall allow api.openai.com
+$ agent-sandbox-ctl proxy allow api.openai.com
   allowed     api.openai.com                    domains
   reloading   the proxy applies this within a second
 
-$ agent-sandbox-ctl firewall allow 8443
+$ agent-sandbox-ctl proxy allow 8443
   allowed     8443                              ports
   reloading   the proxy applies this within a second
 ```
 
 `allow` infers what kind of entry you gave it — domain, address or port — and prints back
 what it decided. Ports have no deny form, since `allow_ports` is a global restriction rather
-than something scoped to a host, so `firewall deny 8443` is refused. The baseline private and
+than something scoped to a host, so `proxy deny 8443` is refused. The baseline private and
 loopback ranges appear in `show` as ordinary `deny_ips` rules attributed to `AGENTS.md` —
 they are included in `policy.base` alongside any user rules and are therefore restored by
-`reset`. `status --export` omits them, since they are always enforced regardless of what
+`reset`. `proxy export` omits them, since they are always enforced regardless of what
 `AGENTS.md` declares and round-tripping them into a new config would be redundant. Setting
 `deny_ips = []` in `AGENTS.md` does not disable the baseline; the launcher appends it
 unconditionally after processing the declared policy. An `allow_ips` entry of equal or greater
 specificity is the only way to open one of those ranges.
 
-Changes take effect for new connections within a second. Connections already established keep running: the proxy checks policy when a connection opens and does not re-check it afterwards, so tightening a rule does not cut a tunnel that is already up — end the session for that. `firewall show` says how many are open when it matters.
+Changes take effect for new connections within a second. Connections already established keep running: the proxy checks policy when a connection opens and does not re-check it afterwards, so tightening a rule does not cut a tunnel that is already up — end the session for that. `proxy show` says how many are open when it matters.
 
 `reset` restores the `[proxy]` policy from `AGENTS.md` rather than emptying the rules, since an empty policy allows everything. The baseline denials are part of what it restores, so a reset cannot drop them either.
 
@@ -355,11 +355,13 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | --- | --- |
 | `load` | build the image and import it into podman |
 | `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows sidecars and forwarders |
-| `status [--export] [--sandbox N]` | one screen per sandbox, pointing at the commands below. With `--export`, prints configuration as AGENTS.md TOML |
+| `status [--sandbox N]` | one screen per sandbox, pointing at the commands below |
 | `net [-f]` | connection summary, or a live feed |
 | `logs [-f]` | the proxy sidecar's log |
-| `firewall show\|allow\|deny\|rm\|reset` | read and change the policy of a running sandbox |
-| `port ls\|add\|rm` | publish a port after launch (needs `--ports-dynamic`, and no proxy) |
+| `proxy show\|allow\|deny\|rm\|reset\|export` | read and change the policy of a running sandbox; `export` prints its `[proxy]` section as AGENTS.md TOML |
+| `port ls\|add\|rm\|export` | publish a port after launch (needs `--ports-dynamic`, and no proxy); `export` prints its `[ports]` section as AGENTS.md TOML |
+| `mount HOST_PATH CONTAINER_PATH` | bind-mount a host directory into a running sandbox |
+| `mount export` | print the `[mounts]` section of a running sandbox as AGENTS.md TOML |
 | `purge [--all] [-n]` | reclaim leftovers; running sandboxes are kept unless `--all` |
 
 Each takes `--sandbox NAME`, which may be omitted when only one sandbox is
