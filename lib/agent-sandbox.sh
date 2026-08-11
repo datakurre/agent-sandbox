@@ -34,6 +34,8 @@ want_ports=0
 want_ports_dynamic=0
 want_ports_any_interface=0
 want_mounts=0
+want_agent_mounts_mode="auto"   # auto | all | none | list
+agent_mounts_list=()
 want_firewall=0
 want_meter_network=0
 want_krun=0
@@ -75,10 +77,6 @@ done <<< "${AGENT_SANDBOX_AGENT_SPECS}"
 
 agent_list="${agent_names[*]}"
 
-if [[ $# -eq 0 ]]; then
-  want_help=1
-fi
-
 usage() {
   cat <<USAGE
 agent-sandbox [FLAGS] [AGENT] [-- COMMAND...]
@@ -87,11 +85,11 @@ Runs an AI coding agent inside a rootless podman container.
 Use flags to opt-in to integrations like mounting the current directory,
 forwarding SSH, or exposing Git identity.
 
-  agent-sandbox                      launch interactive bash (all agents available)
-  agent-sandbox opencode             launch opencode with its specific mounts
+  agent-sandbox                      launch interactive bash (no agent state mounted)
+  agent-sandbox opencode             launch opencode with its own state mounted
+  agent-sandbox --agent-mounts       launch interactive bash with every agent's state mounted
   agent-sandbox --podman opencode    launch opencode with podman enabled
-  agent-sandbox opencode -- bash     launch bash with opencode mounts
-  agent-sandbox -- bash              launch bash without agent specific mounts
+  agent-sandbox opencode -- bash     launch bash with opencode's state mounted
   agent-sandbox --privileged opencode
                                      pass --privileged to podman run
 
@@ -127,6 +125,11 @@ Mounts:
   -v SOURCE[:DEST[:OPTS]]   relative SOURCE resolves against \$PWD; relative
                             DEST is placed under /workspace; "." means
                             /workspace itself
+
+Agent state:
+  --agent-mounts                     $([[ "$want_agent_mounts_mode" == "all" ]] && echo "[on ]" || echo "[off]") Mount every agent's state, not just the one launched.
+  --agent-mounts=AGENT[,AGENT...]    Mount only these agents' state (plus any launched agent). Only the "=" form takes a list.
+  --no-agent-mounts                  Mount no agent state, even for the launched agent.
 
 Podman / Environment:
   --privileged              pass --privileged to podman run (for nested podman)
@@ -267,6 +270,18 @@ while [[ $# -gt 0 ]]; do
     --ports-any-interface) want_ports_any_interface=1 ;;
     --mounts)           want_mounts=1 ;;
     --no-mounts)        want_mounts=0 ;;
+    --agent-mounts)      want_agent_mounts_mode="all" ;;
+    --no-agent-mounts)   want_agent_mounts_mode="none" ;;
+    --agent-mounts=*)
+      want_agent_mounts_mode="list"
+      IFS=',' read -r -a agent_mounts_list <<< "${1#--agent-mounts=}"
+      for a in "${agent_mounts_list[@]}"; do
+        [[ -n "${agent_cmd_json[$a]:-}" ]] || {
+          echo "agent-sandbox: --agent-mounts: unknown agent '$a' (valid: ${agent_list})" >&2
+          exit 1
+        }
+      done
+      ;;
     --firewall)         want_firewall=1 ;;
     --no-firewall)      want_firewall=0 ;;
     --meter-network)    want_meter_network=1 ;;
@@ -471,9 +486,21 @@ else
 fi
 
 # ── Agent state ─────────────────────────────────────────────────────────────
-# All agentic tools are on the PATH in the image, so mount state for all of them
-# so any tool can be invoked interactively.
-for a in "${agent_names[@]}"; do
+# By default only the positionally-selected agent's state is mounted, so we
+# avoid creating host-side state directories for tools that never run.
+# --agent-mounts widens this (to all agents, or a chosen subset) for
+# interactive shells that want more than one tool available; --no-agent-mounts
+# mounts none, even if an agent was selected.
+declare -A agent_mount_set=()
+case "$want_agent_mounts_mode" in
+  none) : ;;
+  all)  for a in "${agent_names[@]}"; do agent_mount_set["$a"]=1; done ;;
+  list) for a in "${agent_mounts_list[@]}"; do agent_mount_set["$a"]=1; done
+        [[ -n "$agent" ]] && agent_mount_set["$agent"]=1 ;;
+  auto) [[ -n "$agent" ]] && agent_mount_set["$agent"]=1 ;;
+esac
+
+for a in "${!agent_mount_set[@]}"; do
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
     mount_rw "$HOME/$rel" "/home/user/$rel"
@@ -739,6 +766,11 @@ cleanup() {
 trap cleanup EXIT
 printf 'root:x:0:0:root:/root:/bin/sh\nuser:x:%s:%s::/home/user:/bin/bash\nnobody:x:65534:65534:Nobody:/:/bin/sh\n' "$(id -u)" "$(id -g)" > "$passwd_tmp"
 printf 'root:x:0:\nuser:x:%s:\nnobody:x:65534:\n' "$(id -g)" > "$group_tmp"
+# World-readable like a real /etc/passwd (no secrets in it): mktemp's default
+# 0600 can end up unreadable to the container's mapped uid across extra
+# user-namespace layers (nested sandboxes, hosts with no /etc/subuid range),
+# which otherwise surfaces as ssh/git failing to resolve "who am I".
+chmod 644 "$passwd_tmp" "$group_tmp"
 
 # Include the hashed workspace path and the launcher PID in the container name so
 # agent-sandbox-ctl port and agent-sandbox-ctl purge find sandboxes without guessing
@@ -1119,8 +1151,8 @@ podman run \
   --label "agent-sandbox.command=${cmd_args[*]}" \
   --workdir "$workspace_dir" \
   -e HOME=/home/user \
-  -v "$passwd_tmp:/etc/passwd:ro" \
-  -v "$group_tmp:/etc/group:ro" \
+  -v "$passwd_tmp:/etc/passwd:ro,z" \
+  -v "$group_tmp:/etc/group:ro,z" \
   --mount type=tmpfs,dst=/home/user/.config,U=true \
   --mount type=tmpfs,dst=/home/user/.cache,U=true \
   --mount type=tmpfs,dst=/home/user/.local,U=true \

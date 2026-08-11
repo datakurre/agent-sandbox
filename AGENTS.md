@@ -53,7 +53,10 @@ A bash script that wraps `podman run`.  Call flow:
    etc.), pass through `-v` volume mounts (with relative-path expansion),
    stop at `--` sentinel.
  2. Build mounts array from toggles (ssh socket, git config, gpg socket,
-    opencode dirs, antigravity-cli dirs, devenv dir, podman host socket, CWD workspace).
+    devenv dir, podman host socket, CWD workspace) plus the state dirs of
+    whichever agents are selected — the positionally-launched one by default,
+    or the set chosen via `--agent-mounts`/`--agent-mounts=…` — sourced from
+    `agents.nix` (opencode, claude-code, copilot, antigravity).
 3. Build env_args array from toggles (SSH_AUTH_SOCK, git identity,
    CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
 4. Create ephemeral `/etc/passwd` and `/etc/group` with the host user's uid/gid.

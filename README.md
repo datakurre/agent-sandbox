@@ -45,7 +45,10 @@ working directory mounted at `/workspace` and every integration enabled. If the
 current directory contains a `devenv.nix`, opencode is started through a devenv
 shell (`devenv shell -- opencode .`) so project dependencies are loaded
 automatically. Running `agent-sandbox` with no arguments launches an interactive
-`bash` shell with all agents and their state directories fully available.
+`bash` shell with every agent's binary on `PATH`, but no agent's state
+pre-mounted — pass `--agent-mounts` to make one, several
+(`--agent-mounts=claude-code,copilot`), or every agent's login/config state
+available too.
 
 See [Usage](#usage) below for overriding the container command, passing raw
 podman flags, and the full [flags reference](#flags).
@@ -57,7 +60,7 @@ podman flags, and the full [flags reference](#flags).
 Everything after the `--` sentinel replaces the default command:
 
 ```sh
-agent-sandbox                                    # interactive shell (all agents available)
+agent-sandbox                                    # interactive shell (every agent's binary on PATH)
 agent-sandbox -- bash -c "nix build .# && echo done"
 agent-sandbox opencode -- devenv shell           # devenv shell with opencode default cmd replaced
 ```
@@ -118,6 +121,7 @@ Every flag in the table below has a corresponding `--no-flag` option (e.g., `--n
 | Ports & mounts | `--ports-dynamic` | Allows `agent-sandbox-ctl port add` post-launch. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
+| Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
 
 A few flags are one-off pass-throughs rather than persistent toggles, so they have no `--no-flag` form:
 
@@ -319,7 +323,7 @@ agent-sandbox copilot                            # github-copilot-cli (copilot),
 agent-sandbox antigravity                        # antigravity-cli (agy), everything on
 agent-sandbox opencode --no-workspace            # no CWD mount
 agent-sandbox opencode --selinux                 # enable :z on built-in writable binds
-agent-sandbox                                    # interactive bash (all agents available)
+agent-sandbox                                    # interactive bash (every agent's binary on PATH)
 agent-sandbox opencode -- devenv shell           # devenv shell replacing opencode cmd
 agent-sandbox --privileged opencode              # nested podman inside container
 ```
@@ -368,7 +372,7 @@ nested rootless podman is pre-configured when the sandbox is launched with
 ## How it works
 
 1. `agent-sandbox-ctl load` imports the OCI image (built with `pkgs.dockerTools.streamLayeredImage`) into the host's podman image store.
-2. `agent-sandbox` calls `podman run` with `--userns=keep-id`, tmpfs mounts for ephemeral home subdirectories, explicit bind mounts for persistent state (opencode, devenv, …), and forwarded sockets (ssh, gpg, podman).
+2. `agent-sandbox` calls `podman run` with `--userns=keep-id`, tmpfs mounts for ephemeral home subdirectories, explicit bind mounts for the selected agent's persistent state (or more, via `--agent-mounts`), devenv, and forwarded sockets (ssh, gpg, podman).
 3. A slim entrypoint loads the Nix store registration so `nix` commands work from the start, sets up the gpg-agent symlink when requested, then `exec`s the container command.
 
 ## Trust model
