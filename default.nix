@@ -418,6 +418,7 @@ let
       coreutils
       gnugrep
       gawk
+      jq
     ];
     text = sandboxResolve + scriptBody ./lib/agent-sandbox-status.sh;
   };

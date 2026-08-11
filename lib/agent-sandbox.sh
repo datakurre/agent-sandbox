@@ -702,6 +702,10 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
   )
   for cidr in "${baseline_deny_ips[@]}"; do
     printf 'deny_ips %s\n' "$cidr" >> "$sidecar_policy/policy"
+    # policy.baseline records just the launcher-added entries so that
+    # `status --export` can omit them: they are always enforced regardless
+    # of what AGENTS.md declares, so round-tripping them is misleading.
+    printf 'deny_ips %s\n' "$cidr" >> "$sidecar_policy/policy.baseline"
   done
 
   # Kept pristine so `agent-sandbox-ctl firewall reset` has something to restore

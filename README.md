@@ -218,9 +218,13 @@ $ agent-sandbox-ctl firewall allow 8443
 `allow` infers what kind of entry you gave it — domain, address or port — and prints back
 what it decided. Ports have no deny form, since `allow_ports` is a global restriction rather
 than something scoped to a host, so `firewall deny 8443` is refused. The baseline private and
-loopback ranges appear in `show` as ordinary `deny_ips` rules; they are currently attributed
-to `AGENTS.md` even though the launcher writes them, which is cosmetic and tracked in
-[`TODO-firewall.md`](./TODO-firewall.md).
+loopback ranges appear in `show` as ordinary `deny_ips` rules attributed to `AGENTS.md` —
+they are included in `policy.base` alongside any user rules and are therefore restored by
+`reset`. `status --export` omits them, since they are always enforced regardless of what
+`AGENTS.md` declares and round-tripping them into a new config would be redundant. Setting
+`deny_ips = []` in `AGENTS.md` does not disable the baseline; the launcher appends it
+unconditionally after processing the declared policy. An `allow_ips` entry of equal or greater
+specificity is the only way to open one of those ranges.
 
 Changes take effect for new connections within a second. Connections already established keep running: the proxy checks policy when a connection opens and does not re-check it afterwards, so tightening a rule does not cut a tunnel that is already up — end the session for that. `firewall show` says how many are open when it matters.
 

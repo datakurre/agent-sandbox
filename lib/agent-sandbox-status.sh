@@ -58,9 +58,21 @@ if [[ "$export_toml" == "1" ]]; then
   if [[ -n "$sidecar" ]]; then
     policy_dir=$(sidecar_mount "$sidecar" /sidecar_policy)
     if [[ -n "$policy_dir" && -r "$policy_dir/policy" ]]; then
-      proxy_toml=$(awk '
+      # Baseline entries (always enforced regardless of AGENTS.md) are omitted
+      # from the export so the output round-trips cleanly.  Falls back to
+      # /dev/null when the sidecar predates policy.baseline.
+      baseline_file="${policy_dir}/policy.baseline"
+      [[ -f "$baseline_file" ]] || baseline_file="/dev/null"
+      proxy_toml=$(awk -v baseline="$baseline_file" '
+        BEGIN {
+          while ((getline line < baseline) > 0) {
+            split(line, a, " "); skip[a[1]" "a[2]] = 1
+          }
+          close(baseline)
+        }
         $1 ~ /^(allow_domains|deny_domains|allow_ips|deny_ips|allow_ports)$/ {
-          list[$1] = list[$1] "\"" $2 "\", "
+          if (!skip[$1" "$2])
+            list[$1] = list[$1] "\"" $2 "\", "
         }
         $1 == "default" { def = $2 }
         END {
@@ -82,7 +94,7 @@ if [[ "$export_toml" == "1" ]]; then
   fi
 
   # ── Ports ───────────────────────────────────────────────────────────────────
-  declare -A ports
+  ports_lines=()
   port_idx=1
   add_ports() {
     local output="$1"
@@ -93,7 +105,7 @@ if [[ "$export_toml" == "1" ]]; then
         local proto="${BASH_REMATCH[2]}"
         local bind="${BASH_REMATCH[3]}"
         local host="${BASH_REMATCH[4]}"
-        ports["port_$port_idx"]="container = $container, host = $host, bind = \"$bind\", protocol = \"$proto\""
+        ports_lines+=("port_$port_idx = { container = $container, host = $host, bind = \"$bind\", protocol = \"$proto\" }")
         ((port_idx++))
       fi
     done <<< "$output"
@@ -106,10 +118,10 @@ if [[ "$export_toml" == "1" ]]; then
     add_ports "$(podman port "$fwd" 2>/dev/null || true)"
   done
 
-  if [[ ${#ports[@]} -gt 0 ]]; then
+  if [[ ${#ports_lines[@]} -gt 0 ]]; then
     echo "[ports]"
-    for k in "${!ports[@]}"; do
-      echo "$k = { ${ports[$k]} }"
+    for line in "${ports_lines[@]}"; do
+      echo "$line"
     done
     echo ""
   fi
