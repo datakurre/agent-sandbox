@@ -22,7 +22,7 @@ if [[ "${AGENT_SANDBOX_GPG_AGENT:-}" == "1" && -S /run/host-gpg-agent ]]; then
   # pinentry prompts on this tty.  It has to be resolved here: the launcher
   # cannot know which pts podman will allocate.
   if [[ -t 0 ]]; then
-    GPG_TTY=$(tty) && export GPG_TTY
+    GPG_TTY=$(readlink /proc/self/fd/0 2>/dev/null) && export GPG_TTY
   fi
 
   # The launcher binds only public key material (see agent-sandbox-gnupg-scan),

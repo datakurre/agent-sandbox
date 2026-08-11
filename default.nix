@@ -136,6 +136,7 @@ let
       sandbox = false
       filter-syscalls = false
       experimental-features = nix-command flakes
+      build-users-group =
     '';
   };
 
