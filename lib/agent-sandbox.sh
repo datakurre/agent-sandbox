@@ -23,8 +23,7 @@ fi
 want_ssh=0
 want_git=0
 want_gpg=0
-want_gpg_sign=0
-want_gnupg_private=0
+want_gpg_private=0
 want_devenv=0
 want_nix=0
 want_podman=0
@@ -99,9 +98,8 @@ Integrations (use --X to enable, --no-X to disable):
   --workspace       $([[ "$want_workspace" == "1" ]] && echo "[on ]" || echo "[off]") Mounts the host's current working directory into /workspace/<dirname>.
   --ssh             $([[ "$want_ssh" == "1" ]] && echo "[on ]" || echo "[off]") Forwards the host's SSH_AUTH_SOCK to the container.
   --git             $([[ "$want_git" == "1" ]] && echo "[on ]" || echo "[off]") Mounts host Git configurations and passes identity env vars.
-  --gpg-agent       $([[ "$want_gpg" == "1" ]] && echo "[on ]" || echo "[off]") Forwards the host GnuPG agent socket for commit signing.
-  --gpg-sign        $([[ "$want_gpg_sign" == "1" ]] && echo "[on ]" || echo "[off]") Sets git config to enable commit signing inside the container.
-  --gnupg-private   $([[ "$want_gnupg_private" == "1" ]] && echo "[on ]" || echo "[off]") Exposes ~/.gnupg even if it holds on-disk secret keys.
+  --gpg             $([[ "$want_gpg" == "1" ]] && echo "[on ]" || echo "[off]") Enables host GnuPG agent forwarding and git commit signing behavior.
+  --gpg-private     $([[ "$want_gpg_private" == "1" ]] && echo "[on ]" || echo "[off]") Exposes ~/.gnupg even if it holds on-disk secret keys.
   --devenv          $([[ "$want_devenv" == "1" ]] && echo "[on ]" || echo "[off]") Persists ~/.local/share/devenv across sessions.
   --nix             $([[ "$want_nix" == "1" ]] && echo "[on ]" || echo "[off]") Mounts the host /nix/store for native Nix execution.
   --podman          $([[ "$want_podman" == "1" ]] && echo "[on ]" || echo "[off]") Forwards the host rootless Podman socket (sibling containers).
@@ -120,9 +118,6 @@ Ports:
 
 Mounts:
   --mounts / --no-mounts             $([[ "$want_mounts" == "1" ]] && echo "[on ]" || echo "[off]") Honors [mounts] declarations from AGENTS.md.
-  -v SOURCE[:DEST[:OPTS]]   relative SOURCE resolves against \$PWD; relative
-                            DEST is placed under /workspace; "." means
-                            /workspace itself
 
 Agent state:
   --agent-mounts                     $([[ "$want_agent_mounts_mode" == "all" ]] && echo "[on ]" || echo "[off]") Mount every agent's state, not just the one launched.
@@ -136,7 +131,7 @@ Podman / Environment:
   -e, --env NAME=VAL        pass environment variable to podman
   --podman-args             treat all following args (until --) as podman args
 
---podman, --ssh and --gpg-agent each hand the agent a capability that reaches
+--podman, --ssh and --gpg each hand the agent a capability that reaches
 outside the sandbox. --podman forwards the host podman socket, allowing the
 agent to create sibling containers on the host (a full sandbox escape).
 To safely let the agent run containers, use --privileged instead to enable
@@ -157,9 +152,8 @@ port_specs=()
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-# Expand a -v spec.  Relative sources resolve against $PWD; relative
-# destinations land under /workspace.  A spec with no destination mounts at
-# the same path it came from, rather than emitting a trailing colon.
+# Expand a mount spec from AGENTS.md [mounts]. Relative sources resolve against
+# $PWD and relative destinations land under /workspace.
 expand_v() {
   local spec="$1" src dest opts
   IFS=':' read -r src dest opts <<< "$spec"
@@ -244,12 +238,10 @@ while [[ $# -gt 0 ]]; do
     --no-ssh)       want_ssh=0 ;;
     --git)          want_git=1 ;;
     --no-git)       want_git=0 ;;
-    --gpg-agent)    want_gpg=1 ;;
-    --no-gpg-agent) want_gpg=0 ;;
-    --gpg-sign)     want_gpg_sign=1 ;;
-    --no-gpg-sign)  want_gpg_sign=0 ;;
-    --gnupg-private)    want_gnupg_private=1 ;;
-    --no-gnupg-private) want_gnupg_private=0 ;;
+    --gpg)          want_gpg=1 ;;
+    --no-gpg)       want_gpg=0 ;;
+    --gpg-private)    want_gpg_private=1 ;;
+    --no-gpg-private) want_gpg_private=0 ;;
     --devenv)       want_devenv=1 ;;
     --no-devenv)    want_devenv=0 ;;
     --nix)          want_nix=1 ;;
@@ -304,12 +296,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --krun-cpus=*)  krun_cpus="${1#--krun-cpus=}" ;;
 
-    -v)
-      shift
-      [[ $# -gt 0 ]] || { echo "agent-sandbox: -v needs an argument" >&2; exit 1; }
-      mounts+=("-v" "$(expand_v "$1")")
+    -v|-v*)
+      echo "agent-sandbox: '$1' is not an agent-sandbox flag." >&2
+      echo "               Use podman passthrough instead:" >&2
+      echo "               agent-sandbox --podman-args $1 ... -- <command>" >&2
+      exit 1
       ;;
-    -v*) mounts+=("-v" "$(expand_v "${1#-v}")") ;;
 
     --podman-args)
       parsing_podman=1
@@ -539,7 +531,7 @@ fi
 # ── GnuPG ───────────────────────────────────────────────────────────────────
 # The agent socket is forwarded so host keys can sign commits.  The keyring
 # directory is a separate decision: it is only exposed when it holds no usable
-# secret on disk (the smart-card case), unless --gnupg-private overrides.
+# secret on disk (the smart-card case), unless --gpg-private overrides.
 
 if [[ "$want_gpg" == "1" ]]; then
   if command -v gpgconf >/dev/null 2>&1; then
@@ -556,9 +548,9 @@ if [[ "$want_gpg" == "1" ]]; then
     gnupg_status=0
     gnupg_offenders=$(agent-sandbox-gnupg-scan "$HOME/.gnupg") || gnupg_status=$?
 
-    if [[ "$gnupg_status" == "0" || "$want_gnupg_private" == "1" ]]; then
+    if [[ "$gnupg_status" == "0" || "$want_gpg_private" == "1" ]]; then
       if [[ "$gnupg_status" != "0" ]]; then
-        echo "agent-sandbox: exposing ~/.gnupg with on-disk secret keys (--gnupg-private)." >&2
+        echo "agent-sandbox: exposing ~/.gnupg with on-disk secret keys (--gpg-private)." >&2
       fi
       # Public material only: the keyring so gpg can name the signing key, and
       # the trust database so it believes the answer.
@@ -567,7 +559,7 @@ if [[ "$want_gpg" == "1" ]]; then
           mounts+=("-v" "$HOME/.gnupg/$keyring:/run/host-gnupg/$keyring:ro")
         fi
       done
-      if [[ "$want_gnupg_private" == "1" && -d "$HOME/.gnupg/private-keys-v1.d" ]]; then
+      if [[ "$want_gpg_private" == "1" && -d "$HOME/.gnupg/private-keys-v1.d" ]]; then
         mounts+=("-v" "$HOME/.gnupg/private-keys-v1.d:/run/host-gnupg/private-keys-v1.d:ro")
       fi
     else
@@ -576,13 +568,13 @@ if [[ "$want_gpg" == "1" ]]; then
         printf '               %s\n' "$offender" >&2
       done <<< "$gnupg_offenders"
       echo "               A smart-card setup keeps only stubs here and is exposed normally." >&2
-      echo "               Override with --gnupg-private, or silence this with --no-gpg-agent." >&2
+      echo "               Override with --gpg-private, or silence this with --no-gpg." >&2
       exit 1
     fi
   fi
 fi
 
-if [[ "$want_gpg_sign" == "0" ]]; then
+if [[ "$want_gpg" == "0" ]]; then
   env_args+=("-e" "GIT_CONFIG_COUNT=1")
   env_args+=("-e" "GIT_CONFIG_KEY_0=commit.gpgsign")
   env_args+=("-e" "GIT_CONFIG_VALUE_0=false")

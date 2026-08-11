@@ -729,13 +729,90 @@ expect_status "list rejects an unknown flag" 1
 run "$list_bin" extra
 expect_status "list rejects a positional" 1
 
+# ── merged --gpg flags ───────────────────────────────────────────────────────
+
+fixture_reset
+
+gpg_home="$tmp/gpg-home"
+mkdir -p "$gpg_home"
+gpg_run="$tmp/gpg-run"
+mkdir -p "$gpg_run"
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" -- true
+expect_status "default launch forces commit.gpgsign=false" 0
+if grep -qF "GIT_CONFIG_KEY_0=commit.gpgsign" <<< "$argv"; then
+  pass "default launch passes commit.gpgsign=false override"
+else
+  fail "default launch passes commit.gpgsign=false override" "$argv"
+fi
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" --gpg -- true
+expect_status "canonical --gpg launch succeeds" 0
+if grep -qF "GIT_CONFIG_KEY_0=commit.gpgsign" <<< "$argv"; then
+  fail "--gpg removes commit.gpgsign=false override" "$argv"
+else
+  pass "--gpg removes commit.gpgsign=false override"
+fi
+if grep -qF "deprecated" <<< "$output"; then
+  fail "--gpg emits no deprecation warning" "$output"
+else
+  pass "--gpg emits no deprecation warning"
+fi
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" --gpg-private -- true
+expect_status "--gpg-private is accepted after rename" 0
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" --gnupg-private -- true
+expect_status "--gnupg-private is rejected after rename" 1
+expect_out "--gnupg-private rejection points to valid flags" "'--gnupg-private' is not an agent-sandbox flag."
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" --gpg-sign -- true
+expect_status "--gpg-sign is rejected after the hard merge" 1
+expect_out "--gpg-sign rejection points to valid flags" "'--gpg-sign' is not an agent-sandbox flag."
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" --no-gpg-agent -- true
+expect_status "--no-gpg-agent is rejected after the hard merge" 1
+expect_out "--no-gpg-agent rejection points to valid flags" "'--no-gpg-agent' is not an agent-sandbox flag."
+
+# --ssh and --proxy behavior should remain independent from merged gpg parsing.
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" --gpg --ssh -- true
+expect_status "--ssh still works with merged --gpg" 0
+if grep -qF "SSH_AUTH_SOCK=/agent.sock" <<< "$argv"; then
+  fail "--ssh without a real host socket does not inject SSH_AUTH_SOCK" "$argv"
+else
+  pass "--ssh without a real host socket does not inject SSH_AUTH_SOCK"
+fi
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" --gpg --proxy --port 8080 -- true
+expect_status "--proxy conflict checks still run with merged --gpg" 1
+expect_out "--proxy conflict message is unchanged by merged --gpg" "--proxy cannot be combined with a published port"
+expect_no_argv "--proxy conflict still refuses before podman run" "run --rm"
+
+# Volume flags are now podman-only passthrough; launcher-level -v is refused.
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" -v ./host:/container -- true
+expect_status "launcher-level -v is rejected" 1
+expect_out    "launcher-level -v points to passthrough" "Use podman passthrough instead:"
+expect_out    "launcher-level -v shows the passthrough form" "--podman-args -v"
+expect_no_argv "launcher-level -v refuses before podman run" "run --rm"
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" -v./host:/container -- true
+expect_status "launcher-level -vSPEC is rejected" 1
+expect_out    "launcher-level -vSPEC points to passthrough" "Use podman passthrough instead:"
+expect_no_argv "launcher-level -vSPEC refuses before podman run" "run --rm"
+
+run env HOME="$gpg_home" XDG_RUNTIME_DIR="$gpg_run" "$launcher_bin" --podman-args -v ./host:/container -- true
+expect_status "podman passthrough -v is accepted" 0
+if grep -qF -- "-v ./host:/container" <<< "$argv"; then
+  pass "podman passthrough keeps -v unchanged"
+else
+  fail "podman passthrough keeps -v unchanged" "$argv"
+fi
+
 # ── --krun preflight ────────────────────────────────────────────────────────
 # Every case here must refuse before podman is asked to do anything, so each is
 # paired with an argv assertion.  A --krun sandbox that got as far as `podman
 # run` with a bad memory value would boot on libkrun's 1 GiB default and give no
 # sign that the number was ignored.
-
-fixture_reset
 
 run "$launcher_bin" --krun --podman -- true
 expect_status  "--krun refuses --podman" 1

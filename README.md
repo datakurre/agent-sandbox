@@ -74,6 +74,7 @@ There are also convenient shortcuts like `--privileged` and `-e` for common podm
 ```sh
 agent-sandbox --privileged opencode               # enable nested podman
 agent-sandbox --podman-args --network=host -- bash # host network
+agent-sandbox --podman-args -v ./cache:/cache -- opencode
 agent-sandbox -e MY_VAR=1 opencode                # pass environment variable
 ```
 
@@ -91,7 +92,7 @@ agent-sandbox = pkgs.symlinkJoin {
   paths = [ inputs.agent-sandbox.packages.${pkgs.stdenv.hostPlatform.system}.default ];
   nativeBuildInputs = [ pkgs.makeWrapper ];
   postBuild = ''
-    wrapProgram $out/bin/agent-sandbox --add-flags "--workspace --ssh --git --gpg-agent --gpg-sign --devenv --nix --ports"
+    wrapProgram $out/bin/agent-sandbox --add-flags "--workspace --ssh --git --gpg --devenv --nix --ports"
   '';
 };
 ```
@@ -100,14 +101,15 @@ agent-sandbox = pkgs.symlinkJoin {
 
 Every flag in the table below has a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
 
+`--gpg-agent` and `--gpg-sign` were merged and removed; use `--gpg` / `--no-gpg`.
+
 | Group | Flag | What it does |
 | --- | --- | --- |
 | Workspace & identity | `--workspace` | Mounts the host's current working directory into `/workspace/<dirname>`. |
 | Workspace & identity | `--ssh` | Forwards the host's `SSH_AUTH_SOCK` to the container. |
 | Workspace & identity | `--git` | Mounts host Git configurations and passes identity env vars. |
-| Workspace & identity | `--gpg-agent` | Forwards the host GnuPG agent socket for commit signing. |
-| Workspace & identity | `--gpg-sign` | Sets git config to enable commit signing inside the container. |
-| Workspace & identity | `--gnupg-private` | Exposes `~/.gnupg` even if it holds on-disk secret keys. |
+| Workspace & identity | `--gpg` | Enables host GnuPG agent forwarding and git commit signing behavior. |
+| Workspace & identity | `--gpg-private` | Exposes `~/.gnupg` even if it holds on-disk secret keys. |
 | Workspace & identity | `--devenv` | Persists `~/.local/share/devenv` across sessions. |
 | Workspace & identity | `--nix` | Mounts the host `/nix/store` for native Nix execution. |
 | Container runtime | `--podman` | Forwards the host rootless Podman socket (sibling containers). See [Trust model](#trust-model). |
@@ -128,14 +130,13 @@ A few flags are one-off pass-throughs rather than persistent toggles, so they ha
 | --- | --- |
 | `--port [HOST:]CONTAINER[/PROTO]` | Publishes a port. |
 | `-e NAME=VAL`, `--env NAME=VAL` | Injects an environment variable. |
-| `-v SOURCE[:DEST[:OPTS]]` | Volume mount, passed before `--`. Relative paths in the source are resolved against `$PWD`; relative destinations are prefixed with `/workspace/`. |
 | `--privileged` | Enables nested podman inside the sandbox (safe — see [Trust model](#trust-model)). |
-| `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel. |
+| `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel (including `-v/--volume`). |
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
-relabeling (`:z`) to built-in writable binds. User-provided `-v` options are
-preserved exactly as supplied.
+relabeling (`:z`) to built-in writable binds. Podman volume options passed via
+`--podman-args` are preserved exactly as supplied.
 
 `--selinux` relabels the *file* a socket is mounted as, but that alone is not
 enough for `--ssh`: connecting to a forwarded `SSH_AUTH_SOCK` (including a
@@ -164,7 +165,7 @@ readiness does not depend on host relabeling flags.
 
 Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar and the port forwarders stay ordinary containers, so `--proxy` and every `agent-sandbox-ctl` subcommand that works by label are unaffected.
 
-- `agent-sandbox-ctl attach` and `agent-sandbox-ctl mount` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `-v`.
+- `agent-sandbox-ctl attach` and `agent-sandbox-ctl mount` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `--podman-args -v ... --`.
 - `--podman` is refused under `--krun`; `--privileged` and `--selinux` are accepted with a warning that they are unverified against a guest.
 
 #### `--proxy` details
@@ -396,7 +397,7 @@ nested rootless podman is pre-configured when the sandbox is launched with
 
 By design, `agent-sandbox` includes options that pierce the sandbox boundary. Note that these give any agent running inside the container capabilities on the host:
 - `--ssh` (opt-in): The agent can authenticate as you using your forwarded SSH identity (e.g. `git push` to your repos).
-- `--gpg-agent` (opt-in): The agent can sign commits or authenticate with any key held by your host GnuPG agent. Note that `agent-sandbox` protects your private key files by checking for them and gracefully failing the GNUPG directory mount if they are present on disk, but the forwarded GnuPG agent socket is still accessible.
+- `--gpg` (opt-in): The agent can sign commits or authenticate with any key held by your host GnuPG agent. Note that `agent-sandbox` protects your private key files by checking for them and gracefully failing the GNUPG directory mount if they are present on disk, but the forwarded GnuPG agent socket is still accessible.
 - `--podman` (opt-in): Forwards the host rootless podman socket. The agent can use this to launch **sibling containers** on the host, which is equivalent to a full sandbox escape (e.g. `podman run -v /:/host ...`).
 
 #### Running Containers: `--podman` vs `--privileged`
@@ -428,7 +429,7 @@ What it closes: host-kernel privilege escalation from code the agent runs. That 
 
 What it does **not** close:
 
-- **None of the three flags above.** `--ssh` and `--gpg-agent` hand out host capabilities; forwarding them into a VM forwards them into a VM. (`--podman` is refused outright under `--krun`.)
+- **None of the three flags above.** `--ssh` and `--gpg` hand out host capabilities; forwarding them into a VM forwards them into a VM. (`--podman` is refused outright under `--krun`.)
 - **Nothing on egress.** The proxy topology, the policy file and the connection log are unchanged. Networking uses libkrun's Transparent Socket Impersonation, where the guest has no virtual NIC and the VMM performs its `connect()` calls — inside the same `--internal` network namespace, which has no route out. The firewall neither widens nor narrows.
 - **Nothing on the workspace.** With `--workspace` the agent can write to your git repository, and code it plants there runs on your host later, as you, outside every boundary described here. For a careless or prompt-injected coding agent this is the operative risk, and no hypervisor addresses it.
 - **Nothing against a podman, netns or userns misconfiguration**, since the VMM sits inside that same configuration.
