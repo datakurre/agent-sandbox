@@ -10,6 +10,12 @@
 #
 # Assumes `agent-sandbox` and `agent-sandbox-ctl` are on PATH and the image is
 # loaded (agent-sandbox-ctl load).
+#
+# This covers the default runtime only: in_sandbox() below is `podman exec`,
+# which a --krun sandbox has no answer for.  The equivalent checks against a
+# microVM live in lib/smoke-krun.sh, which needs /dev/kvm.  The sidecar-side
+# checks here are runtime-agnostic already, which is the point -- --krun changes
+# the sandbox and leaves the proxy an ordinary container.
 
 set -uo pipefail
 

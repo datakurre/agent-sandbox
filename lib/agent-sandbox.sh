@@ -36,9 +36,25 @@ want_ports_any_interface=0
 want_mounts=0
 want_firewall=0
 want_meter_network=0
+want_krun=0
+# Tracked separately from the podman_args passthrough, because --krun warns on it.
+want_privileged=0
+
+# Empty means "not asked for".  --krun defaults the memory below, once it is
+# known that --krun is on at all; the CPU count is left to crun, which uses the
+# process's CPU affinity capped at LIBKRUN_MAX_VCPUS.
+krun_ram_mib=""
+krun_cpus=""
 
 agent=""
 want_help=0
+
+# The Nix wrapper pins this to an absolute store path, so podman never has to
+# resolve a bare runtime name against containers.conf.  The bare name is only a
+# fallback for running this script straight out of the tree.
+if [[ -z "${AGENT_SANDBOX_KRUN_RUNTIME:-}" ]]; then
+  AGENT_SANDBOX_KRUN_RUNTIME="krun"
+fi
 
 if [[ -z "${AGENT_SANDBOX_AGENT_SPECS:-}" ]]; then
   AGENT_SANDBOX_AGENT_SPECS=$'opencode\t["opencode","."]\t[".local/share/opencode",".config/opencode",".cache/opencode"]\t[]\nclaude-code\t["claude"]\t[".claude"]\t[".claude.json"]\ncopilot\t["copilot"]\t[".copilot"]\t[]\nantigravity\t["agy","."]\t[".local/share/antigravity-cli",".config/antigravity-cli",".cache/antigravity-cli",".gemini"]\t[]'
@@ -96,6 +112,9 @@ Integrations (use --X to enable, --no-X to disable):
   --firewall        $([[ "$want_firewall" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S) traffic through a domain-filtering proxy (blocks direct internet access).
   --meter-network   $([[ "$want_meter_network" == "1" ]] && echo "[on ]" || echo "[off]") Routes HTTP(S) traffic through a proxy to capture a post-run summary (blocks direct internet access).
                          Either flag also enables 'agent-sandbox-ctl net' for the running sandbox.
+  --krun            $([[ "$want_krun" == "1" ]] && echo "[on ]" || echo "[off]") Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
+                         Adds a guest-kernel boundary inside the existing container boundary.
+                         'agent-sandbox-ctl attach' and 'ctl mount' do not work against a krun sandbox.
 
 Ports:
   --port [HOST:]CONTAINER[/PROTO]          Publish a port, repeatable.
@@ -111,14 +130,21 @@ Mounts:
 
 Podman / Environment:
   --privileged              pass --privileged to podman run (for nested podman)
+  --krun-memory MiB         guest RAM under --krun (default 4096, must exceed 128)
+  --krun-cpus N             guest vCPUs under --krun (1-16, default: host affinity)
   -e, --env NAME=VAL        pass environment variable to podman
   --podman-args             treat all following args (until --) as podman args
 
 --podman, --ssh and --gpg-agent each hand the agent a capability that reaches
-outside the sandbox. --podman forwards the host podman socket, allowing the 
+outside the sandbox. --podman forwards the host podman socket, allowing the
 agent to create sibling containers on the host (a full sandbox escape).
-To safely let the agent run containers, use --privileged instead to enable 
+To safely let the agent run containers, use --privileged instead to enable
 securely nested containers inside the sandbox. See README for details.
+
+--krun closes none of those three. It adds a guest kernel under the agent, so
+code the agent runs faces a hypervisor before it faces the host kernel, but the
+VM runs inside the same container namespaces and the same proxy topology as
+before. It is not a substitute for leaving the three flags off.
 USAGE
 }
 
@@ -252,6 +278,21 @@ while [[ $# -gt 0 ]]; do
       ;;
     --port=*)       port_specs+=("${1#--port=}") ;;
 
+    --krun)         want_krun=1 ;;
+    --no-krun)      want_krun=0 ;;
+    --krun-memory)
+      shift
+      [[ $# -gt 0 ]] || { echo "agent-sandbox: --krun-memory needs an argument" >&2; exit 1; }
+      krun_ram_mib="$1"
+      ;;
+    --krun-memory=*) krun_ram_mib="${1#--krun-memory=}" ;;
+    --krun-cpus)
+      shift
+      [[ $# -gt 0 ]] || { echo "agent-sandbox: --krun-cpus needs an argument" >&2; exit 1; }
+      krun_cpus="$1"
+      ;;
+    --krun-cpus=*)  krun_cpus="${1#--krun-cpus=}" ;;
+
     -v)
       shift
       [[ $# -gt 0 ]] || { echo "agent-sandbox: -v needs an argument" >&2; exit 1; }
@@ -263,6 +304,7 @@ while [[ $# -gt 0 ]]; do
       parsing_podman=1
       ;;
     --privileged)
+      want_privileged=1
       podman_args+=("--privileged")
       ;;
     -e|--env)
@@ -300,6 +342,91 @@ done
 if [[ "$want_help" == "1" ]]; then
   usage
   exit 0
+fi
+
+# ── --krun preflight ────────────────────────────────────────────────────────
+# Checked here: after parsing, so the flags are final, and before anything is
+# created -- no temp dirs, no network, no relabel -- so a refusal leaves nothing
+# behind.  Same discipline as the --firewall/--port conflict check further down.
+#
+# Ordered cheapest and most portable first.  The /dev/kvm probe is last because
+# it is the one check that depends on the machine rather than on the arguments,
+# and putting it there keeps every refusal above it reachable in a test harness.
+if [[ "$want_krun" == "1" ]]; then
+  # A hypervisor around a forwarded host podman socket is theatre: the socket is
+  # a full escape on its own, and the guest reaches it through the same virtio-fs
+  # tree as everything else.
+  if [[ "$want_podman" == "1" ]]; then
+    echo "agent-sandbox: --krun cannot be combined with --podman." >&2
+    echo "               --podman forwards the host podman socket, which is a full" >&2
+    echo "               sandbox escape whether or not the sandbox is a VM." >&2
+    echo "               Use --privileged for containers nested inside the guest." >&2
+    exit 1
+  fi
+
+  # crun discards a krun.ram_mib of *exactly* LIBKRUN_MINIMUM_RAM_MIB or less
+  # (the check is `<=`, not `<`) and falls back to the OCI memory limit and then
+  # to 1 GiB, without printing anything.  Refusing here is the only way the user
+  # learns that the number they chose was ignored.
+  if [[ -n "$krun_ram_mib" ]]; then
+    if [[ ! "$krun_ram_mib" =~ ^[0-9]+$ ]] || [[ "$krun_ram_mib" -le 128 ]]; then
+      echo "agent-sandbox: --krun-memory needs a whole number of MiB greater than 128." >&2
+      echo "               Got '$krun_ram_mib'.  libkrun silently discards anything at" >&2
+      echo "               or below its 128 MiB minimum and falls back to 1024, so a" >&2
+      echo "               smaller value would look accepted and would not be." >&2
+      exit 1
+    fi
+  else
+    # crun's own default is 1024, which a Node-based agent will not survive.
+    krun_ram_mib=4096
+  fi
+
+  if [[ -n "$krun_cpus" ]]; then
+    if [[ ! "$krun_cpus" =~ ^[0-9]+$ ]] || [[ "$krun_cpus" -lt 1 ]] || [[ "$krun_cpus" -gt 16 ]]; then
+      echo "agent-sandbox: --krun-cpus needs a whole number between 1 and 16." >&2
+      echo "               Got '$krun_cpus'.  16 is libkrun's LIBKRUN_MAX_VCPUS." >&2
+      exit 1
+    fi
+  fi
+
+  # Warnings, not errors: neither has been measured against a real guest, and
+  # guessing wrong in the refusing direction would block the two workloads the
+  # flag exists for.
+  # Measured, not guessed: libkrunfw does carry overlay and fuse, so the kernel
+  # is not the obstacle.  Podman inside the guest sees uid 0 and reaches for
+  # rootful storage under /var/lib, which virtio-fs then refuses because the VMM
+  # writes as your unprivileged uid.  Left as a warning rather than a refusal --
+  # it is a storage-location problem, and pointing podman elsewhere fixes it.
+  if [[ "$want_privileged" == "1" ]]; then
+    echo "agent-sandbox: warning: nested podman inside a --krun guest needs storage" >&2
+    echo "               configuration that is not done for you.  The guest kernel has" >&2
+    echo "               overlay and fuse, but the agent is uid 0 inside the guest, so" >&2
+    echo "               podman defaults to /var/lib/containers -- which virtio-fs will" >&2
+    echo "               not create, because the VMM writes as your host uid." >&2
+  fi
+  # Not a refusal: :z relabeling of the binds still happens and still matters.
+  # It is the *process* label that has to go, and saying so is the point --
+  # otherwise --selinux would look like it confines the sandbox when it does not.
+  if [[ "$want_selinux" == "1" ]]; then
+    echo "agent-sandbox: note: --krun runs the sandbox with 'label=disable'." >&2
+    echo "               --selinux still relabels the bind mounts (:z), but the sandbox" >&2
+    echo "               process itself cannot be SELinux-confined: the kernel refuses a" >&2
+    echo "               domain transition once libkrun has spawned the VM's threads," >&2
+    echo "               and the guest would not boot at all with labeling left on." >&2
+  fi
+
+  if ! "$AGENT_SANDBOX_KRUN_RUNTIME" --version 2>/dev/null | grep -q '+LIBKRUN'; then
+    echo "agent-sandbox: $AGENT_SANDBOX_KRUN_RUNTIME was built without libkrun." >&2
+    echo "               --krun needs a crun with +LIBKRUN in 'crun --version'." >&2
+    exit 1
+  fi
+
+  if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+    echo "agent-sandbox: --krun needs read/write access to /dev/kvm." >&2
+    echo "               Check that the host has KVM (nested virtualisation is often" >&2
+    echo "               off in cloud VMs) and that you are in the 'kvm' group." >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "$agent" && ${#cmd_args[@]} -eq 0 ]]; then
@@ -894,6 +1021,35 @@ elif [[ "$want_meter_network" == "1" ]]; then
   proxy_mode=meter
 fi
 
+# Likewise always recorded, for the same reason: `ctl attach` and `ctl mount`
+# have to refuse against a krun sandbox, and the label is their only way to know.
+# Resources go in as OCI annotations, which is the only channel crun's libkrun
+# handler reads them from.
+krun_args=()
+sandbox_runtime=crun
+if [[ "$want_krun" == "1" ]]; then
+  sandbox_runtime=krun
+  krun_args=(--runtime "$AGENT_SANDBOX_KRUN_RUNTIME"
+             --annotation "krun.ram_mib=$krun_ram_mib")
+  [[ -n "$krun_cpus" ]] && krun_args+=(--annotation "krun.cpus=$krun_cpus")
+
+  # Without this, the guest does not boot at all on an SELinux-enforcing host:
+  #
+  #   write to file `thread-self/attr/current`: Permission denied
+  #
+  # The kernel refuses to set a process's SELinux context once that process has
+  # more than one thread, and libkrun has already spawned the VM's threads by
+  # the time crun's handler attempts the domain transition.  So this is not a
+  # host misconfiguration to work around but a property of running the VMM in
+  # the container process, and no label choice makes it succeed.
+  #
+  # Same reasoning, and the same flag, as the sidecar above.  The trade is real
+  # and belongs in the README: on an SELinux host, --krun exchanges SELinux
+  # confinement of the sandbox process for a guest kernel under the agent.
+  # --selinux still governs :z relabeling of the binds, which is unaffected.
+  krun_args+=(--security-opt label=disable)
+fi
+
 # Only allocate a TTY when there is one to allocate, so piped and CI
 # invocations (agent-sandbox -- bash -c '…' | tee log) still work.
 # GPG_TTY is deliberately not set here: the correct value is the tty podman
@@ -913,6 +1069,7 @@ podman run \
   --label "agent-sandbox.role=sandbox" \
   --label "agent-sandbox.workspace=$PWD" \
   --label "agent-sandbox.proxy=$proxy_mode" \
+  --label "agent-sandbox.runtime=$sandbox_runtime" \
   --label "agent-sandbox.command=${cmd_args[*]}" \
   --workdir "$workspace_dir" \
   -e HOME=/home/user \
@@ -925,6 +1082,7 @@ podman run \
   "${publish_args[@]}" \
   "${mounts[@]}" \
   "${env_args[@]}" \
+  "${krun_args[@]}" \
   "${podman_args[@]}" \
   "$AGENT_SANDBOX_IMAGE" \
   "${cmd_args[@]}"

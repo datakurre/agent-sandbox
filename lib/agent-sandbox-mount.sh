@@ -57,6 +57,17 @@ fi
 host_path="$(readlink -f "$host_path")"
 
 sandbox="$(resolve_sandbox "$sandbox_name" --running)"
+
+# Before the relabel below, which would otherwise start a throwaway container
+# for nothing.  This refusal matters more than attach's: the nsenter --bind at
+# the end of this script *succeeds* against a microVM and changes nothing the
+# guest can see, so without the guard the command would report success and do
+# nothing at all.
+refuse_if_krun "$sandbox" "mount" \
+  "A host-side bind lands in the VMM's mount namespace, not in the guest, so it" \
+  "would appear to succeed and have no effect.  virtio-fs cannot take a new" \
+  "share after boot.  Relaunch with the mount in place:  agent-sandbox --krun -v ..."
+
 pid="$(podman inspect --format '{{.State.Pid}}' "$sandbox")"
 
 # Check if SELinux relabeling is implied by existing mounts (i.e., started with --selinux)

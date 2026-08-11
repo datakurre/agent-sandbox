@@ -41,6 +41,7 @@ compose() { # name source...
     printf '#!%s\n' "$bash_bin"
     printf 'AGENT_SANDBOX_IMAGE="localhost/agent-sandbox:latest"\n'
     printf 'AGENT_SANDBOX_NETWORK="agent-sandbox"\n'
+    printf 'AGENT_SANDBOX_KRUN_RUNTIME="%s"\n' "$tmp/bin/krun-stub"
     local src
     for src in "$@"; do
       tail -n +2 "$lib/$src"   # strip the shebang, as scriptBody does
@@ -56,8 +57,25 @@ compose agent-sandbox-logs   agent-sandbox-resolve.sh agent-sandbox-logs.sh
 compose agent-sandbox-status agent-sandbox-resolve.sh agent-sandbox-status.sh
 compose agent-sandbox-load   agent-sandbox-load.sh
 compose agent-sandbox-firewall agent-sandbox-resolve.sh agent-sandbox-firewall.sh
+compose agent-sandbox-attach agent-sandbox-resolve.sh agent-sandbox-attach.sh
 compose agent-sandbox-purge  agent-sandbox-purge.sh
 purge_bin="$tmp/bin/agent-sandbox-purge"
+# The launcher, for --krun flag handling.  Everything asserted below refuses
+# during the preflight, which runs before the AGENTS.md and gnupg machinery.
+compose agent-sandbox        agent-sandbox.sh
+launcher_bin="$tmp/bin/agent-sandbox"
+
+# Stands in for `crun --version`.  The real preflight greps for +LIBKRUN, so the
+# stub can flip that answer without a crun anywhere near the build.
+{ printf '#!%s\n' "$bash_bin"
+  printf 'echo "crun version 1.27.1"\n'
+  printf 'echo "spec: 1.0.0"\n'
+  # Single-quoted on purpose: the parameter expansion belongs to the stub, and
+  # has to survive being written into it rather than expanding here.
+  # shellcheck disable=SC2016
+  printf 'echo "+SYSTEMD +SELINUX +SECCOMP ${KRUN_STUB_LIBKRUN:-+LIBKRUN} +YAJL"\n'
+} > "$tmp/bin/krun-stub"
+chmod +x "$tmp/bin/krun-stub"
 # Standalone: list reads its labels with `podman inspect` rather than composing
 # the resolve helper.
 compose agent-sandbox-list   agent-sandbox-list.sh
@@ -75,6 +93,7 @@ logs_bin="$tmp/bin/agent-sandbox-logs"
 status_bin="$tmp/bin/agent-sandbox-status"
 load_bin="$tmp/bin/agent-sandbox-load"
 mount_bin="$tmp/bin/agent-sandbox-mount"
+attach_bin="$tmp/bin/agent-sandbox-attach"
 
 failures=0
 
@@ -635,8 +654,11 @@ else
 fi
 
 # A sandbox predating the proxy label must not shift the workspace column.
+# The runtime column is the one exception that still renders: a container older
+# than that label can only have been started by a launcher that had no --krun,
+# so "crun" is a fact about it rather than a guess.
 run "$list_bin" --all
-if grep -qE 'agent-sandbox-old-1 +Up 2 minutes *$' <<< "$output"; then
+if grep -qE 'agent-sandbox-old-1 +Up 2 minutes +crun *$' <<< "$output"; then
   pass "list tolerates a container with no labels"
 else
   fail "list tolerates a container with no labels" "$output"
@@ -664,6 +686,132 @@ expect_status "list rejects an unknown flag" 1
 
 run "$list_bin" extra
 expect_status "list rejects a positional" 1
+
+# ── --krun preflight ────────────────────────────────────────────────────────
+# Every case here must refuse before podman is asked to do anything, so each is
+# paired with an argv assertion.  A --krun sandbox that got as far as `podman
+# run` with a bad memory value would boot on libkrun's 1 GiB default and give no
+# sign that the number was ignored.
+
+fixture_reset
+
+run "$launcher_bin" --krun --podman -- true
+expect_status  "--krun refuses --podman" 1
+expect_out     "--krun says why --podman is refused" "full"
+expect_no_argv "--krun --podman starts no container" "run --rm"
+
+# 128 exactly, because the handler's check is `<=` rather than `<`.
+# An empty value is deliberately absent from this list: it is indistinguishable
+# from the flag not being passed, and falls through to the 4096 default.
+for bad in 0 64 128 abc 12.5; do
+  run "$launcher_bin" --krun --krun-memory "$bad" -- true
+  expect_status  "--krun-memory rejects '$bad'" 1
+  expect_out     "--krun-memory '$bad' explains the 128 MiB floor" "greater than 128"
+  expect_no_argv "--krun-memory '$bad' starts no container" "run --rm"
+done
+
+run "$launcher_bin" --krun --krun-memory 129 --krun-cpus 0 -- true
+expect_status  "--krun-cpus rejects 0" 1
+expect_no_argv "--krun-cpus 0 starts no container" "run --rm"
+
+run "$launcher_bin" --krun --krun-cpus 17 -- true
+expect_status  "--krun-cpus rejects 17 (LIBKRUN_MAX_VCPUS is 16)" 1
+expect_no_argv "--krun-cpus 17 starts no container" "run --rm"
+
+run "$launcher_bin" --krun --krun-memory -- true
+expect_status "--krun-memory alone is an error" 1
+run "$launcher_bin" --krun --krun-cpus -- true
+expect_status "--krun-cpus alone is an error" 1
+
+# Without --krun the values are never examined, so a bogus one must not refuse a
+# perfectly ordinary launch.
+run "$launcher_bin" --krun --no-krun --krun-memory 64 -- true
+expect_status "--no-krun disarms the memory check" 0
+
+# The wrapProgram --add-flags contract: a baked-in --krun has to be switchable
+# off by the user, which is the whole reason the --no- form exists.
+run "$launcher_bin" --krun --no-krun -- true
+expect_status "--no-krun wins when it comes last" 0
+expect_no_argv "--no-krun passes no runtime to podman" "--runtime"
+expect_no_argv "--no-krun passes no krun annotation" "krun.ram_mib"
+
+# A crun without the handler must be caught by name, not by a confusing podman
+# failure at first boot.
+status=0
+output=$(FIXTURE="$tmp/fixture" ARGV_LOG="$tmp/argv" PATH="$tmp/bin:$PATH" \
+         KRUN_STUB_LIBKRUN="-LIBKRUN" "$launcher_bin" --krun -- true 2>&1) || status=$?
+if [[ "$status" == 1 && "$output" == *"without libkrun"* ]]; then
+  pass "--krun refuses a crun built without libkrun"
+else
+  fail "--krun refuses a crun built without libkrun" "exit $status"$'\n'"$output"
+fi
+
+# Advisory, not refusals: --privileged is one of the two workloads --krun exists
+# for, and --selinux still does useful work on the binds.  Both messages describe
+# measured behaviour (see lib/smoke-krun.sh), so they assert on the cause rather
+# than on the word "unverified" they used to carry.
+run "$launcher_bin" --krun --privileged -- true
+expect_out "--krun warns that nested podman needs storage configuration" "/var/lib/containers"
+run "$launcher_bin" --krun --selinux -- true
+expect_out "--krun says the sandbox process is not SELinux-confined" "label=disable"
+
+# /dev/kvm is the one thing no test can conjure, so the assertion follows the
+# machine rather than pretending.  Either way --krun must not reach podman.
+run "$launcher_bin" --krun --krun-cpus 4 -- true
+if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+  expect_status "--krun proceeds past the preflight when /dev/kvm is usable" 0
+  # Only reachable on a KVM host, so this is the one assertion that the run line
+  # is actually wired up rather than merely well-formed.  lib/smoke-krun.sh
+  # covers it against a real guest.
+  for want in "--runtime" "krun.ram_mib=4096" "krun.cpus=4" "agent-sandbox.runtime=krun"; do
+    if grep -qF -- "$want" <<< "$argv"; then
+      pass "--krun passes $want to podman"
+    else
+      fail "--krun passes $want to podman" "$argv"
+    fi
+  done
+else
+  expect_status  "--krun refuses without /dev/kvm" 1
+  expect_out     "--krun names /dev/kvm" "/dev/kvm"
+  expect_no_argv "--krun starts no container without /dev/kvm" "run --rm"
+fi
+
+# ── ctl refusals against a krun sandbox ─────────────────────────────────────
+# attach and mount are the two commands that enter the sandbox, and both must
+# refuse on the label.  mount is the sharper case: its nsenter --bind succeeds
+# against the VMM and changes nothing in the guest, so an unguarded mount would
+# report success and silently do nothing.
+
+fixture_reset
+fixture_set running "agent-sandbox-vm-1"
+fixture_set all     "agent-sandbox-vm-1"
+fixture_set "labels.agent-sandbox-vm-1" "agent-sandbox.runtime=krun"
+
+run "$attach_bin" agent-sandbox-vm-1
+expect_status  "attach refuses a krun sandbox" 1
+expect_out     "attach says it is a microVM" "microVM"
+expect_out     "attach offers a workaround" "agent-sandbox --krun -- bash"
+expect_no_argv "attach execs nothing" "exec"
+
+run "$mount_bin" --sandbox agent-sandbox-vm-1 "$tmp" /mnt/x
+expect_status  "mount refuses a krun sandbox" 1
+expect_out     "mount explains the silent no-op" "no effect"
+expect_no_argv "mount execs nothing" "exec"
+expect_no_argv "mount starts no relabel container" "--entrypoint"
+
+# The label is absent on anything an older launcher started, and those are
+# ordinary containers: refusing them would be a regression, not a safeguard.
+fixture_reset
+fixture_set running "agent-sandbox-old-1"
+fixture_set all     "agent-sandbox-old-1"
+
+run "$attach_bin" agent-sandbox-old-1
+expect_status "attach still works on a sandbox predating the runtime label" 0
+if grep -qF -- "exec" <<< "$argv"; then
+  pass "attach execs into an unlabelled sandbox"
+else
+  fail "attach execs into an unlabelled sandbox" "$argv"
+fi
 
 # ── error output goes to stderr ─────────────────────────────────────────────
 

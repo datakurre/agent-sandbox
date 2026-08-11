@@ -93,6 +93,11 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
 - `--nix`: Mounts the host `/nix/store` for native Nix execution.
 - `--podman`: Forwards the host rootless Podman socket (sibling containers).
 - `--selinux`: Applies SELinux shared relabeling (`:z`) to writable binds in the sandbox container. The proxy sidecar always runs with SELinux labeling disabled for its own policy/readiness mounts.
+- `--krun`: Runs the sandbox as a KVM microVM with its own kernel, using `podman --runtime krun`. Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar and the port forwarders stay ordinary containers, so `--firewall`, `--meter-network` and every `agent-sandbox-ctl` subcommand that works by label are unaffected. See [Trust model](#trust-model) for what this does and does not buy.
+  - `agent-sandbox-ctl attach` and `agent-sandbox-ctl mount` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `-v`.
+  - `--krun-memory MiB` sets guest RAM (default `4096`). Values of 128 or below are rejected, because libkrun silently discards them and falls back to 1 GiB.
+  - `--krun-cpus N` sets guest vCPUs (1–16). Defaults to the host CPU affinity count.
+  - `--podman` is refused under `--krun`; `--privileged` and `--selinux` are accepted with a warning that they are unverified against a guest.
 - `--firewall`: Isolates the container from the internet and routes HTTP(S) and SSH traffic through a domain-filtering proxy based on the `[proxy]` block in `AGENTS.md`. Other traffic is blocked.
   - The `[proxy]` block supports `allow_domains`, `deny_domains`, `allow_ips`, `deny_ips`
     and `allow_ports`.
@@ -324,3 +329,37 @@ If you want the agent to be able to run its own containers, `agent-sandbox` supp
 
 1. **Nested Containers (Safe):** Pass `--privileged` when launching the sandbox. The sandbox image contains its own baked-in Podman stack. `--privileged` gives the sandbox container enough kernel permissions to run a securely isolated Podman daemon *inside* the sandbox. The agent cannot use this to escape to the host.
 2. **Sibling Containers (Unsafe):** Pass `--podman` to forward your host's Podman socket into the sandbox. When the agent runs `podman run`, it talks to your host machine's Podman daemon. The container is created on the host alongside the sandbox. This does *not* require `--privileged`, but it allows the agent to control your host's containers and easily escape the sandbox. Use this only when you need the agent to interact with existing host infrastructure or leverage the host's image cache for performance.
+
+#### A guest kernel: `--krun`
+
+`--krun` runs the sandbox as a KVM microVM. The boundary it adds is **additive, not substitutive** — this is the whole of what it is for, and it is easy to overstate.
+
+libkrun's own security model is explicit that the guest and the VMM are one security context, and that containment must come from the host's mechanisms: namespaces. Under podman that context already exists and is exactly the one the sandbox has without the flag. So the boundaries sit in series:
+
+```
+agent process
+  │  ← guest kernel (libkrunfw), reachable only through virtio + KVM ioctls
+VMM (the sandbox container process)
+  │  ← rootless userns + mount ns + netns + seccomp   ← what you already had
+host
+```
+
+A guest-kernel privilege escalation lands the attacker as your unprivileged uid inside the same container the agent started in, facing the boundary that was always there.
+
+What it closes: host-kernel privilege escalation from code the agent runs. That is the entire gain.
+
+What it does **not** close:
+
+- **None of the three flags above.** `--ssh` and `--gpg-agent` hand out host capabilities; forwarding them into a VM forwards them into a VM. (`--podman` is refused outright under `--krun`.)
+- **Nothing on egress.** The proxy topology, the policy file and the connection log are unchanged. Networking uses libkrun's Transparent Socket Impersonation, where the guest has no virtual NIC and the VMM performs its `connect()` calls — inside the same `--internal` network namespace, which has no route out. The firewall neither widens nor narrows.
+- **Nothing on the workspace.** With `--workspace` the agent can write to your git repository, and code it plants there runs on your host later, as you, outside every boundary described here. For a careless or prompt-injected coding agent this is the operative risk, and no hypervisor addresses it.
+- **Nothing against a podman, netns or userns misconfiguration**, since the VMM sits inside that same configuration.
+
+Two things it changes that are easy to miss, both measured rather than assumed (`lib/smoke-krun.sh`):
+
+- **The agent is `uid 0` inside the guest.** `--userns=keep-id` maps the *VMM process* on the host; it does not reach the guest's own user namespace, so a process that is unprivileged uid 33500 in an ordinary sandbox is root in a `--krun` one. This is not an escalation on the host — files the guest writes still land as your uid, because the VMM performs the write — but "the agent runs unprivileged" stops being true inside the boundary, and anything relying on in-container uid separation should not.
+- **SELinux confinement of the sandbox process is off.** `--krun` runs the sandbox with `--security-opt label=disable`, because the kernel refuses an SELinux domain transition once a process is multi-threaded and libkrun has already spawned the VM's threads by then. With labeling left on, the guest does not boot at all on an enforcing host. `--selinux` still relabels the bind mounts (`:z`). On an SELinux host, `--krun` therefore trades SELinux confinement of the sandbox process for a guest kernel under the agent.
+
+Nested podman inside a `--krun` guest does not work out of the box, despite `--privileged`. The guest kernel has both `overlay` and `fuse`, so the obstacle is not kernel capability: podman sees uid 0, defaults its storage to `/var/lib/containers`, and virtio-fs declines to create that because the VMM writes as your unprivileged host uid. Pointing podman's graphroot somewhere under `/home/user` is the missing piece.
+
+It is opt-in and should stay that way. The honest reasons to reach for it are running genuinely untrusted code, and nested `--privileged` workloads — and the second of those is currently unfinished, per the paragraph above.

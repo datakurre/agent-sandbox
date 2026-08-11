@@ -35,6 +35,14 @@ done
 
 sandbox="$(resolve_sandbox "$explicit" --running)"
 
+# Not left to podman: crun's fallback exec path would enter the *VMM's*
+# namespaces on success, giving a shell on the host kernel beside the VM rather
+# than inside it -- the wrong side of the boundary --krun was chosen for.
+refuse_if_krun "$sandbox" "attach" \
+  "crun's libkrun handler implements no exec, so there is no way into the guest." \
+  "Either launch a second sandbox on the same workspace, or run the shell as" \
+  "the sandbox's own command:  agent-sandbox --krun -- bash"
+
 if [[ ${#cmd[@]} -eq 0 ]]; then
   cmd=(bash)
 fi

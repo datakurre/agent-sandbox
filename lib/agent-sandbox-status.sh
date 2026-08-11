@@ -182,6 +182,13 @@ case "$mode" in
   *)              row proxy "$([[ -n "$sidecar" ]] && echo "on  ($sidecar)" || echo unknown)" ;;
 esac
 
+# An absent label means a launcher that predates it, which could only have
+# started an ordinary container.
+case "$(sandbox_runtime "$sandbox")" in
+  krun) row runtime "krun  (microVM; no attach, no mount)" ;;
+  *)    row runtime "crun" ;;
+esac
+
 networks=$(podman inspect --format \
   '{{range $net, $conf := .NetworkSettings.Networks}}{{$net}} {{end}}' "$sandbox" 2>/dev/null || true)
 [[ -n "${networks// /}" ]] && row networks "${networks% }"

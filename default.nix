@@ -332,8 +332,19 @@ let
     AGENT_SANDBOX_NETWORK="${networkName}"
   '';
 
+  # An absolute store path rather than a bare "krun", because podman resolves a
+  # bare --runtime name against containers.conf and would find whatever the host
+  # happens to have configured.  Note this is unrelated to the runtime = "crun"
+  # in the image's own containers.conf below, which configures *nested* podman.
+  #
+  # nixpkgs builds crun with --with-libkrun by default and substitutes the
+  # absolute libkrun.so.1 path into the binary, so no LD_LIBRARY_PATH is needed;
+  # libkrun's own RPATH then covers libkrunfw.so.  If a nixpkgs change ever flips
+  # withLibkrun off, the launcher's preflight catches it at first use -- probing
+  # for it here would mean running crun during evaluation.
   launcherPreamble = preamble + ''
     AGENT_SANDBOX_AGENT_SPECS=${lib.escapeShellArg agentSpecs}
+    AGENT_SANDBOX_KRUN_RUNTIME="${pkgs.crun}/bin/krun"
   '';
 
   launcher = pkgs.writeShellApplication {

@@ -38,6 +38,34 @@ sandbox_proxy_mode() {
   podman inspect --format '{{index .Config.Labels "agent-sandbox.proxy"}}' "$1" 2>/dev/null || true
 }
 
+# krun | crun, and empty for a container predating the label.  Callers must
+# treat empty as crun: a sandbox started by an older launcher is an ordinary
+# container, and refusing to exec into it would be a regression.
+# Not every consumer of this shared helper calls every function.
+# shellcheck disable=SC2329
+sandbox_runtime() {
+  podman inspect --format '{{index .Config.Labels "agent-sandbox.runtime"}}' "$1" 2>/dev/null || true
+}
+
+# Commands that enter the sandbox have to refuse against a microVM: crun's
+# libkrun handler leaves .exec_func NULL, so `podman exec` fails outright, and
+# a host-side bind mount lands in the VMM's namespace where the guest cannot see
+# it.  Refusing on the label rather than on the podman error is deliberate --
+# the failure is silent in the mount case, and misleading in the exec case.
+# Not every consumer of this shared helper calls every function.
+# shellcheck disable=SC2329
+refuse_if_krun() { # sandbox verb remedy...
+  local sandbox="$1" verb="$2"
+  shift 2
+  [[ "$(sandbox_runtime "$sandbox")" == "krun" ]] || return 0
+  echo "${0##*/}: '$sandbox' is a --krun microVM; $verb is not available." >&2
+  local line
+  for line in "$@"; do
+    echo "               $line" >&2
+  done
+  exit 1
+}
+
 # The proxy sidecar serving a sandbox, by label.  Empty when the sandbox was
 # launched without a proxy, or by a launcher that predates the label.
 # Not every consumer of this shared helper calls every function.

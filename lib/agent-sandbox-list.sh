@@ -49,7 +49,7 @@ container_label() { # container key
 row_format=$'{{.ID}}\t{{.Names}}\t{{.Status}}'
 
 list_sandboxes() { # ps-args...
-  printf 'CONTAINER ID\tNAMES\tSTATUS\tPROXY\tWORKSPACE\tCOMMAND\n'
+  printf 'CONTAINER ID\tNAMES\tSTATUS\tPROXY\tRUNTIME\tWORKSPACE\tCOMMAND\n'
   podman ps "$@" --format "$row_format" |
     while IFS=$'\t' read -r id name status; do
       local ws
@@ -65,8 +65,13 @@ list_sandboxes() { # ps-args...
         cmd="$(podman inspect --format '{{range .Config.Cmd}}{{.}} {{end}}' "$name" 2>/dev/null || true)"
         cmd="${cmd% }"
       fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$short_name" "$status" \
+      # Same fallback as the command column: no label means a launcher that
+      # predates it, and only crun existed then.
+      local runtime
+      runtime="$(container_label "$name" agent-sandbox.runtime)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$short_name" "$status" \
         "$(container_label "$name" agent-sandbox.proxy)" \
+        "${runtime:-crun}" \
         "$ws" \
         "$cmd"
     done
