@@ -5,7 +5,7 @@
 # The image ships a pre-registered Nix store database.  When the host's /nix
 # is mounted over it, the host's own database comes along and this would
 # clobber it.
-if [[ "${AGENT_SANDBOX_HOST_NIX:-}" != "1" ]]; then
+if [[ "${AGENT_SANDBOX_SKIP_NIX_INIT:-0}" != "1" && "${AGENT_SANDBOX_HOST_NIX:-}" != "1" ]]; then
   if [[ ! -f /nix/var/nix/db/db.sqlite ]]; then
     nix-store --load-db < /nix/registration
   fi

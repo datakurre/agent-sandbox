@@ -33,7 +33,7 @@ Key layers:
 
 ### Entrypoint (`agent-sandbox-entrypoint`)
 
-1. Loads the Nix store registration on first start (unless `AGENT_SANDBOX_HOST_NIX=1`, in which case the host's `/nix` mount is used).
+1. Loads the Nix store registration on first start (unless `AGENT_SANDBOX_HOST_NIX=1`, in which case the host's `/nix` mount is used, or `AGENT_SANDBOX_SKIP_NIX_INIT=1`, which sidecar launches set because they do not need Nix bootstrap).
 2. Sets up `known_hosts` for common git forges to avoid first-time connection prompts.
 3. When `AGENT_SANDBOX_GPG_AGENT=1`, symlinks the forwarded host gpg-agent
    socket into `~/.gnupg/S.gpg-agent`.

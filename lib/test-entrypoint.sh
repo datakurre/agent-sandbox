@@ -29,6 +29,10 @@ run_entrypoint() {
   HOME="$tmp/home-$RANDOM" AGENT_SANDBOX_HOST_NIX=1 bash "$entrypoint" env
 }
 
+run_entrypoint_skip_nix() {
+  HOME="$tmp/home-$RANDOM" AGENT_SANDBOX_SKIP_NIX_INIT=1 bash "$entrypoint" env
+}
+
 # --- HTTP_PROXY set: Node's opt-in is turned on ----------------------------
 
 got=$(HTTP_PROXY=http://10.0.0.1:8888 HTTPS_PROXY=http://10.0.0.1:8888 run_entrypoint)
@@ -54,6 +58,15 @@ if grep -qx 'NODE_USE_ENV_PROXY=1' <<< "$got"; then
   fail "no HTTP_PROXY: NODE_USE_ENV_PROXY must stay unset" "$got"
 else
   pass "no HTTP_PROXY: NODE_USE_ENV_PROXY stays unset"
+fi
+
+# --- sidecar path can skip nix bootstrap explicitly --------------------------
+
+got=$(run_entrypoint_skip_nix)
+if grep -qx 'AGENT_SANDBOX_SKIP_NIX_INIT=1' <<< "$got"; then
+  pass "AGENT_SANDBOX_SKIP_NIX_INIT survives into command env"
+else
+  fail "AGENT_SANDBOX_SKIP_NIX_INIT survives into command env" "$got"
 fi
 
 if [[ "$failures" -gt 0 ]]; then

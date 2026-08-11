@@ -92,7 +92,7 @@ Every flag has a corresponding `--no-flag` option (e.g., `--no-workspace`) to ex
 - `--devenv`: Persists `~/.local/share/devenv` across sessions.
 - `--nix`: Mounts the host `/nix/store` for native Nix execution.
 - `--podman`: Forwards the host rootless Podman socket (sibling containers).
-- `--selinux`: Applies SELinux shared relabeling (`:z`) to writable binds.
+- `--selinux`: Applies SELinux shared relabeling (`:z`) to writable binds in the sandbox container. The proxy sidecar always runs with SELinux labeling disabled for its own policy/readiness mounts.
 - `--firewall`: Isolates the container from the internet and routes HTTP(S) and SSH traffic through a domain-filtering proxy based on the `[proxy]` block in `AGENTS.md`. Other traffic is blocked.
   - The `[proxy]` block supports `allow_domains`, `deny_domains`, `allow_ips`, `deny_ips`
     and `allow_ports`.
@@ -242,6 +242,10 @@ By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects.  On SELinux hosts, pass `--selinux` to apply shared
 relabeling (`:z`) to built-in writable binds.  User-provided `-v` options are
 preserved exactly as supplied.
+
+The proxy sidecar is treated as infrastructure: it always runs with SELinux
+labeling disabled for `/sidecar_policy` and `/sidecar_shared` so proxy
+readiness does not depend on host relabeling flags.
 
 ### Examples
 

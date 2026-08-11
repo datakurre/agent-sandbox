@@ -769,13 +769,10 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     sidecar_dns_args+=(--dns "$sidecar_ns")
   done
 
-  # The sidecar is our infrastructure container, not the sandboxed agent code.
-  # Disable SELinux labeling so it can write the readiness marker and the
-  # connection log into the shared volume.
-  sidecar_selinux=()
-  if [[ "$want_selinux" == "1" ]]; then
-    sidecar_selinux=("--security-opt" "label=disable")
-  fi
+  # The sidecar is infrastructure, not agent workload. Keep its policy/log
+  # mounts SELinux-safe by default regardless of --selinux so readiness does not
+  # depend on host labeling conventions.
+  sidecar_security_opts=("--security-opt" "label=disable")
 
   # Not --rm: the cleanup trap removes it, so a sidecar that dies early is still
   # around for `podman logs` to explain itself.
@@ -794,9 +791,10 @@ if [[ "$want_firewall" == "1" || "$want_meter_network" == "1" ]]; then
     --label "agent-sandbox.workspace=$PWD" \
     --network bridge --network "$sidecar_id" \
     "${sidecar_dns_args[@]}" \
-    "${sidecar_selinux[@]}" \
+    "${sidecar_security_opts[@]}" \
     "${sidecar_caps[@]}" -v "$sidecar_shared:/sidecar_shared:$rw_mount_opts" \
     -v "$sidecar_policy:/sidecar_policy:ro" \
+    -e "AGENT_SANDBOX_SKIP_NIX_INIT=1" \
     -e "FIREWALL=$want_firewall" \
     -e "SIDECAR_SUBNET=$sidecar_subnet" \
     "$AGENT_SANDBOX_IMAGE" agent-sandbox-sidecar >/dev/null; then
