@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use clap::{Parser, Subcommand};
 use agent_sandbox_cli::ctl;
+use agent_sandbox_cli::agents::{parse_proxy, format_proxy_policy};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, BufRead, BufReader, IsTerminal};
@@ -325,7 +326,37 @@ before. It is not a substitute for leaving the three flags off.",
     );
 }
 
+
+struct CleanupGuard {
+    sidecar_id: String,
+    sidecar_shared: String,
+    sidecar_policy: String,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if !self.sidecar_id.is_empty() {
+            let _ = ProcessCommand::new("podman").args(["stop", "-t", "1", &self.sidecar_id]).output();
+            let _ = ProcessCommand::new("podman").args(["rm", "-f", &self.sidecar_id]).output();
+            
+            // Reclaim network
+            for _ in 0..20 {
+                if ProcessCommand::new("podman").args(["network", "rm", &self.sidecar_id]).output().is_ok() {
+                    if ProcessCommand::new("podman").args(["network", "exists", &self.sidecar_id]).status().map(|s| !s.success()).unwrap_or(true) {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            
+            if !self.sidecar_shared.is_empty() { let _ = fs::remove_dir_all(&self.sidecar_shared); }
+            if !self.sidecar_policy.is_empty() { let _ = fs::remove_dir_all(&self.sidecar_policy); }
+        }
+    }
+}
+
 fn main() -> Result<()> {
+
     let mut want_ssh = false;
     let mut want_git = false;
     let mut want_gpg = false;
@@ -782,36 +813,171 @@ fn main() -> Result<()> {
 
     mounts = enforce(mounts);
     
+    let mut _cleanup_guard = CleanupGuard { sidecar_id: String::new(), sidecar_shared: String::new(), sidecar_policy: String::new() };
+    let mut sidecar_network_arg = None;
+    let mut proxy_env_vars = Vec::new();
+    
+    // We declare these outside so they can be cleaned up
+    let mut sidecar_id = String::new();
+    let mut sidecar_shared = String::new();
+    let mut sidecar_policy = String::new();
+
     if want_proxy {
         let uuid_str = uuid::Uuid::new_v4().to_string(); let uuid = &uuid_str[0..8];
-        let sidecar_id = format!("agent-sandbox-sidecar-{}", uuid);
-        let sidecar_shared = format!("/tmp/agent-sandbox-sidecar-{}", uuid);
-        let sidecar_policy = format!("/tmp/agent-sandbox-policy-{}", uuid);
+        sidecar_id = format!("agent-sandbox-sidecar-{}", uuid);
+        sidecar_shared = format!("/tmp/agent-sandbox-sidecar-{}", uuid);
+        sidecar_policy = format!("/tmp/agent-sandbox-policy-{}", uuid);
         
+        _cleanup_guard.sidecar_id = sidecar_id.clone();
+        _cleanup_guard.sidecar_shared = sidecar_shared.clone();
+        _cleanup_guard.sidecar_policy = sidecar_policy.clone();
+
         fs::create_dir_all(&sidecar_shared).unwrap();
         fs::create_dir_all(&sidecar_policy).unwrap();
         
-        let _ = ProcessCommand::new("podman")
-            .args(["network", "create", "--internal", "--disable-dns", &sidecar_id])
-            .output();
-            
-        fs::write(format!("{}/policy", sidecar_policy), "default deny\n").unwrap();
+        let mut net_cmd = ProcessCommand::new("podman");
+        net_cmd.args(["network", "create", "--internal", "--disable-dns", &sidecar_id]);
+        if !net_cmd.output().map(|o| o.status.success()).unwrap_or(false) {
+            eprintln!("agent-sandbox: could not create the sidecar network {}", sidecar_id);
+            std::process::exit(1);
+        }
+
+        let mut sidecar_subnet = String::new();
+        let mut inspect_cmd = ProcessCommand::new("podman");
+        inspect_cmd.args(["network", "inspect", &sidecar_id, "--format", "{{(index .Subnets 0).Subnet}}"]);
+        if let Ok(out) = inspect_cmd.output() {
+            if out.status.success() {
+                sidecar_subnet = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+        }
+        if sidecar_subnet.is_empty() {
+            eprintln!("agent-sandbox: could not determine the subnet of {}", sidecar_id);
+            std::process::exit(1);
+        }
+
+        let agents_md_path = Path::new(&pwd).join("AGENTS.md");
+        let mut formatted_policy = String::new();
+        if agents_md_path.exists() {
+            if let Ok(text) = fs::read_to_string(&agents_md_path) {
+                match parse_proxy(&text) {
+                    Ok(policy) => {
+                        formatted_policy = format_proxy_policy(&policy, &agents_md_path.to_string_lossy());
+                    }
+                    Err(_) => {
+                        eprintln!("agent-sandbox: refusing to launch on an invalid [proxy] block (use --no-proxy to skip).");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        
+        let baseline_deny_ips = [
+            "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+            "169.254.0.0/16", "100.64.0.0/10", "0.0.0.0/8", "fc00::/7", "fe80::/10"
+        ];
+        
+        let mut policy_file_content = formatted_policy;
+        let mut baseline_content = String::new();
+        for cidr in &baseline_deny_ips {
+            let line = format!("deny_ips {}\n", cidr);
+            policy_file_content.push_str(&line);
+            baseline_content.push_str(&line);
+        }
+        
+        fs::write(format!("{}/policy", sidecar_policy), &policy_file_content).unwrap();
+        fs::write(format!("{}/policy.baseline", sidecar_policy), &baseline_content).unwrap();
+        fs::copy(format!("{}/policy", sidecar_policy), format!("{}/policy.base", sidecar_policy)).unwrap();
         
         let mut proxy_cmd = ProcessCommand::new("podman");
         proxy_cmd.args(["run", "-d", "--name", &sidecar_id])
                  .args(["--network", "bridge", "--network", &sidecar_id])
                  .args(["-v", &format!("{}:/sidecar_shared:rw", sidecar_shared)])
                  .args(["-v", &format!("{}:/sidecar_policy:ro", sidecar_policy)])
+                 .args(["-e", "AGENT_SANDBOX_SKIP_NIX_INIT=1"])
+                 .args(["-e", &format!("SIDECAR_SUBNET={}", sidecar_subnet)])
                  .args(["--label", "agent-sandbox.role=proxy"])
                  .args(["--label", &format!("agent-sandbox.target={}", container_name)])
                  .args(["--label", &format!("agent-sandbox.workspace={}", pwd)])
                  .arg(&env::var("AGENT_SANDBOX_IMAGE").unwrap_or_default())
                  .arg("agent-sandbox-sidecar");
                  
+        proxy_cmd.stdout(std::process::Stdio::null());
+                 
         if !proxy_cmd.status().map(|s| s.success()).unwrap_or(false) {
             eprintln!("agent-sandbox: could not start the proxy sidecar");
             std::process::exit(1);
         }
+        
+        let mut sidecar_ready = false;
+        let ready_path = format!("{}/ready", sidecar_shared);
+        for _ in 0..350 {
+            if Path::new(&ready_path).exists() {
+                sidecar_ready = true;
+                break;
+            }
+            let mut check_cmd = ProcessCommand::new("podman");
+            check_cmd.args(["container", "inspect", "--format", "{{.State.Running}}", &sidecar_id]);
+            if let Ok(out) = check_cmd.output() {
+                if !String::from_utf8_lossy(&out.stdout).trim().eq("true") {
+                    eprintln!("agent-sandbox: the proxy sidecar exited before signalling readiness:");
+                    let mut logs_cmd = ProcessCommand::new("podman");
+                    logs_cmd.args(["logs", &sidecar_id]);
+                    if let Ok(logs_out) = logs_cmd.output() {
+                        let logs = String::from_utf8_lossy(&logs_out.stderr);
+                        for line in logs.lines() {
+                            eprintln!("               {}", line);
+                        }
+                    }
+                    std::process::exit(1);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        
+        if !sidecar_ready {
+            eprintln!("agent-sandbox: warning: proxy did not signal readiness in 35s");
+            eprintln!("               (continuing; check: podman logs {})", sidecar_id);
+        }
+        
+        let degraded_path = format!("{}/egress-degraded", sidecar_shared);
+        if Path::new(&degraded_path).exists() {
+            eprintln!("agent-sandbox: warning: the proxy could not resolve names at startup");
+            if let Ok(msg) = fs::read_to_string(&degraded_path) {
+                for line in msg.lines() {
+                    eprintln!("               {}", line);
+                }
+            }
+            eprintln!("               (continuing; requests may fail. Full log: agent-sandbox-ctl logs)");
+        }
+        
+        sidecar_network_arg = Some(sidecar_id.clone());
+        
+        let mut sidecar_ip = String::new();
+        for _ in 0..20 {
+            let mut ip_cmd = ProcessCommand::new("podman");
+            ip_cmd.args(["container", "inspect", "--format", &format!("{{{{(index .NetworkSettings.Networks \"{}\").IPAddress}}}}", sidecar_id), &sidecar_id]);
+            if let Ok(out) = ip_cmd.output() {
+                if out.status.success() {
+                    let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !ip.is_empty() {
+                        sidecar_ip = ip;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        
+        if sidecar_ip.is_empty() {
+            eprintln!("agent-sandbox: the proxy sidecar has no address on {}", sidecar_id);
+            eprintln!("               (check: podman logs {})", sidecar_id);
+            std::process::exit(1);
+        }
+        
+        proxy_env_vars.push(format!("HTTP_PROXY=http://{}:8888", sidecar_ip));
+        proxy_env_vars.push(format!("HTTPS_PROXY=http://{}:8888", sidecar_ip));
+        proxy_env_vars.push(format!("http_proxy=http://{}:8888", sidecar_ip));
+        proxy_env_vars.push(format!("https_proxy=http://{}:8888", sidecar_ip));
     }
     
     // We would execute podman here, let's just do it
@@ -847,6 +1013,16 @@ fn main() -> Result<()> {
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.config,U=true"]);
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.cache,U=true"]);
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.local,U=true"]);
+    
+    if let Some(net_id) = sidecar_network_arg {
+        podman_cmd.arg("--network");
+        podman_cmd.arg(net_id);
+    }
+    for proxy_env in proxy_env_vars {
+        podman_cmd.arg("-e");
+        podman_cmd.arg(proxy_env);
+    }
+
     
     for arg in env_args {
         podman_cmd.arg(arg);
