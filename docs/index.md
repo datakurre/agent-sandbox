@@ -1,17 +1,7 @@
 # agent-sandbox
 
-[![Docs](https://img.shields.io/badge/docs-GitHub_Pages-blue.svg)](https://datakurre.github.io/agent-sandbox/)
-
 Sandboxed AI coding environment that runs inside a rootless Podman container.
 Launch `opencode` (or any other tool) and explicitly opt-in to integrations. By default, the environment is isolated and secure.
-
-## Full Documentation
-
-Please visit our **[documentation site](https://datakurre.github.io/agent-sandbox/)** for detailed information on:
-- Usage, flags, and configuration
-- Architecture and Trust Model
-- The internal Proxy and Firewall
-- How to add new agents and tools
 
 ## Quick start
 
@@ -43,4 +33,4 @@ agent-sandbox --workspace opencode
 agent-sandbox --workspace --proxy opencode
 ```
 
-Advanced features like SSH forwarding (`--ssh`), GPG signing (`--gpg`), host Podman socket forwarding (`--podman`), and `devenv` integration are available but opt-in. See the full documentation for details.
+Advanced features like SSH forwarding (`--ssh`), GPG signing (`--gpg`), host Podman socket forwarding (`--podman`), and `devenv` integration are available but opt-in. See [Usage](usage.md) for overriding the container command, passing raw podman flags, and the full flags reference.

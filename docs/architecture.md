@@ -1,20 +1,29 @@
-# AGENTS.md – agent-sandbox
-
-## Project overview
+# Architecture
 
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
 ("agent-sandbox") together with a launcher binary (`agent-sandbox`) and a
 management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
 `list`, `status`, `net`, `logs`, `tui`, `proxy`, `ports`, `mounts`, `attach`, `relay` and `purge`).
 
-- **default.nix** – single Nix module; builds the image and every host script.
-- **agents.nix** – agent catalog (command + persisted state paths per agent).
-- **flake.nix**  – flake entry point; exposes `packages.<system>.default` and
-  `apps.<system>.default`.
+## What's in the image
 
-## Architecture
+| Category      | Tools                                                |
+| ------------- | ---------------------------------------------------- |
+| AI coding     | opencode, claude-code, github-copilot-cli (copilot), antigravity-cli (agy) |
+| Shell / tools | bash, coreutils, ripgrep, fd, jq, curl, wget, …     |
+| Languages     | python3, uv, nodejs, gnumake, gcc libs               |
+| Git / GitHub  | git, gh                                              |
+| Nix           | nix, devenv                                          |
+| Containers    | podman, crun, conmon, skopeo, slirp4netns,           |
+|               | fuse-overlayfs, docker→podman alias                  |
+| Editor        | vim                                                  |
 
-### Image (`image` attr in `default.nix`)
+Podman container config files (`containers.conf`, `storage.conf`,
+`registries.conf`, `policy.json`) are baked in at `/etc/containers/`, so
+nested rootless podman is pre-configured when the sandbox is launched with
+`--privileged`.
+
+## Image (`image` attr in `default.nix`)
 
 Built with `pkgs.dockerTools.streamLayeredImage`.  All tools are baked into a
 `buildEnv` and registered in the Nix store database so `nix` / `devenv` / Nix
@@ -31,7 +40,7 @@ Key layers:
 | `/home/user`          | Home directory (uid/gid mapped at runtime)             |
 | `/workspace`          | Default working directory                              |
 
-### Entrypoint (`agent-sandbox-entrypoint`)
+## Entrypoint (`agent-sandbox-entrypoint`)
 
 1. Loads the Nix store registration on first start (unless `AGENT_SANDBOX_HOST_NIX=1`, in which case the host's `/nix` mount is used, or `AGENT_SANDBOX_SKIP_NIX_INIT=1`, which sidecar launches set because they do not need Nix bootstrap).
 2. Sets up `known_hosts` for common git forges to avoid first-time connection prompts.
@@ -45,7 +54,7 @@ Key layers:
    operator's own explicit `NODE_USE_ENV_PROXY` setting is left alone.
 5. `exec "$@"`.
 
-### Launcher (`agent-sandbox`)
+## Launcher (`agent-sandbox`)
 
 A bash script that wraps `podman run`.  Call flow:
 
@@ -64,11 +73,11 @@ A bash script that wraps `podman run`.  Call flow:
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
    final command (default `opencode`, overridable via `-- …`).
 
-### Loader (`agent-sandbox ctl load`)
+## Loader (`agent-sandbox ctl load`)
 
 `podman load < ${image}`
 
-### Proxy sidecar (`--proxy`)
+## Proxy sidecar (`--proxy`)
 
 `--proxy` makes the launcher start a second container from the same image,
 running `agent-sandbox-sidecar`, and put the sandbox on a `podman network create
@@ -117,8 +126,9 @@ log of what it did. Changing policy is therefore a host-side operation
 `agent-sandbox-allow` was deleted rather than repaired.
 
 **Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
-`[network].allow` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
-`[[network.rules]]` configures L7 paths and optional secret injection.
+`[network].allow` and `[network].deny` contain domains, wildcard domains, IPs, or CIDR blocks.
+`[network].ports` contains port ranges.
+`[[network.http]]` configures L7 paths and optional secret injection.
 
 `agent-sandbox-proxy --check-policy FILE` is the single reference validator:
 `parse_agents.py` writes the file, the proxy reads it, the host-side `proxy`
@@ -126,12 +136,18 @@ command vets its own writes with the same binary, and `checks.firewall-policy`
 tests the whole chain.  There is no second implementation to drift.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
-The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`).
-To authorize secret injection, the operator pastes the exact same `[[network.rules]]` block from `AGENTS.md` into `~/.config/agent-sandbox/secrets.toml`.
-The launcher runs `agent-sandbox-resolve-secrets`, which cross-references this config with the policy's `secret_domains`, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are then written to `/sidecar_secrets/bindings`, which the sidecar reads. The proxy handles actual header injection. When a `secret` field is provided in a `[[network.rules]]` block in `AGENTS.md`, `parse_agents.py` automatically populates the `secret_domains` policy list with their domains, removing the need for manual duplication.
+The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`),
+which defines the exact bindings (domain, header, secret). The launcher runs
+`agent-sandbox-resolve-secrets`, which cross-references this config with the policy's
+`secret_domains` from `AGENTS.md`, and then runs `secretspec export` on the host
+to fetch the values. The filtered bindings are then written to `/sidecar_secrets/bindings`,
+which the sidecar reads. The proxy handles actual header injection. When a `secret` field is provided in a `[[network.http]]` block in `AGENTS.md`, `parse_agents.py` automatically populates the `secret_domains`
+policy list with their domains, removing the need for manual duplication.
 
 The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
+
+**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
@@ -165,8 +181,6 @@ on the internal network, selected by subnet membership from `SIDECAR_SUBNET`
 rather than by interface name -- podman's eth0/eth1 assignment follows the order
 of the `--network` flags and is not something to depend on.
 
-**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol.
-
 **Startup ordering** matters and is why there are two readiness markers: the
 proxy validates policy, probes egress and writes `proxy-ready`; the sidecar then
 installs the routes and writes `ready`; only then does the launcher start the
@@ -192,51 +206,3 @@ second and swaps an `Arc<ProxyConfig>` under an `RwLock`, clearing the DNS cache
 with it; the sidecar reconciles the blackhole routes against the kernel on the
 same interval.  A rejected or vanished policy keeps the one already in force.
 New connections see the change within a second; established ones do not.
-
-## How to add a new integration
-
-1. Add a `want_{name}=1` toggle after the existing toggles (see integration toggles).
-2. Add `--{name}` / `--no-{name}` cases in the argument parsing loop.
-3. Add the mount/env logic after the existing blocks.
-4. If container-side setup is needed in the entrypoint, gate it on an env
-   var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
-5. Update the usage comment.
-6. Test: `nix flake check`
-
-Note what `nix flake check` cannot cover: podman does not run in a Nix build, so
-nothing that starts a container is tested there.  `checks.ctl-args` drives the
-`ctl` scripts against a stub podman, and `lib/smoke-firewall.sh` is the hand-run
-procedure for the rest (`bash lib/smoke-firewall.sh`, needs a real podman and
-network egress).
-
-## How to add a new agent
-
-Add an entry to `agents.nix`. The entry drives:
-
-- inclusion of the agent package in the image PATH,
-- accepted agent names in the launcher,
-- command dispatch when selecting that agent,
-- persisted home-state mounts (`state` directories, `stateFiles` files).
-
-Downstream flakes can override the catalog and default agent via:
-
-`(import ./default.nix { inherit pkgs lib; }).override { agents = ...; defaultAgent = "..."; }`
-
-## How to add a new tool to the image
-
-Add the package to `baseTools`.  It is automatically included in the PATH
-and Nix store registration.  No other changes needed.
-
-## Important implementation constraints
-
-- Nix shell scripts are written with `writeShellScriptBin`; the `''` escaping
-  inheredoc-style strings is Nix's double-single-quote mechanism.
-- The container runs with `--userns=keep-id`, so the uid/gid inside the
-  container match the host user.  Passwd/group files are synthesized per-run.
-- Tmpfs mounts on `~/.config`, `~/.cache`, `~/.local` provide writable home
-  subdirectories by default; persistent tool data (opencode, devenv, …) is
-  layered on top via explicit `-v` bind mounts.
-- Nested rootless podman inside the container requires `--privileged`.
-  The image ships a full podman stack and `/etc/containers` config, so nested
-  podman works out of the box when the privilege flag is passed.
-- **Host Nix shadowing**: When `--nix` is passed (off by default, but commonly baked in by a `wrapProgram` wrapper), the host `/nix/store` is mounted over the image's own store. Every PATH entry and the entrypoint itself then resolves against the host store rather than the baked-in one. This means the image is not entirely self-contained by default: transferring it to another host, or running garbage collection on a host where it wasn't installed via `nix profile`, may break the container at execution time.
