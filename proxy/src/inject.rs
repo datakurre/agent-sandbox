@@ -1,0 +1,869 @@
+use std::io::{self, ErrorKind, Read, Write};
+
+const HEAD_MAX: usize = 64 * 1024;
+
+fn read_head<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => return if buf.is_empty() { Ok(None) } else { Ok(Some(buf)) },
+            Ok(1) => {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    return Ok(Some(buf));
+                }
+                if buf.len() >= HEAD_MAX {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "request head exceeds limit",
+                    ));
+                }
+            }
+            Ok(_) => unreachable!("single-byte buffer"),
+            Err(ref e) if e.kind() == ErrorKind::Interrupted || e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+            Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => {
+                return if buf.is_empty() { Ok(None) } else { Ok(Some(buf)) };
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn read_line_crlf<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return if line.is_empty() {
+                    Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "unexpected EOF while reading line",
+                    ))
+                } else {
+                    Ok(line)
+                };
+            }
+            Ok(1) => {
+                line.push(byte[0]);
+                if line.ends_with(b"\r\n") {
+                    return Ok(line);
+                }
+            }
+            Ok(_) => unreachable!("single-byte buffer"),
+            Err(ref e) if e.kind() == ErrorKind::Interrupted || e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+            Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => {
+                return if line.is_empty() {
+                    Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "unexpected EOF while reading line",
+                    ))
+                } else {
+                    Ok(line)
+                };
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn content_length(head: &str) -> io::Result<Option<usize>> {
+    let mut found: Option<usize> = None;
+    for line in head.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = value.trim().parse::<usize>().map_err(|_| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid Content-Length: {:?}", value.trim()),
+                )
+            })?;
+            if let Some(prev) = found {
+                if prev != parsed {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "conflicting Content-Length headers",
+                    ));
+                }
+            }
+            found = Some(parsed);
+        }
+    }
+    Ok(found)
+}
+
+fn is_chunked(head: &str) -> bool {
+    head.lines().skip(1).any(|line| {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            return false;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
+fn request_method(head: &str) -> io::Result<&str> {
+    let request_line = head
+        .lines()
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
+    request_line
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed request line"))
+}
+
+fn request_path(head: &str) -> io::Result<String> {
+    let request_line = head
+        .lines()
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
+    let mut parts = request_line.split_whitespace();
+    parts.next(); // skip method
+    let target = parts
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request target is missing"))?;
+    
+    // Target could be absolute URI (http://host/path) or absolute path (/path)
+    let path = if let Some(idx) = target.find("://") {
+        let after_scheme = &target[idx + 3..];
+        if let Some(path_idx) = after_scheme.find('/') {
+            &after_scheme[path_idx..]
+        } else {
+            "/"
+        }
+    } else {
+        target
+    };
+    // Strip query string and fragment
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.split('#').next().unwrap_or(path);
+    
+    // Percent decode
+    let decoded = percent_decode(path).map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("invalid percent encoding: {}", e)))?;
+    
+    // Dot segment removal
+    let mut segments = Vec::new();
+    for seg in decoded.split('/') {
+        if seg == "." || (seg.is_empty() && !segments.is_empty()) {
+            continue;
+        } else if seg == ".." {
+            if segments.is_empty() {
+                return Err(io::Error::new(ErrorKind::InvalidData, "invalid path: unresolved '..'"));
+            }
+            segments.pop();
+        } else {
+            segments.push(seg);
+        }
+    }
+    
+    let mut normalized = segments.join("/");
+    if decoded.starts_with('/') && !normalized.starts_with('/') {
+        normalized.insert(0, '/');
+    }
+    if (decoded.ends_with('/') || decoded.ends_with("/.") || decoded.ends_with("/..")) && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    if normalized.is_empty() {
+        normalized.push('/');
+    }
+    
+    Ok(normalized)
+}
+
+fn percent_decode(s: &str) -> Result<String, &'static str> {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| "invalid hex")?;
+                let byte = u8::from_str_radix(hex, 16).map_err(|_| "invalid hex")?;
+                out.push(byte as char);
+                i += 3;
+            } else {
+                return Err("truncated percent encoding");
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn authority_host_port(authority: &str, default_port: u16) -> io::Result<(String, u16)> {
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    if authority.is_empty() {
+        return Err(io::Error::new(ErrorKind::InvalidData, "authority is empty"));
+    }
+
+    let (host, port_text) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, rest)) = rest.split_once(']') else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "malformed bracketed IPv6 authority",
+            ));
+        };
+        let port = match rest.strip_prefix(':') {
+            Some(port) if !port.is_empty() => Some(port),
+            Some(_) => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "authority port is empty",
+                ))
+            }
+            None if rest.is_empty() => None,
+            None => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "malformed bracketed authority",
+                ))
+            }
+        };
+        (host, port)
+    } else if authority.matches(':').count() == 1 {
+        let (host, port) = authority.rsplit_once(':').expect("one colon");
+        if host.is_empty() || port.is_empty() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "malformed authority",
+            ));
+        }
+        (host, Some(port))
+    } else {
+        (authority, None)
+    };
+
+    let port = match port_text {
+        Some(text) => text.parse::<u16>().map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid authority port: {:?}", text),
+            )
+        })?,
+        None => default_port,
+    };
+    Ok((host.trim_end_matches('.').to_ascii_lowercase(), port))
+}
+
+fn request_target_authority(request_target: &str, default_port: u16) -> io::Result<Option<(String, u16)>> {
+    let Some((scheme, rest)) = request_target.split_once("://") else {
+        return Ok(None);
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let scheme_default = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => default_port,
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    authority_host_port(authority, scheme_default).map(Some)
+}
+
+fn host_header_authority(head: &str, default_port: u16) -> io::Result<Option<(String, u16)>> {
+    let mut found: Option<(String, u16)> = None;
+    for line in head.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("host") {
+            let parsed = authority_host_port(value.trim(), default_port)?;
+            if let Some(prev) = &found {
+                if prev != &parsed {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "conflicting Host headers",
+                    ));
+                }
+            }
+            found = Some(parsed);
+        }
+    }
+    Ok(found)
+}
+
+fn validate_request_authority(
+    head: &str,
+    expected_host: &str,
+    expected_port: u16,
+) -> io::Result<()> {
+    let request_line = head
+        .lines()
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
+    let mut parts = request_line.split_whitespace();
+    let _method = parts
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed request line"))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request target is missing"))?;
+
+    let expected = (expected_host.trim_end_matches('.').to_ascii_lowercase(), expected_port);
+    let target_authority = request_target_authority(target, expected_port)?;
+    let host_authority = host_header_authority(head, expected_port)?;
+
+    if let (Some(target), Some(host)) = (&target_authority, &host_authority) {
+        if target != host {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "request target authority does not match Host",
+            ));
+        }
+    }
+
+    let effective = target_authority.or(host_authority).ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "request is missing Host/authority for secret injection",
+        )
+    })?;
+
+    if effective != expected {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "request authority {:?}:{} does not match secret target {:?}:{}",
+                effective.0, effective.1, expected.0, expected.1
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn response_status_code(head: &str) -> io::Result<u16> {
+    let status_line = head
+        .lines()
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "response head is missing status line"))?;
+    let mut parts = status_line.split_whitespace();
+    let _http = parts
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed status line"))?;
+    let status = parts
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "status code is missing"))?;
+    status.parse::<u16>().map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid status code: {:?}", status),
+        )
+    })
+}
+
+fn rewrite_head(head: &[u8], header_name: &str, header_value: &str) -> io::Result<Vec<u8>> {
+    let head_str = std::str::from_utf8(head)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8"))?;
+
+    let mut lines = head_str.split("\r\n");
+    let request_line = lines.next().ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidData, "request head is missing request line")
+    })?;
+    if request_line.split_whitespace().count() < 3 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "malformed HTTP request line",
+        ));
+    }
+
+    let mut out = String::new();
+    out.push_str(request_line);
+    out.push_str("\r\n");
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, _value)) = line.split_once(':') else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("malformed header line: {:?}", line),
+            ));
+        };
+        if name.eq_ignore_ascii_case(header_name) {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out.push_str(header_name);
+    out.push_str(": ");
+    out.push_str(header_value);
+    out.push_str("\r\n\r\n");
+    Ok(out.into_bytes())
+}
+
+fn copy_exact<R: Read, W: Write>(reader: &mut R, writer: &mut W, len: usize) -> io::Result<u64> {
+    let mut left = len;
+    let mut buf = [0u8; 16 * 1024];
+    let mut copied = 0u64;
+    while left > 0 {
+        let chunk = left.min(buf.len());
+        let mut chunk_left = chunk;
+        let mut chunk_pos = 0;
+        while chunk_left > 0 {
+            match reader.read(&mut buf[chunk_pos..chunk_pos + chunk_left]) {
+                Ok(0) => return Err(io::Error::new(ErrorKind::UnexpectedEof, "unexpected EOF in copy_exact")),
+                Ok(n) => {
+                    chunk_left -= n;
+                    chunk_pos += n;
+                }
+                Err(ref e) if e.kind() == ErrorKind::Interrupted || e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        writer.write_all(&buf[..chunk])?;
+        left -= chunk;
+        copied += chunk as u64;
+    }
+    Ok(copied)
+}
+
+fn copy_chunked_body<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
+    let mut copied = 0u64;
+    loop {
+        let line = read_line_crlf(reader)?;
+        copied += line.len() as u64;
+        writer.write_all(&line)?;
+        let line_text = std::str::from_utf8(&line)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "chunk size line is not UTF-8"))?;
+        let line_text = line_text.trim_end_matches("\r\n");
+        let size_text = line_text.split(';').next().unwrap_or("");
+        let size = usize::from_str_radix(size_text, 16).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid chunk size: {:?}", size_text),
+            )
+        })?;
+        if size == 0 {
+            loop {
+                let trailer = read_line_crlf(reader)?;
+                copied += trailer.len() as u64;
+                writer.write_all(&trailer)?;
+                if trailer == b"\r\n" {
+                    return Ok(copied);
+                }
+            }
+        }
+        copied += copy_exact(reader, writer, size + 2)?;
+    }
+}
+
+fn copy_to_eof<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
+    let mut buf = [0u8; 16 * 1024];
+    let mut copied = 0u64;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(copied),
+            Ok(n) => {
+                writer.write_all(&buf[..n])?;
+                copied += n as u64;
+            }
+            Err(ref e) if e.kind() == ErrorKind::Interrupted || e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+            Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(copied),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Rewrites every request on a keep-alive connection so `header_name` appears
+/// exactly once with `header_value`.
+pub fn injecting_request_pump<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    header_name: &str,
+    header_value: &str,
+) -> io::Result<u64> {
+    let mut written = 0u64;
+    loop {
+        let Some(head) = read_head(reader)? else {
+            return Ok(written);
+        };
+        let rewritten = rewrite_head(&head, header_name, header_value)?;
+        writer.write_all(&rewritten)?;
+        written += rewritten.len() as u64;
+
+        let head_text = std::str::from_utf8(&head).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
+        })?;
+        if let Some(len) = content_length(head_text)? {
+            written += copy_exact(reader, writer, len)?;
+            continue;
+        }
+        if is_chunked(head_text) {
+            written += copy_chunked_body(reader, writer)?;
+        }
+    }
+}
+
+fn response_has_no_body(request_method: &str, status_code: u16) -> bool {
+    request_method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status_code)
+        || status_code == 204
+        || status_code == 304
+}
+
+/// Forward HTTP/1.1 request/response exchanges while rewriting each request so
+/// `header_name` appears exactly once, if a secret is provided.
+/// Evaluates L7 policy rules on each request.
+///
+/// Returns `(up_bytes, down_bytes)` measured as plaintext bytes on each side.
+pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
+    client: &mut C,
+    upstream: &mut U,
+    expected_host: &str,
+    expected_port: u16,
+    secret: Option<(&str, &str)>,
+    shared: &std::sync::Arc<crate::Shared>,
+    req_id: Option<&str>,
+) -> io::Result<(u64, u64)> {
+    let mut up_bytes = 0u64;
+    let mut down_bytes = 0u64;
+
+    loop {
+        let Some(request_head) = read_head(client)? else {
+            return Ok((up_bytes, down_bytes));
+        };
+        let request_text = std::str::from_utf8(&request_head).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
+        })?;
+        validate_request_authority(request_text, expected_host, expected_port)?;
+        
+        let has_cl = content_length(request_text)?.is_some();
+        let has_te = is_chunked(request_text);
+        if has_cl && has_te {
+            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            return Err(io::Error::new(ErrorKind::InvalidData, "request has both Content-Length and Transfer-Encoding"));
+        }
+        
+        // Also check if Transfer-Encoding is something other than "chunked"
+        if has_te {
+            let te_valid = request_text.lines().skip(1).filter_map(|line| {
+                let line = line.trim_end_matches('\r');
+                if line.is_empty() { return None; }
+                line.split_once(':')
+            }).any(|(name, value)| {
+                name.eq_ignore_ascii_case("transfer-encoding") && value.trim().eq_ignore_ascii_case("chunked")
+            });
+            if !te_valid {
+                let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                return Err(io::Error::new(ErrorKind::InvalidData, "invalid Transfer-Encoding"));
+            }
+        }
+
+        let method = request_method(request_text)?;
+        let path = request_path(request_text)?;
+
+        let (allowed, reason) = shared.wait_for_l7_ask(expected_host, expected_port, method, &path, req_id);
+        if !allowed {
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            let msg = reason
+                .map(|r| format!("L7 denied: {}", r))
+                .unwrap_or_else(|| "L7 denied".to_string());
+            return Err(io::Error::new(ErrorKind::PermissionDenied, msg));
+        }
+
+        let out_head = match secret {
+            Some((name, value)) => rewrite_head(&request_head, name, value)?,
+            None => request_head.clone(),
+        };
+
+        upstream.write_all(&out_head)?;
+        up_bytes += out_head.len() as u64;
+
+        if let Some(len) = content_length(request_text)? {
+            up_bytes += copy_exact(client, upstream, len)?;
+        } else if is_chunked(request_text) {
+            up_bytes += copy_chunked_body(client, upstream)?;
+        }
+
+        let response_head = read_head(upstream)?.ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "upstream closed before sending an HTTP response",
+            )
+        })?;
+        client.write_all(&response_head)?;
+        down_bytes += response_head.len() as u64;
+
+        let response_text = std::str::from_utf8(&response_head).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidData, "response head is not valid UTF-8")
+        })?;
+        let status = response_status_code(response_text)?;
+        if response_has_no_body(method, status) {
+            continue;
+        }
+
+        if let Some(len) = content_length(response_text)? {
+            down_bytes += copy_exact(upstream, client, len)?;
+            continue;
+        }
+        if is_chunked(response_text) {
+            down_bytes += copy_chunked_body(upstream, client)?;
+            continue;
+        }
+
+        // Close-delimited response body: once this drains, the exchange ends.
+        down_bytes += copy_to_eof(upstream, client)?;
+        return Ok((up_bytes, down_bytes));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[derive(Default)]
+    struct FixtureIo {
+        read: Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        eof_as_unexpected_eof: bool,
+    }
+
+    impl FixtureIo {
+        fn with_read(data: &[u8]) -> Self {
+            Self {
+                read: Cursor::new(data.to_vec()),
+                written: Vec::new(),
+                eof_as_unexpected_eof: false,
+            }
+        }
+
+        fn with_read_eof_error(data: &[u8]) -> Self {
+            Self {
+                read: Cursor::new(data.to_vec()),
+                written: Vec::new(),
+                eof_as_unexpected_eof: true,
+            }
+        }
+    }
+
+    impl Read for FixtureIo {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.read.read(buf)?;
+            if n == 0 && self.eof_as_unexpected_eof {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "peer closed connection without sending TLS close_notify",
+                ));
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for FixtureIo {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rewrites_two_keep_alive_requests() {
+        let input = b"GET /one HTTP/1.1\r\nHost: example.com\r\nAuthorization: old\r\n\r\n\
+                      GET /two HTTP/1.1\r\nHost: example.com\r\nauthorization: old2\r\n\r\n";
+        let mut reader: &[u8] = input;
+        let mut output = Vec::new();
+        let written = injecting_request_pump(
+            &mut reader,
+            &mut output,
+            "Authorization",
+            "Bearer injected-secret",
+        )
+        .expect("pump");
+        assert_eq!(written as usize, output.len());
+        let rendered = String::from_utf8(output).expect("utf8 output");
+        assert_eq!(rendered.matches("Authorization: Bearer injected-secret").count(), 2);
+        assert!(!rendered.contains("Authorization: old"));
+        assert!(!rendered.contains("authorization: old2"));
+    }
+
+    #[test]
+    fn keeps_request_body_for_content_length() {
+        let input = b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
+        let mut reader: &[u8] = input;
+        let mut output = Vec::new();
+        injecting_request_pump(&mut reader, &mut output, "X-Api-Key", "value").expect("pump");
+        let rendered = String::from_utf8(output).expect("utf8 output");
+        assert!(rendered.ends_with("hello"));
+        assert!(rendered.contains("X-Api-Key: value\r\n\r\n"));
+    }
+
+    #[test]
+    fn keeps_chunked_body() {
+        let input = b"POST /chunk HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n\
+                      4\r\ntest\r\n0\r\n\r\n";
+        let mut reader: &[u8] = input;
+        let mut output = Vec::new();
+        injecting_request_pump(&mut reader, &mut output, "X-Test", "yes").expect("pump");
+        let rendered = String::from_utf8(output).expect("utf8 output");
+        assert!(rendered.contains("X-Test: yes\r\n\r\n"));
+        assert!(rendered.ends_with("4\r\ntest\r\n0\r\n\r\n"));
+    }
+
+    #[test]
+    fn proxies_two_request_response_exchanges() {
+        let client_in = b"GET /one HTTP/1.1\r\nHost: example.com\r\nAuthorization: old\r\n\r\n\
+                          GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none\
+                            HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let (up, down) =
+            proxy_http1_with_injection(
+                &mut client,
+                &mut upstream,
+                "example.com",
+                80,
+                Some(("Authorization", "Bearer v")),
+                &crate::dummy_shared(),
+                None,
+            )
+            .expect("proxy");
+
+        assert_eq!(up as usize, upstream.written.len());
+        assert_eq!(down as usize, client.written.len());
+        let upstream_rendered = String::from_utf8(upstream.written).expect("utf8");
+        assert_eq!(upstream_rendered.matches("Authorization: Bearer v").count(), 2);
+        assert!(!upstream_rendered.contains("Authorization: old"));
+
+        let client_rendered = String::from_utf8(client.written).expect("utf8");
+        assert!(client_rendered.contains("HTTP/1.1 200 OK"));
+        assert!(client_rendered.contains("\r\n\r\none"));
+        assert!(client_rendered.ends_with("two"));
+    }
+
+    #[test]
+    fn rejects_host_mismatch_before_injection() {
+        let client_in = b"GET /one HTTP/1.1\r\nHost: attacker.example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let err = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "api.example.com",
+            80,
+            Some(("Authorization", "Bearer v")),
+            &crate::dummy_shared(),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("does not match secret target"),
+            "{err}"
+        );
+        assert!(upstream.written.is_empty());
+    }
+
+    #[test]
+    fn rejects_absolute_form_and_host_mismatch() {
+        let client_in =
+            b"GET http://api.example.com/one HTTP/1.1\r\nHost: attacker.example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let err = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "api.example.com",
+            80,
+            Some(("Authorization", "Bearer v")),
+            &crate::dummy_shared(),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("request target authority does not match Host"),
+            "{err}"
+        );
+        assert!(upstream.written.is_empty());
+    }
+
+    #[test]
+    fn copy_to_eof_treats_unexpected_eof_as_clean_close() {
+        struct EofReader {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl Read for EofReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.data.len() {
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "peer closed connection without sending TLS close_notify",
+                    ));
+                }
+                let n = (self.data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let mut reader = EofReader {
+            data: b"hello world".to_vec(),
+            pos: 0,
+        };
+        let mut output = Vec::new();
+        let copied = copy_to_eof(&mut reader, &mut output).expect("copy should succeed");
+        assert_eq!(copied, 11);
+        assert_eq!(output, b"hello world");
+    }
+
+    #[test]
+    fn proxies_one_request_and_treats_client_unexpected_eof_as_clean_close() {
+        let client_in = b"GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+        let mut client = FixtureIo::with_read_eof_error(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let (up, down) = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            None,
+            &crate::dummy_shared(),
+            None,
+        )
+        .expect("proxy should succeed");
+
+        assert!(up > 0);
+        assert!(down > 0);
+        let client_rendered = String::from_utf8(client.written).expect("utf8");
+        assert!(client_rendered.contains("HTTP/1.1 200 OK"));
+        assert!(client_rendered.ends_with("ok"));
+    }
+}
