@@ -235,12 +235,15 @@ let
     exec ${agentSandboxRust}/bin/agent-sandbox-entrypoint "$@"
   '';
 
-  # streamLayeredImage rather than buildImage: layers are shared between
-  # rebuilds and nothing materialises a multi-gigabyte tarball in the store.
-  # The result is an executable that writes the tar to stdout.
+  # streamLayeredImage with maxLayers = 2 (minimum allowed): produces a minimal-layer image stream
+  # to minimize podman load extraction overhead, overlayfs mount parameter
+  # sizes, and VFS dentry lookup latency during container startup, while still
+  # streaming the tar output to stdout without materializing a multi-gigabyte
+  # tarball in the host Nix store.
   image = pkgs.dockerTools.streamLayeredImage {
     name = imageName;
     tag = imageTag;
+    maxLayers = 2;
 
     contents = [ rootEnv ];
 

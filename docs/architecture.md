@@ -25,8 +25,9 @@ nested rootless podman is pre-configured when the sandbox is launched with
 
 ## Image (`image` attr in `default.nix`)
 
-Built with `pkgs.dockerTools.streamLayeredImage`.  All tools are baked into a
-`buildEnv` and registered in the Nix store database so `nix` / `devenv` / Nix
+Built with `pkgs.dockerTools.streamLayeredImage` (`maxLayers = 2`).  All tools are baked into a
+`buildEnv` and compressed into a minimal number of layers (2) to optimize `podman load` speed and container
+startup latency. They are registered in the Nix store database so `nix` / `devenv` / Nix
 builtins inside the container work without re-substituting store paths.
 
 Key layers:
