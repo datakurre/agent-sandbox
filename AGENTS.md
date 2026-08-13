@@ -5,7 +5,7 @@
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
 ("agent-sandbox") together with a launcher binary (`agent-sandbox`) and a
 management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
-`list`, `status`, `net`, `logs`, `tui`, `proxy`, `ports`, `mounts`, `attach`, `relay` and `purge`).
+`list`, `status`, `net`, `logs`, `tui`, `proxy`, `mounts`, `attach`, `relay` and `purge`).
 
 - **default.nix** – single Nix module; builds the image and every host script.
 - **agents.nix** – agent catalog (command + persisted state paths per agent).

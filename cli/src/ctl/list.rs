@@ -124,12 +124,7 @@ pub fn run(args: ListArgs) -> Result<()> {
         proxy_args.push("--filter");
         proxy_args.push("label=agent-sandbox.role=proxy");
         list_role(&proxy_args)?;
-        
-        println!("\nPort forwarders:");
-        let mut fwd_args = ps_args.clone();
-        fwd_args.push("--filter");
-        fwd_args.push("label=agent-sandbox.role=port-forward");
-        list_role(&fwd_args)?;
+
     }
     
     Ok(())

@@ -36,7 +36,6 @@ enum CtlCommands {
     #[command(about = "Manage proxy rules")] Proxy(ctl::proxy::ProxyArgs),
     #[command(about = "Show network metering for a running sandbox")] Net(ctl::net::NetArgs),
     #[command(about = "Show the proxy log for a running sandbox", alias = "log")] Logs(ctl::logs::LogsArgs),
-    #[command(about = "Publish container ports to the host", alias = "ports")] Port(ctl::port::PortArgs),
     #[command(about = "Attach to a running sandbox and exec a command")] Attach(ctl::attach::AttachArgs),
     #[command(about = "Manage bind mounts into a running sandbox", alias = "mounts")] Mount(ctl::mount::MountArgs),
     #[command(about = "Show SSH/GPG relay policy and logs")] Relay(ctl::relay::RelayArgs),
@@ -272,15 +271,14 @@ Integrations (use --X to enable, --no-X to disable):\n\
   --podman          {} Forwards the host rootless Podman socket (sibling containers).\n\
   --selinux         {} Applies SELinux shared relabeling (:z) to writable binds.\n\
   --proxy           {} Routes HTTP(S)/SSH through a proxy, enforcing AGENTS.md's [proxy] policy if present (blocks direct internet access).\n\
-                         Also enables 'agent-sandbox-ctl net' for the running sandbox.\n\
+                         Also enables 'agent-sandbox ctl net' for the running sandbox.\n\
   --krun            {} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).\n\
                          Adds a guest-kernel boundary inside the existing container boundary.\n\
-                         'agent-sandbox-ctl attach' and 'ctl mounts' do not work against a krun sandbox.\n\
+                         'agent-sandbox ctl attach' and 'ctl mounts' do not work against a krun sandbox.\n\
 \n\
 Ports:\n\
   --port [HOST:]CONTAINER[/PROTO]          Publish a port, repeatable.\n\
   --ports / --no-ports               {} Honors [ports] declarations from AGENTS.md.\n\
-  --ports-dynamic                          Allows `agent-sandbox-ctl ports add` post-launch.\n\
   --ports-any-interface                    Permits port binds outside of loopback interfaces.\n\
 \n\
 Mounts:\n\
@@ -367,7 +365,6 @@ fn main() -> Result<()> {
     let mut want_workspace = false;
     let mut want_selinux = false;
     let mut want_ports = false;
-    let mut want_ports_dynamic = false;
     let mut want_ports_any_interface = false;
     let mut want_mounts = false;
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
@@ -416,7 +413,7 @@ fn main() -> Result<()> {
     // Subcommand routing for ctl
     if !args.is_empty() {
         let first_arg = &args[0];
-        let ctl_subcommands = ["load", "list", "status", "proxy", "net", "logs", "log", "port", "ports", "attach", "mount", "mounts", "relay", "tui", "purge"];
+        let ctl_subcommands = ["load", "list", "status", "proxy", "net", "logs", "log", "attach", "mount", "mounts", "relay", "tui", "purge"];
         let mut run_ctl = false;
         let mut parse_args = vec!["agent-sandbox".to_string()];
         
@@ -445,7 +442,6 @@ fn main() -> Result<()> {
                 CtlCommands::Proxy(a) => ctl::proxy::run(a)?,
                 CtlCommands::Net(a) => ctl::net::run(a)?,
                 CtlCommands::Logs(a) => ctl::logs::run(a)?,
-                CtlCommands::Port(a) => ctl::port::run(a)?,
                 CtlCommands::Attach(a) => ctl::attach::run(a)?,
                 CtlCommands::Mount(a) => ctl::mount::run(a)?,
                 CtlCommands::Relay(a) => ctl::relay::run(a)?,
@@ -502,8 +498,6 @@ fn main() -> Result<()> {
             "--no-selinux" => want_selinux = false,
             "--ports" => want_ports = true,
             "--no-ports" => want_ports = false,
-            "--ports-dynamic" => want_ports_dynamic = true,
-            "--no-ports-dynamic" => want_ports_dynamic = false,
             "--ports-any-interface" => want_ports_any_interface = true,
             "--mounts" => want_mounts = true,
             "--no-mounts" => want_mounts = false,
@@ -755,8 +749,8 @@ fn main() -> Result<()> {
     }
     
     if want_proxy {
-        if !published.is_empty() || want_ports_dynamic {
-            eprintln!("agent-sandbox: --proxy cannot be combined with a published port or --ports-dynamic.");
+        if !published.is_empty() {
+            eprintln!("agent-sandbox: --proxy cannot be combined with a published port.");
             std::process::exit(1);
         }
     }
@@ -947,7 +941,7 @@ fn main() -> Result<()> {
                     eprintln!("               {}", line);
                 }
             }
-            eprintln!("               (continuing; requests may fail. Full log: agent-sandbox-ctl logs)");
+            eprintln!("               (continuing; requests may fail. Full log: agent-sandbox ctl logs)");
         }
         
         sidecar_network_arg = Some(sidecar_id.clone());

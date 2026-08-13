@@ -66,7 +66,7 @@ Every flag in the table below has a corresponding `--no-flag` option (e.g., `--n
 | Network & firewall | `--proxy-train` | Timeout for TUI training mode (default: 300). Also sets default policy to ask. |
 | Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into proxied traffic matching `secret_domains`. Requires `--proxy`. |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
-| Ports & mounts | `--ports-dynamic` | Allows `agent-sandbox ctl ports add` post-launch. |
+
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
@@ -157,7 +157,7 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | `logs [-f] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
 | `tui [WORD] [--sandbox WORD]` | opens an interactive terminal UI to approve or deny requests (requires `policy = "ask"`) |
 | `proxy show\|allow\|deny\|rm\|reset\|export [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as AGENTS.md TOML |
-| `ports ls\|add\|rm\|export [WORD] [--sandbox WORD]` | publish a port after launch (needs `--ports-dynamic`, and no proxy); `export` prints its `[ports]` section as AGENTS.md TOML |
+
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox |
 | `relay [WORD] [--sandbox WORD]` | show SSH/GPG relay policy and logs |
 | `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |

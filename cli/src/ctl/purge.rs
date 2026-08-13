@@ -108,22 +108,7 @@ pub fn run(args: PurgeArgs) -> Result<()> {
         }
     }
     
-    // Orphans
-    let orphans_fwd = orphans_of_role("port-forward");
-    if !orphans_fwd.is_empty() {
-        println!("Orphaned port forwarders:");
-        for o in &orphans_fwd { println!("  {}", o); }
-        println!();
-        if args.dry_run {
-            println!("  would remove {}\n", orphans_fwd.len());
-        } else if confirm("Remove these?", args.force, args.dry_run) {
-            Command::new("podman").arg("rm").arg("-f").args(&orphans_fwd).output()?;
-            println!("  removed {}\n", orphans_fwd.len());
-        } else {
-            println!("  skipped\n");
-        }
-    }
-    
+
     let orphans_proxy = orphans_of_role("proxy");
     if !orphans_proxy.is_empty() {
         println!("Orphaned proxy sidecars:");

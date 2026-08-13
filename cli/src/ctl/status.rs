@@ -153,21 +153,10 @@ pub fn run(args: StatusArgs) -> Result<()> {
     let published = String::from_utf8_lossy(&pub_out.stdout).replace('\n', " ");
     let published = published.trim();
     
-    let mut fwd_cmd = Command::new("podman");
-    let fwd_out = fwd_cmd.arg("ps")
-        .arg("--filter").arg("label=agent-sandbox.role=port-forward")
-        .arg("--filter").arg(format!("label=agent-sandbox.target={}", sandbox))
-        .arg("--format").arg("{{.Names}}").output()?;
-    let forwarded = String::from_utf8_lossy(&fwd_out.stdout).lines().count();
-    
-    if !published.is_empty() || forwarded > 0 {
-        let mut detail = published.to_string();
-        if forwarded > 0 {
-            detail.push_str(&format!(" ({} forwarder(s))", forwarded));
-        }
-        row("ports", &format!("{}        agent-sandbox ctl ports ls", detail));
+    if !published.is_empty() {
+        row("ports", &published.to_string());
     } else {
-        row("ports", "none published        agent-sandbox ctl ports add");
+        row("ports", "none published");
     }
     
     Ok(())

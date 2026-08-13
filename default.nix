@@ -344,7 +344,7 @@ let
   launcher = pkgs.writeShellApplication {
     name = "agent-sandbox";
     runtimeInputs = with pkgs; [
-      podman git coreutils jq gnupg util-linux findutils gnugrep gawk secretspec
+      agentSandboxRust podman git coreutils jq gnupg util-linux findutils gnugrep gawk secretspec
     ];
     text = launcherPreamble + ''
       exec ${agentSandboxRust}/bin/agent-sandbox "$@"

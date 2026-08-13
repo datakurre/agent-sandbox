@@ -150,7 +150,7 @@ impl Resolver {
 // ── Metering ────────────────────────────────────────────────────────────────
 
 /// One JSON line per connection event, consumed by `agent-sandbox-network-summary`
-/// to render the `--proxy` summary and the `agent-sandbox-ctl net` live
+/// to render the `--proxy` summary and the `agent-sandbox ctl net` live
 /// view.  Cheap enough to leave on: a few hundred bytes per connection, versus
 /// the full-payload packet capture it replaces.
 ///

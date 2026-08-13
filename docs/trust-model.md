@@ -69,7 +69,7 @@ The `[network]` block supports `allow` and `[[network.rules]]` for granular cont
 - An invalid `[network]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote.
 - `--proxy` with no `AGENTS.md` defaults to deny all.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
-- **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around. `agent-sandbox ctl ports add` refuses a proxied sandbox for the same reason.
+- **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around.
 - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
 - The traffic summary ranks hosts by volume, collapses the tail beyond 15 hosts, and lists denied and failed connections separately:
 
