@@ -10,6 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, BufRead, BufReader, IsTerminal};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use tempfile::Builder;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -19,8 +20,7 @@ use serde_json::Value;
 #[command(
     name = "agent-sandbox",
     about = "Agent sandbox control CLI",
-    version = "0.1.0",
-    disable_help_subcommand = true
+    version = "0.1.0"
 )]
 struct CtlCli {
     #[command(subcommand)]
@@ -222,18 +222,110 @@ fn usable_dns_options(file: &Path) -> Result<Vec<String>> {
     Ok(opts)
 }
 
-fn main() -> Result<()> {
-    let image = env::var("AGENT_SANDBOX_IMAGE").unwrap_or_default();
-    if !image.is_empty() {
-        let status = ProcessCommand::new("podman")
-            .args(["image", "exists", &image])
-            .status();
-        if status.is_err() || !status.unwrap().success() {
-            eprintln!("agent-sandbox: image {} not found. Run 'agent-sandbox ctl load' first.", image);
-            std::process::exit(1);
-        }
-    }
+fn print_usage(
+    agent_list: &str,
+    want_workspace: bool,
+    want_ssh: bool,
+    want_git: bool,
+    want_gpg: bool,
+    want_gpg_private: bool,
+    want_devenv: bool,
+    want_nix: bool,
+    want_podman: bool,
+    want_selinux: bool,
+    want_proxy: bool,
+    want_krun: bool,
+    want_ports: bool,
+    want_mounts: bool,
+    want_agent_mounts_mode: &AgentMountsMode,
+) {
+    let fmt = |b: bool| if b { "[on ]" } else { "[off]" };
+    let agent_mounts_all = matches!(want_agent_mounts_mode, AgentMountsMode::All);
 
+    println!(
+        "agent-sandbox [FLAGS] [AGENT] [-- COMMAND...]\n\
+\n\
+Runs an AI coding agent inside a rootless podman container.\n\
+Use flags to opt-in to integrations like mounting the current directory,\n\
+forwarding SSH, or exposing Git identity.\n\
+\n\
+  agent-sandbox                      launch interactive bash (no agent state mounted)\n\
+  agent-sandbox opencode             launch opencode with its own state mounted\n\
+  agent-sandbox --agent-mounts       launch interactive bash with every agent's state mounted\n\
+  agent-sandbox --podman opencode    launch opencode with podman enabled\n\
+  agent-sandbox opencode -- bash     launch bash with opencode's state mounted\n\
+  agent-sandbox --privileged opencode\n\
+                                     pass --privileged to podman run\n\
+\n\
+Agents:\n\
+  {}\n\
+\n\
+Integrations (use --X to enable, --no-X to disable):\n\
+  --workspace       {} Mounts the host's current working directory into /workspace/<dirname>.\n\
+  --ssh             {} Forwards the host's SSH_AUTH_SOCK to the container.\n\
+  --git             {} Mounts host Git configurations and passes identity env vars.\n\
+  --gpg             {} Enables host GnuPG agent forwarding and git commit signing behavior.\n\
+  --gpg-private     {} Exposes ~/.gnupg even if it holds on-disk secret keys.\n\
+  --devenv          {} Persists ~/.local/share/devenv across sessions.\n\
+  --nix             {} Mounts the host /nix/store for native Nix execution.\n\
+  --podman          {} Forwards the host rootless Podman socket (sibling containers).\n\
+  --selinux         {} Applies SELinux shared relabeling (:z) to writable binds.\n\
+  --proxy           {} Routes HTTP(S)/SSH through a proxy, enforcing AGENTS.md's [proxy] policy if present (blocks direct internet access).\n\
+                         Also enables 'agent-sandbox-ctl net' for the running sandbox.\n\
+  --krun            {} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).\n\
+                         Adds a guest-kernel boundary inside the existing container boundary.\n\
+                         'agent-sandbox-ctl attach' and 'ctl mounts' do not work against a krun sandbox.\n\
+\n\
+Ports:\n\
+  --port [HOST:]CONTAINER[/PROTO]          Publish a port, repeatable.\n\
+  --ports / --no-ports               {} Honors [ports] declarations from AGENTS.md.\n\
+  --ports-dynamic                          Allows `agent-sandbox-ctl ports add` post-launch.\n\
+  --ports-any-interface                    Permits port binds outside of loopback interfaces.\n\
+\n\
+Mounts:\n\
+  --mounts / --no-mounts             {} Honors [mounts] declarations from AGENTS.md.\n\
+\n\
+Agent state:\n\
+  --agent-mounts                     {} Mount every agent's state, not just the one launched.\n\
+  --agent-mounts=AGENT[,AGENT...]    Mount only these agents' state (plus any launched agent). Only the \"=\" form takes a list.\n\
+  --no-agent-mounts                  Mount no agent state, even for the launched agent.\n\
+\n\
+Podman / Environment:\n\
+  --privileged              pass --privileged to podman run (for nested podman)\n\
+  --krun-memory MiB         guest RAM under --krun (default 4096, must exceed 128)\n\
+  --krun-cpus N             guest vCPUs under --krun (1-16, default: host affinity)\n\
+  -e, --env NAME=VAL        pass environment variable to podman\n\
+  --podman-args             treat all following args (until --) as podman args\n\
+\n\
+--podman, --ssh and --gpg each hand the agent a capability that reaches\n\
+outside the sandbox. --podman forwards the host podman socket, allowing the\n\
+agent to create sibling containers on the host (a full sandbox escape).\n\
+To safely let the agent run containers, use --privileged instead to enable\n\
+securely nested containers inside the sandbox. See README for details.\n\
+\n\
+--krun closes none of those three. It adds a guest kernel under the agent, so\n\
+code the agent runs faces a hypervisor before it faces the host kernel, but the\n\
+VM runs inside the same container namespaces and the same proxy topology as\n\
+before. It is not a substitute for leaving the three flags off.",
+        agent_list,
+        fmt(want_workspace),
+        fmt(want_ssh),
+        fmt(want_git),
+        fmt(want_gpg),
+        fmt(want_gpg_private),
+        fmt(want_devenv),
+        fmt(want_nix),
+        fmt(want_podman),
+        fmt(want_selinux),
+        fmt(want_proxy),
+        fmt(want_krun),
+        fmt(want_ports),
+        fmt(want_mounts),
+        fmt(agent_mounts_all)
+    );
+}
+
+fn main() -> Result<()> {
     let mut want_ssh = false;
     let mut want_git = false;
     let mut want_gpg = false;
@@ -252,6 +344,7 @@ fn main() -> Result<()> {
     let mut proxy_train = String::new();
     let mut want_krun = false;
     let mut want_privileged = false;
+    let mut want_help = false;
     let mut krun_ram_mib = String::new();
     let mut krun_cpus = String::new();
     let mut agent = String::new();
@@ -298,7 +391,11 @@ fn main() -> Result<()> {
         
         if first_arg == "ctl" {
             run_ctl = true;
-            parse_args.extend(args.iter().skip(1).cloned());
+            if args.len() == 1 {
+                parse_args.push("--help".to_string());
+            } else {
+                parse_args.extend(args.iter().skip(1).cloned());
+            }
         } else if ctl_subcommands.contains(&first_arg.as_str()) && !agent_cmd_json.contains_key(first_arg) {
             run_ctl = true;
             parse_args.extend(args.iter().cloned());
@@ -353,10 +450,7 @@ fn main() -> Result<()> {
         }
         
         match arg.as_str() {
-            "-h" | "--help" => {
-                println!("agent-sandbox [FLAGS] [AGENT] [-- COMMAND...]");
-                std::process::exit(0);
-            }
+            "-h" | "--help" | "help" => want_help = true,
             "--ssh" => want_ssh = true,
             "--no-ssh" => want_ssh = false,
             "--git" => want_git = true,
@@ -472,6 +566,27 @@ fn main() -> Result<()> {
             }
         }
         i += 1;
+    }
+    
+    if want_help {
+        print_usage(
+            &agent_list,
+            want_workspace,
+            want_ssh,
+            want_git,
+            want_gpg,
+            want_gpg_private,
+            want_devenv,
+            want_nix,
+            want_podman,
+            want_selinux,
+            want_proxy,
+            want_krun,
+            want_ports,
+            want_mounts,
+            &want_agent_mounts_mode,
+        );
+        std::process::exit(0);
     }
     
     // Check proxy network conflicts (Requirement 4)
@@ -635,6 +750,36 @@ fn main() -> Result<()> {
         n
     };
     
+    let pwd = env::current_dir().unwrap_or_default().to_string_lossy().into_owned();
+    let workspace_dir = if want_workspace {
+        let workspace_name = Path::new(&pwd).file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let dir = format!("/workspace/{}", workspace_name);
+        mounts.push("-v".to_string());
+        mounts.push(format!("{}:{}:{}", pwd, dir, rw_mount_opts));
+        dir
+    } else {
+        "/workspace".to_string()
+    };
+    
+    let uid = nix::unistd::getuid().as_raw();
+    let gid = nix::unistd::getgid().as_raw();
+    let mut passwd_file = Builder::new().prefix("agent-sandbox-passwd-").tempfile().expect("Failed to create temporary passwd file");
+    let mut group_file = Builder::new().prefix("agent-sandbox-group-").tempfile().expect("Failed to create temporary group file");
+    fs::set_permissions(passwd_file.path(), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(group_file.path(), fs::Permissions::from_mode(0o644)).unwrap();
+    writeln!(passwd_file, "root:x:0:0:root:/root:/bin/sh").unwrap();
+    writeln!(passwd_file, "user:x:{}:{}::/home/user:/bin/bash", uid, gid).unwrap();
+    writeln!(passwd_file, "nobody:x:65534:65534:Nobody:/:/bin/sh").unwrap();
+    writeln!(group_file, "root:x:0:").unwrap();
+    writeln!(group_file, "user:x:{}:", gid).unwrap();
+    writeln!(group_file, "nobody:x:65534:").unwrap();
+    let passwd_path = passwd_file.path().to_string_lossy().into_owned();
+    let group_path = group_file.path().to_string_lossy().into_owned();
+    mounts.push("-v".to_string());
+    mounts.push(format!("{}:/etc/passwd:ro", passwd_path));
+    mounts.push("-v".to_string());
+    mounts.push(format!("{}:/etc/group:ro", group_path));
+
     mounts = enforce(mounts);
     
     if want_proxy {
@@ -657,6 +802,9 @@ fn main() -> Result<()> {
                  .args(["--network", "bridge", "--network", &sidecar_id])
                  .args(["-v", &format!("{}:/sidecar_shared:rw", sidecar_shared)])
                  .args(["-v", &format!("{}:/sidecar_policy:ro", sidecar_policy)])
+                 .args(["--label", "agent-sandbox.role=proxy"])
+                 .args(["--label", &format!("agent-sandbox.target={}", container_name)])
+                 .args(["--label", &format!("agent-sandbox.workspace={}", pwd)])
                  .arg(&env::var("AGENT_SANDBOX_IMAGE").unwrap_or_default())
                  .arg("agent-sandbox-sidecar");
                  
@@ -667,6 +815,17 @@ fn main() -> Result<()> {
     }
     
     // We would execute podman here, let's just do it
+    let image = env::var("AGENT_SANDBOX_IMAGE").unwrap_or_default();
+    if !image.is_empty() {
+        let status = ProcessCommand::new("podman")
+            .args(["image", "exists", &image])
+            .status();
+        if status.is_err() || !status.unwrap().success() {
+            eprintln!("agent-sandbox: image {} not found. Run 'agent-sandbox ctl load' first.", image);
+            std::process::exit(1);
+        }
+    }
+    
     let mut podman_cmd = ProcessCommand::new("podman");
     podman_cmd.arg("run").arg("--rm").arg("--interactive");
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -674,6 +833,20 @@ fn main() -> Result<()> {
     }
     podman_cmd.args(["--userns=keep-id", "--name", &container_name]);
     podman_cmd.args(["-e", "HOME=/home/user"]);
+    
+    let proxy_mode = if want_proxy { "proxy" } else { "off" };
+    let sandbox_runtime = if want_krun { "krun" } else { "crun" };
+    
+    podman_cmd.args(["--label", "agent-sandbox.role=sandbox"]);
+    podman_cmd.args(["--label", &format!("agent-sandbox.workspace={}", pwd)]);
+    podman_cmd.args(["--label", &format!("agent-sandbox.proxy={}", proxy_mode)]);
+    podman_cmd.args(["--label", &format!("agent-sandbox.runtime={}", sandbox_runtime)]);
+    podman_cmd.args(["--label", &format!("agent-sandbox.command={}", cmd_args.join(" "))]);
+    podman_cmd.args(["--workdir", &workspace_dir]);
+    
+    podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.config,U=true"]);
+    podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.cache,U=true"]);
+    podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.local,U=true"]);
     
     for arg in env_args {
         podman_cmd.arg(arg);
