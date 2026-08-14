@@ -99,11 +99,18 @@ A few flags are one-off pass-throughs rather than persistent toggles, so they ha
 | `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel (including `-v/--volume` and `-p/--publish`). |
 
 There is no `--port` flag: declare ports in `AGENTS.md` and pass `--ports`, or
-publish one directly with `--podman-args -p HOST:CONTAINER --`. Either way,
-publishing a port cannot be combined with `--proxy`. Prefer `--ports`: it
-defaults each bind to loopback and refuses a wider one unless
+publish one directly with `--podman-args -p HOST:CONTAINER --`. Prefer
+`--ports`: it defaults each bind to loopback and refuses a wider one unless
 `--ports-any-interface` is given, while a raw `-p HOST:CONTAINER` binds
 `0.0.0.0` and exposes the port to the LAN.
+
+`--ports` composes with `--proxy` as long as every bind is loopback. Publishing
+is ingress — podman forwards into the proxy's internal network without giving
+the sandbox a route out of it — so the egress policy is untouched. A bind the
+rest of the network can reach is refused under `--proxy`, because anything out
+there could pull whatever the agent chose to serve and the proxy would never see
+it. A raw `-p` is refused under `--proxy` too: the launcher never parses it, so
+it cannot tell the two cases apart.
 
 Whichever you use, the server *inside* the sandbox must bind `0.0.0.0`.
 Publishing forwards to the sandbox's interface address, so a server bound to the

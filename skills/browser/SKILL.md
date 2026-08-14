@@ -208,7 +208,10 @@ host.
 
 Two modes have no route to the host and cannot do any of this: `--proxy`
 (deliberately — the sandbox is on an `--internal` network) and
-`--shared-network` (a bridge, where pasta options do not apply). The last-resort
+`--shared-network` (a bridge, where pasta options do not apply). A proxied
+sandbox can still *publish* to the host's loopback, so the user can open your
+server in their own browser; it is only the outbound CDP connection that has
+nowhere to go. The last-resort
 fallback remains `agent-sandbox --no-proxy --podman-args --network=host --
 bash`, which shares the host's entire network stack to obtain the one port.
 

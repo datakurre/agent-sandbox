@@ -37,8 +37,10 @@ cause; point it at `127.0.0.1` or set its own no-proxy option.
 
 ## Reaching a published port from the host
 
-Not a proxied-session topic — `--proxy` and a published port are mutually
-exclusive — but the failure looks enough like a firewall problem to belong here.
+A proxied session can publish ports: `[ports]` entries bound to loopback work
+under `--proxy`, because publishing is ingress and the firewall governs egress.
+(A bind the wider network can reach is refused, as is a raw `-p` through
+`--podman-args` — the launcher cannot check that one's bind address.)
 
 **A server behind a `[ports]` mapping must bind `0.0.0.0`, not `127.0.0.1`.**
 Publishing forwards the host's port to the sandbox's *interface* address, so a

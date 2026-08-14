@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -96,6 +97,15 @@ fn expand_v(spec: &str, current_dir: &Path, home_dir: &str) -> String {
     } else {
         format!("{}:{}", src, dest)
     }
+}
+
+/// Whether a `[ports]` bind address is loopback, which is what decides if a
+/// published port is compatible with `--proxy`.  `parse_ports` has already
+/// reduced the field to an IP literal (`"localhost"` included), so anything
+/// that fails to parse here is not a bind this launcher wrote -- treated as
+/// non-loopback, because the refusal is the safe answer.
+fn is_loopback_bind(bind: &str) -> bool {
+    bind.parse::<IpAddr>().map(|a| a.is_loopback()).unwrap_or(false)
 }
 
 fn enforce_selinux_mount_flags(mount_opt: &str, want_selinux: bool) -> String {
@@ -1067,12 +1077,14 @@ fn run() -> Result<i32> {
         podman_args.push("--privileged".to_string());
     }
 
-    // Publishing a port and running a proxy are mutually exclusive, because the
-    // two network topologies contradict each other: podman can only publish
-    // from pasta or a bridge, and either one displaces or supplements the
-    // proxy's --internal network, giving the sandbox a route to the internet
-    // that does not pass through the proxy at all.  Checked for podman-args
-    // here, and for [ports] once that block has been parsed.
+    // A published port is ingress and does not by itself defeat an egress
+    // policy -- podman forwards into the proxy's --internal network without
+    // giving the sandbox a route out of it.  What decides is the bind address:
+    // loopback is this machine, anything wider is a channel the proxy never
+    // sees.  A raw -p is refused under --proxy because this launcher never
+    // parses it and so cannot tell the two apart; a declared [ports] entry is
+    // checked on its bind once that block has been parsed.  Host networking is
+    // refused outright -- it is not publishing, it is the host's whole stack.
     if want_proxy {
         let mut idx = 0;
         while idx < podman_args.len() {
@@ -1091,7 +1103,7 @@ fn run() -> Result<i32> {
                 || arg.starts_with("-p=")
                 || arg.starts_with("--publish=")
             {
-                fail("agent-sandbox: --proxy cannot be combined with a published port.\n               Publishing needs a network mode that routes around the proxy's\n               internal network, so the policy would only be advisory.\n               Drop the port, or drop --proxy.");
+                fail("agent-sandbox: --proxy cannot be combined with a raw -p.\n               The launcher does not parse it, so it cannot tell a loopback\n               bind from one the whole network can pull from, and only the\n               first is compatible with an egress policy.\n               Declare the port in AGENTS.md and pass --ports instead.");
             }
             idx += 1;
         }
@@ -1443,6 +1455,20 @@ fn run() -> Result<i32> {
                 Ok(m) => m,
                 Err(e) => fail(&format!("agent-sandbox: {}", e)),
             };
+            // Under --proxy the bind address decides.  A loopback publish is
+            // ingress from this machine and leaves the egress policy intact:
+            // rootlessport forwards into the --internal network, the sandbox
+            // still has no route out.  A LAN-reachable one is a channel out by
+            // another route -- anything on the network can pull whatever the
+            // agent serves -- and the proxy never sees it, so the policy would
+            // hold for pushed bytes and not for pulled ones.  Refused before
+            // any network is created, so the refusal leaves nothing behind.
+            if want_proxy && !is_loopback_bind(&mapping.bind) {
+                fail(&format!(
+                    "agent-sandbox: --proxy cannot be combined with a port published off loopback ({}).\n               Anything on the network could pull what the agent serves there,\n               which the proxy never sees, so the egress policy would only be\n               advisory.  A loopback bind is fine and needs no flag.\n               Drop --ports-any-interface, or drop --proxy.",
+                    mapping.spec()
+                ));
+            }
             publish_args.push("-p".to_string());
             publish_args.push(mapping.spec());
             published.push(mapping.spec());
@@ -1465,16 +1491,6 @@ fn run() -> Result<i32> {
             declared_mounts.push("-v".to_string());
             declared_mounts.push(expand_v(&spec, Path::new(&pwd), &home));
         }
-    }
-
-    // Checked after the [ports] block is parsed, so a declaration that yields
-    // nothing is not treated as a request, and before any network is created,
-    // so the refusal leaves nothing behind.
-    if want_proxy && !published.is_empty() {
-        fail(&format!(
-            "agent-sandbox: --proxy cannot be combined with a published port ({}).\n               Publishing needs a network mode that routes around the proxy's\n               internal network, so the policy would only be advisory.\n               Drop the port, or drop --proxy.",
-            published[0]
-        ));
     }
 
     // Refused for the same reason a published port is: joining the shared
