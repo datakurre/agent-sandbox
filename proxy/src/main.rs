@@ -132,10 +132,8 @@ impl Resolver {
                         }
                         return Ok(addrs);
                     }
-                    last_err = io::Error::new(
-                        ErrorKind::NotFound,
-                        "resolver returned no addresses",
-                    );
+                    last_err =
+                        io::Error::new(ErrorKind::NotFound, "resolver returned no addresses");
                 }
                 Err(e) => last_err = e,
             }
@@ -275,13 +273,19 @@ impl MetricsLog {
     }
 
     fn denied_detail(&self, host: &str, port: u16, reason: &str, head: &str) {
-        let Some(file) = &self.detail_file else { return; };
+        let Some(file) = &self.detail_file else {
+            return;
+        };
         let head = sanitize_request_head(&String::from_utf8_lossy(
             &head.as_bytes()[..head.len().min(DETAIL_HEAD_MAX_BYTES)],
         ));
         let line = format!(
             "{{\"ts\":{},\"host\":\"{}\",\"port\":{},\"reason\":\"{}\",\"request\":\"{}\"}}\n",
-            now_secs(), json_escape(host), port, json_escape(reason), json_escape(&head)
+            now_secs(),
+            json_escape(host),
+            port,
+            json_escape(reason),
+            json_escape(&head)
         );
         if let Ok(mut file) = file.lock() {
             let _ = rotate_if_needed(&mut file, line.len() as u64, DETAIL_LOG_MAX_BYTES);
@@ -289,17 +293,23 @@ impl MetricsLog {
         }
     }
 
+    fn denied_http_detail(&self, host: &str, port: u16, reason: &str, method: &str, path: &str) {
+        let request = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, host);
+        self.denied_detail(host, port, reason, &request);
+    }
+
     fn next_id(&self) -> String {
-        format!("{}-{}", self.boot, self.next_id.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "{}-{}",
+            self.boot,
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     /// Marks a policy change in the connection log, so `ctl net -f` shows it
     /// interleaved with the connections it affected.
     fn policy_event(&self) {
-        self.write_line(&format!(
-            "{{\"ev\":\"policy\",\"ts\":{}}}\n",
-            now_secs()
-        ));
+        self.write_line(&format!("{{\"ev\":\"policy\",\"ts\":{}}}\n", now_secs()));
     }
 
     /// A connection has been established and is now pumping bytes.
@@ -434,6 +444,12 @@ impl Shared {
         }
     }
 
+    fn denied_http_detail(&self, host: &str, port: u16, reason: &str, method: &str, path: &str) {
+        if let Some(m) = &self.metrics {
+            m.denied_http_detail(host, port, reason, method, path);
+        }
+    }
+
     fn record(
         &self,
         id: Option<&str>,
@@ -449,7 +465,9 @@ impl Shared {
         status: Option<u16>,
     ) {
         if let Some(m) = &self.metrics {
-            m.record(id, host, port, verdict, err, up, down, ms, method, path, status);
+            m.record(
+                id, host, port, verdict, err, up, down, ms, method, path, status,
+            );
         }
     }
 
@@ -512,7 +530,7 @@ impl Write for PrefixedStream {
         self.inner.write(buf)
     }
 
-    fn flush(&mut self, ) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
 }
@@ -585,8 +603,7 @@ fn split_head_and_extra(buf: &[u8]) -> (&[u8], &[u8]) {
 /// `RETRY_WINDOW` so a momentarily unreachable network does not become a 502.
 fn connect_any(addrs: &[SocketAddr], retry_until: Instant) -> Result<TcpStream, io::Error> {
     let deadline = (Instant::now() + RETRY_WINDOW).max(retry_until);
-    let mut last_err =
-        io::Error::new(ErrorKind::InvalidInput, "no addresses to connect to");
+    let mut last_err = io::Error::new(ErrorKind::InvalidInput, "no addresses to connect to");
     loop {
         for addr in addrs {
             match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
@@ -672,7 +689,19 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} ({})", host, port, reason);
         shared.denied_detail(&host, port, &reason, &req_str);
-        shared.record(None, &host, port, "deny", Some(&reason), 0, 0, started.elapsed().as_millis(), Some(method), None, None);
+        shared.record(
+            None,
+            &host,
+            port,
+            "deny",
+            Some(&reason),
+            0,
+            0,
+            started.elapsed().as_millis(),
+            Some(method),
+            None,
+            None,
+        );
         return;
     }
 
@@ -691,9 +720,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 0,
                 0,
                 started.elapsed().as_millis(),
-                None,            None,
-            None,
-        );
+                None,
+                None,
+                None,
+            );
             return;
         }
     };
@@ -706,7 +736,19 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} ({})", host, port, reason);
         shared.denied_detail(&host, port, &reason, &req_str);
-        shared.record(None, &host, port, "deny", Some(&reason), 0, 0, started.elapsed().as_millis(), None, None, None);
+        shared.record(
+            None,
+            &host,
+            port,
+            "deny",
+            Some(&reason),
+            0,
+            0,
+            started.elapsed().as_millis(),
+            None,
+            None,
+            None,
+        );
         return;
     }
 
@@ -725,9 +767,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 0,
                 0,
                 started.elapsed().as_millis(),
-                None,            None,
-            None,
-        );
+                None,
+                None,
+                None,
+            );
             return;
         }
     };
@@ -751,7 +794,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             // any secret route, not only on the routes that would inject.
             if cfg.is_secret_host(&host) {
                 let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-                eprintln!("proxy: deny {}:{} (secret injection requires TLS)", host, port);
+                eprintln!(
+                    "proxy: deny {}:{} (secret injection requires TLS)",
+                    host, port
+                );
                 shared.denied_detail(&host, port, "cleartext-injection", &req_str);
                 shared.record(
                     None,
@@ -762,9 +808,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                     0,
                     0,
                     started.elapsed().as_millis(),
-                    Some(method),                None,
-                None,
-            );
+                    Some(method),
+                    None,
+                    None,
+                );
                 return;
             }
             let id = shared.open_event(&host, port);
@@ -791,9 +838,19 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         outcome.status,
                     );
                 }
-                Err(inject::ProxyHttpError::L7Denied { method, path, reason }) => {
+                Err(inject::ProxyHttpError::L7Denied {
+                    method,
+                    path,
+                    reason,
+                }) => {
                     eprintln!("proxy: deny {}:{} ({})", host, port, reason);
-                    shared.denied_detail(&host, port, &format!("L7 denied: {}", reason), &req_str);
+                    shared.denied_http_detail(
+                        &host,
+                        port,
+                        &format!("L7 denied: {}", reason),
+                        &method,
+                        &path,
+                    );
                     shared.record(
                         id.as_deref(),
                         &host,
@@ -808,8 +865,17 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         Some(403),
                     );
                 }
-                Err(inject::ProxyHttpError::Io { method, path, status, secret_missing, error }) => {
-                    eprintln!("proxy: injected HTTP proxying failed {}:{}: {}", host, port, error);
+                Err(inject::ProxyHttpError::Io {
+                    method,
+                    path,
+                    status,
+                    secret_missing,
+                    error,
+                }) => {
+                    eprintln!(
+                        "proxy: injected HTTP proxying failed {}:{}: {}",
+                        host, port, error
+                    );
                     let mut detail = format!("inject-http: {}", short_err(&error));
                     if secret_missing {
                         detail.push_str(" (secret missing: domain configured for secret injection in policy, but --secrets was not enabled)");
@@ -855,9 +921,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
-                        None,                    None,
-                    None,
-                );
+                        None,
+                        None,
+                        None,
+                    );
                     return;
                 }
             };
@@ -867,7 +934,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 match tls::terminate(PrefixedStream::new(client_sock, extra.to_vec()), &leaf) {
                     Ok(stream) => stream,
                     Err(e) => {
-                        eprintln!("proxy: TLS acceptor setup failed for {}:{}: {}", host, port, e);
+                        eprintln!(
+                            "proxy: TLS acceptor setup failed for {}:{}: {}",
+                            host, port, e
+                        );
                         shared.record(
                             None,
                             &host,
@@ -877,9 +947,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                             0,
                             0,
                             started.elapsed().as_millis(),
-                            None,                        None,
-                        None,
-                    );
+                            None,
+                            None,
+                            None,
+                        );
                         return;
                     }
                 };
@@ -898,9 +969,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                     0,
                     0,
                     started.elapsed().as_millis(),
-                    None,                None,
-                None,
-            );
+                    None,
+                    None,
+                    None,
+                );
                 return;
             }
 
@@ -910,7 +982,9 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 if proto != b"http/1.1" {
                     eprintln!(
                         "proxy: deny {}:{} (MITM requires HTTP/1.1 but client negotiated {:?})",
-                        host, port, String::from_utf8_lossy(proto)
+                        host,
+                        port,
+                        String::from_utf8_lossy(proto)
                     );
                     shared.denied_detail(&host, port, "alpn-unsupported", &req_str);
                     shared.record(
@@ -922,9 +996,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
-                        None,                    None,
-                    None,
-                );
+                        None,
+                        None,
+                        None,
+                    );
                     return;
                 }
             }
@@ -943,9 +1018,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
-                        None,                    None,
-                    None,
-                );
+                        None,
+                        None,
+                        None,
+                    );
                     return;
                 }
             };
@@ -963,9 +1039,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
-                        None,                    None,
-                    None,
-                );
+                        None,
+                        None,
+                        None,
+                    );
                     return;
                 }
             };
@@ -984,9 +1061,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                     0,
                     0,
                     started.elapsed().as_millis(),
-                    None,                None,
-                None,
-            );
+                    None,
+                    None,
+                    None,
+                );
                 return;
             }
 
@@ -1006,9 +1084,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
-                        None,                    None,
-                    None,
-                );
+                        None,
+                        None,
+                        None,
+                    );
                     return;
                 }
             };
@@ -1036,9 +1115,19 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         outcome.status,
                     );
                 }
-                    Err(inject::ProxyHttpError::L7Denied { method, path, reason }) => {
-                        eprintln!("proxy: deny {}:{} ({})", host, port, reason);
-                        shared.denied_detail(&host, port, &format!("L7 denied: {}", reason), &req_str);
+                Err(inject::ProxyHttpError::L7Denied {
+                    method,
+                    path,
+                    reason,
+                }) => {
+                    eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+                    shared.denied_http_detail(
+                        &host,
+                        port,
+                        &format!("L7 denied: {}", reason),
+                        &method,
+                        &path,
+                    );
                     shared.record(
                         id.as_deref(),
                         &host,
@@ -1053,8 +1142,17 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         Some(403),
                     );
                 }
-                Err(inject::ProxyHttpError::Io { method, path, status, secret_missing, error }) => {
-                    eprintln!("proxy: injected HTTPS proxying failed {}:{}: {}", host, port, error);
+                Err(inject::ProxyHttpError::Io {
+                    method,
+                    path,
+                    status,
+                    secret_missing,
+                    error,
+                }) => {
+                    eprintln!(
+                        "proxy: injected HTTPS proxying failed {}:{}: {}",
+                        host, port, error
+                    );
                     let mut detail = format!("inject-https: {}", short_err(&error));
                     if secret_missing {
                         detail.push_str(" (secret missing: domain configured for secret injection in policy, but --secrets was not enabled)");
@@ -1080,7 +1178,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
 
     if method == "CONNECT" && !skip_l7 {
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-        eprintln!("proxy: deny CONNECT {}:{} (L7 rules require TLS interception on port 443)", host, port);
+        eprintln!(
+            "proxy: deny CONNECT {}:{} (L7 rules require TLS interception on port 443)",
+            host, port
+        );
         shared.denied_detail(&host, port, "connect-l7-unintercepted", &req_str);
         shared.record(
             None,
@@ -1091,9 +1192,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             0,
             0,
             started.elapsed().as_millis(),
-            None,        None,
-        None,
-    );
+            None,
+            None,
+            None,
+        );
         return;
     }
 
@@ -1127,7 +1229,19 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         (Ok(c), Ok(r)) => (c, r),
         _ => {
             eprintln!("proxy: cannot duplicate sockets for {}:{}", host, port);
-            shared.record(None, &host, port, "error", Some("fd"), 0, 0, started.elapsed().as_millis(), None, None, None);
+            shared.record(
+                None,
+                &host,
+                port,
+                "error",
+                Some("fd"),
+                0,
+                0,
+                started.elapsed().as_millis(),
+                None,
+                None,
+                None,
+            );
             return;
         }
     };
@@ -1150,9 +1264,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         up,
         down,
         started.elapsed().as_millis(),
-        None,    None,
-    None,
-);
+        None,
+        None,
+        None,
+    );
 }
 
 /// Identity of a policy file, for change detection.
@@ -1327,7 +1442,12 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
                     .parse::<i32>()
                     .ok()
                     .filter(|n| *n >= 0)
-                    .unwrap_or_else(|| fail(&format!("--secret-fd: {:?} is not a non-negative integer", raw)));
+                    .unwrap_or_else(|| {
+                        fail(&format!(
+                            "--secret-fd: {:?} is not a non-negative integer",
+                            raw
+                        ))
+                    });
                 o.secret_fd = Some(fd);
             }
             "--allow-domains" => o.allow_domains = value(),
@@ -1429,7 +1549,10 @@ fn main() {
     let metrics = if opts.log.is_empty() {
         None
     } else {
-        MetricsLog::open(&opts.log, (!opts.detail_log.is_empty()).then_some(opts.detail_log.as_str()))
+        MetricsLog::open(
+            &opts.log,
+            (!opts.detail_log.is_empty()).then_some(opts.detail_log.as_str()),
+        )
     };
 
     let secrets = match SecretBindings::from_fd(opts.secret_fd) {
@@ -1707,8 +1830,16 @@ mod tests {
             "fe80::1",
         ] {
             let ip: IpAddr = addr.parse().unwrap();
-            assert!(!c.is_allowed_ip(ip), "{} should be denied as a literal target", addr);
-            assert!(c.is_denied_address(ip), "{} should be denied as a resolved address", addr);
+            assert!(
+                !c.is_allowed_ip(ip),
+                "{} should be denied as a literal target",
+                addr
+            );
+            assert!(
+                c.is_denied_address(ip),
+                "{} should be denied as a resolved address",
+                addr
+            );
         }
     }
 
@@ -1755,7 +1886,11 @@ mod tests {
         // `retry_until` in the past must not shorten the floor.
         let r = Resolver::new();
         let started = Instant::now();
-        let _ = r.resolve("no-such-host.invalid", 80, Instant::now() - Duration::from_secs(60));
+        let _ = r.resolve(
+            "no-such-host.invalid",
+            80,
+            Instant::now() - Duration::from_secs(60),
+        );
         assert!(
             started.elapsed() >= RETRY_WINDOW,
             "expected retries for at least {:?}, gave up after {:?}",
@@ -1797,7 +1932,11 @@ mod tests {
     fn bounded_log_resets_before_it_grows_past_limit() {
         let path = std::env::temp_dir().join("agent-sandbox-bounded-log.jsonl");
         let _ = std::fs::remove_file(&path);
-        let mut file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
         file.write_all(b"old\n").unwrap();
         rotate_if_needed(&mut file, 5, 8).unwrap();
         file.write_all(b"new!!").unwrap();
@@ -1823,7 +1962,19 @@ mod tests {
         let lines = metrics_lines("open-close", |log| {
             id = log.next_id();
             log.open_event(&id, "example.com", 443);
-            log.record(Some(&id), "example.com", 443, "allow", None, 10, 20, 5, None, None, None);
+            log.record(
+                Some(&id),
+                "example.com",
+                443,
+                "allow",
+                None,
+                10,
+                20,
+                5,
+                None,
+                None,
+                None,
+            );
         });
         assert_eq!(lines.len(), 2, "expected an open and a close: {:?}", lines);
         assert!(lines[0].contains("\"ev\":\"open\""), "{}", lines[0]);
@@ -1843,7 +1994,19 @@ mod tests {
     #[test]
     fn record_without_an_id_carries_no_event_fields() {
         let lines = metrics_lines("no-id", |log| {
-            log.record(None, "example.com", 443, "deny", None, 0, 0, 1, None, None, None);
+            log.record(
+                None,
+                "example.com",
+                443,
+                "deny",
+                None,
+                0,
+                0,
+                1,
+                None,
+                None,
+                None,
+            );
         });
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("{\"ts\":"), "{}", lines[0]);
@@ -1857,10 +2020,33 @@ mod tests {
     #[test]
     fn record_with_a_method_carries_it_through() {
         let lines = metrics_lines("with-method", |log| {
-            log.record(None, "example.com", 443, "deny", Some("domain"), 0, 0, 1, Some("GET"), None, None);
+            log.record(
+                None,
+                "example.com",
+                443,
+                "deny",
+                Some("domain"),
+                0,
+                0,
+                1,
+                Some("GET"),
+                None,
+                None,
+            );
         });
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("\"method\":\"GET\""), "{}", lines[0]);
+    }
+
+    #[test]
+    fn denied_http_detail_records_the_decrypted_request_line() {
+        let path = std::env::temp_dir().join("agent-sandbox-detail-log.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let log = MetricsLog::open(path.to_str().unwrap(), Some(path.to_str().unwrap())).unwrap();
+        log.denied_http_detail("pypi.org", 443, "path denied", "GET", "/simple/");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("GET /simple/ HTTP/1.1"), "{}", body);
+        let _ = std::fs::remove_file(path);
     }
 
     // ── policy parsing ──────────────────────────────────────────────────────
@@ -1978,10 +2164,19 @@ mod tests {
 
     #[test]
     fn single_port_and_range_parse() {
-        assert_eq!(parse_port_range("443").unwrap(), PortRange { start: 443, end: 443 });
+        assert_eq!(
+            parse_port_range("443").unwrap(),
+            PortRange {
+                start: 443,
+                end: 443
+            }
+        );
         assert_eq!(
             parse_port_range("8000-8100").unwrap(),
-            PortRange { start: 8000, end: 8100 }
+            PortRange {
+                start: 8000,
+                end: 8100
+            }
         );
         assert!(parse_port_range("0").is_err());
         assert!(parse_port_range("70000").is_err());
@@ -2005,8 +2200,7 @@ mod tests {
 
     #[test]
     fn explicit_allow_ports_overrides_the_derived_default() {
-        let config =
-            parse_policy("allow_domains github.com\nallow_ports 8443\n").unwrap();
+        let config = parse_policy("allow_domains github.com\nallow_ports 8443\n").unwrap();
         assert!(!config.is_allowed("github.com", 443));
         assert!(config.is_allowed("github.com", 8443));
     }
@@ -2037,8 +2231,6 @@ mod tests {
         assert!(!config.is_allowed("jyu.fi", 22));
         assert!(config.is_allowed("github.com", 443));
     }
-
-
 
     fn policy_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("agent-sandbox-policy-{}", name))
@@ -2071,7 +2263,6 @@ mod tests {
             "missing default allow must make the reloaded policy deny-by-default"
         );
     }
-
 
     #[test]
     fn secret_injection_requires_both_policy_and_provider() {
@@ -2167,7 +2358,11 @@ mod tests {
         let shared = shared_with("allow_domains github.com\n");
         let path = policy_path("reload-widen");
 
-        std::fs::write(&path, "allow_domains github.com\nallow_domains api.openai.com\n").unwrap();
+        std::fs::write(
+            &path,
+            "allow_domains github.com\nallow_domains api.openai.com\n",
+        )
+        .unwrap();
         assert!(reload_once(path.to_str().unwrap(), &shared));
         assert!(shared.config().is_allowed("api.openai.com", 443));
 

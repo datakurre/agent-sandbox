@@ -32,17 +32,30 @@ struct CtlCli {
 
 #[derive(Subcommand, Debug)]
 enum CtlCommands {
-    #[command(about = "Load the agent-sandbox image")] Load(ctl::load::LoadArgs),
-    #[command(about = "List sandboxes and their proxy mode")] List(ctl::list::ListArgs),
-    #[command(about = "Summarise one running sandbox")] Status(ctl::status::StatusArgs),
-    #[command(about = "Manage proxy rules")] Proxy(ctl::proxy::ProxyArgs),
-    #[command(about = "Show network metering for a running sandbox")] Net(ctl::net::NetArgs),
-    #[command(about = "Show the proxy log for a running sandbox", alias = "log")] Logs(ctl::logs::LogsArgs),
-    #[command(about = "Attach to a running sandbox and exec a command")] Attach(ctl::attach::AttachArgs),
-    #[command(about = "Manage bind mounts into a running sandbox", alias = "mounts")] Mount(ctl::mount::MountArgs),
-    #[command(about = "Show SSH/GPG relay policy and logs")] Relay(ctl::relay::RelayArgs),
-    #[command(about = "Interactive dashboard: watch denied requests live and add rules for them")] Tui(ctl::tui::TuiArgs),
-    #[command(about = "Reclaim leftover containers, networks and directories")] Purge(ctl::purge::PurgeArgs),
+    #[command(about = "Load the agent-sandbox image")]
+    Load(ctl::load::LoadArgs),
+    #[command(about = "List sandboxes and their proxy mode")]
+    List(ctl::list::ListArgs),
+    #[command(about = "Summarise one running sandbox")]
+    Status(ctl::status::StatusArgs),
+    #[command(about = "Manage proxy rules")]
+    Proxy(ctl::proxy::ProxyArgs),
+    #[command(about = "Show network metering for a running sandbox")]
+    Net(ctl::net::NetArgs),
+    #[command(about = "Show the proxy log for a running sandbox", alias = "log")]
+    Logs(ctl::logs::LogsArgs),
+    #[command(about = "Attach to a running sandbox and exec a command")]
+    Attach(ctl::attach::AttachArgs),
+    #[command(about = "Manage bind mounts into a running sandbox", alias = "mounts")]
+    Mount(ctl::mount::MountArgs),
+    #[command(about = "Show SSH/GPG relay policy and logs")]
+    Relay(ctl::relay::RelayArgs),
+    #[command(
+        about = "Interactive dashboard: watch denied requests live and add rules for them"
+    )]
+    Tui(ctl::tui::TuiArgs),
+    #[command(about = "Reclaim leftover containers, networks and directories")]
+    Purge(ctl::purge::PurgeArgs),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,7 +164,12 @@ fn usable_nameservers(file: &Path) -> Result<Vec<String>> {
         }
         let candidate = parts[1];
         let lower = candidate.to_lowercase();
-        if lower.starts_with("127.") || lower.starts_with("169.254.") || lower == "::1" || lower.starts_with("fe80:") || lower.contains('%') {
+        if lower.starts_with("127.")
+            || lower.starts_with("169.254.")
+            || lower == "::1"
+            || lower.starts_with("fe80:")
+            || lower.contains('%')
+        {
             continue;
         }
         if candidate.parse::<std::net::IpAddr>().is_ok() {
@@ -181,7 +199,9 @@ fn usable_search(file: &Path) -> Result<Vec<String>> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         for word in parts.into_iter().skip(1) {
             let is_valid = !word.is_empty()
-                && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
             if is_valid {
                 search.push(word.to_string());
             }
@@ -532,7 +552,10 @@ impl CleanupGuard {
         );
         println!(
             "{}",
-            style.dim(&format!("  re-render it with:     agent-sandbox-network-summary {}", display))
+            style.dim(&format!(
+                "  re-render it with:     agent-sandbox-network-summary {}",
+                display
+            ))
         );
         println!("");
     }
@@ -544,10 +567,14 @@ impl Drop for CleanupGuard {
             return;
         }
 
-        let _ = ProcessCommand::new("podman").args(["stop", "-t", "1", &self.sidecar_id]).output();
+        let _ = ProcessCommand::new("podman")
+            .args(["stop", "-t", "1", &self.sidecar_id])
+            .output();
         // Not --rm: a sidecar that exits before signalling readiness has to
         // stay around long enough for `podman logs` to say why.
-        let _ = ProcessCommand::new("podman").args(["rm", "-f", &self.sidecar_id]).output();
+        let _ = ProcessCommand::new("podman")
+            .args(["rm", "-f", &self.sidecar_id])
+            .output();
 
         if !self.sidecar_shared.is_empty() {
             let log = format!("{}/connections.jsonl", self.sidecar_shared);
@@ -559,9 +586,9 @@ impl Drop for CleanupGuard {
             // The aggregate report, not the per-record feed: a busy session has
             // hundreds of connections and what the operator wants at exit is
             // where the traffic went.
-            let had_failures = records.iter().any(|r| {
-                matches!(r.verdict.as_deref(), Some("deny") | Some("error"))
-            });
+            let had_failures = records
+                .iter()
+                .any(|r| matches!(r.verdict.as_deref(), Some("deny") | Some("error")));
             net_summary::process_summary(records);
 
             // The removal below would take the per-connection timings with it,
@@ -576,15 +603,28 @@ impl Drop for CleanupGuard {
         // subnet from the rootless pool until `agent-sandbox ctl purge`
         // reclaims it.
         for _ in 0..20 {
-            if ProcessCommand::new("podman").args(["network", "rm", &self.sidecar_id]).output().is_ok() {
-                if ProcessCommand::new("podman").args(["network", "exists", &self.sidecar_id]).status().map(|s| !s.success()).unwrap_or(true) {
+            if ProcessCommand::new("podman")
+                .args(["network", "rm", &self.sidecar_id])
+                .output()
+                .is_ok()
+            {
+                if ProcessCommand::new("podman")
+                    .args(["network", "exists", &self.sidecar_id])
+                    .status()
+                    .map(|s| !s.success())
+                    .unwrap_or(true)
+                {
                     break;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
 
-        for dir in [&self.sidecar_shared, &self.sidecar_policy, &self.sidecar_secrets] {
+        for dir in [
+            &self.sidecar_shared,
+            &self.sidecar_policy,
+            &self.sidecar_secrets,
+        ] {
             if !dir.is_empty() {
                 let _ = fs::remove_dir_all(dir);
             }
@@ -648,7 +688,8 @@ fn run() -> Result<i32> {
     let mut publish_args: Vec<String> = Vec::new();
     let mut published: Vec<String> = Vec::new();
 
-    let krun_runtime = env::var("AGENT_SANDBOX_KRUN_RUNTIME").unwrap_or_else(|_| "krun".to_string());
+    let krun_runtime =
+        env::var("AGENT_SANDBOX_KRUN_RUNTIME").unwrap_or_else(|_| "krun".to_string());
     let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\nclaude-code\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini\"]\t[]".to_string();
     let agent_specs_str = env::var("AGENT_SANDBOX_AGENT_SPECS").unwrap_or(default_agent_specs);
 
@@ -661,7 +702,9 @@ fn run() -> Result<i32> {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 4 {
             let name = parts[0].to_string();
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
             agent_names.push(name.clone());
             agent_cmd_json.insert(name.clone(), parts[1].to_string());
             agent_state_json.insert(name.clone(), parts[2].to_string());
@@ -677,7 +720,10 @@ fn run() -> Result<i32> {
     let is_ctl_bin = argv0.ends_with("agent-sandbox-ctl");
 
     if is_ctl_bin || !args.is_empty() {
-        let ctl_subcommands = ["load", "list", "status", "proxy", "net", "logs", "log", "attach", "mount", "mounts", "relay", "tui", "purge"];
+        let ctl_subcommands = [
+            "load", "list", "status", "proxy", "net", "logs", "log", "attach", "mount", "mounts",
+            "relay", "tui", "purge",
+        ];
         let mut run_ctl = false;
         let mut parse_args = vec!["agent-sandbox".to_string()];
 
@@ -698,7 +744,9 @@ fn run() -> Result<i32> {
                         parse_args.extend(args.iter().skip(idx + 1).cloned());
                     }
                     break;
-                } else if ctl_subcommands.contains(&arg.as_str()) && !agent_cmd_json.contains_key(arg) {
+                } else if ctl_subcommands.contains(&arg.as_str())
+                    && !agent_cmd_json.contains_key(arg)
+                {
                     run_ctl = true;
                     parse_args.extend(args.iter().skip(idx).cloned());
                     break;
@@ -797,7 +845,10 @@ fn run() -> Result<i32> {
                     let list_vec: Vec<String> = list.split(',').map(|s| s.to_string()).collect();
                     for a in &list_vec {
                         if !agent_cmd_json.contains_key(a) {
-                            fail(&format!("agent-sandbox: --agent-mounts: unknown agent '{}' (valid: {})", a, agent_list));
+                            fail(&format!(
+                                "agent-sandbox: --agent-mounts: unknown agent '{}' (valid: {})",
+                                a, agent_list
+                            ));
                         }
                     }
                     want_agent_mounts_mode = AgentMountsMode::List(list_vec);
@@ -857,9 +908,15 @@ fn run() -> Result<i32> {
                     env_args.push("-e".to_string());
                     env_args.push(v.to_string());
                 } else if arg.starts_with("-v") {
-                    fail(&format!("agent-sandbox: '{}' is not an agent-sandbox flag.", arg));
+                    fail(&format!(
+                        "agent-sandbox: '{}' is not an agent-sandbox flag.",
+                        arg
+                    ));
                 } else if arg.starts_with("--") {
-                    fail(&format!("agent-sandbox: '{}' is not an agent-sandbox flag.", arg));
+                    fail(&format!(
+                        "agent-sandbox: '{}' is not an agent-sandbox flag.",
+                        arg
+                    ));
                 } else {
                     fail(&format!("agent-sandbox: unexpected argument '{}'.", arg));
                 }
@@ -908,10 +965,17 @@ fn run() -> Result<i32> {
             if arg == "--network=host" || arg == "--net=host" {
                 fail("agent-sandbox: hard failure: --proxy cannot be combined with host networking via podman-args");
             }
-            if (arg == "--network" || arg == "--net") && idx + 1 < podman_args.len() && podman_args[idx + 1] == "host" {
+            if (arg == "--network" || arg == "--net")
+                && idx + 1 < podman_args.len()
+                && podman_args[idx + 1] == "host"
+            {
                 fail("agent-sandbox: hard failure: --proxy cannot be combined with host networking via podman-args");
             }
-            if arg == "-p" || arg == "--publish" || arg.starts_with("-p=") || arg.starts_with("--publish=") {
+            if arg == "-p"
+                || arg == "--publish"
+                || arg.starts_with("-p=")
+                || arg.starts_with("--publish=")
+            {
                 fail("agent-sandbox: --proxy cannot be combined with a published port.\n               A published port puts the sandbox on the shared bridge network,\n               which routes to the internet around the proxy, so the policy\n               would only be advisory.\n               Drop the port, or drop --proxy.");
             }
             idx += 1;
@@ -944,7 +1008,9 @@ fn run() -> Result<i32> {
         } else {
             match krun_ram_mib.parse::<u32>() {
                 Ok(ram) if ram > 128 => {}
-                _ => fail("agent-sandbox: --krun-memory needs a whole number of MiB greater than 128."),
+                _ => fail(
+                    "agent-sandbox: --krun-memory needs a whole number of MiB greater than 128.",
+                ),
             }
         }
 
@@ -956,13 +1022,25 @@ fn run() -> Result<i32> {
         }
     }
 
-    if agent.is_empty() && cmd_args.is_empty() {
-        cmd_args.push("bash".to_string());
+    if cmd_args.is_empty() {
+        if agent.is_empty() {
+            cmd_args.push("bash".to_string());
+        } else if let Some(command_json) = agent_cmd_json.get(&agent) {
+            cmd_args = serde_json::from_str(command_json).unwrap_or_else(|_| {
+                fail(&format!(
+                    "agent-sandbox: malformed command specification for agent '{}'",
+                    agent
+                ))
+            });
+        }
     }
 
     let rw_mount_opts = launch::rw_mount_opts(want_selinux);
     let home = env::var("HOME").unwrap_or_default();
-    let pwd = env::current_dir().unwrap_or_default().to_string_lossy().into_owned();
+    let pwd = env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let agents_md_path = Path::new(&pwd).join("AGENTS.md");
     let runtime_dir = env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
@@ -1046,7 +1124,9 @@ fn run() -> Result<i32> {
                     env_args.extend(e);
                 }
             }
-            _ => eprintln!("agent-sandbox: --ssh requested but SSH_AUTH_SOCK does not name a socket."),
+            _ => eprintln!(
+                "agent-sandbox: --ssh requested but SSH_AUTH_SOCK does not name a socket."
+            ),
         }
     }
 
@@ -1065,7 +1145,9 @@ fn run() -> Result<i32> {
                 env_args.extend(launch::git_config_env(&pairs));
                 env_args.extend(launch::git_identity_env(&pairs));
             }
-            _ => eprintln!("agent-sandbox: --git requested but the host git config could not be read."),
+            _ => eprintln!(
+                "agent-sandbox: --git requested but the host git config could not be read."
+            ),
         }
     }
 
@@ -1098,7 +1180,9 @@ fn run() -> Result<i32> {
                         eprintln!("agent-sandbox: exposing ~/.gnupg with on-disk secret keys (--gpg-private).");
                         gnupg_mounts = launch::gnupg_public_mounts(&gnupg_home, true);
                     } else {
-                        eprintln!("agent-sandbox: not exposing ~/.gnupg -- it holds secret keys on disk:");
+                        eprintln!(
+                            "agent-sandbox: not exposing ~/.gnupg -- it holds secret keys on disk:"
+                        );
                         for offender in offenders {
                             eprintln!("               {}", offender.display());
                         }
@@ -1130,7 +1214,10 @@ fn run() -> Result<i32> {
                 env_args.push("AGENT_SANDBOX_GPG_AGENT=1".to_string());
             }
         } else {
-            eprintln!("agent-sandbox: --gpg requested but no gpg-agent socket at {}.", gpg_socket);
+            eprintln!(
+                "agent-sandbox: --gpg requested but no gpg-agent socket at {}.",
+                gpg_socket
+            );
         }
     } else {
         // Without a forwarded agent, signing can only fail: say so in config
@@ -1154,7 +1241,10 @@ fn run() -> Result<i32> {
         let devenv_dir = format!("{}/.local/share/devenv", home);
         fs::create_dir_all(&devenv_dir).unwrap_or(());
         mounts.push("-v".to_string());
-        mounts.push(format!("{}:/home/user/.local/share/devenv:{}", devenv_dir, rw_mount_opts));
+        mounts.push(format!(
+            "{}:/home/user/.local/share/devenv:{}",
+            devenv_dir, rw_mount_opts
+        ));
     }
 
     if want_nix {
@@ -1176,7 +1266,10 @@ fn run() -> Result<i32> {
             mounts.extend(m);
             env_args.extend(e);
         } else {
-            eprintln!("agent-sandbox: --podman requested but no socket at {}.", host_socket);
+            eprintln!(
+                "agent-sandbox: --podman requested but no socket at {}.",
+                host_socket
+            );
             eprintln!("               Start it with: systemctl --user start podman.socket");
         }
     }
@@ -1184,7 +1277,11 @@ fn run() -> Result<i32> {
     // ── Workspace ───────────────────────────────────────────────────────────
 
     let workspace_dir = if want_workspace {
-        let workspace_name = Path::new(&pwd).file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let workspace_name = Path::new(&pwd)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let dir = format!("/workspace/{}", workspace_name);
         mounts.push("-v".to_string());
         mounts.push(format!("{}:{}:{}", pwd, dir, rw_mount_opts));
@@ -1200,7 +1297,8 @@ fn run() -> Result<i32> {
 
     if want_ports && agents_md_path.exists() {
         let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
-        let declared = match agents::parse_ports(&text, want_ports_any_interface, agents::MAX_PORTS) {
+        let declared = match agents::parse_ports(&text, want_ports_any_interface, agents::MAX_PORTS)
+        {
             Ok(mappings) => mappings,
             Err(e) => {
                 eprintln!("agent-sandbox: {}", e);
@@ -1252,7 +1350,8 @@ fn run() -> Result<i32> {
     // default rootless networking untouched.
     let mut network_args: Vec<String> = Vec::new();
     if !published.is_empty() {
-        let network = env::var("AGENT_SANDBOX_NETWORK").unwrap_or_else(|_| "agent-sandbox".to_string());
+        let network =
+            env::var("AGENT_SANDBOX_NETWORK").unwrap_or_else(|_| "agent-sandbox".to_string());
         let exists = ProcessCommand::new("podman")
             .args(["network", "exists", &network])
             .status()
@@ -1265,7 +1364,10 @@ fn run() -> Result<i32> {
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             if !created {
-                fail(&format!("agent-sandbox: could not create the network {}", network));
+                fail(&format!(
+                    "agent-sandbox: could not create the network {}",
+                    network
+                ));
             }
         }
         network_args.push("--network".to_string());
@@ -1279,8 +1381,14 @@ fn run() -> Result<i32> {
 
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
-    let mut passwd_file = Builder::new().prefix("agent-sandbox-passwd-").tempfile().expect("Failed to create temporary passwd file");
-    let mut group_file = Builder::new().prefix("agent-sandbox-group-").tempfile().expect("Failed to create temporary group file");
+    let mut passwd_file = Builder::new()
+        .prefix("agent-sandbox-passwd-")
+        .tempfile()
+        .expect("Failed to create temporary passwd file");
+    let mut group_file = Builder::new()
+        .prefix("agent-sandbox-group-")
+        .tempfile()
+        .expect("Failed to create temporary group file");
     // World-readable like a real /etc/passwd (no secrets in it): the default
     // 0600 can end up unreadable to the container's mapped uid across extra
     // user-namespace layers, which surfaces as ssh/git failing to resolve
@@ -1294,19 +1402,30 @@ fn run() -> Result<i32> {
     writeln!(group_file, "user:x:{}:", gid).unwrap();
     writeln!(group_file, "nobody:x:65534:").unwrap();
     mounts.push("-v".to_string());
-    mounts.push(format!("{}:/etc/passwd:ro", passwd_file.path().to_string_lossy()));
+    mounts.push(format!(
+        "{}:/etc/passwd:ro",
+        passwd_file.path().to_string_lossy()
+    ));
     mounts.push("-v".to_string());
-    mounts.push(format!("{}:/etc/group:ro", group_file.path().to_string_lossy()));
+    mounts.push(format!(
+        "{}:/etc/group:ro",
+        group_file.path().to_string_lossy()
+    ));
 
     // Include the workspace and a short word in the container name so ctl can
     // identify sandboxes without guessing network/PID relationships.  The word
     // is the user-facing selector; the full podman name stays internal.
     let workspace_slug = launch::sanitize_workspace_slug(
-        &Path::new(&pwd).file_name().unwrap_or_default().to_string_lossy(),
+        &Path::new(&pwd)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
     );
     let existing = ctl::resolve::sandbox_containers_all().unwrap_or_default();
     let mut rng = rand::thread_rng();
-    let session_word = match launch::choose_session_word(&existing, || rng.gen_range(0..launch::SESSION_WORDS.len())) {
+    let session_word = match launch::choose_session_word(&existing, || {
+        rng.gen_range(0..launch::SESSION_WORDS.len())
+    }) {
         Some(word) => word,
         None => fail("agent-sandbox: could not allocate a unique session word"),
     };
@@ -1322,7 +1441,8 @@ fn run() -> Result<i32> {
         if let Ok(text) = fs::read_to_string(&agents_md_path) {
             match parse_proxy(&text) {
                 Ok(policy) => {
-                    policy_file_content = format_proxy_policy(&policy, &agents_md_path.to_string_lossy());
+                    policy_file_content =
+                        format_proxy_policy(&policy, &agents_md_path.to_string_lossy());
                     proxy_configured = !policy.allow_domains.is_empty()
                         || !policy.allow_ips.is_empty()
                         || !policy.allow_ports.is_empty()
@@ -1334,7 +1454,10 @@ fn run() -> Result<i32> {
                         eprintln!("agent-sandbox: {}", e);
                         return refuse("agent-sandbox: refusing to launch on an invalid [network] block (use --no-proxy to skip).");
                     } else {
-                        eprintln!("agent-sandbox: warning: invalid [network] block in AGENTS.md: {}", e);
+                        eprintln!(
+                            "agent-sandbox: warning: invalid [network] block in AGENTS.md: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -1359,9 +1482,14 @@ fn run() -> Result<i32> {
     // from the same image, and a missing one would surface as "could not start
     // the proxy sidecar", which sends you looking in the wrong place.
     if !image.is_empty() {
-        let status = ProcessCommand::new("podman").args(["image", "exists", &image]).status();
+        let status = ProcessCommand::new("podman")
+            .args(["image", "exists", &image])
+            .status();
         if status.map(|s| !s.success()).unwrap_or(true) {
-            fail(&format!("agent-sandbox: image {} not found. Run 'agent-sandbox ctl load' first.", image));
+            fail(&format!(
+                "agent-sandbox: image {} not found. Run 'agent-sandbox ctl load' first.",
+                image
+            ));
         }
     }
 
@@ -1392,7 +1520,13 @@ fn run() -> Result<i32> {
         // external name.  With DNS off there is no aardvark in the path and
         // --dns lands in resolv.conf verbatim.
         let net_created = ProcessCommand::new("podman")
-            .args(["network", "create", "--internal", "--disable-dns", &sidecar_id])
+            .args([
+                "network",
+                "create",
+                "--internal",
+                "--disable-dns",
+                &sidecar_id,
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -1408,14 +1542,23 @@ fn run() -> Result<i32> {
         // there.  Handing it its own internal-network subnet lets it bind only
         // the address it holds on that network.
         let sidecar_subnet = ProcessCommand::new("podman")
-            .args(["network", "inspect", &sidecar_id, "--format", "{{(index .Subnets 0).Subnet}}"])
+            .args([
+                "network",
+                "inspect",
+                &sidecar_id,
+                "--format",
+                "{{(index .Subnets 0).Subnet}}",
+            ])
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         if sidecar_subnet.is_empty() {
-            return refuse(&format!("agent-sandbox: could not determine the subnet of {}", sidecar_id));
+            return refuse(&format!(
+                "agent-sandbox: could not determine the subnet of {}",
+                sidecar_id
+            ));
         }
 
         // The policy file is the single channel by which policy reaches the
@@ -1434,10 +1577,16 @@ fn run() -> Result<i32> {
         }
 
         fs::write(format!("{}/policy", sidecar_policy), &policy_file_content)?;
-        fs::write(format!("{}/policy.baseline", sidecar_policy), &baseline_content)?;
+        fs::write(
+            format!("{}/policy.baseline", sidecar_policy),
+            &baseline_content,
+        )?;
         // Kept pristine so `ctl proxy reset` has something to restore and
         // `proxy show` can tell declared rules from ones added at runtime.
-        fs::write(format!("{}/policy.base", sidecar_policy), &policy_file_content)?;
+        fs::write(
+            format!("{}/policy.base", sidecar_policy),
+            &policy_file_content,
+        )?;
 
         if !launch::policy_has_allow_rules(&policy_file_content) {
             eprintln!("agent-sandbox: --proxy is active with no allow rules.");
@@ -1460,7 +1609,9 @@ fn run() -> Result<i32> {
                 Err(e) => return refuse(e.to_string().trim_end()),
             };
             if bindings.is_empty() {
-                eprintln!("agent-sandbox: --secrets resolved no bindings; nothing will be injected.");
+                eprintln!(
+                    "agent-sandbox: --secrets resolved no bindings; nothing will be injected."
+                );
             } else {
                 // Written 0600 and mounted read-only: the values never reach
                 // the sandbox, only the proxy that injects them.
@@ -1490,7 +1641,10 @@ fn run() -> Result<i32> {
             .args(["-e", &format!("SIDECAR_SUBNET={}", sidecar_subnet)])
             .args(&sidecar_extra_env)
             .args(["--label", "agent-sandbox.role=proxy"])
-            .args(["--label", &format!("agent-sandbox.target={}", container_name)]);
+            .args([
+                "--label",
+                &format!("agent-sandbox.target={}", container_name),
+            ]);
         if want_workspace {
             proxy_cmd.args(["--label", &format!("agent-sandbox.workspace={}", pwd)]);
         }
@@ -1518,13 +1672,22 @@ fn run() -> Result<i32> {
             // full 35s would bury the reason under a timeout that suggests a
             // network problem.
             let running = ProcessCommand::new("podman")
-                .args(["container", "inspect", "--format", "{{.State.Running}}", &sidecar_id])
+                .args([
+                    "container",
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    &sidecar_id,
+                ])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
                 .unwrap_or(false);
             if !running {
                 eprintln!("agent-sandbox: the proxy sidecar exited before signalling readiness:");
-                if let Ok(logs_out) = ProcessCommand::new("podman").args(["logs", &sidecar_id]).output() {
+                if let Ok(logs_out) = ProcessCommand::new("podman")
+                    .args(["logs", &sidecar_id])
+                    .output()
+                {
                     for line in String::from_utf8_lossy(&logs_out.stderr).lines() {
                         eprintln!("               {}", line);
                     }
@@ -1536,7 +1699,10 @@ fn run() -> Result<i32> {
 
         if !sidecar_ready {
             eprintln!("agent-sandbox: warning: proxy did not signal readiness in 35s");
-            eprintln!("               (continuing; check: podman logs {})", sidecar_id);
+            eprintln!(
+                "               (continuing; check: podman logs {})",
+                sidecar_id
+            );
         }
 
         let degraded_path = format!("{}/egress-degraded", sidecar_shared);
@@ -1547,7 +1713,9 @@ fn run() -> Result<i32> {
                     eprintln!("               {}", line);
                 }
             }
-            eprintln!("               (continuing; requests may fail. Full log: agent-sandbox ctl logs)");
+            eprintln!(
+                "               (continuing; requests may fail. Full log: agent-sandbox ctl logs)"
+            );
         }
 
         network_args.push("--network".to_string());
@@ -1562,7 +1730,10 @@ fn run() -> Result<i32> {
                     "container",
                     "inspect",
                     "--format",
-                    &format!("{{{{(index .NetworkSettings.Networks \"{}\").IPAddress}}}}", sidecar_id),
+                    &format!(
+                        "{{{{(index .NetworkSettings.Networks \"{}\").IPAddress}}}}",
+                        sidecar_id
+                    ),
                     &sidecar_id,
                 ])
                 .output();
@@ -1609,7 +1780,8 @@ fn run() -> Result<i32> {
             mounts.push("-v".to_string());
             mounts.push(format!("{}:/run/agent-sandbox-proxy-ca.pem:ro", ca_pem));
             env_args.push("-e".to_string());
-            env_args.push("AGENT_SANDBOX_PROXY_CA_FILE=/run/agent-sandbox-proxy-ca.pem".to_string());
+            env_args
+                .push("AGENT_SANDBOX_PROXY_CA_FILE=/run/agent-sandbox-proxy-ca.pem".to_string());
         }
     }
 
@@ -1655,8 +1827,14 @@ fn run() -> Result<i32> {
         podman_cmd.args(["--label", &format!("agent-sandbox.workspace={}", pwd)]);
     }
     podman_cmd.args(["--label", &format!("agent-sandbox.proxy={}", proxy_mode)]);
-    podman_cmd.args(["--label", &format!("agent-sandbox.runtime={}", sandbox_runtime)]);
-    podman_cmd.args(["--label", &format!("agent-sandbox.command={}", cmd_args.join(" "))]);
+    podman_cmd.args([
+        "--label",
+        &format!("agent-sandbox.runtime={}", sandbox_runtime),
+    ]);
+    podman_cmd.args([
+        "--label",
+        &format!("agent-sandbox.command={}", cmd_args.join(" ")),
+    ]);
     podman_cmd.args(["--workdir", &workspace_dir]);
 
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.config,U=true"]);
@@ -1672,7 +1850,10 @@ fn run() -> Result<i32> {
     }
 
     podman_cmd.arg("-e");
-    podman_cmd.arg(format!("TERM={}", env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string())));
+    podman_cmd.arg(format!(
+        "TERM={}",
+        env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string())
+    ));
     if let Ok(colorterm) = env::var("COLORTERM") {
         if !colorterm.is_empty() {
             podman_cmd.arg("-e");
@@ -1711,10 +1892,22 @@ mod tests {
     #[test]
     fn expand_v_roots_relative_paths_in_the_workspace() {
         let cwd = Path::new("/home/ada/repo");
-        assert_eq!(expand_v("data:/workspace/data", cwd, "/home/ada"), "/home/ada/repo/data:/workspace/data");
-        assert_eq!(expand_v("cache:tmp:ro", cwd, "/home/ada"), "/home/ada/repo/cache:/workspace/tmp:ro");
-        assert_eq!(expand_v("~/.cache/x:/cache", cwd, "/home/ada"), "/home/ada/.cache/x:/cache");
-        assert_eq!(expand_v("/etc/hosts", cwd, "/home/ada"), "/etc/hosts:/etc/hosts");
+        assert_eq!(
+            expand_v("data:/workspace/data", cwd, "/home/ada"),
+            "/home/ada/repo/data:/workspace/data"
+        );
+        assert_eq!(
+            expand_v("cache:tmp:ro", cwd, "/home/ada"),
+            "/home/ada/repo/cache:/workspace/tmp:ro"
+        );
+        assert_eq!(
+            expand_v("~/.cache/x:/cache", cwd, "/home/ada"),
+            "/home/ada/.cache/x:/cache"
+        );
+        assert_eq!(
+            expand_v("/etc/hosts", cwd, "/home/ada"),
+            "/etc/hosts:/etc/hosts"
+        );
     }
 
     #[test]
@@ -1724,7 +1917,10 @@ mod tests {
         assert_eq!(enforce_selinux_mount_flags("/a:/b:ro", false), "/a:/b:ro");
         assert_eq!(enforce_selinux_mount_flags("/a:/b:ro,z", false), "/a:/b:ro");
         // Already labeled: not labeled twice.
-        assert_eq!(enforce_selinux_mount_flags("/a:/b:rw,Z", true), "/a:/b:rw,Z");
+        assert_eq!(
+            enforce_selinux_mount_flags("/a:/b:rw,Z", true),
+            "/a:/b:rw,Z"
+        );
     }
 
     #[test]
@@ -1746,10 +1942,16 @@ mod tests {
         let mut guard = CleanupGuard::new();
         guard.session_word = "teapot".to_string();
         let name = guard.log_file_name();
-        assert!(name.starts_with("agent-sandbox-connections-teapot-"), "{}", name);
+        assert!(
+            name.starts_with("agent-sandbox-connections-teapot-"),
+            "{}",
+            name
+        );
         assert!(name.ends_with(".jsonl"), "{}", name);
 
         // A guard that never got a word still produces a usable name.
-        assert!(CleanupGuard::new().log_file_name().starts_with("agent-sandbox-connections-session-"));
+        assert!(CleanupGuard::new()
+            .log_file_name()
+            .starts_with("agent-sandbox-connections-session-"));
     }
 }

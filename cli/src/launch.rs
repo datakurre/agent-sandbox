@@ -31,7 +31,10 @@ fn env(name: &str, value: &str) -> Vec<String> {
 /// The agent socket is bound at a fixed path: the entrypoint keys its
 /// `known_hosts` seeding off `/agent.sock` existing.
 pub fn ssh_direct(sock: &str, rw: &str) -> (Vec<String>, Vec<String>) {
-    (bind(sock, "/agent.sock", rw), env("SSH_AUTH_SOCK", "/agent.sock"))
+    (
+        bind(sock, "/agent.sock", rw),
+        env("SSH_AUTH_SOCK", "/agent.sock"),
+    )
 }
 
 // ── Git ─────────────────────────────────────────────────────────────────────
@@ -92,7 +95,10 @@ pub fn git_config_env(pairs: &[(String, String)]) -> Vec<String> {
             continue;
         }
         out.extend(env(&format!("AGENT_SANDBOX_GIT_CONFIG_KEY_{}", count), key));
-        out.extend(env(&format!("AGENT_SANDBOX_GIT_CONFIG_VALUE_{}", count), value));
+        out.extend(env(
+            &format!("AGENT_SANDBOX_GIT_CONFIG_VALUE_{}", count),
+            value,
+        ));
         count += 1;
     }
     let mut prefixed = env("AGENT_SANDBOX_GIT_CONFIG_COUNT", &count.to_string());
@@ -157,7 +163,11 @@ pub fn gnupg_public_mounts(gnupg_home: &Path, want_private: bool) -> Vec<String>
 /// Multi-user nix delegates builds to the host daemon over its socket, so the
 /// store can stay read-only.  Single-user nix has no daemon, so the whole tree
 /// is overlaid instead and the container writes into the upper layer.
-pub fn nix_mounts(daemon_socket_is_socket: bool, store_exists: bool, rw: &str) -> (Vec<String>, Vec<String>) {
+pub fn nix_mounts(
+    daemon_socket_is_socket: bool,
+    store_exists: bool,
+    rw: &str,
+) -> (Vec<String>, Vec<String>) {
     let mut mounts = Vec::new();
     let mut envs = Vec::new();
     if daemon_socket_is_socket {
@@ -210,13 +220,70 @@ pub fn krun_args(runtime: &str, ram_mib: &str, cpus: &str) -> Vec<String> {
 /// is the selector every `agent-sandbox ctl` command accepts.  Keep the pool
 /// deliberately larger than the usual number of concurrent sandboxes.
 pub const SESSION_WORDS: &[&str] = &[
-    "autumn", "hidden", "bitter", "misty", "silent", "empty", "dry", "dark", "summer", "icy",
-    "delicate", "quiet", "white", "cool", "spring", "winter", "patient", "twilight", "dawn",
-    "crimson", "wispy", "weathered", "blue", "billowing", "broken", "cold", "damp", "falling",
-    "frosty", "green", "long", "late", "lingering", "bold", "little", "morning", "muddy", "old",
-    "red", "rough", "still", "small", "sparkling", "throbbing", "shy", "wandering", "withered",
-    "wild", "black", "young", "holy", "solitary", "fragrant", "aged", "snowy", "proud", "floral",
-    "restless", "divine", "polished", "ancient", "purple", "lively", "nameless",
+    "autumn",
+    "hidden",
+    "bitter",
+    "misty",
+    "silent",
+    "empty",
+    "dry",
+    "dark",
+    "summer",
+    "icy",
+    "delicate",
+    "quiet",
+    "white",
+    "cool",
+    "spring",
+    "winter",
+    "patient",
+    "twilight",
+    "dawn",
+    "crimson",
+    "wispy",
+    "weathered",
+    "blue",
+    "billowing",
+    "broken",
+    "cold",
+    "damp",
+    "falling",
+    "frosty",
+    "green",
+    "long",
+    "late",
+    "lingering",
+    "bold",
+    "little",
+    "morning",
+    "muddy",
+    "old",
+    "red",
+    "rough",
+    "still",
+    "small",
+    "sparkling",
+    "throbbing",
+    "shy",
+    "wandering",
+    "withered",
+    "wild",
+    "black",
+    "young",
+    "holy",
+    "solitary",
+    "fragrant",
+    "aged",
+    "snowy",
+    "proud",
+    "floral",
+    "restless",
+    "divine",
+    "polished",
+    "ancient",
+    "purple",
+    "lively",
+    "nameless",
 ];
 
 pub fn sanitize_workspace_slug(basename: &str) -> String {
@@ -330,11 +397,16 @@ mod tests {
         assert_eq!(
             git_config_env(&pairs),
             vec![
-                "-e", "AGENT_SANDBOX_GIT_CONFIG_COUNT=2",
-                "-e", "AGENT_SANDBOX_GIT_CONFIG_KEY_0=user.name",
-                "-e", "AGENT_SANDBOX_GIT_CONFIG_VALUE_0=Ada",
-                "-e", "AGENT_SANDBOX_GIT_CONFIG_KEY_1=user.email",
-                "-e", "AGENT_SANDBOX_GIT_CONFIG_VALUE_1=ada@example.com",
+                "-e",
+                "AGENT_SANDBOX_GIT_CONFIG_COUNT=2",
+                "-e",
+                "AGENT_SANDBOX_GIT_CONFIG_KEY_0=user.name",
+                "-e",
+                "AGENT_SANDBOX_GIT_CONFIG_VALUE_0=Ada",
+                "-e",
+                "AGENT_SANDBOX_GIT_CONFIG_KEY_1=user.email",
+                "-e",
+                "AGENT_SANDBOX_GIT_CONFIG_VALUE_1=ada@example.com",
             ]
         );
     }
@@ -354,10 +426,14 @@ mod tests {
         assert_eq!(
             git_identity_env(&pairs),
             vec![
-                "-e", "GIT_AUTHOR_NAME=Ada",
-                "-e", "GIT_COMMITTER_NAME=Ada",
-                "-e", "GIT_AUTHOR_EMAIL=ada@example.com",
-                "-e", "GIT_COMMITTER_EMAIL=ada@example.com",
+                "-e",
+                "GIT_AUTHOR_NAME=Ada",
+                "-e",
+                "GIT_COMMITTER_NAME=Ada",
+                "-e",
+                "GIT_AUTHOR_EMAIL=ada@example.com",
+                "-e",
+                "GIT_COMMITTER_EMAIL=ada@example.com",
             ]
         );
         assert!(git_identity_env(&parse_git_config_null("user.email\n\0")).is_empty());
@@ -366,7 +442,10 @@ mod tests {
     #[test]
     fn ssh_socket_lands_on_the_path_the_entrypoint_probes() {
         let (mounts, envs) = ssh_direct("/run/user/1000/keyring/ssh", "rw");
-        assert_eq!(mounts, vec!["-v", "/run/user/1000/keyring/ssh:/agent.sock:rw"]);
+        assert_eq!(
+            mounts,
+            vec!["-v", "/run/user/1000/keyring/ssh:/agent.sock:rw"]
+        );
         assert_eq!(envs, vec!["-e", "SSH_AUTH_SOCK=/agent.sock"]);
     }
 
@@ -434,7 +513,9 @@ mod tests {
     #[test]
     fn allow_rules_are_detected_only_from_domains_and_ips() {
         assert!(policy_has_allow_rules("allow_domains github.com\n"));
-        assert!(policy_has_allow_rules("deny_ips 10.0.0.0/8\nallow_ips 1.2.3.4\n"));
+        assert!(policy_has_allow_rules(
+            "deny_ips 10.0.0.0/8\nallow_ips 1.2.3.4\n"
+        ));
         assert!(!policy_has_allow_rules("allow_ports 443\ndefault deny\n"));
     }
 

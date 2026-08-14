@@ -63,6 +63,9 @@ mod tests {
         assert!(glob_match("/foo/bar", "/**"));
         assert!(!glob_match("/foo/bar/baz", "/*/*"));
         assert!(glob_match("/foo/bar/baz", "/*/**"));
-        assert!(glob_match("/user/repo.git/git-upload-pack", "/*/*.git/git-upload-pack"));
+        assert!(glob_match(
+            "/user/repo.git/git-upload-pack",
+            "/*/*.git/git-upload-pack"
+        ));
     }
 }

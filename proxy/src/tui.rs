@@ -8,7 +8,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Paragraph, Row, Table, TableState, Wrap},
     Terminal,
 };
 use serde::Deserialize;
@@ -38,12 +38,12 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// A line from `connections.jsonl`. Only the id-less lines with
-/// `verdict:"deny"` matter here — an outright deny before any tunnel opened
-/// (see the doc comment on `MetricsLog` in `main.rs`).
+/// A line from `connections.jsonl`. Denials can be id-less when rejected before
+/// a tunnel opens, or `close` events when an L7 request is rejected after MITM.
 #[derive(Deserialize, Debug, Clone)]
 struct ConnEvent {
     ev: Option<String>,
+    id: Option<String>,
     verdict: Option<String>,
     host: Option<String>,
     port: Option<u16>,
@@ -55,6 +55,45 @@ struct ConnEvent {
     pub path: Option<String>,
     pub status: Option<u16>,
     ts: Option<u64>,
+}
+
+fn is_denied_event(ev: &ConnEvent) -> bool {
+    ev.verdict.as_deref() == Some("deny") && (ev.ev.is_none() || ev.ev.as_deref() == Some("close"))
+}
+
+fn is_connection_event(ev: &ConnEvent) -> bool {
+    ev.ev.as_deref() != Some("policy") && ev.host.is_some() && ev.port.is_some()
+}
+
+/// Correlate open/close events while retaining id-less terminal events.
+fn ingest_connection_event(connections: &mut Vec<ConnEvent>, event: ConnEvent) {
+    if !is_connection_event(&event) {
+        return;
+    }
+
+    if let Some(id) = event.id.as_deref() {
+        if let Some(existing) = connections
+            .iter_mut()
+            .find(|entry| entry.id.as_deref() == Some(id))
+        {
+            *existing = event;
+        } else {
+            connections.push(event);
+        }
+    } else {
+        connections.push(event);
+    }
+
+    if connections.len() > MAX_CONNECTION_ROWS {
+        if let Some(oldest) = connections
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.ts.unwrap_or(0))
+            .map(|(index, _)| index)
+        {
+            connections.remove(oldest);
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -93,6 +132,7 @@ impl DeniedEntry {
 /// `connections.jsonl` has no size cap, so the in-memory denied set doesn't
 /// either unless bounded here.
 const MAX_DENIED_ROWS: usize = 200;
+const MAX_CONNECTION_ROWS: usize = 200;
 const MAX_DETAIL_BYTES_PER_ROW: usize = 16 * 1024;
 
 /// Whether `h` (allow HTTP route) makes sense for this row: only once a real
@@ -134,6 +174,7 @@ impl StatusKind {
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Requests,
+    Connections,
     Rules,
 }
 
@@ -158,9 +199,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut denied_reqs: HashMap<(String, u16), DeniedEntry> = HashMap::new();
+    let mut connections: Vec<ConnEvent> = Vec::new();
     let mut view = View::Requests;
     let mut selected_idx = 0;
     let mut table_state = TableState::default();
+    let mut connections_selected_idx = 0;
+    let mut connections_table_state = TableState::default();
     let mut rules_selected_idx = 0;
     let mut rules_table_state = TableState::default();
     let mut status_msg = String::new();
@@ -189,22 +233,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(ref mut reader) = conn_file {
             if let Ok(meta) = reader.get_ref().metadata() {
-                if meta.len() < conn_pos { conn_pos = 0; }
+                if meta.len() < conn_pos {
+                    conn_pos = 0;
+                }
             }
             let _ = reader.seek(SeekFrom::Start(conn_pos));
             let mut line = String::new();
             while let Ok(n) = reader.read_line(&mut line) {
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 if !line.ends_with('\n') {
                     let _ = reader.seek(SeekFrom::Current(-(line.len() as i64)));
                     break;
                 }
                 if let Ok(ev) = serde_json::from_str::<ConnEvent>(&line) {
-                    // An outright deny before any tunnel opened: no `ev`/`id`
-                    // on the line (see the doc comment on `MetricsLog` in
-                    // main.rs). Open/close events are filtered out by
-                    // requiring `ev` to be absent.
-                    if ev.ev.is_none() && ev.verdict.as_deref() == Some("deny") {
+                    ingest_connection_event(&mut connections, ev.clone());
+                    // Include pre-tunnel denials and L7 denials emitted as a
+                    // terminal close event. Allowed close events remain out.
+                    if is_denied_event(&ev) {
                         if let (Some(host), Some(port)) = (ev.host.clone(), ev.port) {
                             let ts = ev.ts.unwrap_or_else(now_secs);
                             let key = (host.clone(), port);
@@ -220,8 +267,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
                             entry.count += 1;
                             entry.last_seen = ts;
-                            if ev.err.is_some() { entry.reason = ev.err.clone(); }
-                            if ev.method.is_some() { entry.method = ev.method.clone(); }
+                            if ev.err.is_some() {
+                                entry.reason = ev.err.clone();
+                            }
+                            if ev.method.is_some() {
+                                entry.method = ev.method.clone();
+                            }
                             if is_new && denied_reqs.len() > MAX_DENIED_ROWS {
                                 if let Some(oldest) = denied_reqs
                                     .iter()
@@ -248,35 +299,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(ref mut reader) = details_file {
             if let Ok(meta) = reader.get_ref().metadata() {
-                if meta.len() < details_pos { details_pos = 0; }
+                if meta.len() < details_pos {
+                    details_pos = 0;
+                }
             }
             let _ = reader.seek(SeekFrom::Start(details_pos));
             let mut line = String::new();
             while let Ok(n) = reader.read_line(&mut line) {
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 if !line.ends_with('\n') {
                     let _ = reader.seek(SeekFrom::Current(-(line.len() as i64)));
                     break;
                 }
                 if let Ok(ev) = serde_json::from_str::<DetailEvent>(&line) {
                     if let Some(entry) = denied_reqs.get_mut(&(ev.host, ev.port)) {
-                        entry.detail = Some(format!("Reason: {}\n\n{}", ev.reason,
-                            ev.request.chars().take(MAX_DETAIL_BYTES_PER_ROW).collect::<String>()));
+                        entry.detail = Some(format!(
+                            "Reason: {}\n\n{}",
+                            ev.reason,
+                            ev.request
+                                .chars()
+                                .take(MAX_DETAIL_BYTES_PER_ROW)
+                                .collect::<String>()
+                        ));
                         entry.reason = Some(ev.reason.clone());
                     }
                 }
                 line.clear();
             }
-            if let Ok(pos) = reader.stream_position() { details_pos = pos; }
+            if let Ok(pos) = reader.stream_position() {
+                details_pos = pos;
+            }
         }
 
         let mut denied_list: Vec<DeniedEntry> = denied_reqs.values().cloned().collect();
         denied_list.sort_by_key(|d| std::cmp::Reverse(d.last_seen));
+        let mut connections_list = connections.clone();
+        connections_list.sort_by_key(|entry| std::cmp::Reverse(entry.ts.unwrap_or(0)));
 
         // Only loaded while the Rules view is active — cheap either way (a
         // small file, and this loop already re-reads connections.jsonl at
         // ~10Hz), but no point parsing it every frame when it's not shown.
-        let (policy_lines, base_lines, baseline_lines): (Vec<String>, HashSet<String>, HashSet<String>) = if view == View::Rules {
+        let (policy_lines, base_lines, baseline_lines): (
+            Vec<String>,
+            HashSet<String>,
+            HashSet<String>,
+        ) = if view == View::Rules {
             let lines = load_policy_lines(sidecar_policy);
             let base = fs::read_to_string(format!("{}/policy.base", sidecar_policy))
                 .map(|s| s.lines().map(|l| l.to_string()).collect())
@@ -312,10 +381,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match view {
                 View::Requests => {
                     if show_detail {
-                        let text = denied_list.get(selected_idx)
-                            .and_then(|d| d.detail.as_deref())
-                            .unwrap_or("No detailed request is available for this denial yet.");
+                        let mut text = denied_list.get(selected_idx)
+                            .and_then(|d| d.detail.clone())
+                            .unwrap_or_else(|| "No detailed request is available for this denial yet.".to_string());
+                        if let Some(row) = denied_list.get(selected_idx) {
+                            if row.method.as_deref() == Some("CONNECT") {
+                                text.push_str(&format!(
+                                    "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.rules]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
+                                    row.host, row.port
+                                ));
+                            }
+                        }
                         let detail = Paragraph::new(text)
+                            .wrap(Wrap { trim: false })
                             .scroll((detail_scroll, 0))
                             .block(Block::default().borders(Borders::ALL).title("Denied Request Details (redacted)"));
                         f.render_widget(detail, chunks[1]);
@@ -363,6 +441,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .block(Block::default().borders(Borders::ALL).title(format!("Denied Requests ({})", denied_list.len())));
                         f.render_stateful_widget(table, chunks[1], &mut table_state);
+                    }
+                }
+                View::Connections => {
+                    if connections_list.is_empty() {
+                        let p = Paragraph::new("No connections yet. Waiting for sandbox egress...")
+                            .style(Style::default().fg(Color::DarkGray))
+                            .block(Block::default().borders(Borders::ALL).title("Connections (0)"));
+                        f.render_widget(p, chunks[1]);
+                        connections_selected_idx = 0;
+                        connections_table_state.select(None);
+                    } else {
+                        if connections_selected_idx >= connections_list.len() {
+                            connections_selected_idx = connections_list.len().saturating_sub(1);
+                        }
+                        connections_table_state.select(Some(connections_selected_idx));
+
+                        let rows = connections_list.iter().enumerate().map(|(i, ev)| {
+                            let method = ev.method.as_deref().unwrap_or("");
+                            let state = if ev.ev.as_deref() == Some("open") {
+                                "OPEN".to_string()
+                            } else {
+                                ev.verdict.as_deref().unwrap_or("?").to_ascii_uppercase()
+                            };
+                            let target = match (&ev.host, ev.path.as_deref()) {
+                                (Some(host), Some(path)) => format!("{}:{}{}", host, ev.port.unwrap_or(0), path),
+                                (Some(host), None) => format!("{}:{}", host, ev.port.unwrap_or(0)),
+                                _ => "?".to_string(),
+                            };
+                            let mut info = Vec::new();
+                            if let Some(status) = ev.status { info.push(format!("HTTP {}", status)); }
+                            if let Some(err) = &ev.err { info.push(err.clone()); }
+                            if ev.ev.as_deref() != Some("open") {
+                                info.push(format!("up {} / down {} / {}ms", ev.up.unwrap_or(0), ev.down.unwrap_or(0), ev.ms.unwrap_or(0)));
+                            }
+                            let style = if i == connections_selected_idx { selected_style } else { normal_style };
+                            let state_style = match state.as_str() {
+                                "ALLOW" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                                "DENY" | "ERROR" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                                "OPEN" => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                _ => Style::default().fg(Color::Yellow),
+                            };
+                            Row::new(vec![
+                                ratatui::text::Span::styled(state, state_style),
+                                ratatui::text::Span::raw(method.to_string()),
+                                ratatui::text::Span::raw(target),
+                                ratatui::text::Span::raw(info.join(", ")),
+                            ]).style(style)
+                        });
+
+                        let table = Table::new(
+                            rows,
+                            [Constraint::Length(8), Constraint::Length(9), Constraint::Percentage(38), Constraint::Percentage(42)],
+                        )
+                        .header(
+                            Row::new(vec!["State", "Method", "Destination", "Info"])
+                                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+                        )
+                        .block(Block::default().borders(Borders::ALL).title(format!("Connections ({})", connections_list.len())));
+                        f.render_stateful_widget(table, chunks[1], &mut connections_table_state);
                     }
                 }
                 View::Rules => {
@@ -413,7 +550,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let legend_text = match view {
                 View::Requests if show_detail => "↑/↓ scroll   [d]/[Esc] Back   [q] Quit",
-                View::Requests => "↑/↓ select   [d] Details   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[r] Rules view   [c] Clear   [q]/[Esc] Quit",
+                View::Requests => "↑/↓ select   [d] Details   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[v] Connections view   [r] Rules view   [c] Clear   [q]/[Esc] Quit",
+                View::Connections => "↑/↓ select   [v] Denied requests   [r] Rules view   [q]/[Esc] Quit",
                 View::Rules => "↑/↓ select   [x] Remove rule (blocked for built-in/AGENTS.md rules)\n[r] Requests view   [q]/[Esc] Quit",
             };
             let instructions = Paragraph::new(legend_text)
@@ -433,26 +571,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Esc if show_detail => { show_detail = false; detail_scroll = 0; }
+                    KeyCode::Esc if show_detail => {
+                        show_detail = false;
+                        detail_scroll = 0;
+                    }
                     KeyCode::Esc => break,
                     KeyCode::Up => match view {
-                        View::Requests if show_detail => detail_scroll = detail_scroll.saturating_sub(1),
+                        View::Requests if show_detail => {
+                            detail_scroll = detail_scroll.saturating_sub(1)
+                        }
                         View::Requests => selected_idx = selected_idx.saturating_sub(1),
+                        View::Connections => {
+                            connections_selected_idx = connections_selected_idx.saturating_sub(1)
+                        }
                         View::Rules => rules_selected_idx = rules_selected_idx.saturating_sub(1),
                     },
                     KeyCode::Down => match view {
-                        View::Requests if show_detail => detail_scroll = detail_scroll.saturating_add(1),
+                        View::Requests if show_detail => {
+                            detail_scroll = detail_scroll.saturating_add(1)
+                        }
                         View::Requests => {
-                            selected_idx = (selected_idx + 1).min(denied_list.len().saturating_sub(1));
+                            selected_idx =
+                                (selected_idx + 1).min(denied_list.len().saturating_sub(1));
+                        }
+                        View::Connections => {
+                            connections_selected_idx = (connections_selected_idx + 1)
+                                .min(connections_list.len().saturating_sub(1));
                         }
                         View::Rules => {
-                            rules_selected_idx = (rules_selected_idx + 1).min(policy_lines.len().saturating_sub(1));
+                            rules_selected_idx =
+                                (rules_selected_idx + 1).min(policy_lines.len().saturating_sub(1));
                         }
                     },
                     KeyCode::Char('r') => {
                         view = match view {
-                            View::Requests => View::Rules,
                             View::Rules => View::Requests,
+                            _ => View::Rules,
+                        };
+                    }
+                    KeyCode::Char('v') if !show_detail => {
+                        view = match view {
+                            View::Requests => View::Connections,
+                            View::Connections => View::Requests,
+                            View::Rules => View::Connections,
                         };
                     }
                     KeyCode::Char('c') if view == View::Requests => {
@@ -464,7 +625,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         show_detail = !show_detail;
                         detail_scroll = 0;
                     }
-                    KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('h') if view == View::Requests && !show_detail => {
+                    KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('h')
+                        if view == View::Requests && !show_detail =>
+                    {
                         if !denied_list.is_empty() && selected_idx < denied_list.len() {
                             let row = &denied_list[selected_idx];
                             let host = row.host.clone();
@@ -532,7 +695,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('x') if view == View::Rules => {
                         if let Some(line) = policy_lines.get(rules_selected_idx) {
                             if base_lines.contains(line) {
-                                let label = if baseline_lines.contains(line) { "built-in" } else { "AGENTS.md's baseline" };
+                                let label = if baseline_lines.contains(line) {
+                                    "built-in"
+                                } else {
+                                    "AGENTS.md's baseline"
+                                };
                                 status_msg = format!(
                                     "'{}' comes from {} policy and can't be removed here — edit AGENTS.md and relaunch, or `agent-sandbox ctl proxy reset` first",
                                     line, label
@@ -561,4 +728,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ingest_connection_event, is_denied_event, ConnEvent};
+
+    fn event(ev: Option<&str>, verdict: Option<&str>) -> ConnEvent {
+        ConnEvent {
+            ev: ev.map(str::to_string),
+            id: None,
+            verdict: verdict.map(str::to_string),
+            host: None,
+            port: None,
+            err: None,
+            up: None,
+            down: None,
+            ms: None,
+            method: None,
+            path: None,
+            status: None,
+            ts: None,
+        }
+    }
+
+    #[test]
+    fn includes_l7_denial_close_events() {
+        assert!(is_denied_event(&event(Some("close"), Some("deny"))));
+        assert!(is_denied_event(&event(None, Some("deny"))));
+        assert!(!is_denied_event(&event(Some("close"), Some("allow"))));
+        assert!(!is_denied_event(&event(Some("open"), Some("deny"))));
+    }
+
+    fn connection(ev: &str, id: Option<&str>, ts: u64) -> ConnEvent {
+        ConnEvent {
+            ev: Some(ev.to_string()),
+            id: id.map(str::to_string),
+            verdict: if ev == "close" {
+                Some("allow".to_string())
+            } else {
+                None
+            },
+            host: Some("example.com".to_string()),
+            port: Some(443),
+            err: None,
+            up: Some(10),
+            down: Some(20),
+            ms: Some(5),
+            method: None,
+            path: None,
+            status: None,
+            ts: Some(ts),
+        }
+    }
+
+    #[test]
+    fn correlates_open_and_close_events() {
+        let mut connections = Vec::new();
+        ingest_connection_event(&mut connections, connection("open", Some("1"), 1));
+        ingest_connection_event(&mut connections, connection("close", Some("1"), 2));
+
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].ev.as_deref(), Some("close"));
+        assert_eq!(connections[0].id.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn retains_idless_terminal_events() {
+        let mut connections = Vec::new();
+        ingest_connection_event(&mut connections, connection("close", None, 1));
+
+        assert_eq!(connections.len(), 1);
+        assert!(connections[0].id.is_none());
+    }
 }

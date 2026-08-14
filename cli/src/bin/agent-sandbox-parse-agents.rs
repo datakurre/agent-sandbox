@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
+use agent_sandbox_cli::agents::{
+    allocate, format_proxy_policy, parse_mounts, parse_ports, parse_proxy, MAX_PORTS,
+};
 use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use agent_sandbox_cli::agents::{
-    allocate, format_proxy_policy, parse_mounts, parse_ports, parse_proxy, MAX_PORTS,
-};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -23,7 +23,10 @@ struct Args {
     #[arg(long, default_value_t = MAX_PORTS, help = "cap on mappings (default 32)")]
     max: usize,
 
-    #[arg(long = "no-allocate", help = "leave `host = 0` unresolved instead of picking a free port")]
+    #[arg(
+        long = "no-allocate",
+        help = "leave `host = 0` unresolved instead of picking a free port"
+    )]
     no_allocate: bool,
 
     #[arg(

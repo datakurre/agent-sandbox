@@ -1,9 +1,9 @@
 use super::resolve::*;
 use anyhow::Result;
 use clap::Parser;
-use std::process::Command;
 use std::env;
 use std::io::{BufRead, BufReader};
+use std::process::Command;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -12,7 +12,11 @@ use std::io::{BufRead, BufReader};
     after_help = "The PROXY column is the launch mode: proxy or off."
 )]
 pub struct ListArgs {
-    #[arg(short, long, help = "every sandbox, any workspace, including stopped ones")]
+    #[arg(
+        short,
+        long,
+        help = "every sandbox, any workspace, including stopped ones"
+    )]
     pub all: bool,
 
     #[arg(long, help = "also list the proxy sidecars and port forwarders")]
@@ -31,7 +35,7 @@ fn list_sandboxes(args: &[&str]) -> Result<()> {
         cmd.arg(a);
     }
     cmd.arg("--format").arg("{{.ID}}\t{{.Names}}\t{{.Status}}");
-    
+
     let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
@@ -47,10 +51,11 @@ fn list_sandboxes(args: &[&str]) -> Result<()> {
                 let mut cmd_label = container_label(name, "agent-sandbox.command");
                 if cmd_label.is_empty() {
                     let mut inspect = Command::new("podman");
-                    inspect.arg("inspect")
-                           .arg("--format")
-                           .arg("{{range .Config.Cmd}}{{.}} {{end}}")
-                           .arg(name);
+                    inspect
+                        .arg("inspect")
+                        .arg("--format")
+                        .arg("{{range .Config.Cmd}}{{.}} {{end}}")
+                        .arg(name);
                     if let Ok(out) = inspect.output() {
                         cmd_label = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     }
@@ -60,8 +65,11 @@ fn list_sandboxes(args: &[&str]) -> Result<()> {
                     runtime = "crun".to_string();
                 }
                 let proxy = container_label(name, "agent-sandbox.proxy");
-                
-                println!("{}\t{}\t{}\t{}\t{}\t{}\t{}", id, short_name, status, proxy, runtime, ws, cmd_label);
+
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    id, short_name, status, proxy, runtime, ws, cmd_label
+                );
             }
         }
     }
@@ -77,7 +85,7 @@ fn list_role(args: &[&str]) -> Result<()> {
         cmd.arg(a);
     }
     cmd.arg("--format").arg("{{.ID}}\t{{.Names}}\t{{.Status}}");
-    
+
     let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
@@ -118,14 +126,13 @@ pub fn run(args: ListArgs) -> Result<()> {
         if args.all {
             ps_args.push("-a");
         }
-        
+
         println!("\nProxy sidecars:");
         let mut proxy_args = ps_args.clone();
         proxy_args.push("--filter");
         proxy_args.push("label=agent-sandbox.role=proxy");
         list_role(&proxy_args)?;
-
     }
-    
+
     Ok(())
 }

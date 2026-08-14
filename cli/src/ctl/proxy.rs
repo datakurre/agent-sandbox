@@ -29,7 +29,9 @@ pub enum ProxyCommand {
     Reset(TargetArgs),
     #[command(about = "Print the current policy as an AGENTS.md [network] TOML block")]
     Export(TargetArgs),
-    #[command(about = "Check whether a host (and optionally port) would be allowed under the current policy")]
+    #[command(
+        about = "Check whether a host (and optionally port) would be allowed under the current policy"
+    )]
     Check(CheckArgs),
 }
 
@@ -45,7 +47,11 @@ pub struct TargetArgs {
 pub struct AllowArgs {
     #[arg(help = "Domain name, IP/CIDR, or port/port-range to allow")]
     pub target: String,
-    #[arg(long, value_name = "METHOD", help = "Allow an HTTP route on TARGET instead of the whole domain (combine with --path)")]
+    #[arg(
+        long,
+        value_name = "METHOD",
+        help = "Allow an HTTP route on TARGET instead of the whole domain (combine with --path)"
+    )]
     pub l7: Option<String>,
     #[arg(long, default_value = "/*", help = "Path pattern for --l7")]
     pub path: String,
@@ -112,7 +118,10 @@ fn policy_dir(word: &Option<String>, sandbox: &Option<String>) -> Result<(String
     let sidecar = require_sidecar(&sandbox_name)?;
     let dir = sidecar_mount(&sidecar, "/sidecar_policy")?;
     if dir.is_empty() {
-        eprintln!("agent-sandbox ctl proxy: cannot find the policy mount for sandbox '{}'", sandbox_name);
+        eprintln!(
+            "agent-sandbox ctl proxy: cannot find the policy mount for sandbox '{}'",
+            sandbox_name
+        );
         std::process::exit(1);
     }
     Ok((sandbox_name, dir))
@@ -199,13 +208,23 @@ fn show(args: TargetArgs) -> Result<()> {
     println!("  default     {}", default_desc);
 
     for line in &lines {
-        let Some((key, value)) = line.split_once(char::is_whitespace) else { continue };
+        let Some((key, value)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
         if key == "default" {
             continue;
         }
         let value = value.trim();
-        let display_value = if key == "allow_l7" { value.replace('\t', " ") } else { value.to_string() };
-        let source = if base_lines.contains(line) { "AGENTS.md" } else { "" };
+        let display_value = if key == "allow_l7" {
+            value.replace('\t', " ")
+        } else {
+            value.to_string()
+        };
+        let source = if base_lines.contains(line) {
+            "AGENTS.md"
+        } else {
+            ""
+        };
         println!("  {:<13} {:<34} {}", key, display_value, source);
     }
     Ok(())
@@ -235,12 +254,22 @@ fn allow(args: AllowArgs) -> Result<()> {
     let mut lines = load_policy_lines(&dir);
     if let Some(method) = args.l7 {
         if is_ip_or_cidr(&args.target) {
-            eprintln!("agent-sandbox ctl proxy: --l7 needs a domain, not an IP/CIDR ('{}')", args.target);
+            eprintln!(
+                "agent-sandbox ctl proxy: --l7 needs a domain, not an IP/CIDR ('{}')",
+                args.target
+            );
             std::process::exit(1);
         }
         warn_if_no_session_ca(&dir, &args.target);
-        lines.push(format!("allow_l7\t{}\t{}\t{}", args.target, method, args.path));
-        println!("  allowed     {:<34} {}", format!("{} {} {}", args.target, method, args.path), "http route");
+        lines.push(format!(
+            "allow_l7\t{}\t{}\t{}",
+            args.target, method, args.path
+        ));
+        println!(
+            "  allowed     {:<34} {}",
+            format!("{} {} {}", args.target, method, args.path),
+            "http route"
+        );
     } else {
         let kind = target_kind(&args.target);
         let key = match kind {
@@ -283,11 +312,19 @@ fn rm(args: RmArgs) -> Result<()> {
             let mut lines = load_policy_lines(&dir);
             let needle = format!("allow_l7\t{}\t{}\t{}", a.host, a.method, a.path);
             let removed = remove_matching(&mut lines, |l| l == needle);
-            (dir, lines, removed, format!("allow_l7 {} {} {}", a.host, a.method, a.path))
+            (
+                dir,
+                lines,
+                removed,
+                format!("allow_l7 {} {} {}", a.host, a.method, a.path),
+            )
         }
     };
     if !removed {
-        eprintln!("agent-sandbox ctl proxy: no matching rule found for '{}'", summary);
+        eprintln!(
+            "agent-sandbox ctl proxy: no matching rule found for '{}'",
+            summary
+        );
         std::process::exit(1);
     }
     println!("  removed     {}", summary);
@@ -354,9 +391,15 @@ fn check(args: CheckArgs) -> Result<()> {
         }
         None => {
             if cfg.is_allowed_target(&host) {
-                println!("  allowed     {}  (port not checked — pass HOST:PORT for a complete answer)", host);
+                println!(
+                    "  allowed     {}  (port not checked — pass HOST:PORT for a complete answer)",
+                    host
+                );
             } else {
-                println!("  denied      {}  (port not checked — pass HOST:PORT for a complete answer)", host);
+                println!(
+                    "  denied      {}  (port not checked — pass HOST:PORT for a complete answer)",
+                    host
+                );
                 println!("              {}", cfg.why_target_denied(&host));
             }
         }

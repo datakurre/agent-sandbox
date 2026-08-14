@@ -37,7 +37,10 @@ impl Mapping {
         } else {
             self.bind.clone()
         };
-        format!("{}:{}:{}/{}", bind, self.host, self.container, self.protocol)
+        format!(
+            "{}:{}:{}/{}",
+            bind, self.host, self.container, self.protocol
+        )
     }
 }
 
@@ -88,9 +91,9 @@ fn _port(name: &str, field: &str, value: &Value, allow_zero: bool) -> Result<u16
 }
 
 fn _bind(name: &str, value: &Value, allow_any_interface: bool) -> Result<String, ConfigError> {
-    let s = value.as_str().ok_or_else(|| {
-        ConfigError::msg(format!("ports.{}.bind: expected a string", name))
-    })?;
+    let s = value
+        .as_str()
+        .ok_or_else(|| ConfigError::msg(format!("ports.{}.bind: expected a string", name)))?;
     let literal = if s == "localhost" { "127.0.0.1" } else { s };
     let addr: IpAddr = literal.parse().map_err(|_| {
         ConfigError::msg(format!(
@@ -138,14 +141,27 @@ fn is_valid_name(n: &str) -> bool {
     true
 }
 
-fn parse_entry(name: &str, value: &Value, allow_any_interface: bool) -> Result<Mapping, ConfigError> {
+fn parse_entry(
+    name: &str,
+    value: &Value,
+    allow_any_interface: bool,
+) -> Result<Mapping, ConfigError> {
     if !is_valid_name(name) {
-        return Err(ConfigError::msg(format!("ports.{:?}: name must match pattern", name)));
+        return Err(ConfigError::msg(format!(
+            "ports.{:?}: name must match pattern",
+            name
+        )));
     }
 
     if let Some(table) = value.as_table() {
-        let allowed_fields: HashSet<&str> = ["container", "host", "bind", "protocol"].iter().cloned().collect();
-        let unknown: Vec<_> = table.keys().filter(|k| !allowed_fields.contains(k.as_str())).collect();
+        let allowed_fields: HashSet<&str> = ["container", "host", "bind", "protocol"]
+            .iter()
+            .cloned()
+            .collect();
+        let unknown: Vec<_> = table
+            .keys()
+            .filter(|k| !allowed_fields.contains(k.as_str()))
+            .collect();
         if !unknown.is_empty() {
             return Err(ConfigError::msg(format!(
                 "ports.{}: unknown field(s) {:?}",
@@ -153,7 +169,10 @@ fn parse_entry(name: &str, value: &Value, allow_any_interface: bool) -> Result<M
             )));
         }
         if !table.contains_key("container") {
-            return Err(ConfigError::msg(format!("ports.{}: missing required field 'container'", name)));
+            return Err(ConfigError::msg(format!(
+                "ports.{}: missing required field 'container'",
+                name
+            )));
         }
         let container = _port(name, "container", &table["container"], false)?;
         let host = if let Some(h) = table.get("host") {
@@ -190,30 +209,37 @@ fn parse_entry(name: &str, value: &Value, allow_any_interface: bool) -> Result<M
     }
 }
 
-pub fn parse_ports(text: &str, allow_any_interface: bool, max_ports: usize) -> Result<Vec<Mapping>, ConfigError> {
+pub fn parse_ports(
+    text: &str,
+    allow_any_interface: bool,
+    max_ports: usize,
+) -> Result<Vec<Mapping>, ConfigError> {
     let mut mappings = std::collections::HashMap::new();
     let blocks = iter_tagged_blocks(text);
-    
+
     for body in blocks {
         let block: Value = body.parse().map_err(|e| {
             ConfigError::msg(format!("malformed TOML in agent-sandbox block: {}", e))
         })?;
-        
+
         if let Some(ports) = block.get("ports") {
-            let ports_table = ports.as_table().ok_or_else(|| {
-                ConfigError::msg("[ports] must be a table")
-            })?;
-            
+            let ports_table = ports
+                .as_table()
+                .ok_or_else(|| ConfigError::msg("[ports] must be a table"))?;
+
             for (name, value) in ports_table {
                 if mappings.contains_key(name) {
-                    return Err(ConfigError::msg(format!("ports.{}: declared more than once", name)));
+                    return Err(ConfigError::msg(format!(
+                        "ports.{}: declared more than once",
+                        name
+                    )));
                 }
                 let mapping = parse_entry(name, value, allow_any_interface)?;
                 mappings.insert(name.clone(), mapping);
             }
         }
     }
-    
+
     if mappings.len() > max_ports {
         return Err(ConfigError::msg(format!(
             "{} port mappings declared, limit is {}",
@@ -221,7 +247,7 @@ pub fn parse_ports(text: &str, allow_any_interface: bool, max_ports: usize) -> R
             max_ports
         )));
     }
-    
+
     Ok(mappings.into_values().collect())
 }
 
@@ -229,13 +255,19 @@ pub fn allocate(mapping: Mapping) -> Result<Mapping, ConfigError> {
     if mapping.host != 0 {
         return Ok(mapping);
     }
-    let bind_addr: IpAddr = mapping.bind.parse().map_err(|e| ConfigError::msg(format!("invalid bind: {}", e)))?;
+    let bind_addr: IpAddr = mapping
+        .bind
+        .parse()
+        .map_err(|e| ConfigError::msg(format!("invalid bind: {}", e)))?;
     let host_port = if mapping.protocol == "udp" {
         let sock = UdpSocket::bind((bind_addr, 0)).map_err(|e| ConfigError::msg(e))?;
         sock.local_addr().map_err(|e| ConfigError::msg(e))?.port()
     } else {
         let listener = TcpListener::bind((bind_addr, 0)).map_err(|e| ConfigError::msg(e))?;
-        listener.local_addr().map_err(|e| ConfigError::msg(e))?.port()
+        listener
+            .local_addr()
+            .map_err(|e| ConfigError::msg(e))?
+            .port()
     };
     let mut m = mapping;
     m.host = host_port;
@@ -250,16 +282,22 @@ pub fn parse_mounts(text: &str) -> Result<Vec<String>, ConfigError> {
             ConfigError::msg(format!("malformed TOML in agent-sandbox block: {}", e))
         })?;
         if let Some(mounts) = block.get("mounts") {
-            let mounts_table = mounts.as_table().ok_or_else(|| {
-                ConfigError::msg("[mounts] must be a table")
-            })?;
+            let mounts_table = mounts
+                .as_table()
+                .ok_or_else(|| ConfigError::msg("[mounts] must be a table"))?;
             for (src, value) in mounts_table {
                 let (dest, opts) = if let Some(s) = value.as_str() {
                     (s.to_string(), String::new())
                 } else if let Some(table) = value.as_table() {
-                    let dest = table.get("destination")
+                    let dest = table
+                        .get("destination")
                         .and_then(|d| d.as_str())
-                        .ok_or_else(|| ConfigError::msg(format!("mounts.{}: missing required field 'destination' or not a string", src)))?
+                        .ok_or_else(|| {
+                            ConfigError::msg(format!(
+                                "mounts.{}: missing required field 'destination' or not a string",
+                                src
+                            ))
+                        })?
                         .to_string();
                     let mut opts = String::new();
                     if let Some(opts_val) = table.get("options") {
@@ -271,22 +309,38 @@ pub fn parse_mounts(text: &str) -> Result<Vec<String>, ConfigError> {
                                 if let Some(s) = o.as_str() {
                                     opt_strings.push(s.to_string());
                                 } else {
-                                    return Err(ConfigError::msg(format!("mounts.{}.options: expected a string or list of strings", src)));
+                                    return Err(ConfigError::msg(format!(
+                                        "mounts.{}.options: expected a string or list of strings",
+                                        src
+                                    )));
                                 }
                             }
                             opts = opt_strings.join(",");
                         } else {
-                            return Err(ConfigError::msg(format!("mounts.{}.options: expected a string or list of strings", src)));
+                            return Err(ConfigError::msg(format!(
+                                "mounts.{}.options: expected a string or list of strings",
+                                src
+                            )));
                         }
                     }
-                    let allowed: HashSet<&str> = ["destination", "options"].iter().cloned().collect();
-                    let unknown: Vec<_> = table.keys().filter(|k| !allowed.contains(k.as_str())).collect();
+                    let allowed: HashSet<&str> =
+                        ["destination", "options"].iter().cloned().collect();
+                    let unknown: Vec<_> = table
+                        .keys()
+                        .filter(|k| !allowed.contains(k.as_str()))
+                        .collect();
                     if !unknown.is_empty() {
-                        return Err(ConfigError::msg(format!("mounts.{}: unknown field(s) {:?}", src, unknown)));
+                        return Err(ConfigError::msg(format!(
+                            "mounts.{}: unknown field(s) {:?}",
+                            src, unknown
+                        )));
                     }
                     (dest, opts)
                 } else {
-                    return Err(ConfigError::msg(format!("mounts.{}: expected a string or table", src)));
+                    return Err(ConfigError::msg(format!(
+                        "mounts.{}: expected a string or table",
+                        src
+                    )));
                 };
                 let mut spec = format!("{}:{}", src, dest);
                 if !opts.is_empty() {
@@ -360,7 +414,12 @@ fn _proxy_ip(field: &str, value: &str) -> Result<(), ConfigError> {
 
 fn _proxy_port(field: &str, value: &str) -> Result<(), ConfigError> {
     let parts: Vec<&str> = value.split('-').collect();
-    let parse_err = || ConfigError::msg(format!("{}: {:?} is not a port or port range", field, value));
+    let parse_err = || {
+        ConfigError::msg(format!(
+            "{}: {:?} is not a port or port range",
+            field, value
+        ))
+    };
     let (start, end) = if parts.len() == 1 {
         let p: u32 = parts[0].parse().map_err(|_| parse_err())?;
         (p, p)
@@ -372,18 +431,26 @@ fn _proxy_port(field: &str, value: &str) -> Result<(), ConfigError> {
         return Err(parse_err());
     };
     if start < 1 || start > 65535 || end < 1 || end > 65535 || start > end {
-        return Err(ConfigError::msg(format!("{}: {:?} is out of range or start > end", field, value)));
+        return Err(ConfigError::msg(format!(
+            "{}: {:?} is out of range or start > end",
+            field, value
+        )));
     }
     Ok(())
 }
 
-fn _proxy_list<F>(field: &str, value: &Value, mut validate: F, prefix: &str) -> Result<Vec<String>, ConfigError>
+fn _proxy_list<F>(
+    field: &str,
+    value: &Value,
+    mut validate: F,
+    prefix: &str,
+) -> Result<Vec<String>, ConfigError>
 where
     F: FnMut(&str, &str) -> Result<(), ConfigError>,
 {
-    let arr = value.as_array().ok_or_else(|| {
-        ConfigError::msg(format!("{}{}", prefix, field))
-    })?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| ConfigError::msg(format!("{}{}", prefix, field)))?;
     let mut out = Vec::new();
     for item in arr {
         let s = item.as_str().ok_or_else(|| {
@@ -398,10 +465,10 @@ where
 pub fn parse_host_port(s: &str) -> (String, Option<String>) {
     if let Some(pos) = s.rfind(':') {
         let left = &s[..pos];
-        let right = &s[pos+1..];
+        let right = &s[pos + 1..];
         if right.chars().all(|c| c.is_ascii_digit()) || right == "*" || right.contains('-') {
             let host = if left.starts_with('[') && left.ends_with(']') {
-                &left[1..left.len()-1]
+                &left[1..left.len() - 1]
             } else {
                 left
             };
@@ -429,58 +496,83 @@ pub struct ProxyPolicy {
 pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
     let mut policy = ProxyPolicy::default();
     policy.default = vec!["deny".to_string()];
-    
+
     let blocks = iter_tagged_blocks(text);
-    
+
     for body in blocks {
         let block: Value = body.parse().map_err(|e| {
             ConfigError::msg(format!("malformed TOML in agent-sandbox block: {}", e))
         })?;
-        
+
         if let Some(table) = block.as_table() {
-            let allowed_tables: HashSet<&str> = ["network", "ports", "mounts"].iter().cloned().collect();
-            let unknown: Vec<_> = table.keys().filter(|k| !allowed_tables.contains(k.as_str())).collect();
+            let allowed_tables: HashSet<&str> =
+                ["network", "ports", "mounts"].iter().cloned().collect();
+            let unknown: Vec<_> = table
+                .keys()
+                .filter(|k| !allowed_tables.contains(k.as_str()))
+                .collect();
             if !unknown.is_empty() {
-                return Err(ConfigError::msg(format!("unknown top-level table(s): {:?}", unknown)));
+                return Err(ConfigError::msg(format!(
+                    "unknown top-level table(s): {:?}",
+                    unknown
+                )));
             }
         }
-        
+
         if let Some(network) = block.get("network") {
-            let net_table = network.as_table().ok_or_else(|| ConfigError::msg("[network] must be a table"))?;
-            
+            let net_table = network
+                .as_table()
+                .ok_or_else(|| ConfigError::msg("[network] must be a table"))?;
+
             let allowed_net: HashSet<&str> = ["allow", "rules"].iter().cloned().collect();
-            let unknown: Vec<_> = net_table.keys().filter(|k| !allowed_net.contains(k.as_str())).collect();
+            let unknown: Vec<_> = net_table
+                .keys()
+                .filter(|k| !allowed_net.contains(k.as_str()))
+                .collect();
             if let Some(first_unknown) = unknown.first() {
                 return Err(ConfigError::msg(format!("[network]: unknown key '{}'. Valid keys under [network] are 'allow' and 'rules' ([[network.rules]]).", first_unknown)));
             }
-            
+
             let mut allow_set = HashSet::new();
             let mut allow_has_wildcard = false;
             let mut rules_hosts_no_secret = HashSet::new();
             let mut rules_hosts_with_secret = HashSet::new();
             let mut has_non_secret_rule = false;
-            
+
             if let Some(rules) = net_table.get("rules") {
-                let rules_arr = rules.as_array().ok_or_else(|| ConfigError::msg("[network].rules must be an array of tables"))?;
+                let rules_arr = rules.as_array().ok_or_else(|| {
+                    ConfigError::msg("[network].rules must be an array of tables")
+                })?;
                 for (i, rule_val) in rules_arr.iter().enumerate() {
-                    let rule = rule_val.as_table().ok_or_else(|| ConfigError::msg(format!("[[network.rules]][{}]: must be a table", i)))?;
-                    
-                    let allowed_rule_keys: HashSet<&str> = ["host", "method", "path", "secret", "header", "prefix"].iter().cloned().collect();
-                    if let Some(unknown_key) = rule.keys().find(|k| !allowed_rule_keys.contains(k.as_str())) {
+                    let rule = rule_val.as_table().ok_or_else(|| {
+                        ConfigError::msg(format!("[[network.rules]][{}]: must be a table", i))
+                    })?;
+
+                    let allowed_rule_keys: HashSet<&str> =
+                        ["host", "method", "path", "secret", "header", "prefix"]
+                            .iter()
+                            .cloned()
+                            .collect();
+                    if let Some(unknown_key) = rule
+                        .keys()
+                        .find(|k| !allowed_rule_keys.contains(k.as_str()))
+                    {
                         return Err(ConfigError::msg(format!("[[network.rules]][{}]: unknown field '{}'. Valid keys under [[network.rules]] are 'host', 'method', 'path', 'secret', 'header', and 'prefix'.", i, unknown_key)));
                     }
-                    
+
                     let host_val = rule.get("host").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.rules]][{}]: missing required field 'host'. Example: host = \"registry.npmjs.org:443\".", i)))?;
                     let method = rule.get("method").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.rules]][{}]: missing required field 'method'. Specify an HTTP method (e.g. method = \"GET\", method = \"POST\", or method = \"*\").", i)))?;
                     let path = rule.get("path").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.rules]][{}]: missing required field 'path'. Example: path = \"/api/*\" or path = \"/\".", i)))?;
-                    
-                    if method != "*" && (!method.chars().all(|c| c.is_ascii_uppercase()) || method.is_empty()) {
+
+                    if method != "*"
+                        && (!method.chars().all(|c| c.is_ascii_uppercase()) || method.is_empty())
+                    {
                         return Err(ConfigError::msg(format!("[[network.rules]][{}].method: '{}' must be uppercase (e.g. method = \"GET\" or method = \"*\").", i, method)));
                     }
                     if !path.starts_with('/') {
                         return Err(ConfigError::msg(format!("[[network.rules]][{}].path: 'path' must start with '/'. Change to path = \"/{}\".", i, path.trim_start_matches('/'))));
                     }
-                    
+
                     if rule.contains_key("secret") {
                         rules_hosts_with_secret.insert(host_val.to_string());
                     } else {
@@ -489,12 +581,15 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     }
                 }
             }
-            
+
             if let Some(allow) = net_table.get("allow") {
                 let items = _proxy_list("allow", allow, |_, _| Ok(()), "[network].")?;
                 for item in items {
                     if !allow_set.insert(item.clone()) {
-                        return Err(ConfigError::msg(format!("[network].allow: duplicate entry '{}'. Remove the redundant entry.", item)));
+                        return Err(ConfigError::msg(format!(
+                            "[network].allow: duplicate entry '{}'. Remove the redundant entry.",
+                            item
+                        )));
                     }
                     if item == "*" || item.starts_with("*:") {
                         allow_has_wildcard = true;
@@ -504,11 +599,11 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     }
                 }
             }
-            
+
             if allow_has_wildcard && has_non_secret_rule {
                 return Err(ConfigError::msg("[network]: wildcard allow makes non-secret [[network.rules]] ineffective. Remove the rule or add a secret."));
             }
-            
+
             if allow_has_wildcard {
                 policy.default = vec!["allow".to_string()];
             }
@@ -543,7 +638,10 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     // destination of its own -- what enables signing at all.
                     // The relay refuses everything while allow_signing is
                     // empty, so this is the only way to turn it on.
-                    if port == "22" && host_part != "*" && !policy.allow_signing.contains(&host_part) {
+                    if port == "22"
+                        && host_part != "*"
+                        && !policy.allow_signing.contains(&host_part)
+                    {
                         policy.allow_signing.push(host_part.clone());
                     }
                     if host_part == "*" {
@@ -551,7 +649,7 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     }
                 }
             }
-            
+
             if let Some(rules) = net_table.get("rules") {
                 let rules_arr = rules.as_array().unwrap();
                 for (i, rule_val) in rules_arr.iter().enumerate() {
@@ -559,9 +657,9 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     let host_val = rule.get("host").and_then(|v| v.as_str()).unwrap();
                     let method = rule.get("method").and_then(|v| v.as_str()).unwrap();
                     let path = rule.get("path").and_then(|v| v.as_str()).unwrap();
-                    
+
                     let (host_part, port_part) = parse_host_port(host_val);
-                    
+
                     if host_part != "*" {
                         let combined = match &port_part {
                             Some(p) => format!("{}:{}", host_part, p),
@@ -578,19 +676,24 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                             }
                         }
                     }
-                    
+
                     if let Some(port) = port_part {
                         _proxy_port(&format!("[[network.rules]][{}].host", i), &port)?;
                         if host_part == "*" && !policy.allow_ports.contains(&port) {
                             policy.allow_ports.push(port.clone());
                         }
                     }
-                    
-                    policy.allow_l7.push(format!("{}\t{}\t{}", host_part, method, path));
-                    
+
+                    policy
+                        .allow_l7
+                        .push(format!("{}\t{}\t{}", host_part, method, path));
+
                     if let Some(secret) = rule.get("secret") {
                         if !secret.is_str() {
-                            return Err(ConfigError::msg(format!("[[network.rules]][{}].secret: must be a string", i)));
+                            return Err(ConfigError::msg(format!(
+                                "[[network.rules]][{}].secret: must be a string",
+                                i
+                            )));
                         }
                         // The route, not just the host: this is what the proxy
                         // matches a request against before injecting.
@@ -603,21 +706,38 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
             }
         }
     }
-    
+
     Ok(policy)
 }
 
 pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
-    let mut lines = vec![format!("# generated by agent-sandbox-parse-agents from {}", source)];
-    
-    for val in &policy.allow_domains { lines.push(format!("allow_domains {}", val)); }
-    for val in &policy.secret_l7 { lines.push(format!("secret_l7\t{}", val)); }
-    for val in &policy.allow_signing { lines.push(format!("allow_signing {}", val)); }
-    for val in &policy.allow_ips { lines.push(format!("allow_ips {}", val)); }
-    for val in &policy.allow_ports { lines.push(format!("allow_ports {}", val)); }
-    
-    for val in &policy.allow_l7 { lines.push(format!("allow_l7\t{}", val)); }
-    for val in &policy.default { lines.push(format!("default {}", val)); }
+    let mut lines = vec![format!(
+        "# generated by agent-sandbox-parse-agents from {}",
+        source
+    )];
+
+    for val in &policy.allow_domains {
+        lines.push(format!("allow_domains {}", val));
+    }
+    for val in &policy.secret_l7 {
+        lines.push(format!("secret_l7\t{}", val));
+    }
+    for val in &policy.allow_signing {
+        lines.push(format!("allow_signing {}", val));
+    }
+    for val in &policy.allow_ips {
+        lines.push(format!("allow_ips {}", val));
+    }
+    for val in &policy.allow_ports {
+        lines.push(format!("allow_ports {}", val));
+    }
+
+    for val in &policy.allow_l7 {
+        lines.push(format!("allow_l7\t{}", val));
+    }
+    for val in &policy.default {
+        lines.push(format!("default {}", val));
+    }
 
     lines.join("\n") + "\n"
 }
@@ -663,11 +783,15 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
     let mut advisory: Vec<String> = Vec::new();
     if let Some(ranges) = &cfg.allow_ports {
         if ranges.as_slice() != agent_sandbox_proxy::policy::DEFAULT_ALLOW_PORTS.as_slice() {
-            for r in ranges { advisory.push(format!("allow_ports {}", r)); }
+            for r in ranges {
+                advisory.push(format!("allow_ports {}", r));
+            }
         }
     }
     if !advisory.is_empty() {
-        out.push_str("\n# The following have no [network] TOML equivalent (it only supports 'allow'\n");
+        out.push_str(
+            "\n# The following have no [network] TOML equivalent (it only supports 'allow'\n",
+        );
         out.push_str("# and 'rules') and were left out of the block above. Re-apply them after\n");
         out.push_str("# relaunching with `agent-sandbox ctl proxy allow`:\n");
         for line in advisory {
@@ -694,7 +818,10 @@ mod export_tests {
         .unwrap();
         let toml = format_policy_as_network_toml(&cfg);
         assert!(toml.contains("[network]\n"), "{toml}");
-        assert!(toml.contains("allow = [\"github.com\", \"10.0.0.0/8\"]"), "{toml}");
+        assert!(
+            toml.contains("allow = [\"github.com\", \"10.0.0.0/8\"]"),
+            "{toml}"
+        );
         assert!(toml.contains("[[network.rules]]"), "{toml}");
         assert!(toml.contains("host = \"api.github.com\""), "{toml}");
         assert!(toml.contains("method = \"GET\""), "{toml}");
@@ -733,7 +860,10 @@ mod export_tests {
     fn exports_a_non_default_port_range_as_an_advisory_comment() {
         let cfg = parse_policy("allow_ports 8000-8100\n").unwrap();
         let toml = format_policy_as_network_toml(&cfg);
-        assert!(!toml.contains("deny ="), "deny has no [network] TOML key: {toml}");
+        assert!(
+            !toml.contains("deny ="),
+            "deny has no [network] TOML key: {toml}"
+        );
         assert!(toml.contains("# allow_ports 8000-8100"), "{toml}");
     }
 

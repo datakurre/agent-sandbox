@@ -75,7 +75,12 @@ fn main() -> Result<()> {
                     let signing_key = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !signing_key.is_empty() {
                         let _ = Command::new("gpg")
-                            .args(["--keyserver", "keyserver.ubuntu.com", "--recv-keys", &signing_key])
+                            .args([
+                                "--keyserver",
+                                "keyserver.ubuntu.com",
+                                "--recv-keys",
+                                &signing_key,
+                            ])
                             .status();
                     }
                 }
@@ -114,7 +119,10 @@ fn main() -> Result<()> {
 
         if needs_append {
             let known_hosts_content = "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=\ngithub.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\ngithub.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=\ngitlab.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFSMqzJeV9rUzU4kWitGjeR4PWSa29SPqJ1fVkhtj3Hw9xjLVXVYrU9QlYWrOLXBpQ6KWjbjTDTdDkoohFzgbEY=\ngitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf\ngitlab.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCsj2bNKTBSpIYDEGk9KxsGh3mySTRgMtXL583qmBpzeQ+jqCMRgBqB98u3z++J1sKlXHWfM9dyhSevkMwSbhoR8XIq/U0tCNyokEi/ueaBMCvbcTHhO7FcwzY92WK4Yt0aGROY5qX2UKSeOvuP4D6TPqKF1onrSzH9bx9XUf2lEdWT/ia1NEKjunUqu1xOB/StKDHMoX4/OKyIzuS0q/T1zOATthvasJFoPrAjkohTyaDUz2LN5JoH839hViyEG82yB+MjcFV5MU3N1l1QL3cVUCh93xSaua1N85qivl+siMkPGbO5xR/En4iEY6K2XPASUEMaieWVNTRCtJ4S8H+9\nbitbucket.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPIQmuzMBuKdWeF4+a2sjSSpBK0iqitSQ+5BM9KhpexuGt20JpTVM7u5BDZngncgrqDMbWdxMWWOGtZ9UgbqgZE=\nbitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO\nbitbucket.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDQeJzhupRu0u0cdegZIa8e86EG2qOCsIsD1Xw0xSeiPDlCr7kq97NLmMbpKTX6Esc30NuoqEEHCuc7yWtwp8dI76EEEB1VqY9QJq6vk+aySyboD5QF61I/1WeTwu+deCbgKMGbUijeXhtfbxSxm6JwGrXrhBdofTsbKRUsrN1WoNgUa8uqN1Vx6WAJw1JHPhglEGGHea6QICwJOAr/6mrui/oB7pkaWKHj3z7d1IC4KWLtY47elvjbaTlkN04Kc/5LFEirorGYVbt15kAUlqGM65pk6ZBxtaO3+30LVlORZkxOh+LKL/BvbZ/iRNhItLqNyieoQj/uh/7Iv4uyH/cV/0b4WDSd3DptigWq84lJubb9t/DnZlrJazxyDCulTmKdOR7vs9gMTo+uoIrPSb8ScTtvw65+odKAlBj59dhnVp9zd7QUojOpXlL62Aw56U4oO+FALuevvMjiWeavKhJqlR7i5n9srYcrNV7ttmDw7kf/97P5zauIhxcjX+xHv4M=\n";
-            let mut file = fs::OpenOptions::new().create(true).append(true).open(&known_hosts)?;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&known_hosts)?;
             file.write_all(known_hosts_content.as_bytes())?;
         }
     }
@@ -134,11 +142,14 @@ fn main() -> Result<()> {
                 let mut parts = proxy_host_port.splitn(2, ':');
                 let proxy_host = parts.next().unwrap_or("");
                 let proxy_port = parts.next().unwrap_or("");
-                
+
                 let config_content = format!("Host *\n  ProxyCommand socat - PROXY:{proxy_host}:%h:%p,proxyport={proxy_port}\n");
-                let mut file = fs::OpenOptions::new().create(true).append(true).open(&ssh_config)?;
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&ssh_config)?;
                 file.write_all(config_content.as_bytes())?;
-                
+
                 let mut p = fs::metadata(&ssh_config)?.permissions();
                 p.set_mode(0o600);
                 fs::set_permissions(&ssh_config, p)?;
@@ -155,7 +166,10 @@ fn main() -> Result<()> {
         if !proxy_ca_file.is_empty() {
             let proxy_ca_path = Path::new(&proxy_ca_file);
             if !proxy_ca_path.exists() {
-                eprintln!("entrypoint: AGENT_SANDBOX_PROXY_CA_FILE is set but not readable: {}", proxy_ca_file);
+                eprintln!(
+                    "entrypoint: AGENT_SANDBOX_PROXY_CA_FILE is set but not readable: {}",
+                    proxy_ca_file
+                );
                 std::process::exit(1);
             }
 
@@ -164,7 +178,10 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| "/etc/ssl/certs/ca-bundle.crt".to_string());
             let base_bundle_path = Path::new(&base_bundle);
             if !base_bundle_path.exists() {
-                eprintln!("entrypoint: base CA bundle is not readable: {}", base_bundle);
+                eprintln!(
+                    "entrypoint: base CA bundle is not readable: {}",
+                    base_bundle
+                );
                 std::process::exit(1);
             }
 
@@ -175,11 +192,11 @@ fn main() -> Result<()> {
 
             let base_content = fs::read_to_string(base_bundle_path)?;
             let proxy_content = fs::read_to_string(proxy_ca_path)?;
-            
+
             let mut file = fs::File::create(&merged_bundle)?;
             file.write_all(base_content.as_bytes())?;
             file.write_all(proxy_content.as_bytes())?;
-            
+
             let mut p = fs::metadata(&merged_bundle)?.permissions();
             p.set_mode(0o600);
             fs::set_permissions(&merged_bundle, p)?;
@@ -200,15 +217,21 @@ fn main() -> Result<()> {
         if let Some(parent) = gitconfig.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&gitconfig)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitconfig)?;
         file.write_all(b"[gpg]\n\tprogram = relay-gpg\n")?;
     }
-    
+
     if env::var("AGENT_SANDBOX_NO_GPG_SIGN").unwrap_or_default() == "1" {
         if let Some(parent) = gitconfig.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&gitconfig)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitconfig)?;
         // Tags as well as commits: the host config that switched signing on
         // usually switches on both, and either one fails the same way without
         // a forwarded agent.
@@ -232,7 +255,10 @@ fn main() -> Result<()> {
     if gitconfig.exists() {
         env::set_var("GIT_CONFIG_COUNT", (base_count + 1).to_string());
         env::set_var(format!("GIT_CONFIG_KEY_{}", base_count), "include.path");
-        env::set_var(format!("GIT_CONFIG_VALUE_{}", base_count), gitconfig.to_string_lossy().to_string());
+        env::set_var(
+            format!("GIT_CONFIG_VALUE_{}", base_count),
+            gitconfig.to_string_lossy().to_string(),
+        );
     } else {
         env::set_var("GIT_CONFIG_COUNT", base_count.to_string());
     }
@@ -242,14 +268,17 @@ fn main() -> Result<()> {
         env::set_var("GIT_SSH_COMMAND", "relay-ssh");
         let local_bin = home_path.join(".local/bin");
         fs::create_dir_all(&local_bin)?;
-        
+
         // Find relay-ssh in PATH or use command -v equivalent
         if let Ok(relay_ssh_path) = which("relay-ssh") {
             let _ = std::os::unix::fs::symlink(&relay_ssh_path, local_bin.join("ssh"));
         }
-        
+
         let current_path = env::var("PATH").unwrap_or_default();
-        env::set_var("PATH", format!("{}:{}", local_bin.to_string_lossy(), current_path));
+        env::set_var(
+            "PATH",
+            format!("{}:{}", local_bin.to_string_lossy(), current_path),
+        );
     }
 
     // 8. exec "$@"
