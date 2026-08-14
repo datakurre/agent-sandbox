@@ -255,7 +255,8 @@ New connections see the change within a second; established ones do not.
 4. If container-side setup is needed in the entrypoint, gate it on an env
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
 5. Update `print_usage` and `docs/usage.md`.
-6. Test: `cargo test`, then `nix flake check`.
+6. Test: `cargo test`, then `nix flake check`. For the GitHub Pages site, run
+   `nix-shell -I nixpkgs=channel:nixos-unstable -p 'python3.withPackages (ps: with ps; [ mkdocs mkdocs-material ])' --run 'mkdocs build --strict'`.
 
 Note what neither can cover: podman does not run in a Nix build, so nothing
 that starts a container is tested there. The cheap end-to-end check is a stub
