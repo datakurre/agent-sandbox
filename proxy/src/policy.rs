@@ -41,13 +41,31 @@ pub struct L7Rule {
     pub path_pattern: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetRule<T> {
+    pub target: T,
+    pub ports: Option<Vec<PortRange>>,
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for TargetRule<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.ports {
+            Some(ports) => {
+                let p: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+                write!(f, "{}:{}", self.target, p.join(","))
+            }
+            None => write!(f, "{}", self.target),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProxyConfig {
-    pub allow_domains: Vec<String>,
-    pub deny_domains: Vec<String>,
+    pub allow_domains: Vec<TargetRule<String>>,
+    pub deny_domains: Vec<TargetRule<String>>,
     pub secret_domains: Vec<String>,
-    pub allow_ips: Vec<IpNet>,
-    pub deny_ips: Vec<IpNet>,
+    pub allow_ips: Vec<TargetRule<IpNet>>,
+    pub deny_ips: Vec<TargetRule<IpNet>>,
     pub default_allow: bool,
     pub allow_ports: Option<Vec<PortRange>>,
     pub l7_rules: Vec<L7Rule>,
@@ -55,11 +73,11 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     pub fn new(
-        allow_domains: Vec<String>,
-        deny_domains: Vec<String>,
+        allow_domains: Vec<TargetRule<String>>,
+        deny_domains: Vec<TargetRule<String>>,
         secret_domains: Vec<String>,
-        allow_ips: Vec<IpNet>,
-        deny_ips: Vec<IpNet>,
+        allow_ips: Vec<TargetRule<IpNet>>,
+        deny_ips: Vec<TargetRule<IpNet>>,
         allow_ports_override: Option<Vec<PortRange>>,
         default_override: Option<bool>,
         l7_rules: Vec<L7Rule>,
@@ -180,8 +198,12 @@ pub fn parse_net(s: &str) -> Result<IpNet, String> {
     }
 }
 
-pub fn parse_csv_ips(s: &str) -> Result<Vec<IpNet>, String> {
-    split_list(s).map(parse_net).collect()
+pub fn parse_csv_ips(s: &str) -> Result<Vec<TargetRule<IpNet>>, String> {
+    split_list(s).map(parse_ip_target).collect()
+}
+
+pub fn parse_csv_domains(s: &str) -> Result<Vec<TargetRule<String>>, String> {
+    split_list(s).map(parse_domain_target).collect()
 }
 
 pub fn parse_port_range(s: &str) -> Result<PortRange, String> {
@@ -205,6 +227,38 @@ pub fn parse_port_range(s: &str) -> Result<PortRange, String> {
 
 pub fn parse_csv_ports(s: &str) -> Result<Vec<PortRange>, String> {
     split_list(s).map(parse_port_range).collect()
+}
+
+fn parse_target_with_ports(s: &str) -> Result<(String, Option<Vec<PortRange>>), String> {
+    if let Some(pos) = s.rfind(':') {
+        let left = &s[..pos];
+        let right = &s[pos + 1..];
+        
+        let looks_like_port = !right.is_empty() && right.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '-');
+        let is_unbracketed_ipv6 = left.contains(':') && !left.starts_with('[');
+        
+        if looks_like_port && !is_unbracketed_ipv6 {
+            let host = if left.starts_with('[') && left.ends_with(']') {
+                &left[1..left.len()-1]
+            } else {
+                left
+            }.to_string();
+            let ports = parse_csv_ports(right)?;
+            return Ok((host, Some(ports)));
+        }
+    }
+    Ok((s.to_string(), None))
+}
+
+pub fn parse_ip_target(s: &str) -> Result<TargetRule<IpNet>, String> {
+    let (host, ports) = parse_target_with_ports(s)?;
+    let net = parse_net(&host)?;
+    Ok(TargetRule { target: net, ports })
+}
+
+pub fn parse_domain_target(s: &str) -> Result<TargetRule<String>, String> {
+    let (host, ports) = parse_target_with_ports(s)?;
+    Ok(TargetRule { target: host.to_ascii_lowercase(), ports })
 }
 
 pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
@@ -239,13 +293,13 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
         }
 
         match key {
-            "allow_domains" => allow_domains.push(value.to_ascii_lowercase()),
-            "deny_domains" => deny_domains.push(value.to_ascii_lowercase()),
+            "allow_domains" => allow_domains.push(parse_domain_target(value).map_err(|e| format!("{}: allow_domains: {}", lineno, e))?),
+            "deny_domains" => deny_domains.push(parse_domain_target(value).map_err(|e| format!("{}: deny_domains: {}", lineno, e))?),
             "secret_domains" => secret_domains.push(value.to_ascii_lowercase()),
             "allow_ips" => allow_ips
-                .push(parse_net(value).map_err(|e| format!("{}: allow_ips: {}", lineno, e))?),
+                .push(parse_ip_target(value).map_err(|e| format!("{}: allow_ips: {}", lineno, e))?),
             "deny_ips" => deny_ips
-                .push(parse_net(value).map_err(|e| format!("{}: deny_ips: {}", lineno, e))?),
+                .push(parse_ip_target(value).map_err(|e| format!("{}: deny_ips: {}", lineno, e))?),
             "allow_ports" => {
                 let r = parse_port_range(value)
                     .map_err(|e| format!("{}: allow_ports: {}", lineno, e))?;
@@ -363,61 +417,88 @@ pub fn has_backed_secret_domains(config: &ProxyConfig, secrets: &SecretBindings)
     })
 }
 
+fn is_port_in_target_ports(port: u16, target_ports: Option<&Vec<PortRange>>, global_ports: Option<&[PortRange]>) -> bool {
+    match target_ports {
+        Some(ports) => ports.iter().any(|r| r.contains(port)),
+        None => global_ports.map_or(true, |ranges| ranges.iter().any(|r| r.contains(port))),
+    }
+}
+
 impl ProxyConfig {
-    pub fn is_allowed_domain(&self, domain: &str) -> bool {
+    pub fn check_domain(&self, domain: &str) -> (bool, Option<&Vec<PortRange>>) {
         let mut best_len: i32 = -1;
         let mut allowed = self.default_allow;
+        let mut winner_ports = None;
 
-        for p in &self.allow_domains {
+        for rule in &self.allow_domains {
+            let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
                 allowed = true;
+                winner_ports = rule.ports.as_ref();
             }
         }
 
-        for p in &self.deny_domains {
+        for rule in &self.deny_domains {
+            let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
                 allowed = false;
+                winner_ports = rule.ports.as_ref();
             }
         }
 
-        allowed
+        (allowed, winner_ports)
+    }
+
+    pub fn check_ip(&self, ip: IpAddr) -> (bool, Option<&Vec<PortRange>>) {
+        let mut best_prefix: i32 = -1;
+        let mut allowed = self.default_allow;
+        let mut winner_ports = None;
+
+        for rule in &self.allow_ips {
+            let net = &rule.target;
+            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
+                best_prefix = net.prefix_len() as i32;
+                allowed = true;
+                winner_ports = rule.ports.as_ref();
+            }
+        }
+
+        for rule in &self.deny_ips {
+            let net = &rule.target;
+            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
+                best_prefix = net.prefix_len() as i32;
+                allowed = false;
+                winner_ports = rule.ports.as_ref();
+            }
+        }
+
+        (allowed, winner_ports)
+    }
+
+    pub fn is_allowed_domain(&self, domain: &str) -> bool {
+        self.check_domain(domain).0
     }
 
     pub fn is_allowed_ip(&self, ip: IpAddr) -> bool {
-        let mut best_prefix: i32 = -1;
-        let mut allowed = self.default_allow;
-
-        for net in &self.allow_ips {
-            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
-                best_prefix = net.prefix_len() as i32;
-                allowed = true;
-            }
-        }
-
-        for net in &self.deny_ips {
-            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
-                best_prefix = net.prefix_len() as i32;
-                allowed = false;
-            }
-        }
-
-        allowed
+        self.check_ip(ip).0
     }
 
     pub fn is_denied_address(&self, ip: IpAddr) -> bool {
         let mut best_prefix: i32 = -1;
         let mut denied = false;
 
-        for net in &self.deny_ips {
+        for rule in &self.deny_ips {
+            let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 denied = true;
             }
         }
 
-        for net in &self.allow_ips {
+        for rule in &self.allow_ips {
+            let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) >= best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 denied = false;
@@ -445,7 +526,20 @@ impl ProxyConfig {
     }
 
     pub fn is_allowed(&self, host: &str, port: u16) -> bool {
-        self.is_allowed_target(host) && self.is_allowed_port(port)
+        let host_normalized = match normalize_host(host) {
+            Some(h) => h,
+            None => return false,
+        };
+        match host_normalized.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+            Ok(ip) => {
+                let (allowed, winner_ports) = self.check_ip(ip);
+                allowed && is_port_in_target_ports(port, winner_ports, self.allow_ports.as_deref())
+            }
+            Err(_) => {
+                let (allowed, winner_ports) = self.check_domain(&host_normalized);
+                allowed && is_port_in_target_ports(port, winner_ports, self.allow_ports.as_deref())
+            }
+        }
     }
 
     /// Explains why `is_allowed_domain` returned false for `domain`. Mirrors
@@ -456,13 +550,15 @@ impl ProxyConfig {
     fn why_domain_denied(&self, domain: &str) -> String {
         let mut best_len: i32 = -1;
         let mut winner: Option<(&str, bool)> = None;
-        for p in &self.allow_domains {
+        for rule in &self.allow_domains {
+            let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
                 winner = Some((p.as_str(), false));
             }
         }
-        for p in &self.deny_domains {
+        for rule in &self.deny_domains {
+            let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
                 winner = Some((p.as_str(), true));
@@ -480,13 +576,15 @@ impl ProxyConfig {
     fn why_ip_denied(&self, ip: IpAddr) -> String {
         let mut best_prefix: i32 = -1;
         let mut winner: Option<(&IpNet, bool)> = None;
-        for net in &self.allow_ips {
+        for rule in &self.allow_ips {
+            let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 winner = Some((net, false));
             }
         }
-        for net in &self.deny_ips {
+        for rule in &self.deny_ips {
+            let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 winner = Some((net, true));
@@ -534,13 +632,15 @@ impl ProxyConfig {
     pub fn why_address_denied(&self, ip: IpAddr) -> String {
         let mut best_prefix: i32 = -1;
         let mut winner: Option<&IpNet> = None;
-        for net in &self.deny_ips {
+        for rule in &self.deny_ips {
+            let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 winner = Some(net);
             }
         }
-        for net in &self.allow_ips {
+        for rule in &self.allow_ips {
+            let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) >= best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 winner = None;
@@ -556,10 +656,39 @@ impl ProxyConfig {
     /// responsible), for `is_allowed(host, port)` returning false. Callers
     /// must only invoke this once denial is already confirmed.
     pub fn why_denied(&self, host: &str, port: u16) -> String {
-        if !self.is_allowed_port(port) {
-            self.why_port_denied(port)
+        let host_normalized = match normalize_host(host) {
+            Some(h) => h,
+            None => return format!("{:?} is not a valid host", host),
+        };
+        let (allowed, winner_ports, why_target) = match host_normalized.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+            Ok(ip) => {
+                let (allowed, winner_ports) = self.check_ip(ip);
+                (allowed, winner_ports, self.why_ip_denied(ip))
+            }
+            Err(_) => {
+                let (allowed, winner_ports) = self.check_domain(&host_normalized);
+                (allowed, winner_ports, self.why_domain_denied(&host_normalized))
+            }
+        };
+
+        if !allowed {
+            why_target
+        } else if !is_port_in_target_ports(port, winner_ports, self.allow_ports.as_deref()) {
+            match winner_ports {
+                Some(ports) => {
+                    let list: Vec<String> = ports.iter().map(|r| r.to_string()).collect();
+                    format!("port {} is not in target's allowed ports (configured: {})", port, list.join(", "))
+                }
+                None => match &self.allow_ports {
+                    Some(global_ports) => {
+                        let list: Vec<String> = global_ports.iter().map(|r| r.to_string()).collect();
+                        format!("port {} is not in global allow_ports (configured: {})", port, list.join(", "))
+                    }
+                    None => format!("port {} is not allowed", port),
+                }
+            }
         } else {
-            self.why_target_denied(host)
+            "unknown denial reason".to_string()
         }
     }
 

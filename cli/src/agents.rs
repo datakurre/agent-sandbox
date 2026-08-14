@@ -514,17 +514,21 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
             for item in allow_set {
                 let (host_part, port_part) = parse_host_port(&item);
                 if host_part != "*" {
+                    let combined = match &port_part {
+                        Some(p) => format!("{}:{}", host_part, p),
+                        None => host_part.clone(),
+                    };
                     if is_ip_or_cidr(&host_part) {
-                        if !policy.allow_ips.contains(&host_part) {
-                            policy.allow_ips.push(host_part.clone());
+                        if !policy.allow_ips.contains(&combined) {
+                            policy.allow_ips.push(combined);
                         }
                     } else {
                         _proxy_domain("[network].allow", &host_part)?;
                         // One line per host, not one per port: the same host on
                         // two ports is two allow entries but one rule to read
                         // in `ctl proxy show`.
-                        if !policy.allow_domains.contains(&host_part) {
-                            policy.allow_domains.push(host_part.clone());
+                        if !policy.allow_domains.contains(&combined) {
+                            policy.allow_domains.push(combined);
                         }
                     }
                 }
@@ -538,7 +542,9 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     if port == "22" && host_part != "*" && !policy.allow_signing.contains(&host_part) {
                         policy.allow_signing.push(host_part.clone());
                     }
-                    policy.allow_ports.push(port);
+                    if host_part == "*" {
+                        policy.allow_ports.push(port);
+                    }
                 }
             }
             
@@ -553,21 +559,25 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     let (host_part, port_part) = parse_host_port(host_val);
                     
                     if host_part != "*" {
+                        let combined = match &port_part {
+                            Some(p) => format!("{}:{}", host_part, p),
+                            None => host_part.clone(),
+                        };
                         if is_ip_or_cidr(&host_part) {
-                            if !policy.allow_ips.contains(&host_part) {
-                                policy.allow_ips.push(host_part.clone());
+                            if !policy.allow_ips.contains(&combined) {
+                                policy.allow_ips.push(combined);
                             }
                         } else {
                             _proxy_domain(&format!("[[network.rules]][{}].host", i), &host_part)?;
-                            if !policy.allow_domains.contains(&host_part) {
-                                policy.allow_domains.push(host_part.clone());
+                            if !policy.allow_domains.contains(&combined) {
+                                policy.allow_domains.push(combined);
                             }
                         }
                     }
                     
                     if let Some(port) = port_part {
                         _proxy_port(&format!("[[network.rules]][{}].host", i), &port)?;
-                        if !policy.allow_ports.contains(&port) {
+                        if host_part == "*" && !policy.allow_ports.contains(&port) {
                             policy.allow_ports.push(port.clone());
                         }
                     }
@@ -623,7 +633,7 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
 pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
     let mut out = String::from("[network]\n");
 
-    let mut allow_items: Vec<String> = cfg.allow_domains.clone();
+    let mut allow_items: Vec<String> = cfg.allow_domains.iter().map(|r| r.to_string()).collect();
     allow_items.extend(cfg.allow_ips.iter().map(|n| n.to_string()));
     if !allow_items.is_empty() {
         let quoted: Vec<String> = allow_items.iter().map(|s| format!("{:?}", s)).collect();
@@ -645,7 +655,9 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
     for d in &cfg.deny_domains { advisory.push(format!("deny_domains {}", d)); }
     for ip in &cfg.deny_ips { advisory.push(format!("deny_ips {}", ip)); }
     if let Some(ranges) = &cfg.allow_ports {
-        for r in ranges { advisory.push(format!("allow_ports {}", r)); }
+        if ranges.as_slice() != agent_sandbox_proxy::policy::DEFAULT_ALLOW_PORTS.as_slice() {
+            for r in ranges { advisory.push(format!("allow_ports {}", r)); }
+        }
     }
     if !advisory.is_empty() {
         out.push_str("\n# The following have no [network] TOML equivalent (it only supports 'allow'\n");
@@ -681,6 +693,14 @@ mod export_tests {
         assert!(toml.contains("method = \"GET\""), "{toml}");
         assert!(toml.contains("path = \"/repos/*\""), "{toml}");
         assert!(toml.contains("secret = true"), "{toml}");
+    }
+
+    #[test]
+    fn roundtrip_allow_with_ports() {
+        let cfg = parse_policy("allow_domains *.jyu.fi:443\n").unwrap();
+        let toml = format_policy_as_network_toml(&cfg);
+        assert!(toml.contains("allow = [\"*.jyu.fi:443\"]"), "{toml}");
+        assert!(!toml.contains("allow_ports"), "{toml}");
     }
 
     #[test]

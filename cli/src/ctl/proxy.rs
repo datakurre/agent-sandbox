@@ -142,7 +142,8 @@ fn apply(policy_dir: &str, lines: Vec<String>) -> Result<()> {
 /// IP/CIDR, a bare port or port range (`8443`, `8000-8100`), or — the
 /// fallback — a domain name.
 fn target_kind(target: &str) -> &'static str {
-    if is_ip_or_cidr(target) {
+    let (host_part, _port_part) = parse_host_port(target);
+    if is_ip_or_cidr(&host_part) {
         "ips"
     } else if parse_port_range(target).is_ok() {
         "ports"
@@ -159,10 +160,13 @@ mod tests {
     fn target_kind_infers_ip_port_or_domain() {
         assert_eq!(target_kind("10.0.0.0/8"), "ips");
         assert_eq!(target_kind("169.254.169.254"), "ips");
+        assert_eq!(target_kind("10.0.0.0/8:8443"), "ips");
+        assert_eq!(target_kind("169.254.169.254:80"), "ips");
         assert_eq!(target_kind("8443"), "ports");
         assert_eq!(target_kind("8000-8100"), "ports");
         assert_eq!(target_kind("api.openai.com"), "domains");
         assert_eq!(target_kind("github.com"), "domains");
+        assert_eq!(target_kind("github.com:22"), "domains");
     }
 }
 

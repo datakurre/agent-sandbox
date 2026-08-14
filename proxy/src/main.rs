@@ -385,8 +385,7 @@ impl Shared {
     }
 
     fn is_allowed(&self, host: &str, port: u16) -> bool {
-        let cfg = self.config();
-        cfg.is_allowed_target(host) && cfg.is_allowed_port(port)
+        self.config().is_allowed(host, port)
     }
 
     /// Returns `(true, None)` if the request is allowed, or `(false, Some(reason))`
@@ -1243,9 +1242,18 @@ fn initial_config(o: &Options) -> ProxyConfig {
                 Err(e) => fail(&format!("--allow-ports: {}", e)),
             }
         };
+        let allow_domains = match parse_csv_domains(&o.allow_domains) {
+            Ok(v) => v,
+            Err(e) => fail(&format!("--allow-domains: {}", e)),
+        };
+        let deny_domains = match parse_csv_domains(&o.deny_domains) {
+            Ok(v) => v,
+            Err(e) => fail(&format!("--deny-domains: {}", e)),
+        };
+
         ProxyConfig::new(
-            parse_csv(&o.allow_domains),
-            parse_csv(&o.deny_domains),
+            allow_domains,
+            deny_domains,
             Vec::new(),
             allow_ips,
             deny_ips,
@@ -1406,8 +1414,8 @@ mod tests {
 
     fn cfg(allow_d: &str, deny_d: &str, allow_i: &str, deny_i: &str) -> ProxyConfig {
         ProxyConfig::new(
-            parse_csv(allow_d),
-            parse_csv(deny_d),
+            parse_csv_domains(allow_d).expect("test allow_domains"),
+            parse_csv_domains(deny_d).expect("test deny_domains"),
             Vec::new(),
             parse_csv_ips(allow_i).expect("test allow_ips"),
             parse_csv_ips(deny_i).expect("test deny_ips"),
@@ -1849,10 +1857,32 @@ mod tests {
         assert!(!config.is_allowed("github.com", 8443));
     }
 
+    #[test]
+    fn domain_specific_port_isolation() {
+        // A target-bound port rule must not leak to other targets: jyu.fi is
+        // restricted to 443, github.com keeps the default ports (80, 443, 22).
+        let config = parse_policy("allow_domains jyu.fi:443\nallow_domains github.com\n").unwrap();
+        assert!(config.is_allowed("jyu.fi", 443));
+        assert!(!config.is_allowed("jyu.fi", 22));
+        assert!(config.is_allowed("github.com", 443));
+    }
+
 
 
     fn policy_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("agent-sandbox-policy-{}", name))
+    }
+
+    #[test]
+    fn shared_is_allowed_respects_per_target_ports() {
+        // Regression test: `Shared::is_allowed` is the gate `handle_client` actually
+        // calls per-connection, and it used to bypass `ProxyConfig::is_allowed`'s
+        // per-target port matching by checking the host and the (global) port
+        // independently — which let a domain allowed only on one port through on
+        // any default port too.
+        let shared = shared_with("allow_domains github.com:22\n");
+        assert!(shared.is_allowed("github.com", 22));
+        assert!(!shared.is_allowed("github.com", 443));
     }
 
     #[test]
