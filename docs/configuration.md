@@ -4,9 +4,11 @@
 
 Configurations must be written in TOML and placed inside a fenced code block tagged with `agent-sandbox`:
 
+````markdown
 ```toml agent-sandbox
 # Configuration goes here
 ```
+````
 
 The launcher parses this configuration when starting the sandbox environment.
 
@@ -27,6 +29,7 @@ Each entry is a key-value pair where the key is the mapping name. The value can 
 
 #### Examples
 
+````markdown
 ```toml agent-sandbox
 [ports]
 # Simple mapping: host 3000 -> container 3000 (binds to 127.0.0.1)
@@ -37,6 +40,7 @@ api = { container = 8080, host = 18080 }
 db  = { container = 5432, host = 0 } # 0 means allocate a free host port dynamically
 dns = { container = 53, protocol = "udp", bind = "0.0.0.0" }
 ```
+````
 
 ### 2. `[mounts]`
 
@@ -45,11 +49,13 @@ The `[mounts]` table allows you to bind mount paths from the host into the sandb
 Each key represents the source path (which can be absolute or relative to the workspace directory). The value can be a string representing the destination path inside the container, or a table with additional options.
 
 Fields when using a table:
+
 - **`destination`** (required): The absolute path inside the container.
 - **`options`** (optional): A string or list of strings representing mount options (e.g., `"ro"`, `"rw"`, `"Z"`).
 
 #### Examples
 
+````markdown
 ```toml agent-sandbox
 [mounts]
 # Simple source -> destination mapping
@@ -59,12 +65,18 @@ Fields when using a table:
 "cache" = { destination = "/tmp/cache", options = "ro" }
 "logs" = { destination = "/var/log/app", options = ["rw", "Z"] }
 ```
+````
 
 ### 3. `[network]`
 
 The `[network]` table configures the egress proxy's firewall policy. The sandbox is **deny-by-default**, meaning all traffic is blocked unless explicitly allowed.
 
-- **`allowed_hosts`** (optional): A list of IP addresses, CIDR blocks, or domains along with their port to allow (e.g., `"github.com:443"`, `"10.0.0.0/8:80"`). Wildcard domains (e.g., `"*.github.com:443"`) are supported. To allow all traffic (wildcard allow), you can use `"*"` or `"*:port"`.
+- **`allowed_hosts`** (optional): A list of IP addresses, CIDR blocks, or domains, each with the port it may be reached on (e.g., `"github.com:443"`, `"10.0.0.0/8:80"`). Wildcard domains (e.g., `"*.github.com:443"`) are supported. To allow all traffic (wildcard allow), you can use `"*"` or `"*:port"`.
+
+  An entry may omit the port (`"github.com"`), in which case the built-in
+  default ports **80, 443 and 22** apply to it — not every port. Write the
+  port explicitly for anything else; a rule that carries one is matched on
+  that port alone.
 
 An `allowed_hosts` entry on port `22` does double duty: it is also what authorizes the
 SSH/GPG relay for that host. Under `--proxy` the host agent sockets are held by
@@ -93,6 +105,7 @@ its route.
 
 #### Examples
 
+````markdown
 ```toml agent-sandbox
 [network]
 allowed_hosts = [
@@ -115,6 +128,7 @@ host = "registry.npmjs.org:443"
 method = "*"
 path = "/"
 ```
+````
 
 #### Secrets
 

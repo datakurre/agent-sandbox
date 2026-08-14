@@ -4,6 +4,7 @@
     `--ssh`, `--gpg`, and `--podman` each hand the agent a capability that reaches outside the container. Review the section for each flag below before enabling them.
 
 By design, `agent-sandbox` includes options that pierce the sandbox boundary. Note that these give any agent running inside the container capabilities on the host:
+
 - `--ssh` (opt-in): The agent can authenticate as you using your forwarded SSH identity (e.g. `git push` to your repos).
 - `--gpg` (opt-in): The agent can sign commits or authenticate with any key held by your host GnuPG agent. Note that `agent-sandbox` protects your private key files by checking for them and gracefully failing the GNUPG directory mount if they are present on disk, but the forwarded GnuPG agent socket is still accessible.
 - `--podman` (opt-in): Forwards the host rootless podman socket. The agent can use this to launch **sibling containers** on the host, which is equivalent to a full sandbox escape (e.g. `podman run -v /:/host ...`).
@@ -56,6 +57,7 @@ It is opt-in and should stay that way. The honest reasons to reach for it are ru
 ## Proxy Details (`--proxy`)
 
 The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` for granular controls.
+
 - **Default Policy**: The policy is always **deny by default**. To allow all traffic, specify `allowed_hosts = ["*"]` or `allowed_hosts = ["*:port"]`.
 - **Policy sources**: `--proxy` uses the workspace `AGENTS.md` network policy only. `--proxy-profile NAME` uses the explicit host-owned profile only and implies `--proxy`. Supplying both merges the profile and `AGENTS.md` additively. Profiles may be repeated and are never loaded implicitly.
 - **Profile trust**: Profiles are read from `$XDG_CONFIG_HOME/agent-sandbox/profiles/` or `~/.config/agent-sandbox/profiles/` and are host-controlled configuration. `AGENTS.md` remains project-controlled configuration. Neither source can add a deny directive; the firewall remains deny-by-default.
@@ -115,8 +117,9 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
   | `all` | saved to the current directory every session |
 
   Saved logs are named `agent-sandbox-connections-<session>-<timestamp>.jsonl`, and the summary prints the path as a terminal hyperlink. `agent-sandbox-network-summary <log>` re-renders a saved log. `--proxy-log` implies `--proxy`.
+
 - Neither the policy nor the log is reachable from inside the sandbox, so the agent can neither widen its own firewall nor edit the record of its traffic.
-- The connection log is bounded at 16 MiB during a session. When a limit is reached, the oldest log contents are discarded; this prevents a busy or long-lived container from accumulating unbounded logs.
+- The connection log is bounded at 16 MiB during a session, and the TUI's request-detail stream at 4 MiB. When a limit is reached the oldest records are dropped — cut at a record boundary, keeping the newest half of the budget — so a busy or long-lived container cannot accumulate an unbounded log, and the recent history survives the trim.
 - To inspect an HTTPS method and path after a domain is denied at `CONNECT`, the operator may temporarily add an L7 placeholder rule such as `host = "pypi.org:443"`, `method = "GET"`, `path = "/noop"`. This permits the CONNECT/MITM inspection stage but keeps `/noop` and every other unmatched path denied. The operator should replace it with the observed path pattern or remove it after training.
 
 ### What the policy covers
@@ -126,13 +129,22 @@ an internal network with no route off it, so the proxy is the only reachable des
 an agent that ignores `HTTP_PROXY` simply fails. Everything below is the *policy* applied at
 the proxy. Two limits remain by design; they are described at the end of this section.
 
-Rules match on host **and** port. The syntax requires both to be specified in the same string, e.g. `allowed_hosts = ["github.com:443", "api.github.com:443"]`.
+Rules match on host **and** port, written in the same string, e.g.
+`allowed_hosts = ["github.com:443", "api.github.com:443"]`. The port is
+optional; an entry written without one (`"github.com"`) falls back to the
+built-in default set of **80, 443 and 22** rather than to every port, so write
+the port whenever the host should be reachable on anything else.
 
 Denials will say which part refused the connection, so an allowed host on an unlisted port is distinguishable from a host that was never allowed:
 
 ```
-proxy: deny github.com:8443 (port 8443 is not in allow_port (configured: 80, 443, 22))
+proxy: deny github.com:8443 (port 8443 is not in target's allowed ports (configured: 443))
+proxy: deny github.com:8443 (port 8443 is not in global allow_port (configured: 80, 443, 22))
 ```
+
+The first names the ports carried by the rule that matched the host; the second
+appears when the matching rule carried no port of its own and the session-wide
+list decided it.
 
 The same explanation — naming the specific rule, or absence of one, that decided the verdict — is what shows up per-row in `agent-sandbox ctl tui` and in `agent-sandbox ctl proxy check`.
 
@@ -168,8 +180,15 @@ sandbox has no route into the sidecar at all, its only egress is `CONNECT` to th
 the proxy still checks every resolved address against the policy's `deny_ip` ranges. A `CONNECT` aimed at your
 resolver stays refused.
 
-The host's `search` domains and resolver `options` travel with the nameservers, so an
-unqualified name that resolves on the host resolves in the sandbox too.
+The nameservers themselves come from the host's `/etc/resolv.conf` (falling back to
+systemd-resolved's own `/run/systemd/resolve/resolv.conf`, since the `127.0.0.53` stub is
+not reachable from the sidecar). The host's `search` domains and resolver `options` travel
+with them, so an unqualified name that resolves on the host resolves in the sandbox too.
+When the host offers no usable nameserver at all, the sidecar falls back to the public
+`8.8.8.8` and `1.1.1.1`, and the search list is dropped along with the host's servers —
+a public resolver cannot answer for an internal zone. Names are resolved in the sidecar,
+so that fallback decides where the *proxy's* lookups go; `--podman-args` configures the
+sandbox container and cannot change it.
 
 Hostnames are normalised before matching, so a trailing dot (`github.com.`) and an
 IPv4-mapped IPv6 literal (`[::ffff:10.0.0.1]`) match the same rules as their plain forms.

@@ -62,7 +62,7 @@ agent-sandbox = pkgs.symlinkJoin {
 
 ### Flags
 
-Most flags in the table below have a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it — the exceptions are the ones taking a value (`--krun-memory`, `--krun-cpus`) and `--ports-any-interface`. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
+Most flags in the table below have a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it — the exceptions are the ones taking a value (`--proxy-profile`, `--krun-memory`, `--krun-cpus`) and `--ports-any-interface`. A `--no-proxy` after `--proxy-profile` still turns the proxy off, dropping the profiles with it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
 
 `--gpg-agent` and `--gpg-sign` were merged and removed; use `--gpg` / `--no-gpg`.
 
@@ -141,10 +141,10 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
    - `A`: Allow IP
    - `v`: Switch between the live Connections view and denied requests
    - `r`: Switch to the Rules view — the live effective policy, with `x` to remove a rule (blocked for rules that came from `AGENTS.md`)
-   - `d`: Show sanitized details for the selected denial; use `↑`/`↓` to scroll and `Esc` to return
+   - `d`: Show sanitized details for the selected row, in the denied-requests view or the Connections view; use `↑`/`↓` to scroll and `Esc` to return
    - `c`: Clear the list of recorded denials
    - `q` or `Esc`: Quit the TUI
-4. **Save Rules**: When you've trained the proxy to your liking, export the complete active policy, including the original `AGENTS.md` rules and live additions, by running `agent-sandbox ctl proxy export > AGENTS.md` (or append it to your existing `[network]` blocks). For reusable rules, save the `[network]` block as `~/.config/agent-sandbox/profiles/<name>.toml` and launch with `--proxy-profile <name>`. When the sandbox exits, its summary also prints only the rules added live as copy-pasteable `allowed_hosts` and `[[network.allowed_routes]]` TOML.
+4. **Save Rules**: When you've trained the proxy to your liking, export the complete active policy — the original `AGENTS.md` rules plus the live additions — with `agent-sandbox ctl proxy export`. It prints a fenced ```` ```toml agent-sandbox ```` block, which is the form the launcher reads, so append it to the project's `AGENTS.md` (`agent-sandbox ctl proxy export >> AGENTS.md`) and delete the `[network]` block it supersedes. Redirect with a single `>` only into a scratch file: it would truncate `AGENTS.md`, prose and all. For reusable rules, `agent-sandbox ctl proxy export --plain` prints the same policy without the Markdown fence — that is what a `~/.config/agent-sandbox/profiles/<name>.toml` file wants, launched with `--proxy-profile <name>`. When the sandbox exits, its summary also prints only the rules added live as copy-pasteable `allowed_hosts` and `[[network.allowed_routes]]` TOML.
 
 The proxy source is selected explicitly:
 
@@ -163,7 +163,7 @@ allowed_hosts = ["github.com:443", "registry.npmjs.org:443"]
 
 At session exit, rules added live through the TUI or `agent-sandbox ctl proxy allow` are printed as a TOML block. Add that block to `AGENTS.md` for project-specific persistence, or merge it into a profile for reuse across projects.
 
-The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Press `v` to switch to the Connections view, which shows all recent allowed, denied, failed, and currently-open connections live. Press `d` on a row to inspect the latest sanitized request head, including its method, target, path, and non-sensitive headers. The detail stream is ephemeral, capped at 4 MiB, and the TUI retains at most 200 rows in each view with one bounded detail per denied row. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
+The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Press `v` to switch to the Connections view, which shows all recent allowed, denied, failed, and currently-open connections live. Press `d` on a row in either view to inspect it: the denied-requests view shows the latest sanitized request head — method, target, path, and non-sensitive headers — and the Connections view shows the row's own verdict, timings and byte counts, followed by that head when one was recorded for the destination. Request heads exist for denials only; an allowed HTTPS tunnel is never decrypted unless a route or secret rule covers it, and the detail pane says so rather than showing an empty box. The detail stream is ephemeral, capped at 4 MiB, and the TUI retains at most 200 rows in each view with one bounded detail per denied row. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
 
 For an HTTPS domain denied at `CONNECT`, the encrypted method and path are not available yet. The TUI detail view suggests a temporary placeholder L7 rule to let the proxy terminate TLS and observe the real request:
 
@@ -179,6 +179,7 @@ Retry the request, inspect the resulting L7 denial, then replace `/noop` with th
 ### Git Integration Details
 
 When using Git inside the sandbox, be aware of how the integration flags interact:
+
 - `--git` injects your effective Git configuration into the container using environment variables instead of mounting `.gitconfig`. Host-side `[include]` directives are evaluated and flattened on the host, while host-specific file paths (like `gpg.*.program`, credential helpers, global gitignore, and custom hooks) are automatically blocklisted so they don't break Git inside the container.
 - `--gpg` is required for `--git` to also include commit signing. Without it, the sandbox explicitly disables signing (`commit.gpgsign = false`, `tag.gpgsign = false`) to prevent signing failures when the host's GnuPG agent is not forwarded.
 - `--ssh` is required for `git pull` and `git push` to work with SSH remotes. It forwards your host's `SSH_AUTH_SOCK`. Because we avoid excessive host mounts, we do *not* mount your host's `known_hosts` file. Instead, we pre-populate the container's `~/.ssh/known_hosts` with the public keys for GitHub, GitLab, and Bitbucket so first-time connections do not prompt for verification.
@@ -224,7 +225,7 @@ and `~/.gemini/skills` for tools that use those discovery paths.
 | `net [-f] [WORD] [--sandbox WORD]` | connection summary, or a live feed |
 | `logs [-f] [--tail N] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
 | `tui [WORD] [--sandbox WORD]` | interactive terminal UI: shows denied requests live so you can add the missing rule, a Connections view (`v`) of all recent connections including currently-open ones, plus a Rules view (`r`) to inspect and remove existing rules, without leaving the dashboard |
-| `proxy show\|allow\|rm\|reset\|export\|check [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as AGENTS.md TOML; `check HOST[:PORT]` dry-runs whether a target would be allowed |
+| `proxy show\|allow\|rm\|reset\|export\|check [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as a fenced AGENTS.md block (`--plain` for a bare-TOML profile file); `check HOST[:PORT]` dry-runs whether a target would be allowed |
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
 | `relay [-f] [WORD] [--sandbox WORD]` | show the SSH/GPG relay's `allow_signing` policy and what it has been asked for |
 | `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |

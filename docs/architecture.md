@@ -41,7 +41,12 @@ Key layers:
 | `/usr/bin/env`        | Symlink to coreutils `env` for generic shebangs        |
 | `/lib64/ld-linux-*`   | ELF interpreter for prebuilt npm binaries              |
 | `/home/user`          | Home directory (uid/gid mapped at runtime)             |
+| `/home/user/.agents/skills` | Bundled `nix`, `nix-flake` and `devenv` skills   |
 | `/workspace`          | Default working directory                              |
+
+The skills are image content, not a launcher-managed mount, and the image links
+the canonical tree from each tool's own discovery path. See
+[Usage](usage.md#bundled-opencode-skills) for how to replace them.
 
 ## Entrypoint (`agent-sandbox-entrypoint`)
 
@@ -123,10 +128,12 @@ without aardvark there is nothing to resolve that name.  That also retires a rac
 nothing ever gated on -- the readiness handshake never proved aardvark had
 published the sidecar's record before the sandbox started.
 
-The proxy itself is Rust (`proxy/src/main.rs`): a thread-per-connection HTTP
-forward proxy handling `CONNECT` and absolute-form requests, terminating TLS for
-the hosts that carry an L7 rule.  Policy decisions happen once per connection,
-before the byte pumps start; an established tunnel is never re-evaluated.
+The proxy itself is Rust (`proxy/src/main.rs`; `ipnet` for CIDR matching,
+`rustls`/`rcgen`/`webpki-roots` for the MITM path, `ratatui`/`crossterm` for the
+TUI): a thread-per-connection HTTP forward proxy handling `CONNECT` and
+absolute-form requests, terminating TLS for the hosts that carry an L7 rule.
+Policy decisions happen once per connection, before the byte pumps start; an
+established tunnel is never re-evaluated.
 
 Three directories, and which side can see them is the design:
 
@@ -135,7 +142,7 @@ Three directories, and which side can see them is the design:
 | `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base`, `policy.baseline` |
 | `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `ca.pem`, `connections.jsonl`, `denied-requests.jsonl`, `relay.jsonl` |
 | `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
-| (host temp dirs) | — | removed when the launcher exits |
+| (host temp dirs) | — | removed by the launcher's `CleanupGuard` on the way out |
 
 None of them is mounted into the sandbox — `ca.pem` is bound in as a single
 file, not by exposing its directory. That is deliberate and load-bearing: the
@@ -147,9 +154,12 @@ log of what it did. Changing policy is therefore a host-side operation
 **Policy format.** The proxy enforces the merged declarative `[network]` blocks
 from `AGENTS.md` and any explicitly selected host-owned profiles.
 `[network].allowed_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
-with a port or port range.  `[[network.allowed_routes]]` configures L7 routes and
-optional secret injection.  Those two keys are the whole surface: an unknown key
-under `[network]` refuses the launch rather than being ignored.
+with a port or port range; an entry written without one is matched against the
+compiled-in `DEFAULT_ALLOW_PORTS` (80, 443, 22) instead, which is also what
+`allow_port` defaults to when the policy declares none.
+`[[network.allowed_routes]]` configures L7 routes and optional secret injection.
+Those two keys are the whole surface: an unknown key under `[network]` refuses
+the launch rather than being ignored.
 
 The launcher merges and compiles those blocks into the flat, line-oriented policy file the
 proxy reads (`allow_host`, `allow_ip`, `allow_port`, `allow_route`,
@@ -157,10 +167,23 @@ proxy reads (`allow_host`, `allow_ip`, `allow_port`, `allow_route`,
 format `agent-sandbox ctl proxy` edits in place.  `secret_route` records a
 *route* -- `domain<TAB>method<TAB>path`, like `allow_route` -- not a domain, and
 `deny_ip` is written only by the launcher: there is no domain deny list, and
-a live edit that changes the deny set is refused.  `agent-sandbox-proxy
---check-policy FILE` validates it: the launcher writes the file, the proxy reads
-it, and the host-side `proxy` command vets its own writes with the same parser,
-so there is no second implementation to drift.
+`install_policy` refuses a live edit that changes the deny set.  One host on two
+ports is two `allow_host` lines carrying the same pattern; the proxy unions the
+ports of every line tied at the winning specificity, so both are in force.
+`agent-sandbox-proxy --check-policy FILE` validates it: the launcher writes the
+file, the proxy reads it, and the host-side `proxy` command vets its own writes
+with the same parser, so there is no second implementation to drift.
+
+`agent-sandbox ctl proxy export` prints that policy back as a fenced
+```` ```toml agent-sandbox ```` block, since the launcher parses configuration
+only inside that fence; `--plain` drops it for a `--proxy-profile` file, which is
+plain TOML.  `ctl mounts export` emits the same fence.
+
+The two JSONL streams under `/sidecar_shared` are bounded — `connections.jsonl`
+at 16 MiB, `denied-requests.jsonl` at 4 MiB.  `rotate_if_needed` drops the
+*oldest* records to get back under the cap and cuts at a record boundary: every
+reader parses one JSON object per line, so a fragment at the top of the file
+would fail the first line of every trimmed log.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
 The source of authority is a host-controlled TOML file
@@ -199,7 +222,7 @@ rather than failing later at certificate validation.
 The launcher appends a baseline `deny_ip` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
 
-**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol.
+**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol. An `allowed_hosts` entry on port 22 is what populates `allow_signing`, and the relay refuses every request while that list is empty — gpg has no destination of its own, so this is also what enables signing at all.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
@@ -215,9 +238,10 @@ longest-prefix match *is* the specificity comparison the proxy makes, so every
 blackhole by itself; the one case a routing table cannot express is the
 equal-prefix tie, there being room for a single route per prefix, and that is
 handled by not installing the blackhole at all.  Until it did this, a re-allowed
-range -- including the README's own `allow_ip = ["10.0.0.0/8"]` against the
-baseline -- was permitted by the proxy and then dropped on the floor by the
-route, with `proxy show` reporting the rule as in force.
+range -- including the documented `allowed_hosts = ["10.0.0.0/8"]` for corporate
+git over a VPN, which compiles to `allow_ip` against the baseline -- was
+permitted by the proxy and then dropped on the floor by the route, with
+`proxy show` reporting the rule as in force.
 
 The sidecar's nameservers, read from its own `/etc/resolv.conf`, are exempted
 unconditionally.  Resolution happens in the sidecar via libc, before any rule is
