@@ -16,8 +16,8 @@ pub struct RelayArgs {
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
 
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 /// The relay refuses every request while this list is empty, so it is the
@@ -32,7 +32,7 @@ fn allow_signing_rules(policy_dir: &str) -> Vec<String> {
 }
 
 pub fn run(args: RelayArgs) -> Result<()> {
-    let explicit = args.sandbox.clone().or_else(|| args.word.clone());
+    let explicit = args.container.clone().or_else(|| args.word.clone());
     let sandbox = resolve_sandbox(explicit.as_deref(), true)?;
     let sidecar = require_sidecar(&sandbox)?;
 

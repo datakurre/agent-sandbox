@@ -15,13 +15,13 @@ pub struct NetArgs {
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
     
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 pub fn run(args: NetArgs) -> Result<()> {
     let mut sandbox_name = None;
-    if let Some(s) = args.sandbox {
+    if let Some(s) = args.container {
         sandbox_name = Some(s);
     } else if let Some(w) = args.word {
         sandbox_name = Some(w);

@@ -31,8 +31,8 @@ pub enum MountCommand {
 pub struct TargetArgs {
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -43,8 +43,8 @@ pub struct AddArgs {
     pub container_path: String,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -53,8 +53,8 @@ pub struct RmArgs {
     pub container_path: String,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,7 +147,7 @@ fn container_pid(sandbox: &str) -> Result<String> {
 }
 
 fn run_ls(args: TargetArgs) -> Result<()> {
-    let explicit = target(&args.word, &args.sandbox);
+    let explicit = target(&args.word, &args.container);
     let names = if explicit.is_some() {
         vec![resolve_sandbox(explicit.as_deref(), true)?]
     } else {
@@ -178,7 +178,7 @@ fn run_ls(args: TargetArgs) -> Result<()> {
 }
 
 fn run_export(args: TargetArgs) -> Result<()> {
-    let explicit = target(&args.word, &args.sandbox);
+    let explicit = target(&args.word, &args.container);
     let sandbox = resolve_sandbox(explicit.as_deref(), true)?;
     let workspace = sandbox_workspace(&sandbox).unwrap_or_default();
     let mounts = added_mounts(&sandbox)?;
@@ -222,7 +222,7 @@ fn run_export(args: TargetArgs) -> Result<()> {
 }
 
 fn run_add(args: AddArgs) -> Result<()> {
-    let explicit = target(&args.word, &args.sandbox);
+    let explicit = target(&args.word, &args.container);
     let sandbox = resolve_sandbox(explicit.as_deref(), true)?;
 
     let host_path = Path::new(&args.host_path);
@@ -294,7 +294,7 @@ fn run_add(args: AddArgs) -> Result<()> {
 }
 
 fn run_rm(args: RmArgs) -> Result<()> {
-    let explicit = target(&args.word, &args.sandbox);
+    let explicit = target(&args.word, &args.container);
     let sandbox = resolve_sandbox(explicit.as_deref(), true)?;
     refuse_if_krun(
         &sandbox,

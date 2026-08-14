@@ -37,8 +37,8 @@ pub enum ProxyCommand {
 pub struct TargetArgs {
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -51,8 +51,8 @@ pub struct AllowArgs {
     pub path: String,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -61,8 +61,8 @@ pub struct CheckArgs {
     pub target: String,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -85,8 +85,8 @@ pub struct RmTargetArgs {
     pub target: String,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -96,8 +96,8 @@ pub struct RmL7Args {
     pub path: String,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
-    #[arg(long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
 }
 
 fn sandbox_target(word: &Option<String>, sandbox: &Option<String>) -> Option<String> {
@@ -182,7 +182,7 @@ pub fn run(args: ProxyArgs) -> Result<()> {
 }
 
 fn show(args: TargetArgs) -> Result<()> {
-    let (sandbox_name, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let (sandbox_name, dir) = policy_dir(&args.word, &args.container)?;
     let lines = load_policy_lines(&dir);
     let cfg = parse_lines(&lines)?;
     let base_lines: HashSet<String> = fs::read_to_string(format!("{}/policy.base", dir))
@@ -212,7 +212,7 @@ fn show(args: TargetArgs) -> Result<()> {
 }
 
 fn allow(args: AllowArgs) -> Result<()> {
-    let (_, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let (_, dir) = policy_dir(&args.word, &args.container)?;
     let mut lines = load_policy_lines(&dir);
     if let Some(method) = args.l7 {
         if is_ip_or_cidr(&args.target) {
@@ -248,7 +248,7 @@ fn remove_matching(lines: &mut Vec<String>, predicate: impl Fn(&str) -> bool) ->
 fn rm(args: RmArgs) -> Result<()> {
     let (dir, lines, removed, summary) = match args.kind {
         RmKind::Allow(a) => {
-            let (_, dir) = policy_dir(&a.word, &a.sandbox)?;
+            let (_, dir) = policy_dir(&a.word, &a.container)?;
             let mut lines = load_policy_lines(&dir);
             let key = match target_kind(&a.target) {
                 "ips" => "allow_ips",
@@ -259,7 +259,7 @@ fn rm(args: RmArgs) -> Result<()> {
             (dir, lines, removed, format!("{} {}", key, a.target))
         }
         RmKind::L7(a) => {
-            let (_, dir) = policy_dir(&a.word, &a.sandbox)?;
+            let (_, dir) = policy_dir(&a.word, &a.container)?;
             let mut lines = load_policy_lines(&dir);
             let needle = format!("allow_l7\t{}\t{}\t{}", a.host, a.method, a.path);
             let removed = remove_matching(&mut lines, |l| l == needle);
@@ -275,7 +275,7 @@ fn rm(args: RmArgs) -> Result<()> {
 }
 
 fn reset(args: TargetArgs) -> Result<()> {
-    let (_, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let (_, dir) = policy_dir(&args.word, &args.container)?;
     let base_path = format!("{}/policy.base", dir);
     let base = match fs::read_to_string(&base_path) {
         Ok(text) => text,
@@ -292,7 +292,7 @@ fn reset(args: TargetArgs) -> Result<()> {
 }
 
 fn export(args: TargetArgs) -> Result<()> {
-    let (_, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let (_, dir) = policy_dir(&args.word, &args.container)?;
     // The baseline private/loopback deny_ips ranges are enforced
     // unconditionally regardless of AGENTS.md (see `policy.baseline`,
     // written once at launch with exactly that set), so round-tripping them
@@ -310,7 +310,7 @@ fn export(args: TargetArgs) -> Result<()> {
 }
 
 fn check(args: CheckArgs) -> Result<()> {
-    let (sandbox_name, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let (sandbox_name, dir) = policy_dir(&args.word, &args.container)?;
     let lines = load_policy_lines(&dir);
     let cfg = parse_lines(&lines)?;
     let (host, port_str) = parse_host_port(&args.target);

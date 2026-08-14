@@ -10,12 +10,16 @@ use std::os::unix::process::CommandExt;
     about = "Interactive dashboard: approve pending ask-mode requests, add rules for denied ones"
 )]
 pub struct TuiArgs {
+    #[arg(short, long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
+    
     #[arg(help = "Sandbox name (positional)")]
-    pub sandbox: Option<String>,
+    pub word: Option<String>,
 }
 
 pub fn run(args: TuiArgs) -> Result<()> {
-    let sandbox = resolve_sandbox(args.sandbox.as_deref(), true)?;
+    let explicit = args.container.clone().or_else(|| args.word.clone());
+    let sandbox = resolve_sandbox(explicit.as_deref(), true)?;
     let sidecar = require_sidecar(&sandbox)?;
     
     let policy_dir = sidecar_mount(&sidecar, "/sidecar_policy")?;

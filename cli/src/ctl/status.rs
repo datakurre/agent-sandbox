@@ -9,8 +9,8 @@ use std::process::Command;
     about = "Summarises one running sandbox: workspace, proxy mode, policy and traffic\ncounts, and published ports.  Each line names the command that shows more.\n\nWith one sandbox running, --sandbox may be omitted."
 )]
 pub struct StatusArgs {
-    #[arg(short, long, help = "Sandbox name")]
-    pub sandbox: Option<String>,
+    #[arg(short, long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
     
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
@@ -18,7 +18,7 @@ pub struct StatusArgs {
 
 pub fn run(args: StatusArgs) -> Result<()> {
     let mut sandbox_name = None;
-    if let Some(s) = args.sandbox {
+    if let Some(s) = args.container {
         sandbox_name = Some(s);
     } else if let Some(w) = args.word {
         sandbox_name = Some(w);

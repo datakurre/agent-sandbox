@@ -223,14 +223,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Only loaded while the Rules view is active — cheap either way (a
         // small file, and this loop already re-reads connections.jsonl at
         // ~10Hz), but no point parsing it every frame when it's not shown.
-        let (policy_lines, base_lines): (Vec<String>, HashSet<String>) = if view == View::Rules {
+        let (policy_lines, base_lines, baseline_lines): (Vec<String>, HashSet<String>, HashSet<String>) = if view == View::Rules {
             let lines = load_policy_lines(sidecar_policy);
             let base = fs::read_to_string(format!("{}/policy.base", sidecar_policy))
                 .map(|s| s.lines().map(|l| l.to_string()).collect())
                 .unwrap_or_default();
-            (lines, base)
+            let baseline = fs::read_to_string(format!("{}/policy.baseline", sidecar_policy))
+                .map(|s| s.lines().map(|l| l.to_string()).collect())
+                .unwrap_or_default();
+            (lines, base, baseline)
         } else {
-            (Vec::new(), HashSet::new())
+            (Vec::new(), HashSet::new(), HashSet::new())
         };
 
         terminal.draw(|f| {
@@ -323,7 +326,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 value.trim().to_string()
                             };
-                            let source = if base_lines.contains(line) { "AGENTS.md" } else { "" };
+                            let source = if baseline_lines.contains(line) {
+                                "built-in"
+                            } else if base_lines.contains(line) {
+                                "AGENTS.md"
+                            } else {
+                                "live"
+                            };
                             Row::new(vec![key.to_string(), display_value, source.to_string()]).style(style)
                         });
 
@@ -342,8 +351,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let legend_text = match view {
-                View::Requests => "↑/↓ select   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[r] Rules view   [q]/[Esc] Quit",
-                View::Rules => "↑/↓ select   [x] Remove rule (blocked for AGENTS.md rules)\n[r] Requests view   [q]/[Esc] Quit",
+                View::Requests => "↑/↓ select   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[r] Rules view   [c] Clear   [q]/[Esc] Quit",
+                View::Rules => "↑/↓ select   [x] Remove rule (blocked for built-in/AGENTS.md rules)\n[r] Requests view   [q]/[Esc] Quit",
             };
             let instructions = Paragraph::new(legend_text)
                 .block(Block::default().borders(Borders::ALL).title("Keybindings"));
@@ -379,6 +388,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             View::Requests => View::Rules,
                             View::Rules => View::Requests,
                         };
+                    }
+                    KeyCode::Char('c') if view == View::Requests => {
+                        denied_reqs.clear();
+                        denied_list.clear();
+                        selected_idx = 0;
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('h') if view == View::Requests => {
                         if !denied_list.is_empty() && selected_idx < denied_list.len() {
@@ -439,9 +453,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('x') if view == View::Rules => {
                         if let Some(line) = policy_lines.get(rules_selected_idx) {
                             if base_lines.contains(line) {
+                                let label = if baseline_lines.contains(line) { "built-in" } else { "AGENTS.md's baseline" };
                                 status_msg = format!(
-                                    "'{}' comes from AGENTS.md's baseline policy and can't be removed here — edit AGENTS.md and relaunch, or `agent-sandbox ctl proxy reset` first",
-                                    line
+                                    "'{}' comes from {} policy and can't be removed here — edit AGENTS.md and relaunch, or `agent-sandbox ctl proxy reset` first",
+                                    line, label
                                 );
                                 status_kind = StatusKind::Info;
                                 status_until = Some(Instant::now() + Duration::from_secs(5));
