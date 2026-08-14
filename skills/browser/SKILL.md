@@ -150,41 +150,45 @@ sandbox can drive this tab" and "anything on the network can read every
 cookie and run arbitrary JS in it."
 
 By default the sandbox has **no route to the host's loopback at all**, so this
-needs one flag at launch. Podman's rootless pasta setup passes `--no-map-gw`,
-which disables the gateway-to-loopback translation, and wires
+needs `--host-loopback` at launch. Podman's rootless pasta setup passes
+`--no-map-gw`, which disables the gateway-to-loopback translation, and wires
 `host.containers.internal` with `--map-guest-addr` — that lands on the host's
 *LAN* address, not `127.0.0.1`. Neither one reaches a loopback-bound Chrome.
-Ask pasta for the mapping explicitly instead:
+The flag asks pasta for the mapping:
 
 ```sh
-agent-sandbox --podman-args --network=pasta:--map-host-loopback,169.254.1.3 -- bash
+agent-sandbox --host-loopback -- bash
 ```
 
-Now anything the sandbox sends to `169.254.1.3` arrives on the host as
+Anything the sandbox then sends to `169.254.1.3` arrives on the host as
 `127.0.0.1 → 127.0.0.1`. Chrome stays bound to loopback, one address reaches
-it, and nothing else on the network can. The address is arbitrary — any unused
-link-local will do; `169.254.1.1` and `169.254.1.2` are already taken by
-podman's DNS forwarder and `host.containers.internal`.
+it, and nothing else on the network can.
 
-Check the endpoint before attaching:
+**Check `$AGENT_SANDBOX_HOST_LOOPBACK` first.** The launcher sets it to the
+mapped address, and only when the route exists:
 
 ```sh
-curl -s http://169.254.1.3:9222/json/version
+echo "${AGENT_SANDBOX_HOST_LOOPBACK:?relaunch with: agent-sandbox --host-loopback}"
+curl -s "http://$AGENT_SANDBOX_HOST_LOOPBACK:9222/json/version"
 ```
 
-A refusal means Chrome isn't listening on the host's `127.0.0.1:9222`, or the
-sandbox was launched without that `--network` spec. Note that an already-running
-Chrome ignores `--remote-debugging-port`; the user needs a separate
-`--user-data-dir` for the flag to take effect.
+Unset means this session cannot reach the host at all — say so and ask the user
+to relaunch, rather than guessing at ports. Set but refused means Chrome isn't
+listening on the host's `127.0.0.1:9222`: an already-running Chrome ignores
+`--remote-debugging-port`, so the user needs a separate `--user-data-dir` for
+the flag to take effect. Use the variable rather than the literal below; the
+user may have picked another address with `--host-loopback=ADDR`.
 
 Then attach as a CDP client — this is a remote connection, not a local launch,
 so `PLAYWRIGHT_BROWSERS_PATH` and `FONTCONFIG_FILE` aren't needed:
 
 ```python
+import os
 from playwright.sync_api import sync_playwright
 
+host = os.environ["AGENT_SANDBOX_HOST_LOOPBACK"]   # KeyError = no route, relaunch
 p = sync_playwright().start()
-browser = p.chromium.connect_over_cdp("http://169.254.1.3:9222")
+browser = p.chromium.connect_over_cdp(f"http://{host}:9222")
 page = browser.contexts[0].pages[0]     # the host's already-open tab
 page.goto("https://example.com")
 ```
@@ -196,8 +200,7 @@ To point that browser at a server running *in* the sandbox, publish a port as
 well — the two compose, since publishing no longer changes the network mode:
 
 ```sh
-agent-sandbox --ports \
-  --podman-args --network=pasta:--map-host-loopback,169.254.1.3 -- bash
+agent-sandbox --ports --host-loopback -- bash
 ```
 
 The host's Chrome then reaches it over the host's own loopback, e.g.

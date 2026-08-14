@@ -1,13 +1,14 @@
 # Trust model
 
 !!! warning "Flags that pierce the sandbox boundary"
-    `--ssh`, `--gpg`, and `--podman` each hand the agent a capability that reaches outside the container. Review the section for each flag below before enabling them.
+    `--ssh`, `--gpg`, `--podman`, and `--host-loopback` each hand the agent a capability that reaches outside the container. Review the section for each flag below before enabling them.
 
 By design, `agent-sandbox` includes options that pierce the sandbox boundary. Note that these give any agent running inside the container capabilities on the host:
 
 - `--ssh` (opt-in): The agent can authenticate as you using your forwarded SSH identity (e.g. `git push` to your repos).
 - `--gpg` (opt-in): The agent can sign commits or authenticate with any key held by your host GnuPG agent. Note that `agent-sandbox` protects your private key files by checking for them and gracefully failing the GNUPG directory mount if they are present on disk, but the forwarded GnuPG agent socket is still accessible.
 - `--podman` (opt-in): Forwards the host rootless podman socket. The agent can use this to launch **sibling containers** on the host, which is equivalent to a full sandbox escape (e.g. `podman run -v /:/host ...`).
+- `--host-loopback` (opt-in): Maps one address to the host's `127.0.0.1`, so the agent can reach services you run there — **all of them**, not only the one you had in mind. Narrower than the `--network=host` it replaces, which shares the host's entire network stack, but it is still a route out of the sandbox: anything listening on your loopback, including an unproxied forward proxy or a database with no password because "it's only local", is reachable. Refused with `--proxy`.
 
 ### Running Containers: `--podman` vs `--privileged`
 If you want the agent to be able to run its own containers, `agent-sandbox` supports two distinct models:

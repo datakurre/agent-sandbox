@@ -99,6 +99,46 @@ fn expand_v(spec: &str, current_dir: &Path, home_dir: &str) -> String {
     }
 }
 
+/// The address `--host-loopback` maps to the host's loopback when none is
+/// given.  Link-local, so it collides with nothing routable, and `.3` because
+/// podman has already taken the two below it: `169.254.1.1` is its pasta DNS
+/// forwarder and `169.254.1.2` is `host.containers.internal`.
+const HOST_LOOPBACK_DEFAULT: &str = "169.254.1.3";
+
+/// An operator-supplied `--host-loopback=ADDR`, or a refusal.  Rejecting the
+/// two addresses podman already uses is the point of validating at all: pasta
+/// accepts the mapping either way and the collision surfaces much later, as a
+/// sandbox whose DNS or `host.containers.internal` has quietly become the
+/// host's loopback.
+fn validated_host_loopback(addr: &str) -> String {
+    let parsed: IpAddr = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => fail(&format!(
+            "agent-sandbox: --host-loopback: {:?} is not an IP address literal",
+            addr
+        )),
+    };
+    if parsed.is_loopback() || parsed.is_unspecified() {
+        fail(&format!(
+            "agent-sandbox: --host-loopback: {} names the sandbox's own stack, not a\n               route to the host.  Use an address nothing else answers on, such\n               as {}.",
+            parsed, HOST_LOOPBACK_DEFAULT
+        ));
+    }
+    if addr == "169.254.1.1" || addr == "169.254.1.2" {
+        fail(&format!(
+            "agent-sandbox: --host-loopback: {} is already podman's ({}).\n               Use another address, such as {}.",
+            addr,
+            if addr == "169.254.1.1" {
+                "the pasta DNS forwarder"
+            } else {
+                "host.containers.internal"
+            },
+            HOST_LOOPBACK_DEFAULT
+        ));
+    }
+    parsed.to_string()
+}
+
 /// Whether a `[ports]` bind address is loopback, which is what decides if a
 /// published port is compatible with `--proxy`.  `parse_ports` has already
 /// reduced the field to an IP literal (`"localhost"` included), so anything
@@ -303,6 +343,7 @@ fn print_usage(
     want_krun: bool,
     want_ports: bool,
     want_shared_network: bool,
+    want_host_loopback: bool,
     want_mounts: bool,
     want_agent_mounts_mode: &AgentMountsMode,
 ) {
@@ -375,10 +416,15 @@ Ports:
                                            --podman-args -p HOST:CONTAINER --
   --shared-network                   {shared_network} Joins the shared bridge network, so other
                                            containers can reach this one by name.  Replaces
-                                           pasta, so pasta options no longer apply -- including
-                                           --map-host-loopback, the only way to reach a service
-                                           bound to the host's 127.0.0.1.
+                                           pasta with a bridge, so --host-loopback and any
+                                           other pasta option no longer apply.
                                            --no-shared-network turns it back off.
+  --host-loopback[=ADDR]             {host_loopback} Maps ADDR (default {host_loopback_default}) to the
+                                           host's 127.0.0.1, so a service the user runs there
+                                           is reachable without being exposed to anything
+                                           else.  The sandbox gets the address as
+                                           $AGENT_SANDBOX_HOST_LOOPBACK.  Refused with
+                                           --proxy: it is a route around the sidecar.
 
 Mounts:
   --mounts / --no-mounts             {mounts} Honors [mounts] declarations from AGENTS.md.
@@ -423,6 +469,8 @@ before. It is not a substitute for leaving the three flags off."#,
         krun = fmt(want_krun),
         ports = fmt(want_ports),
         shared_network = fmt(want_shared_network),
+        host_loopback = fmt(want_host_loopback),
+        host_loopback_default = HOST_LOOPBACK_DEFAULT,
         mounts = fmt(want_mounts),
         agent_mounts = fmt(agent_mounts_all)
     );
@@ -760,6 +808,7 @@ fn run() -> Result<i32> {
     let mut want_ports = false;
     let mut want_ports_any_interface = false;
     let mut want_shared_network = false;
+    let mut want_host_loopback: Option<String> = None;
     let mut want_mounts = false;
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
     let mut want_proxy = false;
@@ -920,6 +969,8 @@ fn run() -> Result<i32> {
             "--ports-any-interface" => want_ports_any_interface = true,
             "--shared-network" => want_shared_network = true,
             "--no-shared-network" => want_shared_network = false,
+            "--host-loopback" => want_host_loopback = Some(HOST_LOOPBACK_DEFAULT.to_string()),
+            "--no-host-loopback" => want_host_loopback = None,
             "--mounts" => want_mounts = true,
             "--no-mounts" => want_mounts = false,
             "--agent-mounts" => want_agent_mounts_mode = AgentMountsMode::All,
@@ -955,6 +1006,8 @@ fn run() -> Result<i32> {
                         }
                     }
                     want_agent_mounts_mode = AgentMountsMode::List(list_vec);
+                } else if let Some(addr) = arg.strip_prefix("--host-loopback=") {
+                    want_host_loopback = Some(validated_host_loopback(addr));
                 } else if arg == "--proxy-log" || arg.starts_with("--proxy-log=") {
                     let value = match arg.strip_prefix("--proxy-log=") {
                         Some(v) => v.to_string(),
@@ -1067,6 +1120,7 @@ fn run() -> Result<i32> {
             want_krun,
             want_ports,
             want_shared_network,
+            want_host_loopback.is_some(),
             want_mounts,
             &want_agent_mounts_mode,
         );
@@ -1109,21 +1163,44 @@ fn run() -> Result<i32> {
         }
     }
 
-    // Both --network flags would reach podman, which can only report the
+    // Two flags choose the network mode themselves, and each would reach podman
+    // as a second --network beside the operator's.  Podman can only report that
     // contradiction in its own words, long after the launcher had a chance to
-    // say something useful.  Worth catching because the documented way to reach
-    // a service on the host's loopback is a --network spec of exactly this
-    // shape, and a bridge is what cannot honour it.
-    if want_shared_network {
+    // say which flag to drop.
+    let launcher_owns_network = if want_shared_network {
+        Some("--shared-network")
+    } else if want_host_loopback.is_some() {
+        Some("--host-loopback")
+    } else {
+        None
+    };
+    if let Some(flag) = launcher_owns_network {
         for arg in &podman_args {
             if arg == "--network"
                 || arg == "--net"
                 || arg.starts_with("--network=")
                 || arg.starts_with("--net=")
             {
-                fail("agent-sandbox: --shared-network cannot be combined with a --network of your own.\n               The shared network is a bridge, and pasta options -- including\n               --map-host-loopback, the only route to the host's loopback -- do\n               not apply there.\n               Drop --shared-network, or drop the --network argument.");
+                fail(&format!(
+                    "agent-sandbox: {} cannot be combined with a --network of your own.\n               It is a --network spec itself, and podman takes only one.\n               Drop {}, or write the whole spec by hand.",
+                    flag, flag
+                ));
             }
         }
+    }
+
+    // Both are network modes, and pasta is not a bridge.
+    if want_shared_network && want_host_loopback.is_some() {
+        fail("agent-sandbox: --shared-network cannot be combined with --host-loopback.\n               The shared network is a bridge, where pasta options -- including\n               --map-host-loopback -- do not apply.\n               Drop one of the two.");
+    }
+
+    // A route to the host's loopback is a route the proxy never sees, and what
+    // is listening there is not this launcher's to vouch for -- an unproxied
+    // forward proxy on the host would be an egress path with the policy still
+    // nominally on.  Refused rather than warned about, like every other way of
+    // leaving the sidecar behind.
+    if want_proxy && want_host_loopback.is_some() {
+        fail("agent-sandbox: --proxy cannot be combined with --host-loopback.\n               Mapping the host's loopback into the sandbox is a route around\n               the sidecar, so the egress policy would only be advisory.\n               Drop --host-loopback, or drop --proxy.");
     }
 
     if want_secrets && !want_proxy {
@@ -1508,11 +1585,10 @@ fn run() -> Result<i32> {
     // rootless default (pasta) with a bridge, and pasta options are the only
     // route to the host's loopback.  Podman passes --no-map-gw and points
     // host.containers.internal at the host's *LAN* address, so reaching a
-    // service on the host's 127.0.0.1 means asking for it by hand with
-    // --podman-args --network=pasta:--map-host-loopback,ADDR -- which a bridge
+    // service on the host's 127.0.0.1 takes --host-loopback, which a bridge
     // cannot honour.  Publishing needs neither -- podman publishes under pasta
-    // just as well -- so the two decisions are kept apart, and the flag stands
-    // on its own: being reachable by name is useful without publishing
+    // just as well -- so the three decisions are kept apart, and the flag
+    // stands on its own: being reachable by name is useful without publishing
     // anything to the host.
     let mut network_args: Vec<String> = Vec::new();
     if want_shared_network {
@@ -1538,6 +1614,19 @@ fn run() -> Result<i32> {
         }
         network_args.push("--network".to_string());
         network_args.push(network);
+    }
+
+    // The whole of --host-loopback: pasta translates one address to the host's
+    // loopback, so a service the user runs on 127.0.0.1 is reachable without
+    // being exposed to anything else.  The address is also handed to the
+    // sandbox, because an agent cannot otherwise tell a session that has this
+    // route from one that does not -- both look like a refused connection.
+    if let Some(addr) = &want_host_loopback {
+        network_args.push(format!("--network=pasta:--map-host-loopback,{}", addr));
+        eprintln!(
+            "agent-sandbox: {} maps to the host's 127.0.0.1 (AGENT_SANDBOX_HOST_LOOPBACK)",
+            addr
+        );
     }
 
     // Outside the block above: a port is published in either network mode, and
@@ -2063,6 +2152,13 @@ fn run() -> Result<i32> {
 
     podman_cmd.args(&network_args);
     podman_cmd.args(&publish_args);
+
+    // Set only when the route exists, so an agent can test for it rather than
+    // discovering its absence as a refused connection.
+    if let Some(addr) = &want_host_loopback {
+        podman_cmd.arg("-e");
+        podman_cmd.arg(format!("AGENT_SANDBOX_HOST_LOOPBACK={}", addr));
+    }
 
     for proxy_env in proxy_env_vars {
         podman_cmd.arg("-e");

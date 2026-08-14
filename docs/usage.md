@@ -86,6 +86,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
 | Ports & mounts | `--shared-network` | Joins the shared bridge network so other containers can reach this one by name. Costs access to the host's loopback — see below. |
+| Ports & mounts | `--host-loopback[=ADDR]` | Maps `ADDR` (default `169.254.1.3`) to the host's `127.0.0.1`, and exports it as `$AGENT_SANDBOX_HOST_LOOPBACK`. Refused with `--proxy`. See below. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
 
@@ -117,25 +118,36 @@ Publishing forwards to the sandbox's interface address, so a server bound to the
 sandbox's own `127.0.0.1` answers from inside and refuses from the host.
 
 Publishing does not change the network mode, which matters for reaching back to
-the host. Rootless podman leaves the sandbox on pasta, and pasta can be asked to
-translate one address to the host's loopback:
+the host. Rootless podman leaves the sandbox on pasta, and `--host-loopback`
+asks pasta to translate one address to the host's loopback:
 
 ```sh
-agent-sandbox --podman-args --network=pasta:--map-host-loopback,169.254.1.3 -- bash
+agent-sandbox --host-loopback -- bash
 ```
 
 Packets the sandbox sends to `169.254.1.3` then arrive on the host as
 `127.0.0.1 → 127.0.0.1`, which is how a sandbox reaches a service the user runs
-on the host without exposing it — a browser's CDP port, say (see the `browser`
-skill). This is not on by default: podman passes pasta `--no-map-gw`, and the
-`host.containers.internal` entry it does set up points at the host's *LAN*
-address, not its loopback.
+on the host without exposing it to anything else — a browser's CDP port, say
+(see the `browser` skill). This is not on by default: podman passes pasta
+`--no-map-gw`, and the `host.containers.internal` entry it does set up points at
+the host's *LAN* address, not its loopback.
 
-`--shared-network` gives that up. It puts the sandbox on a bridge so sibling
-containers can reach it by name, and pasta options do not apply there — the two
-are mutually exclusive at the podman level. So the shared network is opt-in and
-most sandboxes should leave it off. `AGENT_SANDBOX_NETWORK` names the network
-when the flag is on.
+The sandbox is told which address it got, as `$AGENT_SANDBOX_HOST_LOOPBACK`, so
+an agent inside can test for the route instead of learning it is missing from a
+refused connection. `--host-loopback=ADDR` picks a different address; anything
+unused will do, but not `169.254.1.1` or `169.254.1.2`, which are podman's own
+DNS forwarder and `host.containers.internal`.
+
+This is a capability, not just a convenience: it exposes everything listening on
+the host's loopback, not only the service you had in mind. It is refused with
+`--proxy`, where it would be a route around the sidecar, and with
+`--shared-network`.
+
+`--shared-network` gives the mapping up. It puts the sandbox on a bridge so
+sibling containers can reach it by name, and pasta options do not apply there —
+the two are mutually exclusive at the podman level. So the shared network is
+opt-in and most sandboxes should leave it off. `AGENT_SANDBOX_NETWORK` names the
+network when the flag is on.
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
