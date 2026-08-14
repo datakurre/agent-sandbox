@@ -5,9 +5,28 @@ use thiserror::Error;
 use crate::agents::parse_host_port;
 
 #[derive(Debug, Clone)]
-pub struct RequestedBinding {
-    pub domain: String,
+pub struct SecretRule {
+    pub host: String,
+    pub method: String,
+    pub path: String,
     pub secret: String,
+    pub header: String,
+    pub prefix: String,
+}
+
+impl SecretRule {
+    pub fn matches_host_binding(&self, hb: &HostBinding) -> bool {
+        let (self_domain, self_port) = parse_host_port(&self.host);
+        let (hb_domain, hb_port) = parse_host_port(&hb.host);
+
+        self_domain.to_lowercase() == hb_domain.to_lowercase()
+            && self_port == hb_port
+            && self.method.to_uppercase() == hb.method.to_uppercase()
+            && self.path == hb.path
+            && self.secret == hb.secret
+            && self.header.to_lowercase() == hb.header.to_lowercase()
+            && self.prefix == hb.prefix.as_deref().unwrap_or("")
+    }
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -23,10 +42,19 @@ pub struct HostConfig {
 pub struct HostBinding {
     #[serde(alias = "domain")]
     pub host: String,
+    #[serde(default = "default_method")]
+    pub method: String,
+    #[serde(default = "default_path")]
+    pub path: String,
     pub secret: String,
+    #[serde(default = "default_header")]
     pub header: String,
     pub prefix: Option<String>,
 }
+
+fn default_method() -> String { "GET".to_string() }
+fn default_path() -> String { "/".to_string() }
+fn default_header() -> String { "Authorization".to_string() }
 
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -77,8 +105,8 @@ pub fn iter_tagged_blocks(content: &str) -> Vec<String> {
     blocks
 }
 
-pub fn get_requested_bindings(workspace: &Path) -> Vec<RequestedBinding> {
-    let mut requested_bindings = Vec::new();
+pub fn get_requested_rules(workspace: &Path) -> Vec<SecretRule> {
+    let mut requested_rules = Vec::new();
     if let Ok(content) = std::fs::read_to_string(workspace) {
         let blocks = iter_tagged_blocks(&content);
         for block in blocks {
@@ -89,10 +117,17 @@ pub fn get_requested_bindings(workspace: &Path) -> Vec<RequestedBinding> {
                             if let Some(rule_table) = rule.as_table() {
                                 if let (Some(secret_val), Some(host_val)) = (rule_table.get("secret"), rule_table.get("host")) {
                                     if let (Some(secret), Some(host)) = (secret_val.as_str(), host_val.as_str()) {
-                                        let (domain, _) = parse_host_port(host);
-                                        requested_bindings.push(RequestedBinding {
-                                            domain: domain.to_lowercase(),
+                                        let method = rule_table.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+                                        let path = rule_table.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                                        let header = rule_table.get("header").and_then(|v| v.as_str()).unwrap_or("Authorization");
+                                        let prefix = rule_table.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+                                        requested_rules.push(SecretRule {
+                                            host: host.to_string(),
+                                            method: method.to_string(),
+                                            path: path.to_string(),
                                             secret: secret.to_string(),
+                                            header: header.to_string(),
+                                            prefix: prefix.to_string(),
                                         });
                                     }
                                 }
@@ -103,7 +138,7 @@ pub fn get_requested_bindings(workspace: &Path) -> Vec<RequestedBinding> {
             }
         }
     }
-    requested_bindings
+    requested_rules
 }
 
 pub fn domain_match(domain: &str, pattern: &str) -> bool {
@@ -184,7 +219,7 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
         return Ok(Vec::new());
     }
 
-    let requested_bindings = get_requested_bindings(workspace);
+    let requested_rules = get_requested_rules(workspace);
 
     let (host_config, _toml_val) = match std::fs::read_to_string(config) {
         Ok(c) => {
@@ -230,19 +265,14 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
     let mut filtered_bindings = Vec::new();
     let mut seen_domains: Vec<String> = Vec::new();
 
-    for req in requested_bindings {
-        let req_domain = req.domain;
-        let req_secret = req.secret;
+    let mut missing_rules = Vec::new();
 
+    for req in requested_rules {
         let mut authorized = false;
         let mut matched_host_binding = None;
 
         for hb in &host_config.bindings {
-            let (hb_domain, _hb_port) = parse_host_port(&hb.host);
-            let hb_domain = hb_domain.to_lowercase();
-            let hb_secret = &hb.secret;
-
-            if domain_match(&req_domain, &hb_domain) && hb_secret == &req_secret {
+            if req.matches_host_binding(hb) {
                 authorized = true;
                 matched_host_binding = Some(hb.clone());
                 break;
@@ -250,19 +280,8 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
         }
 
         if !authorized {
-            let mut err_msg = String::new();
-            err_msg.push_str(&format!("agent-sandbox: AGENTS.md requests secret '{}' for host '{}',\n", req_secret, req_domain));
-            err_msg.push_str(&format!("               but this secret binding is not authorized in {}.\n\n", config.display()));
-            err_msg.push_str(&format!("               To authorize this secret binding, add the following block to {}:\n\n", config.display()));
-            err_msg.push_str("               [[network.rules]]\n");
-            err_msg.push_str(&format!("               host = \"{}\"\n", req_domain)); // Simplified host suggestion
-            err_msg.push_str("               method = \"GET\"\n"); // Provide defaults as per plan error 7
-            err_msg.push_str("               path = \"/\"\n");
-            err_msg.push_str(&format!("               secret = \"{}\"\n", req_secret));
-            err_msg.push_str("               header = \"Authorization\"\n");
-            err_msg.push_str("               prefix = \"Bearer \"\n\n");
-            err_msg.push_str("               Or remove 'secret' from the [[network.rules]] in AGENTS.md if untrusted.\n");
-            anyhow::bail!("{}", err_msg);
+            missing_rules.push(req);
+            continue;
         }
 
         let hb = matched_host_binding.unwrap();
@@ -287,6 +306,25 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
             filtered_bindings.push(hb);
             seen_domains.push(hb_domain.clone());
         }
+    }
+
+    if !missing_rules.is_empty() {
+        let mut err_msg = String::new();
+        for req in missing_rules {
+            err_msg.push_str(&format!("agent-sandbox: AGENTS.md requests secret '{}' for rule:\n", req.secret));
+            err_msg.push_str(&format!("               host = \"{}\", method = \"{}\", path = \"{}\"\n", req.host, req.method, req.path));
+            err_msg.push_str(&format!("               but this secret definition is not authorized in {}.\n\n", config.display()));
+            err_msg.push_str(&format!("               To authorize this secret definition, add the following block to {}:\n\n", config.display()));
+            err_msg.push_str("               [[network.rules]]\n");
+            err_msg.push_str(&format!("               host = \"{}\"\n", req.host));
+            err_msg.push_str(&format!("               method = \"{}\"\n", req.method));
+            err_msg.push_str(&format!("               path = \"{}\"\n", req.path));
+            err_msg.push_str(&format!("               secret = \"{}\"\n", req.secret));
+            err_msg.push_str(&format!("               header = \"{}\"\n", req.header));
+            err_msg.push_str(&format!("               prefix = \"{}\"\n\n", req.prefix));
+            err_msg.push_str("               Or remove 'secret' from the [[network.rules]] in AGENTS.md if untrusted.\n\n");
+        }
+        anyhow::bail!("{}", err_msg.trim_end());
     }
 
     if filtered_bindings.is_empty() {
@@ -360,3 +398,105 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
 
     Ok(lines)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    #[test]
+    fn test_secret_rule_matches() {
+        let rule = SecretRule {
+            host: "api.github.com:443".to_string(),
+            method: "POST".to_string(),
+            path: "/graphql".to_string(),
+            secret: "GITHUB_TOKEN".to_string(),
+            header: "Authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+        };
+
+        // Exact match
+        let mut hb = HostBinding {
+            host: "api.github.com:443".to_string(),
+            method: "POST".to_string(),
+            path: "/graphql".to_string(),
+            secret: "GITHUB_TOKEN".to_string(),
+            header: "Authorization".to_string(),
+            prefix: Some("Bearer ".to_string()),
+        };
+        assert!(rule.matches_host_binding(&hb));
+
+        // Missing port in HostBinding -> mismatch
+        hb.host = "api.github.com".to_string();
+        assert!(!rule.matches_host_binding(&hb));
+
+        // Different method -> mismatch
+        hb.host = "api.github.com:443".to_string();
+        hb.method = "GET".to_string();
+        assert!(!rule.matches_host_binding(&hb));
+
+        // Different path -> mismatch
+        hb.method = "POST".to_string();
+        hb.path = "/v1".to_string();
+        assert!(!rule.matches_host_binding(&hb));
+
+        // Different secret -> mismatch
+        hb.path = "/graphql".to_string();
+        hb.secret = "OTHER_TOKEN".to_string();
+        assert!(!rule.matches_host_binding(&hb));
+
+        // Different header -> mismatch
+        hb.secret = "GITHUB_TOKEN".to_string();
+        hb.header = "X-Api-Key".to_string();
+        assert!(!rule.matches_host_binding(&hb));
+
+        // Different prefix -> mismatch
+        hb.header = "Authorization".to_string();
+        hb.prefix = Some("Basic ".to_string());
+        assert!(!rule.matches_host_binding(&hb));
+    }
+
+    #[test]
+    fn test_get_requested_rules_parsing() {
+        let content = r#"
+```agent-sandbox
+[network]
+allow = ["github.com:443"]
+
+[[network.rules]]
+host = "api.github.com:443"
+method = "POST"
+path = "/graphql"
+secret = "GITHUB_TOKEN"
+header = "Authorization"
+prefix = "Bearer "
+
+[[network.rules]]
+host = "registry.npmjs.org:443"
+method = "GET"
+path = "/*"
+secret = "NPM_TOKEN"
+```
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(content.as_bytes()).unwrap();
+
+        let rules = get_requested_rules(tmp.path());
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].host, "api.github.com:443");
+        assert_eq!(rules[0].method, "POST");
+        assert_eq!(rules[0].path, "/graphql");
+        assert_eq!(rules[0].secret, "GITHUB_TOKEN");
+        assert_eq!(rules[0].header, "Authorization");
+        assert_eq!(rules[0].prefix, "Bearer ");
+
+        assert_eq!(rules[1].host, "registry.npmjs.org:443");
+        assert_eq!(rules[1].method, "GET");
+        assert_eq!(rules[1].path, "/*");
+        assert_eq!(rules[1].secret, "NPM_TOKEN");
+        assert_eq!(rules[1].header, "Authorization");
+        assert_eq!(rules[1].prefix, "");
+    }
+}
+
