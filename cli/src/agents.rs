@@ -663,7 +663,6 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
 mod export_tests {
     use super::*;
     use agent_sandbox_proxy::policy::parse_policy;
-    use std::time::Duration;
 
     #[test]
     fn exports_allow_entries_and_l7_rules_as_toml() {
@@ -672,7 +671,6 @@ mod export_tests {
              allow_ips 10.0.0.0/8\n\
              secret_domains api.github.com\n\
              allow_l7\tapi.github.com\tGET\t/repos/*\n",
-            Duration::from_secs(300),
         )
         .unwrap();
         let toml = format_policy_as_network_toml(&cfg);
@@ -689,7 +687,6 @@ mod export_tests {
     fn exports_deny_and_ports_as_an_advisory_comment_not_toml_keys() {
         let cfg = parse_policy(
             "deny_domains evil.example.com\ndeny_ips 169.254.169.254/32\nallow_ports 8000-8100\n",
-            Duration::from_secs(300),
         )
         .unwrap();
         let toml = format_policy_as_network_toml(&cfg);

@@ -374,13 +374,6 @@ fn main() -> Result<()> {
         proxy_args.push("3".to_string());
     }
 
-    if let Ok(timeout) = env::var("AGENT_SANDBOX_ASK_TIMEOUT") {
-        if !timeout.is_empty() {
-            proxy_args.push("--proxy-train".to_string());
-            proxy_args.push(timeout);
-        }
-    }
-
     let mut sidecar_listen = String::new();
     if !config.dry_run {
         match get_sidecar_listen() {

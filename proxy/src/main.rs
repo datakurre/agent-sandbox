@@ -295,48 +295,6 @@ impl MetricsLog {
     }
 }
 
-struct PendingLog {
-    file: Mutex<File>,
-}
-
-impl PendingLog {
-    fn open(path: &str) -> Option<Arc<PendingLog>> {
-        match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(f) => Some(Arc::new(PendingLog { file: Mutex::new(f) })),
-            Err(e) => {
-                eprintln!("proxy: cannot open pending log {}: {}", path, e);
-                None
-            }
-        }
-    }
-
-    fn write_pending(&self, id: &str, host: &str, port: u16, method: &str) {
-        if let Ok(mut f) = self.file.lock() {
-            let _ = writeln!(
-                f,
-                "{{\"ev\":\"pending\",\"id\":\"{}\",\"ts\":{},\"host\":\"{}\",\"port\":{},\"method\":\"{}\"}}",
-                id,
-                now_secs(),
-                json_escape(host),
-                port,
-                json_escape(method)
-            );
-        }
-    }
-
-    fn write_resolved(&self, id: &str, verdict: &str) {
-        if let Ok(mut f) = self.file.lock() {
-            let _ = writeln!(
-                f,
-                "{{\"ev\":\"resolved\",\"id\":\"{}\",\"ts\":{},\"verdict\":\"{}\"}}",
-                id,
-                now_secs(),
-                verdict
-            );
-        }
-    }
-}
-
 // ── Connection handling ─────────────────────────────────────────────────────
 
 struct Shared {
@@ -350,7 +308,6 @@ struct Shared {
     session_ca: Option<Arc<SessionCa>>,
     resolver: Resolver,
     metrics: Option<Arc<MetricsLog>>,
-    pending: Option<Arc<PendingLog>>,
     /// Instant until which the resolve/connect paths keep retrying.
     startup_until: Instant,
 }
@@ -427,97 +384,18 @@ impl Shared {
         Some(id)
     }
 
-    fn wait_for_ask(self: &Arc<Self>, host: &str, port: u16, method: &str, req_id: Option<&str>) -> bool {
+    fn is_allowed(&self, host: &str, port: u16) -> bool {
         let cfg = self.config();
-        if cfg.is_allowed_target(host) && cfg.is_allowed_port(port) {
-            return true;
-        }
-        if !cfg.default_ask {
-            return false;
-        }
-
-        let id = req_id.map(|s| s.to_string()).unwrap_or_else(|| {
-            self.metrics.as_ref().map(|m| m.next_id()).unwrap_or_else(|| format!("{}-tmp", now_secs()))
-        });
-
-        if let Some(p) = &self.pending {
-            p.write_pending(&id, host, port, method);
-        }
-        let deadline = Instant::now() + cfg.ask_timeout;
-        let mut verdict = "timeout";
-        loop {
-            thread::sleep(POLICY_POLL);
-            if Instant::now() >= deadline { break; }
-            let new_cfg = self.config();
-            if new_cfg.is_allowed_target(host) && new_cfg.is_allowed_port(port) {
-                verdict = "allow";
-                break;
-            }
-            if !new_cfg.default_ask && !new_cfg.is_allowed_target(host) {
-                verdict = "deny";
-                break;
-            }
-        }
-        if let Some(p) = &self.pending {
-            p.write_resolved(&id, verdict);
-        }
-        verdict == "allow"
+        cfg.is_allowed_target(host) && cfg.is_allowed_port(port)
     }
 
     /// Returns `(true, None)` if the request is allowed, or `(false, Some(reason))`
     /// when it is denied.  The reason is meant for logs only, not for the client.
-    pub fn wait_for_l7_ask(
-        self: &Arc<Self>,
-        host: &str,
-        port: u16,
-        method: &str,
-        path: &str,
-        req_id: Option<&str>,
-    ) -> (bool, Option<String>) {
+    pub fn l7_check(&self, host: &str, method: &str, path: &str) -> (bool, Option<String>) {
         let cfg = self.config();
         if cfg.is_l7_allowed(host, method, path) {
-            return (true, None);
-        }
-        if !cfg.default_ask {
-            return (false, Some(cfg.why_l7_denied(host, method, path)));
-        }
-
-        let id = req_id.map(|s| s.to_string()).unwrap_or_else(|| {
-            self.metrics
-                .as_ref()
-                .map(|m| m.next_id())
-                .unwrap_or_else(|| format!("{}-tmp", now_secs()))
-        });
-
-        if let Some(p) = &self.pending {
-            p.write_pending(&id, host, port, method);
-        }
-        let deadline = Instant::now() + cfg.ask_timeout;
-        let mut verdict = "timeout";
-        loop {
-            thread::sleep(POLICY_POLL);
-            if Instant::now() >= deadline {
-                break;
-            }
-            let new_cfg = self.config();
-            if new_cfg.is_l7_allowed(host, method, path) {
-                verdict = "allow";
-                break;
-            }
-            if !new_cfg.default_ask && !new_cfg.is_l7_allowed(host, method, path) {
-                verdict = "deny";
-                break;
-            }
-        }
-        if let Some(p) = &self.pending {
-            p.write_resolved(&id, verdict);
-        }
-        if verdict == "allow" {
             (true, None)
-        } else if verdict == "timeout" {
-            (false, Some("ask timeout".to_string()))
         } else {
-            let cfg = self.config();
             (false, Some(cfg.why_l7_denied(host, method, path)))
         }
     }
@@ -712,14 +590,12 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     // resolved-address check disagree.
     let cfg = shared.config();
 
-    if !cfg.is_allowed_target(&host) || !cfg.is_allowed_port(port) {
-        if !shared.wait_for_ask(&host, port, method, None) {
-            let reason = if !cfg.is_allowed_port(port) { "port" } else { "domain" };
-            let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-            eprintln!("proxy: deny {}:{}", host, port);
-            shared.record(None, &host, port, "deny", Some(reason), 0, 0, started.elapsed().as_millis(), Some(method));
-            return;
-        }
+    if !shared.is_allowed(&host, port) {
+        let reason = cfg.why_denied(&host, port);
+        let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+        shared.record(None, &host, port, "deny", Some(&reason), 0, 0, started.elapsed().as_millis(), Some(method));
+        return;
     }
 
     let addrs = match shared.resolver.resolve(&host, port, shared.startup_until) {
@@ -747,9 +623,10 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     // resolves to, so a denied address cannot be reached via an allowed (or
     // merely unlisted) hostname.
     if let Some(bad) = addrs.iter().find(|a| cfg.is_denied_address(a.ip())) {
+        let reason = cfg.why_address_denied(bad.ip());
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-        eprintln!("proxy: deny {}:{} (resolves to denied address {})", host, port, bad.ip());
-        shared.record(None, &host, port, "deny", Some("address"), 0, 0, started.elapsed().as_millis(), None);
+        eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+        shared.record(None, &host, port, "deny", Some(&reason), 0, 0, started.elapsed().as_millis(), None);
         return;
     }
 
@@ -815,7 +692,6 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 port,
                 secret_binding.as_ref().map(|b| (b.header.as_str(), b.value.as_str())),
                 &shared,
-                id.as_deref(),
             ) {
                 Ok((up, down)) => {
                     shared.record(
@@ -1026,7 +902,6 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 port,
                 secret_binding.as_ref().map(|b| (b.header.as_str(), b.value.as_str())),
                 &shared,
-                id.as_deref(),
             ) {
                 Ok((up, down)) => {
                     shared.record(
@@ -1150,7 +1025,7 @@ fn policy_stamp(path: &str) -> Option<(SystemTime, u64)> {
 /// A rejected or vanished policy keeps the one already in force: the alternative
 /// is falling back to a config nobody wrote, which is how an empty allow list --
 /// meaning allow everything -- would sneak in.
-fn reload_once(path: &str, ask_timeout: Duration, shared: &Shared) -> bool {
+fn reload_once(path: &str, shared: &Shared) -> bool {
     if policy_stamp(path).is_none() {
         eprintln!(
             "proxy: policy {} is gone; keeping the policy already in force",
@@ -1158,7 +1033,7 @@ fn reload_once(path: &str, ask_timeout: Duration, shared: &Shared) -> bool {
         );
         return false;
     }
-    match load_policy(path, ask_timeout) {
+    match load_policy(path) {
         Ok(config) => {
             shared.replace_config(config);
             true
@@ -1176,7 +1051,7 @@ fn reload_once(path: &str, ask_timeout: Duration, shared: &Shared) -> bool {
 /// hand-rolled handler, `signal_hook` would be the crate's only dependency, and
 /// one `stat` a second is free.  A second is also below the threshold where a
 /// human running `proxy allow` and immediately retrying would notice.
-fn watch_policy(path: String, ask_timeout: Duration, shared: Arc<Shared>) {
+fn watch_policy(path: String, shared: Arc<Shared>) {
     let mut current = policy_stamp(&path);
     loop {
         thread::sleep(POLICY_POLL);
@@ -1185,7 +1060,7 @@ fn watch_policy(path: String, ask_timeout: Duration, shared: Arc<Shared>) {
             continue;
         }
         current = stamp;
-        reload_once(&path, ask_timeout, &shared);
+        reload_once(&path, &shared);
     }
 }
 
@@ -1251,7 +1126,6 @@ Usage: agent-sandbox-proxy [OPTIONS]
   --allow-ips LIST
   --deny-ips LIST
   --allow-ports LIST     ports and ranges, e.g. 443,8000-8100
-  --proxy-train SECS     timeout for dynamic allow (default 300)
 ";
 
 /// Exit codes: 2 for anything wrong with the policy, so the sidecar and the
@@ -1271,7 +1145,6 @@ struct Options {
     allow_ips: String,
     deny_ips: String,
     allow_ports: String,
-    ask_timeout: Duration,
 }
 
 fn parse_args(args: &[String]) -> (Options, Option<String>) {
@@ -1285,7 +1158,6 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
         allow_ips: String::new(),
         deny_ips: String::new(),
         allow_ports: String::new(),
-        ask_timeout: Duration::from_secs(300),
     };
     let mut check = None;
     let mut i = 1;
@@ -1318,9 +1190,8 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
             "--deny-ips" => o.deny_ips = value(),
             "--allow-ports" => o.allow_ports = value(),
             "--proxy-train" => {
-                let v = value();
-                let s = v.parse::<u64>().unwrap_or_else(|_| fail(&format!("invalid --proxy-train: {}", v)));
-                o.ask_timeout = Duration::from_secs(s);
+                let _ = value();
+                fail("'--proxy-train' was removed. Run with a policy 'default deny' and watch denied requests via `agent-sandbox ctl tui`.");
             }
             "-h" | "--help" => {
                 print!("{}", USAGE);
@@ -1351,7 +1222,7 @@ fn initial_config(o: &Options) -> ProxyConfig {
         if inline {
             fail("--policy and --allow-domains/--deny-domains/--allow-ips/--deny-ips/--allow-ports are mutually exclusive");
         }
-        match load_policy(&o.policy, o.ask_timeout) {
+        match load_policy(&o.policy) {
             Ok(c) => c,
             Err(e) => fail(&e),
         }
@@ -1380,8 +1251,6 @@ fn initial_config(o: &Options) -> ProxyConfig {
             deny_ips,
             allow_ports,
             None,
-            None,
-            o.ask_timeout,
             Vec::new(),
         )
     }
@@ -1394,7 +1263,7 @@ fn main() {
     // Validation mode: the host runs this to vet a policy before installing it,
     // so an invalid policy can never reach a running proxy.
     if let Some(path) = check {
-        match load_policy(&path, opts.ask_timeout) {
+        match load_policy(&path) {
             Ok(config) => {
                 for line in config.describe() {
                     println!("{}", line);
@@ -1433,8 +1302,6 @@ fn main() {
     eprintln!("proxy: session CA generated at {}", PROXY_CA_PEM);
     let session_ca = Some(Arc::new(session_ca));
 
-    let pending = PendingLog::open("/sidecar_shared/pending.jsonl");
-
     // Bind before probing egress so a port clash fails immediately rather than
     // after the readiness wait.
     let listener = match TcpListener::bind(&opts.listen) {
@@ -1455,7 +1322,6 @@ fn main() {
         session_ca,
         resolver: Resolver::new(),
         metrics,
-        pending,
         startup_until: Instant::now() + STARTUP_GRACE,
     });
 
@@ -1466,7 +1332,7 @@ fn main() {
         let watched = Arc::clone(&shared);
         if thread::Builder::new()
             .stack_size(256 * 1024)
-            .spawn(move || watch_policy(path, opts.ask_timeout, watched))
+            .spawn(move || watch_policy(path, watched))
             .is_err()
         {
             eprintln!("proxy: cannot spawn the policy watcher; policy changes will not apply");
@@ -1509,12 +1375,11 @@ pub(crate) fn dummy_shared() -> Arc<Shared> {
 #[cfg(test)]
 pub(crate) fn shared_with(policy: &str) -> Shared {
     Shared {
-        config: RwLock::new(Arc::new(parse_policy(policy, Duration::from_secs(300)).expect("initial policy"))),
+        config: RwLock::new(Arc::new(parse_policy(policy).expect("initial policy"))),
         secrets: Arc::new(SecretBindings::default()),
         session_ca: None,
         resolver: Resolver::new(),
         metrics: None,
-        pending: None,
         startup_until: Instant::now(),
     }
 }
@@ -1522,12 +1387,11 @@ pub(crate) fn shared_with(policy: &str) -> Shared {
 #[cfg(test)]
 pub(crate) fn shared_with_secrets(policy: &str, secrets: &str) -> Shared {
     Shared {
-        config: RwLock::new(Arc::new(parse_policy(policy, Duration::from_secs(300)).expect("initial policy"))),
+        config: RwLock::new(Arc::new(parse_policy(policy).expect("initial policy"))),
         secrets: Arc::new(SecretBindings::parse(secrets).expect("initial secrets")),
         session_ca: None,
         resolver: Resolver::new(),
         metrics: None,
-        pending: None,
         startup_until: Instant::now(),
     }
 }
@@ -1536,12 +1400,8 @@ pub(crate) fn shared_with_secrets(policy: &str, secrets: &str) -> Shared {
 mod tests {
     use super::*;
 
-    fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
-        super::parse_policy(text, Duration::from_secs(300))
-    }
-
     fn reload_once(path: &str, shared: &Shared) -> bool {
-        super::reload_once(path, Duration::from_secs(300), shared)
+        super::reload_once(path, shared)
     }
 
     fn cfg(allow_d: &str, deny_d: &str, allow_i: &str, deny_i: &str) -> ProxyConfig {
@@ -1553,8 +1413,6 @@ mod tests {
             parse_csv_ips(deny_i).expect("test deny_ips"),
             None,
             None,
-            None,
-            Duration::from_secs(300),
             Vec::new(),
         )
     }

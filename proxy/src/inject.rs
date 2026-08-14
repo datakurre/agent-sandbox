@@ -535,7 +535,6 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
     expected_port: u16,
     secret: Option<(&str, &str)>,
     shared: &std::sync::Arc<crate::Shared>,
-    req_id: Option<&str>,
 ) -> io::Result<(u64, u64)> {
     let mut up_bytes = 0u64;
     let mut down_bytes = 0u64;
@@ -574,7 +573,7 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
         let method = request_method(request_text)?;
         let path = request_path(request_text)?;
 
-        let (allowed, reason) = shared.wait_for_l7_ask(expected_host, expected_port, method, &path, req_id);
+        let (allowed, reason) = shared.l7_check(expected_host, method, &path);
         if !allowed {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             let msg = reason
@@ -743,7 +742,6 @@ mod tests {
                 80,
                 Some(("Authorization", "Bearer v")),
                 &crate::dummy_shared(),
-                None,
             )
             .expect("proxy");
 
@@ -773,7 +771,6 @@ mod tests {
             80,
             Some(("Authorization", "Bearer v")),
             &crate::dummy_shared(),
-            None,
         )
         .unwrap_err();
 
@@ -799,7 +796,6 @@ mod tests {
             80,
             Some(("Authorization", "Bearer v")),
             &crate::dummy_shared(),
-            None,
         )
         .unwrap_err();
 
@@ -856,7 +852,6 @@ mod tests {
             80,
             None,
             &crate::dummy_shared(),
-            None,
         )
         .expect("proxy should succeed");
 

@@ -1,12 +1,11 @@
 use super::resolve::*;
-use crate::agents::{format_policy_as_network_toml, is_ip_or_cidr};
+use crate::agents::{format_policy_as_network_toml, is_ip_or_cidr, parse_host_port};
 use agent_sandbox_proxy::policy::{parse_policy, parse_port_range, ProxyConfig};
 use agent_sandbox_proxy::policy_io::{install_policy, load_policy_lines};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::fs;
-use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -24,14 +23,14 @@ pub enum ProxyCommand {
     Show(TargetArgs),
     #[command(about = "Allow a domain, IP/CIDR, port, or (with --l7) an HTTP route")]
     Allow(AllowArgs),
-    #[command(about = "Deny a domain or IP/CIDR (ports have no deny form)")]
-    Deny(DenyArgs),
     #[command(about = "Remove a previously added rule")]
     Rm(RmArgs),
     #[command(about = "Reset the policy back to how the sandbox was launched")]
     Reset(TargetArgs),
     #[command(about = "Print the current policy as an AGENTS.md [network] TOML block")]
     Export(TargetArgs),
+    #[command(about = "Check whether a host (and optionally port) would be allowed under the current policy")]
+    Check(CheckArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -57,8 +56,8 @@ pub struct AllowArgs {
 }
 
 #[derive(Parser, Debug)]
-pub struct DenyArgs {
-    #[arg(help = "Domain name or IP/CIDR to deny")]
+pub struct CheckArgs {
+    #[arg(help = "Host or host:port to check, e.g. api.example.com or api.example.com:443")]
     pub target: String,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
@@ -76,8 +75,6 @@ pub struct RmArgs {
 pub enum RmKind {
     #[command(about = "Remove an allow_domains/allow_ips/allow_ports rule")]
     Allow(RmTargetArgs),
-    #[command(about = "Remove a deny_domains/deny_ips rule")]
-    Deny(RmTargetArgs),
     #[command(about = "Remove an allow_l7 rule")]
     L7(RmL7Args),
 }
@@ -123,7 +120,7 @@ fn policy_dir(word: &Option<String>, sandbox: &Option<String>) -> Result<(String
 
 fn parse_lines(lines: &[String]) -> Result<ProxyConfig> {
     let text = lines.join("\n") + "\n";
-    match parse_policy(&text, Duration::from_secs(300)) {
+    match parse_policy(&text) {
         Ok(cfg) => Ok(cfg),
         Err(e) => {
             eprintln!("agent-sandbox ctl proxy: current policy is invalid: {}", e);
@@ -173,10 +170,10 @@ pub fn run(args: ProxyArgs) -> Result<()> {
     match args.command {
         ProxyCommand::Show(a) => show(a),
         ProxyCommand::Allow(a) => allow(a),
-        ProxyCommand::Deny(a) => deny(a),
         ProxyCommand::Rm(a) => rm(a),
         ProxyCommand::Reset(a) => reset(a),
         ProxyCommand::Export(a) => export(a),
+        ProxyCommand::Check(a) => check(a),
     }
 }
 
@@ -190,9 +187,7 @@ fn show(args: TargetArgs) -> Result<()> {
 
     println!("{}", sandbox_name);
     println!("  policy      {}/policy", dir);
-    let default_desc = if cfg.default_ask {
-        "ask   (unlisted requests pause for a live decision — see `ctl tui`)".to_string()
-    } else if cfg.default_allow {
+    let default_desc = if cfg.default_allow {
         "allow (everything is reachable except the rules below)".to_string()
     } else {
         "deny  (only the rules below are reachable)".to_string()
@@ -235,23 +230,6 @@ fn allow(args: AllowArgs) -> Result<()> {
     apply(&dir, lines)
 }
 
-fn deny(args: DenyArgs) -> Result<()> {
-    if target_kind(&args.target) == "ports" {
-        eprintln!(
-            "agent-sandbox ctl proxy: ports have no deny form ('{}' looks like a port); [network].ports is a global allow-list, not something scoped to a host",
-            args.target
-        );
-        std::process::exit(1);
-    }
-    let (_, dir) = policy_dir(&args.word, &args.sandbox)?;
-    let mut lines = load_policy_lines(&dir);
-    let kind = target_kind(&args.target);
-    let key = if kind == "ips" { "deny_ips" } else { "deny_domains" };
-    lines.push(format!("{} {}", key, args.target));
-    println!("  denied      {:<34} {}", args.target, kind);
-    apply(&dir, lines)
-}
-
 /// Drops the first line matching `predicate`; reports whether anything was
 /// removed so callers can tell the user when there was nothing to do.
 fn remove_matching(lines: &mut Vec<String>, predicate: impl Fn(&str) -> bool) -> bool {
@@ -273,13 +251,6 @@ fn rm(args: RmArgs) -> Result<()> {
                 "ports" => "allow_ports",
                 _ => "allow_domains",
             };
-            let removed = remove_matching(&mut lines, |l| l == format!("{} {}", key, a.target));
-            (dir, lines, removed, format!("{} {}", key, a.target))
-        }
-        RmKind::Deny(a) => {
-            let (_, dir) = policy_dir(&a.word, &a.sandbox)?;
-            let mut lines = load_policy_lines(&dir);
-            let key = if is_ip_or_cidr(&a.target) { "deny_ips" } else { "deny_domains" };
             let removed = remove_matching(&mut lines, |l| l == format!("{} {}", key, a.target));
             (dir, lines, removed, format!("{} {}", key, a.target))
         }
@@ -331,5 +302,40 @@ fn export(args: TargetArgs) -> Result<()> {
         .collect();
     let cfg = parse_lines(&lines)?;
     print!("{}", format_policy_as_network_toml(&cfg));
+    Ok(())
+}
+
+fn check(args: CheckArgs) -> Result<()> {
+    let (sandbox_name, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let lines = load_policy_lines(&dir);
+    let cfg = parse_lines(&lines)?;
+    let (host, port_str) = parse_host_port(&args.target);
+
+    println!("{}", sandbox_name);
+    match port_str {
+        Some(p) => {
+            let Ok(port) = p.parse::<u16>() else {
+                eprintln!(
+                    "agent-sandbox ctl proxy: '{}' is not a plain port (ranges/wildcards aren't a single target to check)",
+                    p
+                );
+                std::process::exit(1);
+            };
+            if cfg.is_allowed(&host, port) {
+                println!("  allowed     {}:{}", host, port);
+            } else {
+                println!("  denied      {}:{}", host, port);
+                println!("              {}", cfg.why_denied(&host, port));
+            }
+        }
+        None => {
+            if cfg.is_allowed_target(&host) {
+                println!("  allowed     {}  (port not checked — pass HOST:PORT for a complete answer)", host);
+            } else {
+                println!("  denied      {}  (port not checked — pass HOST:PORT for a complete answer)", host);
+                println!("              {}", cfg.why_target_denied(&host));
+            }
+        }
+    }
     Ok(())
 }

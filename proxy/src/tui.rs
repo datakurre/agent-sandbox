@@ -13,7 +13,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, BufRead, Seek, SeekFrom},
     net::IpAddr,
@@ -38,22 +38,9 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// A row from `pending.jsonl` — only ever written while the policy's
-/// `default` is `ask` (see `Shared::wait_for_ask`/`wait_for_l7_ask` in
-/// `main.rs`).
-#[derive(Deserialize, Debug, Clone)]
-struct LogEvent {
-    ev: Option<String>,
-    id: Option<String>,
-    ts: Option<u64>,
-    host: Option<String>,
-    port: Option<u16>,
-    method: Option<String>,
-}
-
-/// A line from `connections.jsonl`. Distinct schema from `LogEvent`: no `id`
-/// on the lines this TUI cares about (an outright, id-less deny — see the
-/// doc comment on `MetricsLog` in `main.rs`).
+/// A line from `connections.jsonl`. Only the id-less lines with
+/// `verdict:"deny"` matter here — an outright deny before any tunnel opened
+/// (see the doc comment on `MetricsLog` in `main.rs`).
 #[derive(Deserialize, Debug, Clone)]
 struct ConnEvent {
     ev: Option<String>,
@@ -77,70 +64,32 @@ struct DeniedEntry {
     last_seen: u64,
 }
 
+impl DeniedEntry {
+    fn info_cell(&self) -> String {
+        let age = now_secs().saturating_sub(self.last_seen);
+        let reason = self.reason.as_deref().unwrap_or("denied");
+        if self.count > 1 {
+            format!("{} (×{}, {}s ago)", reason, self.count, age)
+        } else {
+            format!("{} ({}s ago)", reason, age)
+        }
+    }
+}
+
 /// `connections.jsonl` has no size cap, so the in-memory denied set doesn't
 /// either unless bounded here.
 const MAX_DENIED_ROWS: usize = 200;
 
-enum DisplayRow {
-    Pending(LogEvent),
-    Denied(DeniedEntry),
-}
-
-impl DisplayRow {
-    fn state_label(&self) -> &'static str {
-        match self {
-            DisplayRow::Pending(_) => "PEND",
-            DisplayRow::Denied(_) => "DENY",
-        }
-    }
-
-    fn host(&self) -> Option<&str> {
-        match self {
-            DisplayRow::Pending(r) => r.host.as_deref(),
-            DisplayRow::Denied(d) => Some(d.host.as_str()),
-        }
-    }
-
-    fn port(&self) -> u16 {
-        match self {
-            DisplayRow::Pending(r) => r.port.unwrap_or(0),
-            DisplayRow::Denied(d) => d.port,
-        }
-    }
-
-    fn method(&self) -> Option<&str> {
-        match self {
-            DisplayRow::Pending(r) => r.method.as_deref(),
-            DisplayRow::Denied(d) => d.method.as_deref(),
-        }
-    }
-
-    fn info_cell(&self) -> String {
-        match self {
-            DisplayRow::Pending(_) => String::new(),
-            DisplayRow::Denied(d) => {
-                let age = now_secs().saturating_sub(d.last_seen);
-                let reason = d.reason.as_deref().unwrap_or("denied");
-                if d.count > 1 {
-                    format!("{} (×{}, {}s ago)", reason, d.count, age)
-                } else {
-                    format!("{} ({}s ago)", reason, age)
-                }
-            }
-        }
-    }
-}
-
 /// Whether `h` (allow HTTP route) makes sense for this row: only once a real
-/// HTTP method is known. A domain-level ask (or an outright deny before any
-/// L7 check ran) carries `"CONNECT"` or no method at all, and a rule built
-/// from either can never match a real request.
+/// HTTP method is known. A domain/IP-level deny before any L7 check ran
+/// carries `"CONNECT"` or no method at all, and a rule built from either can
+/// never match a real request.
 fn h_available(method: Option<&str>) -> bool {
     matches!(method, Some(m) if m != "CONNECT")
 }
 
-/// Whether `A`/`D` (allow/deny IP) makes sense for this row's host: it must
-/// actually parse as an IP or CIDR. Most rows carry a domain name instead.
+/// Whether `A` (allow IP) makes sense for this row's host: it must actually
+/// parse as an IP or CIDR. Most rows carry a domain name instead.
 fn ip_available(host: &str) -> bool {
     match host.split_once('/') {
         Some((ip, mask)) => ip.parse::<IpAddr>().is_ok() && mask.parse::<u8>().is_ok(),
@@ -165,6 +114,14 @@ impl StatusKind {
     }
 }
 
+/// The two screens this dashboard flips between: the live denied-request
+/// feed (default), and a read/remove view of the policy actually in force.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Requests,
+    Rules,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
@@ -174,7 +131,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox_name = &args[1];
     let sidecar_policy = &args[2];
     let sidecar_shared = &args[3];
-    let pending_log = format!("{}/pending.jsonl", sidecar_shared);
     let connections_log = format!("{}/connections.jsonl", sidecar_shared);
 
     enable_raw_mode()?;
@@ -185,16 +141,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut pending_reqs: HashMap<String, LogEvent> = HashMap::new();
     let mut denied_reqs: HashMap<(String, u16), DeniedEntry> = HashMap::new();
+    let mut view = View::Requests;
     let mut selected_idx = 0;
     let mut table_state = TableState::default();
+    let mut rules_selected_idx = 0;
+    let mut rules_table_state = TableState::default();
     let mut status_msg = String::new();
     let mut status_kind = StatusKind::Info;
     let mut status_until: Option<Instant> = None;
 
-    let mut pending_file = None;
-    let mut pending_pos = 0;
     let mut conn_file = None;
     let mut conn_pos = 0;
 
@@ -203,37 +159,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if Instant::now() >= until {
                 status_msg.clear();
                 status_until = None;
-            }
-        }
-
-        if pending_file.is_none() {
-            if let Ok(f) = fs::File::open(&pending_log) {
-                pending_file = Some(io::BufReader::new(f));
-            }
-        }
-        if let Some(ref mut reader) = pending_file {
-            let _ = reader.seek(SeekFrom::Start(pending_pos));
-            let mut line = String::new();
-            while let Ok(n) = reader.read_line(&mut line) {
-                if n == 0 { break; }
-                if !line.ends_with('\n') {
-                    // Incomplete line written mid-frame; rewind so we re-read next loop
-                    let _ = reader.seek(SeekFrom::Current(-(line.len() as i64)));
-                    break;
-                }
-                if let Ok(ev) = serde_json::from_str::<LogEvent>(&line) {
-                    if let Some(id) = ev.id.clone() {
-                        if ev.ev.as_deref() == Some("pending") {
-                            pending_reqs.insert(id, ev);
-                        } else if ev.ev.as_deref() == Some("resolved") {
-                            pending_reqs.remove(&id);
-                        }
-                    }
-                }
-                line.clear();
-            }
-            if let Ok(pos) = reader.stream_position() {
-                pending_pos = pos;
             }
         }
 
@@ -254,8 +179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(ev) = serde_json::from_str::<ConnEvent>(&line) {
                     // An outright deny before any tunnel opened: no `ev`/`id`
                     // on the line (see the doc comment on `MetricsLog` in
-                    // main.rs). Ask-mode pendings and open/close events are
-                    // filtered out by requiring `ev` to be absent.
+                    // main.rs). Open/close events are filtered out by
+                    // requiring `ev` to be absent.
                     if ev.ev.is_none() && ev.verdict.as_deref() == Some("deny") {
                         if let (Some(host), Some(port)) = (ev.host.clone(), ev.port) {
                             let ts = ev.ts.unwrap_or_else(now_secs);
@@ -292,23 +217,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let mut pending_list: Vec<LogEvent> = pending_reqs.values().cloned().collect();
-        pending_list.sort_by_key(|r| r.ts.unwrap_or(0));
-        let pending_count = pending_list.len();
-
         let mut denied_list: Vec<DeniedEntry> = denied_reqs.values().cloned().collect();
         denied_list.sort_by_key(|d| std::cmp::Reverse(d.last_seen));
-        let denied_count = denied_list.len();
 
-        // Pending rows always come first and are never interleaved with
-        // denies: a pending ask is time-boxed by `ask_timeout` and must stay
-        // visually prominent, so a burst of repeated denies can't push it
-        // off-screen.
-        let row_list: Vec<DisplayRow> = pending_list
-            .into_iter()
-            .map(DisplayRow::Pending)
-            .chain(denied_list.into_iter().map(DisplayRow::Denied))
-            .collect();
+        // Only loaded while the Rules view is active — cheap either way (a
+        // small file, and this loop already re-reads connections.jsonl at
+        // ~10Hz), but no point parsing it every frame when it's not shown.
+        let (policy_lines, base_lines): (Vec<String>, HashSet<String>) = if view == View::Rules {
+            let lines = load_policy_lines(sidecar_policy);
+            let base = fs::read_to_string(format!("{}/policy.base", sidecar_policy))
+                .map(|s| s.lines().map(|l| l.to_string()).collect())
+                .unwrap_or_default();
+            (lines, base)
+        } else {
+            (Vec::new(), HashSet::new())
+        };
 
         terminal.draw(|f| {
             let size = f.size();
@@ -330,70 +253,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let selected_style = Style::default().add_modifier(Modifier::REVERSED);
             let normal_style = Style::default();
 
-            if row_list.is_empty() {
-                let p = Paragraph::new("No pending or recently denied requests. Waiting for sandbox egress...")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .block(Block::default().borders(Borders::ALL).title("Requests (0)"));
-                f.render_widget(p, chunks[1]);
-                selected_idx = 0;
-                table_state.select(None);
-            } else {
-                if selected_idx >= row_list.len() {
-                    selected_idx = row_list.len().saturating_sub(1);
+            match view {
+                View::Requests => {
+                    if denied_list.is_empty() {
+                        let p = Paragraph::new("No denied requests yet. Waiting for sandbox egress...")
+                            .style(Style::default().fg(Color::DarkGray))
+                            .block(Block::default().borders(Borders::ALL).title("Denied Requests (0)"));
+                        f.render_widget(p, chunks[1]);
+                        selected_idx = 0;
+                        table_state.select(None);
+                    } else {
+                        if selected_idx >= denied_list.len() {
+                            selected_idx = denied_list.len().saturating_sub(1);
+                        }
+                        table_state.select(Some(selected_idx));
+
+                        let rows = denied_list.iter().enumerate().map(|(i, d)| {
+                            let method = d.method.as_deref().unwrap_or("");
+                            let style = if i == selected_idx { selected_style } else { normal_style };
+                            let method_style = match method {
+                                "GET" | "POST" | "PUT" | "DELETE" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                                "CONNECT" => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                                _ => Style::default().fg(Color::White),
+                            };
+                            Row::new(vec![
+                                ratatui::text::Span::styled(method.to_string(), method_style),
+                                ratatui::text::Span::raw(d.host.clone()),
+                                ratatui::text::Span::raw(d.port.to_string()),
+                                ratatui::text::Span::raw(d.info_cell()),
+                            ]).style(style)
+                        });
+
+                        let table = Table::new(
+                            rows,
+                            [
+                                Constraint::Length(9),
+                                Constraint::Percentage(40),
+                                Constraint::Length(7),
+                                Constraint::Percentage(44),
+                            ],
+                        )
+                        .header(
+                            Row::new(vec!["Method", "Destination Host/IP", "Port", "Info"])
+                                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+                        )
+                        .block(Block::default().borders(Borders::ALL).title(format!("Denied Requests ({})", denied_list.len())));
+                        f.render_stateful_widget(table, chunks[1], &mut table_state);
+                    }
                 }
-                table_state.select(Some(selected_idx));
+                View::Rules => {
+                    if policy_lines.is_empty() {
+                        let p = Paragraph::new("No policy rules yet.")
+                            .style(Style::default().fg(Color::DarkGray))
+                            .block(Block::default().borders(Borders::ALL).title("Rules (0)"));
+                        f.render_widget(p, chunks[1]);
+                        rules_selected_idx = 0;
+                        rules_table_state.select(None);
+                    } else {
+                        if rules_selected_idx >= policy_lines.len() {
+                            rules_selected_idx = policy_lines.len().saturating_sub(1);
+                        }
+                        rules_table_state.select(Some(rules_selected_idx));
 
-                let rows = row_list.iter().enumerate().map(|(i, row)| {
-                    let host = row.host().unwrap_or("unknown");
-                    let port = row.port();
-                    let method = row.method().unwrap_or("");
-                    let style = if i == selected_idx { selected_style } else { normal_style };
+                        let rows = policy_lines.iter().enumerate().map(|(i, line)| {
+                            let style = if i == rules_selected_idx { selected_style } else { normal_style };
+                            let (key, value) = line.split_once(char::is_whitespace).unwrap_or((line.as_str(), ""));
+                            let display_value = if key == "allow_l7" {
+                                value.trim().replace('\t', " ")
+                            } else {
+                                value.trim().to_string()
+                            };
+                            let source = if base_lines.contains(line) { "AGENTS.md" } else { "" };
+                            Row::new(vec![key.to_string(), display_value, source.to_string()]).style(style)
+                        });
 
-                    let state_style = match row {
-                        DisplayRow::Pending(_) => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                        DisplayRow::Denied(_) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    };
-                    let method_style = match method {
-                        "GET" | "POST" | "PUT" | "DELETE" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                        "CONNECT" => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                        _ => Style::default().fg(Color::White),
-                    };
-
-                    Row::new(vec![
-                        ratatui::text::Span::styled(row.state_label(), state_style),
-                        ratatui::text::Span::styled(method.to_string(), method_style),
-                        ratatui::text::Span::raw(host.to_string()),
-                        ratatui::text::Span::raw(port.to_string()),
-                        ratatui::text::Span::raw(row.info_cell()),
-                    ]).style(style)
-                });
-
-                let table = Table::new(
-                    rows,
-                    [
-                        Constraint::Length(6),
-                        Constraint::Length(9),
-                        Constraint::Percentage(40),
-                        Constraint::Length(7),
-                        Constraint::Percentage(35),
-                    ],
-                )
-                .header(
-                    Row::new(vec!["State", "Method", "Destination Host/IP", "Port", "Info"])
-                        .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
-                )
-                .block(Block::default().borders(Borders::ALL).title(format!(
-                    "Requests ({} pending, {} denied)",
-                    pending_count, denied_count
-                )));
-                f.render_stateful_widget(table, chunks[1], &mut table_state);
+                        let table = Table::new(
+                            rows,
+                            [Constraint::Length(15), Constraint::Percentage(60), Constraint::Length(12)],
+                        )
+                        .header(
+                            Row::new(vec!["Key", "Value", "Source"])
+                                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+                        )
+                        .block(Block::default().borders(Borders::ALL).title(format!("Rules ({})", policy_lines.len())));
+                        f.render_stateful_widget(table, chunks[1], &mut rules_table_state);
+                    }
+                }
             }
 
-            let instructions = Paragraph::new(
-                "↑/↓ select   [a] Allow domain   [h] Allow HTTP route   [d] Deny domain\n\
-                 [A] Allow IP  [D] Deny IP  ·  PEND=awaiting decision, DENY=already rejected   [q]/[Esc] Quit",
-            )
-            .block(Block::default().borders(Borders::ALL).title("Keybindings"));
+            let legend_text = match view {
+                View::Requests => "↑/↓ select   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[r] Rules view   [q]/[Esc] Quit",
+                View::Rules => "↑/↓ select   [x] Remove rule (blocked for AGENTS.md rules)\n[r] Requests view   [q]/[Esc] Quit",
+            };
+            let instructions = Paragraph::new(legend_text)
+                .block(Block::default().borders(Borders::ALL).title("Keybindings"));
             f.render_widget(instructions, chunks[2]);
 
             if !status_msg.is_empty() {
@@ -409,70 +362,98 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Up => {
-                        selected_idx = selected_idx.saturating_sub(1);
+                    KeyCode::Up => match view {
+                        View::Requests => selected_idx = selected_idx.saturating_sub(1),
+                        View::Rules => rules_selected_idx = rules_selected_idx.saturating_sub(1),
+                    },
+                    KeyCode::Down => match view {
+                        View::Requests => {
+                            selected_idx = (selected_idx + 1).min(denied_list.len().saturating_sub(1));
+                        }
+                        View::Rules => {
+                            rules_selected_idx = (rules_selected_idx + 1).min(policy_lines.len().saturating_sub(1));
+                        }
+                    },
+                    KeyCode::Char('r') => {
+                        view = match view {
+                            View::Requests => View::Rules,
+                            View::Rules => View::Requests,
+                        };
                     }
-                    KeyCode::Down => {
-                        selected_idx = (selected_idx + 1).min(row_list.len().saturating_sub(1));
-                    }
-                    KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Char('h') => {
-                        if !row_list.is_empty() && selected_idx < row_list.len() {
-                            let row = &row_list[selected_idx];
-                            if let Some(host) = row.host().map(|h| h.to_string()) {
-                                let method = row.method().map(|m| m.to_string());
+                    KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('h') if view == View::Requests => {
+                        if !denied_list.is_empty() && selected_idx < denied_list.len() {
+                            let row = &denied_list[selected_idx];
+                            let host = row.host.clone();
+                            let method = row.method.clone();
 
-                                let mut guard_msg: Option<String> = None;
-                                let mut detail = String::new();
-                                let mut policy = load_policy_lines(sidecar_policy);
+                            let mut guard_msg: Option<String> = None;
+                            let mut detail = String::new();
+                            let mut policy = load_policy_lines(sidecar_policy);
 
-                                match key.code {
-                                    KeyCode::Char('a') => {
-                                        detail = format!("allow_domains {}", host);
-                                        policy.push(detail.clone());
-                                    }
-                                    KeyCode::Char('d') => {
-                                        detail = format!("deny_domains {}", host);
-                                        policy.push(detail.clone());
-                                    }
-                                    KeyCode::Char('A') | KeyCode::Char('D') => {
-                                        if !ip_available(&host) {
-                                            guard_msg = Some(format!(
-                                                "'{}' is not an IP — use 'a'/'d' to allow/deny the domain instead",
-                                                host
-                                            ));
-                                        } else if key.code == KeyCode::Char('A') {
-                                            detail = format!("allow_ips {}", host);
-                                            policy.push(detail.clone());
-                                        } else {
-                                            detail = format!("deny_ips {}", host);
-                                            policy.push(detail.clone());
-                                        }
-                                    }
-                                    KeyCode::Char('h') => {
-                                        if !h_available(method.as_deref()) {
-                                            guard_msg = Some(
-                                                "No HTTP method known yet for this row — allow the domain first with 'a'; 'h' becomes available once a real request is seen"
-                                                    .to_string(),
-                                            );
-                                        } else {
-                                            let m = method.unwrap();
-                                            detail = format!("allow_l7 {} {}", host, m);
-                                            policy.push(format!("allow_l7\t{}\t{}\t/*", host, m));
-                                        }
-                                    }
-                                    _ => {}
+                            match key.code {
+                                KeyCode::Char('a') => {
+                                    detail = format!("allow_domains {}", host);
+                                    policy.push(detail.clone());
                                 }
+                                KeyCode::Char('A') => {
+                                    if !ip_available(&host) {
+                                        guard_msg = Some(format!(
+                                            "'{}' is not an IP — use 'a' to allow the domain instead",
+                                            host
+                                        ));
+                                    } else {
+                                        detail = format!("allow_ips {}", host);
+                                        policy.push(detail.clone());
+                                    }
+                                }
+                                KeyCode::Char('h') => {
+                                    if !h_available(method.as_deref()) {
+                                        guard_msg = Some(
+                                            "No HTTP method known yet for this row — allow the domain first with 'a'; 'h' becomes available once a real request is seen"
+                                                .to_string(),
+                                        );
+                                    } else {
+                                        let m = method.unwrap();
+                                        detail = format!("allow_l7 {} {}", host, m);
+                                        policy.push(format!("allow_l7\t{}\t{}\t/*", host, m));
+                                    }
+                                }
+                                _ => {}
+                            }
 
-                                if let Some(msg) = guard_msg {
-                                    status_msg = msg;
-                                    status_kind = StatusKind::Info;
-                                    status_until = Some(Instant::now() + Duration::from_secs(4));
-                                } else if let Err(e) = install_policy(sidecar_policy, &policy) {
+                            if let Some(msg) = guard_msg {
+                                status_msg = msg;
+                                status_kind = StatusKind::Info;
+                                status_until = Some(Instant::now() + Duration::from_secs(4));
+                            } else if let Err(e) = install_policy(sidecar_policy, &policy) {
+                                status_msg = format!("Error: {}", e);
+                                status_kind = StatusKind::Error;
+                                status_until = None;
+                            } else {
+                                status_msg = format!("Added: {}", detail);
+                                status_kind = StatusKind::Success;
+                                status_until = Some(Instant::now() + Duration::from_secs(3));
+                            }
+                        }
+                    }
+                    KeyCode::Char('x') if view == View::Rules => {
+                        if let Some(line) = policy_lines.get(rules_selected_idx) {
+                            if base_lines.contains(line) {
+                                status_msg = format!(
+                                    "'{}' comes from AGENTS.md's baseline policy and can't be removed here — edit AGENTS.md and relaunch, or `agent-sandbox ctl proxy reset` first",
+                                    line
+                                );
+                                status_kind = StatusKind::Info;
+                                status_until = Some(Instant::now() + Duration::from_secs(5));
+                            } else {
+                                let mut lines = policy_lines.clone();
+                                lines.remove(rules_selected_idx);
+                                if let Err(e) = install_policy(sidecar_policy, &lines) {
                                     status_msg = format!("Error: {}", e);
                                     status_kind = StatusKind::Error;
                                     status_until = None;
                                 } else {
-                                    status_msg = format!("Added: {}", detail);
+                                    status_msg = format!("Removed: {}", line);
                                     status_kind = StatusKind::Success;
                                     status_until = Some(Instant::now() + Duration::from_secs(3));
                                 }

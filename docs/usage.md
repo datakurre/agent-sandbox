@@ -115,16 +115,15 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
 
 1. **Start the Sandbox**: Run `agent-sandbox --proxy`. With no `[network]` block yet, requests are recorded and the ones that do not match a rule are denied.
 2. **Open the TUI**: In a **separate terminal**, run `agent-sandbox ctl tui`. This interactive interface lists the requests the sandbox is making, including the denied ones.
-3. **Approve or Deny**: Use the following keybindings to update the policy in real time:
+3. **Approve**: Use the following keybindings to update the policy in real time:
    - `a`: Allow domain
-   - `d`: Deny domain
    - `h`: Allow HTTP route (domain + method) (creates a `[[network.rules]]` rule)
    - `A`: Allow IP
-   - `D`: Deny IP
+   - `r`: Switch to the Rules view — the live effective policy, with `x` to remove a rule (blocked for rules that came from `AGENTS.md`)
    - `q` or `Esc`: Quit the TUI
 4. **Save Rules**: When you've trained the proxy to your liking, export the active rules by running `agent-sandbox ctl proxy export > AGENTS.md` (or append them to your existing `[network]` blocks).
 
-The same TUI also works against a normal (`policy = "deny"`) sandbox launched with plain `--proxy`: it has no pending requests to approve, but it tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count), so you can add the missing rule with the same keybindings without leaving the dashboard. Rows for an outright deny won't offer `h` (allow HTTP route) unless a method was recorded for it — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route ask.
+The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `d`/`D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
 
 ### Git Integration Details
 
@@ -166,8 +165,8 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | `status [WORD] [--sandbox WORD]` | one screen per sandbox, pointing at the commands below |
 | `net [-f] [WORD] [--sandbox WORD]` | connection summary, or a live feed |
 | `logs [-f] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
-| `tui [WORD] [--sandbox WORD]` | interactive terminal UI: approves ask-mode requests live, and shows recently-denied connections so you can add the missing rule without leaving the dashboard |
-| `proxy show\|allow\|deny\|rm\|reset\|export [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as AGENTS.md TOML |
+| `tui [WORD] [--sandbox WORD]` | interactive terminal UI: shows recently-denied connections live so you can add the missing rule, plus a Rules view (`r`) to inspect and remove existing rules, without leaving the dashboard |
+| `proxy show\|allow\|rm\|reset\|export\|check [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as AGENTS.md TOML; `check HOST[:PORT]` dry-runs whether a target would be allowed |
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
 | `relay [-f] [WORD] [--sandbox WORD]` | show the SSH/GPG relay's `allow_signing` policy and what it has been asked for |
 | `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |

@@ -1,6 +1,5 @@
 use ipnet::IpNet;
 use std::net::IpAddr;
-use std::time::Duration;
 use crate::secret::SecretBindings;
 
 /// A single port, or an inclusive range (`8000-8100`).
@@ -50,8 +49,6 @@ pub struct ProxyConfig {
     pub allow_ips: Vec<IpNet>,
     pub deny_ips: Vec<IpNet>,
     pub default_allow: bool,
-    pub default_ask: bool,
-    pub ask_timeout: Duration,
     pub allow_ports: Option<Vec<PortRange>>,
     pub l7_rules: Vec<L7Rule>,
 }
@@ -65,12 +62,9 @@ impl ProxyConfig {
         deny_ips: Vec<IpNet>,
         allow_ports_override: Option<Vec<PortRange>>,
         default_override: Option<bool>,
-        ask_override: Option<bool>,
-        ask_timeout: Duration,
         l7_rules: Vec<L7Rule>,
     ) -> ProxyConfig {
         let default_allow = default_override.unwrap_or(false);
-        let default_ask = ask_override.unwrap_or(false);
         let allow_ports = match allow_ports_override {
             Some(v) => Some(v),
             None if default_allow => None,
@@ -83,8 +77,6 @@ impl ProxyConfig {
             allow_ips,
             deny_ips,
             default_allow,
-            default_ask,
-            ask_timeout,
             allow_ports,
             l7_rules,
         }
@@ -160,13 +152,7 @@ impl ProxyConfig {
         }
         out.push(format!(
             "default {}",
-            if self.default_ask {
-                "ask"
-            } else if self.default_allow {
-                "allow"
-            } else {
-                "deny"
-            }
+            if self.default_allow { "allow" } else { "deny" }
         ));
         out
     }
@@ -221,7 +207,7 @@ pub fn parse_csv_ports(s: &str) -> Result<Vec<PortRange>, String> {
     split_list(s).map(parse_port_range).collect()
 }
 
-pub fn parse_policy(text: &str, ask_timeout: Duration) -> Result<ProxyConfig, String> {
+pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
     let mut allow_domains = Vec::new();
     let mut deny_domains = Vec::new();
     let mut secret_domains = Vec::new();
@@ -229,7 +215,6 @@ pub fn parse_policy(text: &str, ask_timeout: Duration) -> Result<ProxyConfig, St
     let mut deny_ips = Vec::new();
     let mut allow_ports_override: Option<Vec<PortRange>> = None;
     let mut default_override = None;
-    let mut ask_override = None;
     let mut l7_rules = Vec::new();
 
     for (i, raw) in text.lines().enumerate() {
@@ -278,11 +263,12 @@ pub fn parse_policy(text: &str, ask_timeout: Duration) -> Result<ProxyConfig, St
                 });
             }
             "default" => match value {
-                "allow" | "deny" | "ask" => {
-                    default_override = Some(value != "deny");
-                    ask_override = Some(value == "ask");
-                }
-                _ => return Err(format!("{}: default: expected 'allow', 'deny' or 'ask', got {:?}", lineno, value)),
+                "allow" | "deny" => default_override = Some(value == "allow"),
+                "ask" => return Err(format!(
+                    "{}: default: 'ask' is no longer supported; use 'allow' or 'deny', and watch denied requests live via `agent-sandbox ctl tui`",
+                    lineno
+                )),
+                _ => return Err(format!("{}: default: expected 'allow' or 'deny', got {:?}", lineno, value)),
             },
             other => return Err(format!("{}: unknown key {:?}", lineno, other)),
         }
@@ -296,16 +282,14 @@ pub fn parse_policy(text: &str, ask_timeout: Duration) -> Result<ProxyConfig, St
         deny_ips,
         allow_ports_override,
         default_override,
-        ask_override,
-        ask_timeout,
         l7_rules,
     ))
 }
 
-pub fn load_policy(path: &str, ask_timeout: Duration) -> Result<ProxyConfig, String> {
+pub fn load_policy(path: &str) -> Result<ProxyConfig, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read policy {}: {}", path, e))?;
-    parse_policy(&text, ask_timeout).map_err(|e| format!("{}:{}", path, e))
+    parse_policy(&text).map_err(|e| format!("{}:{}", path, e))
 }
 
 pub fn fold_ipv6(ip: std::net::Ipv6Addr) -> IpAddr {
@@ -464,6 +448,121 @@ impl ProxyConfig {
         self.is_allowed_target(host) && self.is_allowed_port(port)
     }
 
+    /// Explains why `is_allowed_domain` returned false for `domain`. Mirrors
+    /// its longest-match-wins loop exactly, tracking which pattern actually
+    /// decided the verdict rather than just the outcome, so the explanation
+    /// can never name a pattern other than the real one. Callers must only
+    /// invoke this once denial is already confirmed.
+    fn why_domain_denied(&self, domain: &str) -> String {
+        let mut best_len: i32 = -1;
+        let mut winner: Option<(&str, bool)> = None;
+        for p in &self.allow_domains {
+            if domain_match(domain, p) && p.len() as i32 > best_len {
+                best_len = p.len() as i32;
+                winner = Some((p.as_str(), false));
+            }
+        }
+        for p in &self.deny_domains {
+            if domain_match(domain, p) && p.len() as i32 > best_len {
+                best_len = p.len() as i32;
+                winner = Some((p.as_str(), true));
+            }
+        }
+        match winner {
+            Some((pattern, true)) => format!("matches deny_domains {:?}", pattern),
+            Some((pattern, false)) => format!("matches allow_domains {:?}", pattern),
+            None => format!("no allow_domains rule matches {:?}; default is deny", domain),
+        }
+    }
+
+    /// Explains why `is_allowed_ip` returned false for `ip`. Same mirroring
+    /// approach as `why_domain_denied`.
+    fn why_ip_denied(&self, ip: IpAddr) -> String {
+        let mut best_prefix: i32 = -1;
+        let mut winner: Option<(&IpNet, bool)> = None;
+        for net in &self.allow_ips {
+            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
+                best_prefix = net.prefix_len() as i32;
+                winner = Some((net, false));
+            }
+        }
+        for net in &self.deny_ips {
+            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
+                best_prefix = net.prefix_len() as i32;
+                winner = Some((net, true));
+            }
+        }
+        match winner {
+            Some((net, true)) => format!("matches deny_ips {}", net),
+            Some((net, false)) => format!("matches allow_ips {}", net),
+            None => format!("no allow_ips rule matches {}; default is deny", ip),
+        }
+    }
+
+    /// Explains why `is_allowed_target` returned false for `host`. Dispatches
+    /// to the domain or IP explanation exactly like `is_allowed_target` picks
+    /// between `is_allowed_domain`/`is_allowed_ip`.
+    pub fn why_target_denied(&self, host: &str) -> String {
+        let normalized = match normalize_host(host) {
+            Some(h) => h,
+            None => return format!("{:?} is not a valid host", host),
+        };
+        match normalized.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+            Ok(ip) => self.why_ip_denied(ip),
+            Err(_) => self.why_domain_denied(&normalized),
+        }
+    }
+
+    /// Explains why `is_allowed_port` returned false for `port`.
+    pub fn why_port_denied(&self, port: u16) -> String {
+        match &self.allow_ports {
+            Some(ranges) => {
+                let list: Vec<String> = ranges.iter().map(|r| r.to_string()).collect();
+                format!("port {} is not in allow_ports (configured: {})", port, list.join(", "))
+            }
+            None => format!("port {} is not allowed", port),
+        }
+    }
+
+    /// Explains why `is_denied_address` returned true for a *resolved*
+    /// address. Distinct algorithm from `why_ip_denied`/`is_allowed_ip`: a
+    /// `deny_ips` entry wins on a strictly greater prefix, but an `allow_ips`
+    /// entry of *equal or greater* specificity overrides it (see
+    /// `is_denied_address`'s own comment for why the tie-break is
+    /// asymmetric). Mirrors that exact algorithm so the explanation can't
+    /// disagree with the real decision.
+    pub fn why_address_denied(&self, ip: IpAddr) -> String {
+        let mut best_prefix: i32 = -1;
+        let mut winner: Option<&IpNet> = None;
+        for net in &self.deny_ips {
+            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
+                best_prefix = net.prefix_len() as i32;
+                winner = Some(net);
+            }
+        }
+        for net in &self.allow_ips {
+            if net.contains(&ip) && (net.prefix_len() as i32) >= best_prefix {
+                best_prefix = net.prefix_len() as i32;
+                winner = None;
+            }
+        }
+        match winner {
+            Some(net) => format!("resolved address {} matches deny_ips {}", ip, net),
+            None => format!("resolved address {} has no matching deny_ips rule", ip),
+        }
+    }
+
+    /// Full explanation for a pre-resolution deny (host or port, whichever is
+    /// responsible), for `is_allowed(host, port)` returning false. Callers
+    /// must only invoke this once denial is already confirmed.
+    pub fn why_denied(&self, host: &str, port: u16) -> String {
+        if !self.is_allowed_port(port) {
+            self.why_port_denied(port)
+        } else {
+            self.why_target_denied(host)
+        }
+    }
+
     pub fn is_secret_domain(&self, host: &str) -> bool {
         let host = match normalize_host(host) {
             Some(h) => h,
@@ -485,7 +584,7 @@ mod tests {
     #[test]
     fn parse_policy_reads_allow_l7_rules() {
         let text = "default deny\nallow_l7\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
-        let cfg = parse_policy(text, Duration::from_secs(300)).expect("parse should succeed");
+        let cfg = parse_policy(text).expect("parse should succeed");
         assert_eq!(cfg.l7_rules.len(), 1);
         assert_eq!(cfg.l7_rules[0].domain, "repo.kopla.jyu.fi");
         assert_eq!(cfg.l7_rules[0].method, "GET");
@@ -497,14 +596,14 @@ mod tests {
     #[test]
     fn parse_policy_rejects_whitespace_in_other_values() {
         let text = "allow_ips 10.0.0.0/8 192.168.0.0/16\n";
-        let err = parse_policy(text, Duration::from_secs(300)).unwrap_err();
+        let err = parse_policy(text).unwrap_err();
         assert!(err.contains("whitespace"), "unexpected error: {err}");
     }
 
     #[test]
     fn why_l7_denied_explains_no_rules_for_domain() {
         let text = "default deny\nallow_l7\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
-        let cfg = parse_policy(text, Duration::from_secs(300)).expect("parse should succeed");
+        let cfg = parse_policy(text).expect("parse should succeed");
         let reason = cfg.why_l7_denied("other.example.com", "GET", "/");
         assert!(reason.contains("no L7 allow rules for domain"), "{reason}");
         assert!(reason.contains("other.example.com"), "{reason}");
@@ -513,7 +612,7 @@ mod tests {
     #[test]
     fn why_l7_denied_explains_method_mismatch() {
         let text = "default deny\nallow_l7\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
-        let cfg = parse_policy(text, Duration::from_secs(300)).expect("parse should succeed");
+        let cfg = parse_policy(text).expect("parse should succeed");
         let reason = cfg.why_l7_denied("repo.kopla.jyu.fi", "POST", "/api/pypi/pypi");
         assert!(reason.contains("none allow method"), "{reason}");
         assert!(reason.contains("POST"), "{reason}");
@@ -523,10 +622,73 @@ mod tests {
     #[test]
     fn why_l7_denied_explains_path_mismatch() {
         let text = "default deny\nallow_l7\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
-        let cfg = parse_policy(text, Duration::from_secs(300)).expect("parse should succeed");
+        let cfg = parse_policy(text).expect("parse should succeed");
         let reason = cfg.why_l7_denied("repo.kopla.jyu.fi", "GET", "/packages/wheel.whl");
         assert!(reason.contains("path"), "{reason}");
         assert!(reason.contains("/packages/wheel.whl"), "{reason}");
         assert!(reason.contains("/api/pypi/pypi"), "{reason}");
+    }
+
+    #[test]
+    fn default_ask_line_produces_an_actionable_error() {
+        let err = parse_policy("default ask\n").unwrap_err();
+        assert!(err.contains("no longer supported"), "{err}");
+        assert!(err.contains("ctl tui"), "{err}");
+    }
+
+    #[test]
+    fn why_target_denied_names_the_winning_deny_domains_pattern() {
+        let cfg = parse_policy("allow_domains *.example.com\ndeny_domains internal.example.com\n").unwrap();
+        assert!(!cfg.is_allowed_target("internal.example.com"));
+        let reason = cfg.why_target_denied("internal.example.com");
+        assert!(reason.contains("deny_domains"), "{reason}");
+        assert!(reason.contains("internal.example.com"), "{reason}");
+    }
+
+    #[test]
+    fn why_target_denied_explains_the_implicit_default_deny() {
+        let cfg = parse_policy("allow_domains github.com\n").unwrap();
+        assert!(!cfg.is_allowed_target("evil.example.com"));
+        let reason = cfg.why_target_denied("evil.example.com");
+        assert!(reason.contains("no allow_domains rule matches"), "{reason}");
+        assert!(reason.contains("default is deny"), "{reason}");
+    }
+
+    #[test]
+    fn why_target_denied_names_the_winning_deny_ips_pattern() {
+        let cfg = parse_policy("allow_ips 10.0.0.0/8\ndeny_ips 10.5.0.0/16\n").unwrap();
+        let ip: IpAddr = "10.5.1.1".parse().unwrap();
+        assert!(!cfg.is_allowed_target("10.5.1.1"));
+        let reason = cfg.why_target_denied("10.5.1.1");
+        assert!(reason.contains("deny_ips"), "{reason}");
+        assert!(reason.contains(&ip.to_string()) || reason.contains("10.5.0.0/16"), "{reason}");
+    }
+
+    #[test]
+    fn why_port_denied_lists_the_configured_ranges() {
+        let cfg = parse_policy("allow_domains github.com\nallow_ports 443\n").unwrap();
+        assert!(!cfg.is_allowed_port(8443));
+        let reason = cfg.why_port_denied(8443);
+        assert!(reason.contains("8443"), "{reason}");
+        assert!(reason.contains("443"), "{reason}");
+    }
+
+    #[test]
+    fn why_address_denied_names_the_matching_baseline_range() {
+        let cfg = parse_policy("allow_domains github.com\ndeny_ips 169.254.0.0/16\n").unwrap();
+        let ip: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(cfg.is_denied_address(ip));
+        let reason = cfg.why_address_denied(ip);
+        assert!(reason.contains("deny_ips"), "{reason}");
+        assert!(reason.contains("169.254.0.0/16"), "{reason}");
+    }
+
+    #[test]
+    fn why_denied_prioritizes_the_port_reason_over_the_domain_reason() {
+        let cfg = parse_policy("allow_domains github.com\nallow_ports 443\n").unwrap();
+        assert!(cfg.is_allowed_target("github.com"));
+        assert!(!cfg.is_allowed("github.com", 8443));
+        let reason = cfg.why_denied("github.com", 8443);
+        assert!(reason.contains("port"), "{reason}");
     }
 }
