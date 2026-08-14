@@ -123,6 +123,8 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
    - `q` or `Esc`: Quit the TUI
 4. **Save Rules**: When you've trained the proxy to your liking, export the active rules by running `agent-sandbox ctl proxy export > AGENTS.md` (or append them to your existing `[network]` blocks).
 
+The same TUI also works against a normal (`policy = "deny"`) sandbox launched with plain `--proxy`: it has no pending requests to approve, but it tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count), so you can add the missing rule with the same keybindings without leaving the dashboard. Rows for an outright deny won't offer `h` (allow HTTP route) unless a method was recorded for it — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route ask.
+
 ### Git Integration Details
 
 When using Git inside the sandbox, be aware of how the integration flags interact:
@@ -155,7 +157,7 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | `status [WORD] [--sandbox WORD]` | one screen per sandbox, pointing at the commands below |
 | `net [-f] [WORD] [--sandbox WORD]` | connection summary, or a live feed |
 | `logs [-f] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
-| `tui [WORD] [--sandbox WORD]` | opens an interactive terminal UI to approve or deny requests (requires `policy = "ask"`) |
+| `tui [WORD] [--sandbox WORD]` | interactive terminal UI: approves ask-mode requests live, and shows recently-denied connections so you can add the missing rule without leaving the dashboard |
 | `proxy show\|allow\|deny\|rm\|reset\|export [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as AGENTS.md TOML |
 
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox |

@@ -1,20 +1,335 @@
+use super::resolve::*;
+use crate::agents::{format_policy_as_network_toml, is_ip_or_cidr};
+use agent_sandbox_proxy::policy::{parse_policy, parse_port_range, ProxyConfig};
+use agent_sandbox_proxy::policy_io::{install_policy, load_policy_lines};
 use anyhow::Result;
-use clap::Parser;
-use std::process::Command;
-use std::os::unix::process::CommandExt;
+use clap::{Parser, Subcommand};
+use std::collections::HashSet;
+use std::fs;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-sandbox-proxy",
-    about = "Manage proxy rules (delegates to lib/agent-sandbox-firewall.sh)"
+    about = "Manage proxy rules for a running sandbox"
 )]
 pub struct ProxyArgs {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
+    #[command(subcommand)]
+    pub command: ProxyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProxyCommand {
+    #[command(about = "Print the running sandbox's current policy")]
+    Show(TargetArgs),
+    #[command(about = "Allow a domain, IP/CIDR, port, or (with --l7) an HTTP route")]
+    Allow(AllowArgs),
+    #[command(about = "Deny a domain or IP/CIDR (ports have no deny form)")]
+    Deny(DenyArgs),
+    #[command(about = "Remove a previously added rule")]
+    Rm(RmArgs),
+    #[command(about = "Reset the policy back to how the sandbox was launched")]
+    Reset(TargetArgs),
+    #[command(about = "Print the current policy as an AGENTS.md [network] TOML block")]
+    Export(TargetArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct TargetArgs {
+    #[arg(help = "Sandbox name (positional)")]
+    pub word: Option<String>,
+    #[arg(long, help = "Sandbox name")]
+    pub sandbox: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct AllowArgs {
+    #[arg(help = "Domain name, IP/CIDR, or port/port-range to allow")]
+    pub target: String,
+    #[arg(long, value_name = "METHOD", help = "Allow an HTTP route on TARGET instead of the whole domain (combine with --path)")]
+    pub l7: Option<String>,
+    #[arg(long, default_value = "/*", help = "Path pattern for --l7")]
+    pub path: String,
+    #[arg(help = "Sandbox name (positional)")]
+    pub word: Option<String>,
+    #[arg(long, help = "Sandbox name")]
+    pub sandbox: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct DenyArgs {
+    #[arg(help = "Domain name or IP/CIDR to deny")]
+    pub target: String,
+    #[arg(help = "Sandbox name (positional)")]
+    pub word: Option<String>,
+    #[arg(long, help = "Sandbox name")]
+    pub sandbox: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct RmArgs {
+    #[command(subcommand)]
+    pub kind: RmKind,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RmKind {
+    #[command(about = "Remove an allow_domains/allow_ips/allow_ports rule")]
+    Allow(RmTargetArgs),
+    #[command(about = "Remove a deny_domains/deny_ips rule")]
+    Deny(RmTargetArgs),
+    #[command(about = "Remove an allow_l7 rule")]
+    L7(RmL7Args),
+}
+
+#[derive(Parser, Debug)]
+pub struct RmTargetArgs {
+    #[arg(help = "Domain name, IP/CIDR, or port/port-range to remove")]
+    pub target: String,
+    #[arg(help = "Sandbox name (positional)")]
+    pub word: Option<String>,
+    #[arg(long, help = "Sandbox name")]
+    pub sandbox: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct RmL7Args {
+    pub host: String,
+    pub method: String,
+    pub path: String,
+    #[arg(help = "Sandbox name (positional)")]
+    pub word: Option<String>,
+    #[arg(long, help = "Sandbox name")]
+    pub sandbox: Option<String>,
+}
+
+fn sandbox_target(word: &Option<String>, sandbox: &Option<String>) -> Option<String> {
+    sandbox.clone().or_else(|| word.clone())
+}
+
+/// Resolves `word`/`--sandbox` to the running sandbox's policy directory on
+/// the host — the same directory `agent-sandbox ctl tui` writes to.
+fn policy_dir(word: &Option<String>, sandbox: &Option<String>) -> Result<(String, String)> {
+    let explicit = sandbox_target(word, sandbox);
+    let sandbox_name = resolve_sandbox(explicit.as_deref(), true)?;
+    let sidecar = require_sidecar(&sandbox_name)?;
+    let dir = sidecar_mount(&sidecar, "/sidecar_policy")?;
+    if dir.is_empty() {
+        eprintln!("agent-sandbox ctl proxy: cannot find the policy mount for sandbox '{}'", sandbox_name);
+        std::process::exit(1);
+    }
+    Ok((sandbox_name, dir))
+}
+
+fn parse_lines(lines: &[String]) -> Result<ProxyConfig> {
+    let text = lines.join("\n") + "\n";
+    match parse_policy(&text, Duration::from_secs(300)) {
+        Ok(cfg) => Ok(cfg),
+        Err(e) => {
+            eprintln!("agent-sandbox ctl proxy: current policy is invalid: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn apply(policy_dir: &str, lines: Vec<String>) -> Result<()> {
+    if let Err(e) = install_policy(policy_dir, &lines) {
+        eprintln!("agent-sandbox ctl proxy: {}", e);
+        std::process::exit(1);
+    }
+    println!("  reloading   the proxy applies this within a second");
+    Ok(())
+}
+
+/// What kind of `[network]` entry a bare target string looks like: an
+/// IP/CIDR, a bare port or port range (`8443`, `8000-8100`), or — the
+/// fallback — a domain name.
+fn target_kind(target: &str) -> &'static str {
+    if is_ip_or_cidr(target) {
+        "ips"
+    } else if parse_port_range(target).is_ok() {
+        "ports"
+    } else {
+        "domains"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_kind;
+
+    #[test]
+    fn target_kind_infers_ip_port_or_domain() {
+        assert_eq!(target_kind("10.0.0.0/8"), "ips");
+        assert_eq!(target_kind("169.254.169.254"), "ips");
+        assert_eq!(target_kind("8443"), "ports");
+        assert_eq!(target_kind("8000-8100"), "ports");
+        assert_eq!(target_kind("api.openai.com"), "domains");
+        assert_eq!(target_kind("github.com"), "domains");
+    }
 }
 
 pub fn run(args: ProxyArgs) -> Result<()> {
-    let script = "agent-sandbox-firewall";
-    let err = Command::new(script).args(&args.args).exec();
-    Err(anyhow::anyhow!("exec failed: {}", err))
+    match args.command {
+        ProxyCommand::Show(a) => show(a),
+        ProxyCommand::Allow(a) => allow(a),
+        ProxyCommand::Deny(a) => deny(a),
+        ProxyCommand::Rm(a) => rm(a),
+        ProxyCommand::Reset(a) => reset(a),
+        ProxyCommand::Export(a) => export(a),
+    }
+}
+
+fn show(args: TargetArgs) -> Result<()> {
+    let (sandbox_name, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let lines = load_policy_lines(&dir);
+    let cfg = parse_lines(&lines)?;
+    let base_lines: HashSet<String> = fs::read_to_string(format!("{}/policy.base", dir))
+        .map(|s| s.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default();
+
+    println!("{}", sandbox_name);
+    println!("  policy      {}/policy", dir);
+    let default_desc = if cfg.default_ask {
+        "ask   (unlisted requests pause for a live decision — see `ctl tui`)".to_string()
+    } else if cfg.default_allow {
+        "allow (everything is reachable except the rules below)".to_string()
+    } else {
+        "deny  (only the rules below are reachable)".to_string()
+    };
+    println!("  default     {}", default_desc);
+
+    for line in &lines {
+        let Some((key, value)) = line.split_once(char::is_whitespace) else { continue };
+        if key == "default" {
+            continue;
+        }
+        let value = value.trim();
+        let display_value = if key == "allow_l7" { value.replace('\t', " ") } else { value.to_string() };
+        let source = if base_lines.contains(line) { "AGENTS.md" } else { "" };
+        println!("  {:<13} {:<34} {}", key, display_value, source);
+    }
+    Ok(())
+}
+
+fn allow(args: AllowArgs) -> Result<()> {
+    let (_, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let mut lines = load_policy_lines(&dir);
+    if let Some(method) = args.l7 {
+        if is_ip_or_cidr(&args.target) {
+            eprintln!("agent-sandbox ctl proxy: --l7 needs a domain, not an IP/CIDR ('{}')", args.target);
+            std::process::exit(1);
+        }
+        lines.push(format!("allow_l7\t{}\t{}\t{}", args.target, method, args.path));
+        println!("  allowed     {:<34} {}", format!("{} {} {}", args.target, method, args.path), "http route");
+    } else {
+        let kind = target_kind(&args.target);
+        let key = match kind {
+            "ips" => "allow_ips",
+            "ports" => "allow_ports",
+            _ => "allow_domains",
+        };
+        lines.push(format!("{} {}", key, args.target));
+        println!("  allowed     {:<34} {}", args.target, kind);
+    }
+    apply(&dir, lines)
+}
+
+fn deny(args: DenyArgs) -> Result<()> {
+    if target_kind(&args.target) == "ports" {
+        eprintln!(
+            "agent-sandbox ctl proxy: ports have no deny form ('{}' looks like a port); [network].ports is a global allow-list, not something scoped to a host",
+            args.target
+        );
+        std::process::exit(1);
+    }
+    let (_, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let mut lines = load_policy_lines(&dir);
+    let kind = target_kind(&args.target);
+    let key = if kind == "ips" { "deny_ips" } else { "deny_domains" };
+    lines.push(format!("{} {}", key, args.target));
+    println!("  denied      {:<34} {}", args.target, kind);
+    apply(&dir, lines)
+}
+
+/// Drops the first line matching `predicate`; reports whether anything was
+/// removed so callers can tell the user when there was nothing to do.
+fn remove_matching(lines: &mut Vec<String>, predicate: impl Fn(&str) -> bool) -> bool {
+    if let Some(idx) = lines.iter().position(|l| predicate(l)) {
+        lines.remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
+fn rm(args: RmArgs) -> Result<()> {
+    let (dir, lines, removed, summary) = match args.kind {
+        RmKind::Allow(a) => {
+            let (_, dir) = policy_dir(&a.word, &a.sandbox)?;
+            let mut lines = load_policy_lines(&dir);
+            let key = match target_kind(&a.target) {
+                "ips" => "allow_ips",
+                "ports" => "allow_ports",
+                _ => "allow_domains",
+            };
+            let removed = remove_matching(&mut lines, |l| l == format!("{} {}", key, a.target));
+            (dir, lines, removed, format!("{} {}", key, a.target))
+        }
+        RmKind::Deny(a) => {
+            let (_, dir) = policy_dir(&a.word, &a.sandbox)?;
+            let mut lines = load_policy_lines(&dir);
+            let key = if is_ip_or_cidr(&a.target) { "deny_ips" } else { "deny_domains" };
+            let removed = remove_matching(&mut lines, |l| l == format!("{} {}", key, a.target));
+            (dir, lines, removed, format!("{} {}", key, a.target))
+        }
+        RmKind::L7(a) => {
+            let (_, dir) = policy_dir(&a.word, &a.sandbox)?;
+            let mut lines = load_policy_lines(&dir);
+            let needle = format!("allow_l7\t{}\t{}\t{}", a.host, a.method, a.path);
+            let removed = remove_matching(&mut lines, |l| l == needle);
+            (dir, lines, removed, format!("allow_l7 {} {} {}", a.host, a.method, a.path))
+        }
+    };
+    if !removed {
+        eprintln!("agent-sandbox ctl proxy: no matching rule found for '{}'", summary);
+        std::process::exit(1);
+    }
+    println!("  removed     {}", summary);
+    apply(&dir, lines)
+}
+
+fn reset(args: TargetArgs) -> Result<()> {
+    let (_, dir) = policy_dir(&args.word, &args.sandbox)?;
+    let base_path = format!("{}/policy.base", dir);
+    let base = match fs::read_to_string(&base_path) {
+        Ok(text) => text,
+        Err(_) => {
+            eprintln!(
+                "agent-sandbox ctl proxy: no policy.base found for this sandbox (it may not have been launched with --proxy)"
+            );
+            std::process::exit(1);
+        }
+    };
+    let lines: Vec<String> = base.lines().map(|s| s.to_string()).collect();
+    println!("  reset       to the policy this sandbox was launched with");
+    apply(&dir, lines)
+}
+
+fn export(args: TargetArgs) -> Result<()> {
+    let (_, dir) = policy_dir(&args.word, &args.sandbox)?;
+    // The baseline private/loopback deny_ips ranges are enforced
+    // unconditionally regardless of AGENTS.md (see `policy.baseline`,
+    // written once at launch with exactly that set), so round-tripping them
+    // into an exported config would just be noise.
+    let baseline: HashSet<String> = fs::read_to_string(format!("{}/policy.baseline", dir))
+        .map(|s| s.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default();
+    let lines: Vec<String> = load_policy_lines(&dir)
+        .into_iter()
+        .filter(|l| !baseline.contains(l))
+        .collect();
+    let cfg = parse_lines(&lines)?;
+    print!("{}", format_policy_as_network_toml(&cfg));
+    Ok(())
 }

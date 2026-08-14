@@ -39,7 +39,7 @@ enum CtlCommands {
     #[command(about = "Attach to a running sandbox and exec a command")] Attach(ctl::attach::AttachArgs),
     #[command(about = "Manage bind mounts into a running sandbox", alias = "mounts")] Mount(ctl::mount::MountArgs),
     #[command(about = "Show SSH/GPG relay policy and logs")] Relay(ctl::relay::RelayArgs),
-    #[command(about = "Interactive ask-mode dashboard")] Tui(ctl::tui::TuiArgs),
+    #[command(about = "Interactive dashboard: approve pending ask-mode requests, add rules for denied ones")] Tui(ctl::tui::TuiArgs),
     #[command(about = "Reclaim leftover containers, networks and directories")] Purge(ctl::purge::PurgeArgs),
 }
 

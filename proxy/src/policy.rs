@@ -155,9 +155,18 @@ impl ProxyConfig {
                 out.push(format!("allow_ports {}", r));
             }
         }
+        for r in &self.l7_rules {
+            out.push(format!("allow_l7\t{}\t{}\t{}", r.domain, r.method, r.path_pattern));
+        }
         out.push(format!(
             "default {}",
-            if self.default_allow { "allow" } else { "deny" }
+            if self.default_ask {
+                "ask"
+            } else if self.default_allow {
+                "allow"
+            } else {
+                "deny"
+            }
         ));
         out
     }

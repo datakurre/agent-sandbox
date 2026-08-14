@@ -265,6 +265,7 @@ impl MetricsLog {
         up: u64,
         down: u64,
         ms: u128,
+        method: Option<&str>,
     ) {
         let mut line = String::new();
         if let Some(id) = id {
@@ -284,6 +285,9 @@ impl MetricsLog {
         ));
         if let Some(e) = err {
             line.push_str(&format!(",\"err\":\"{}\"", json_escape(e)));
+        }
+        if let Some(m) = method {
+            line.push_str(&format!(",\"method\":\"{}\"", json_escape(m)));
         }
         line.push_str("}\n");
 
@@ -407,9 +411,10 @@ impl Shared {
         up: u64,
         down: u64,
         ms: u128,
+        method: Option<&str>,
     ) {
         if let Some(m) = &self.metrics {
-            m.record(id, host, port, verdict, err, up, down, ms);
+            m.record(id, host, port, verdict, err, up, down, ms, method);
         }
     }
 
@@ -712,7 +717,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             let reason = if !cfg.is_allowed_port(port) { "port" } else { "domain" };
             let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             eprintln!("proxy: deny {}:{}", host, port);
-            shared.record(None, &host, port, "deny", Some(reason), 0, 0, started.elapsed().as_millis());
+            shared.record(None, &host, port, "deny", Some(reason), 0, 0, started.elapsed().as_millis(), Some(method));
             return;
         }
     }
@@ -732,6 +737,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 0,
                 0,
                 started.elapsed().as_millis(),
+                None,
             );
             return;
         }
@@ -743,7 +749,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     if let Some(bad) = addrs.iter().find(|a| cfg.is_denied_address(a.ip())) {
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} (resolves to denied address {})", host, port, bad.ip());
-        shared.record(None, &host, port, "deny", Some("address"), 0, 0, started.elapsed().as_millis());
+        shared.record(None, &host, port, "deny", Some("address"), 0, 0, started.elapsed().as_millis(), None);
         return;
     }
 
@@ -762,6 +768,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 0,
                 0,
                 started.elapsed().as_millis(),
+                None,
             );
             return;
         }
@@ -795,6 +802,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                     0,
                     0,
                     started.elapsed().as_millis(),
+                    Some(method),
                 );
                 return;
             }
@@ -819,6 +827,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         up,
                         down,
                         started.elapsed().as_millis(),
+                        None,
                     );
                 }
                 Err(e) => {
@@ -833,6 +842,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
+                        None,
                     );
                 }
             }
@@ -862,6 +872,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
+                        None,
                     );
                     return;
                 }
@@ -882,6 +893,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                             0,
                             0,
                             started.elapsed().as_millis(),
+                            None,
                         );
                         return;
                     }
@@ -901,6 +913,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                     0,
                     0,
                     started.elapsed().as_millis(),
+                    None,
                 );
                 return;
             }
@@ -922,6 +935,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
+                        None,
                     );
                     return;
                 }
@@ -940,6 +954,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
+                        None,
                     );
                     return;
                 }
@@ -957,6 +972,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
+                        None,
                     );
                     return;
                 }
@@ -975,6 +991,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                     0,
                     0,
                     started.elapsed().as_millis(),
+                    None,
                 );
                 return;
             }
@@ -995,6 +1012,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
+                        None,
                     );
                     return;
                 }
@@ -1020,6 +1038,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         up,
                         down,
                         started.elapsed().as_millis(),
+                        None,
                     );
                 }
                 Err(e) => {
@@ -1034,6 +1053,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         0,
                         0,
                         started.elapsed().as_millis(),
+                        None,
                     );
                 }
             }
@@ -1053,6 +1073,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             0,
             0,
             started.elapsed().as_millis(),
+            None,
         );
         return;
     }
@@ -1087,7 +1108,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         (Ok(c), Ok(r)) => (c, r),
         _ => {
             eprintln!("proxy: cannot duplicate sockets for {}:{}", host, port);
-            shared.record(None, &host, port, "error", Some("fd"), 0, 0, started.elapsed().as_millis());
+            shared.record(None, &host, port, "error", Some("fd"), 0, 0, started.elapsed().as_millis(), None);
             return;
         }
     };
@@ -1110,6 +1131,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         up,
         down,
         started.elapsed().as_millis(),
+        None,
     );
 }
 
@@ -1766,7 +1788,7 @@ mod tests {
         let lines = metrics_lines("open-close", |log| {
             id = log.next_id();
             log.open_event(&id, "example.com", 443);
-            log.record(Some(&id), "example.com", 443, "allow", None, 10, 20, 5);
+            log.record(Some(&id), "example.com", 443, "allow", None, 10, 20, 5, None);
         });
         assert_eq!(lines.len(), 2, "expected an open and a close: {:?}", lines);
         assert!(lines[0].contains("\"ev\":\"open\""), "{}", lines[0]);
@@ -1786,13 +1808,24 @@ mod tests {
     #[test]
     fn record_without_an_id_carries_no_event_fields() {
         let lines = metrics_lines("no-id", |log| {
-            log.record(None, "example.com", 443, "deny", None, 0, 0, 1);
+            log.record(None, "example.com", 443, "deny", None, 0, 0, 1, None);
         });
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("{\"ts\":"), "{}", lines[0]);
         assert!(!lines[0].contains("\"ev\""), "{}", lines[0]);
         assert!(!lines[0].contains("\"id\""), "{}", lines[0]);
         assert!(lines[0].contains("\"verdict\":\"deny\""), "{}", lines[0]);
+    }
+
+    /// A denied request's method, when known, is threaded through so a live
+    /// TUI reading `connections.jsonl` can offer an L7-route rule directly.
+    #[test]
+    fn record_with_a_method_carries_it_through() {
+        let lines = metrics_lines("with-method", |log| {
+            log.record(None, "example.com", 443, "deny", Some("domain"), 0, 0, 1, Some("GET"));
+        });
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"method\":\"GET\""), "{}", lines[0]);
     }
 
     // ── policy parsing ──────────────────────────────────────────────────────

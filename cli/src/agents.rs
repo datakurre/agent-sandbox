@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use agent_sandbox_proxy::policy::ProxyConfig;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
 use std::collections::HashSet;
 use std::net::{IpAddr, TcpListener, UdpSocket};
@@ -331,7 +332,7 @@ fn _proxy_domain(field: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn is_ip_or_cidr(value: &str) -> bool {
+pub(crate) fn is_ip_or_cidr(value: &str) -> bool {
     if let Some((ip_str, mask_str)) = value.split_once('/') {
         if let Ok(ip) = ip_str.parse::<IpAddr>() {
             if let Ok(mask) = mask_str.parse::<u8>() {
@@ -583,6 +584,106 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
     
     for val in &policy.allow_l7 { lines.push(format!("allow_l7\t{}", val)); }
     for val in &policy.default { lines.push(format!("default {}", val)); }
-    
+
     lines.join("\n") + "\n"
+}
+
+/// The reverse of `format_proxy_policy`: renders a running sandbox's current
+/// (possibly live-edited) policy back as an AGENTS.md `[network]` TOML block,
+/// for `agent-sandbox ctl proxy export`.
+///
+/// Not fully round-trippable: `[network]` only supports `allow` (bare
+/// host/IP entries) and `[[network.rules]]` (`allow_l7`), so `deny_domains`,
+/// `deny_ips`, and a non-default `allow_ports` — all of which can only be
+/// added live (via the TUI or `ctl proxy allow/deny`), never declared in
+/// AGENTS.md — are emitted as a trailing advisory comment instead of being
+/// silently dropped or invented as unsupported TOML keys. A `secret = true`
+/// on an exported rule is a placeholder too: the policy file only records
+/// that the domain takes a secret, not which one, so the real reference has
+/// to be filled in by hand.
+pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
+    let mut out = String::from("[network]\n");
+
+    let mut allow_items: Vec<String> = cfg.allow_domains.clone();
+    allow_items.extend(cfg.allow_ips.iter().map(|n| n.to_string()));
+    if !allow_items.is_empty() {
+        let quoted: Vec<String> = allow_items.iter().map(|s| format!("{:?}", s)).collect();
+        out.push_str(&format!("allow = [{}]\n", quoted.join(", ")));
+    }
+
+    for r in &cfg.l7_rules {
+        out.push('\n');
+        out.push_str("[[network.rules]]\n");
+        out.push_str(&format!("host = {:?}\n", r.domain));
+        out.push_str(&format!("method = {:?}\n", r.method));
+        out.push_str(&format!("path = {:?}\n", r.path_pattern));
+        if cfg.secret_domains.iter().any(|d| d == &r.domain) {
+            out.push_str("secret = true # placeholder -- fill in the real secret reference; the policy file doesn't retain it\n");
+        }
+    }
+
+    let mut advisory: Vec<String> = Vec::new();
+    for d in &cfg.deny_domains { advisory.push(format!("deny_domains {}", d)); }
+    for ip in &cfg.deny_ips { advisory.push(format!("deny_ips {}", ip)); }
+    if let Some(ranges) = &cfg.allow_ports {
+        for r in ranges { advisory.push(format!("allow_ports {}", r)); }
+    }
+    if !advisory.is_empty() {
+        out.push_str("\n# The following have no [network] TOML equivalent (it only supports 'allow'\n");
+        out.push_str("# and 'rules') and were left out of the block above. Re-apply them after\n");
+        out.push_str("# relaunching with `agent-sandbox ctl proxy allow`/`deny`:\n");
+        for line in advisory {
+            out.push_str(&format!("# {}\n", line));
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use agent_sandbox_proxy::policy::parse_policy;
+    use std::time::Duration;
+
+    #[test]
+    fn exports_allow_entries_and_l7_rules_as_toml() {
+        let cfg = parse_policy(
+            "allow_domains github.com\n\
+             allow_ips 10.0.0.0/8\n\
+             secret_domains api.github.com\n\
+             allow_l7\tapi.github.com\tGET\t/repos/*\n",
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        let toml = format_policy_as_network_toml(&cfg);
+        assert!(toml.contains("[network]\n"), "{toml}");
+        assert!(toml.contains("allow = [\"github.com\", \"10.0.0.0/8\"]"), "{toml}");
+        assert!(toml.contains("[[network.rules]]"), "{toml}");
+        assert!(toml.contains("host = \"api.github.com\""), "{toml}");
+        assert!(toml.contains("method = \"GET\""), "{toml}");
+        assert!(toml.contains("path = \"/repos/*\""), "{toml}");
+        assert!(toml.contains("secret = true"), "{toml}");
+    }
+
+    #[test]
+    fn exports_deny_and_ports_as_an_advisory_comment_not_toml_keys() {
+        let cfg = parse_policy(
+            "deny_domains evil.example.com\ndeny_ips 169.254.169.254/32\nallow_ports 8000-8100\n",
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        let toml = format_policy_as_network_toml(&cfg);
+        assert!(!toml.contains("deny ="), "deny has no [network] TOML key: {toml}");
+        assert!(toml.contains("# deny_domains evil.example.com"), "{toml}");
+        assert!(toml.contains("# deny_ips 169.254.169.254/32"), "{toml}");
+        assert!(toml.contains("# allow_ports 8000-8100"), "{toml}");
+    }
+
+    #[test]
+    fn is_ip_or_cidr_distinguishes_ips_from_domains() {
+        assert!(is_ip_or_cidr("10.0.0.0/8"));
+        assert!(is_ip_or_cidr("169.254.169.254"));
+        assert!(!is_ip_or_cidr("example.com"));
+    }
 }
