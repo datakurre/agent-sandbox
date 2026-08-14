@@ -152,6 +152,16 @@ fn ip_available(host: &str) -> bool {
     }
 }
 
+fn clear_allowed_request(
+    denied_reqs: &mut HashMap<(String, u16), DeniedEntry>,
+    host: &str,
+    port: u16,
+    selected_idx: &mut usize,
+) {
+    denied_reqs.remove(&(host.to_string(), port));
+    *selected_idx = (*selected_idx).min(denied_reqs.len().saturating_sub(1));
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum StatusKind {
     Success,
@@ -631,6 +641,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !denied_list.is_empty() && selected_idx < denied_list.len() {
                             let row = &denied_list[selected_idx];
                             let host = row.host.clone();
+                            let port = row.port;
                             let method = row.method.clone();
 
                             let mut guard_msg: Option<String> = None;
@@ -659,7 +670,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             "No HTTP method known yet for this row — allow the domain first with 'a'; 'h' becomes available once a real request is seen"
                                                 .to_string(),
                                         );
-                                    } else if !base_lines.iter().any(|l| l.starts_with("allow_route\t")) {
+                                    } else if !base_lines
+                                        .iter()
+                                        .any(|l| l.starts_with("allow_route\t"))
+                                    {
                                         // An L7 rule means the proxy terminates TLS for
                                         // that host, and the session CA is bound into the
                                         // sandbox only when the launch policy already had
@@ -686,6 +700,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 status_kind = StatusKind::Error;
                                 status_until = None;
                             } else {
+                                clear_allowed_request(
+                                    &mut denied_reqs,
+                                    &host,
+                                    port,
+                                    &mut selected_idx,
+                                );
                                 status_msg = format!("Added: {}", detail);
                                 status_kind = StatusKind::Success;
                                 status_until = Some(Instant::now() + Duration::from_secs(3));
@@ -732,7 +752,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ingest_connection_event, is_denied_event, ConnEvent};
+    use super::{
+        clear_allowed_request, ingest_connection_event, is_denied_event, ConnEvent, DeniedEntry,
+    };
+    use std::collections::HashMap;
 
     fn event(ev: Option<&str>, verdict: Option<&str>) -> ConnEvent {
         ConnEvent {
@@ -800,5 +823,46 @@ mod tests {
 
         assert_eq!(connections.len(), 1);
         assert!(connections[0].id.is_none());
+    }
+
+    #[test]
+    fn clears_allowed_request_and_clamps_selection() {
+        let mut denied_reqs = HashMap::new();
+        denied_reqs.insert(
+            ("example.com".to_string(), 443),
+            DeniedEntry {
+                host: "example.com".to_string(),
+                port: 443,
+                reason: None,
+                method: None,
+                detail: None,
+                count: 1,
+                last_seen: 1,
+            },
+        );
+        denied_reqs.insert(
+            ("other.example.com".to_string(), 443),
+            DeniedEntry {
+                host: "other.example.com".to_string(),
+                port: 443,
+                reason: None,
+                method: None,
+                detail: None,
+                count: 1,
+                last_seen: 1,
+            },
+        );
+        let mut selected_idx = 1;
+
+        clear_allowed_request(
+            &mut denied_reqs,
+            "other.example.com",
+            443,
+            &mut selected_idx,
+        );
+
+        assert!(!denied_reqs.contains_key(&("other.example.com".to_string(), 443)));
+        assert_eq!(denied_reqs.len(), 1);
+        assert_eq!(selected_idx, 0);
     }
 }
