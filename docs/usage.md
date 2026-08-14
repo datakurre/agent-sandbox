@@ -195,9 +195,14 @@ When using Git inside the sandbox, be aware of how the integration flags interac
 
 The image includes three OpenCode skills at `/home/user/.agents/skills`:
 
-- `nix` for reproducible one-off tools and temporary Nix environments.
-- `nix-flake` for `flake.nix`, `flake.lock`, outputs, development shells, and checks.
-- `devenv` for `devenv.sh`, `devenv.nix`, and declared development environments.
+- `nix` for running any nixpkgs tool ad hoc, without installing it.
+- `nix-flake` for `flake.nix`: packaging software, outputs, checks, and simple
+  `nix develop --command` development shells.
+- `devenv` for `devenv.nix`: declarative environments with language toolchains
+  and supporting services, entered with `devenv shell -- <command>`.
+
+Each skill is a `SKILL.md` with the common path plus a `reference.md` with
+advanced patterns.
 
 They are bundled into the image rather than mounted by the launcher. To use
 user-owned skills instead, mount a replacement tree with

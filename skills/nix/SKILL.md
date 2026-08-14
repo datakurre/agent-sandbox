@@ -1,47 +1,87 @@
 ---
 name: nix
-description: Use Nix for reproducible one-off tools and temporary environments. Trigger for nix commands, missing CLI tools, Nix package lookup, or requests to avoid global installation.
+description: Run any tool from nixpkgs ad hoc, without installing it. Trigger when a CLI tool is missing, when a command fails with "command not found", when a one-off or temporary environment is needed, when looking up a Nix package name, or when asked to avoid global installation.
 compatibility: opencode
 metadata:
   workflow: ephemeral-tooling
   audience: developers-and-agents
 ---
 
-# Nix Tooling
+# Ad-hoc Nix
 
-Use the smallest Nix boundary that solves the task.
+Anything in nixpkgs can be run for one command without installing it. Never
+install into the host with `apt`, `brew`, `npm -g`, `pip install`, or
+`cargo install` when Nix can provide the tool for the duration of one command.
 
-## Choose the command
+## Pick the smallest boundary
 
-- Use `nix run nixpkgs#<package> -- <args>` for one executable needed for one command.
-- Use `nix shell nixpkgs#<package> ...` when several packages are needed for a short sequence of commands.
-- Use `nix develop --command <command> [args...]` when the current repository provides a flake development shell. See the `nix-flake` skill.
+| Situation | Use |
+| --- | --- |
+| One missing executable, one command | `nix run nixpkgs#<pkg> -- <args>` |
+| Several tools for one command | `nix shell nixpkgs#<a> nixpkgs#<b> --command <cmd>` |
+| Repository has `devenv.nix` | `devenv shell -- <cmd>` — see the `devenv` skill |
+| Repository has `flake.nix` with a devShell | `nix develop --command <cmd>` — see the `nix-flake` skill |
+| The user wants the tool to stay | `nix profile add nixpkgs#<pkg>` — ask first |
 
-Examples:
+Check the repository before reaching for nixpkgs. A project command
+(`make test`, a devenv script, a flake app) always beats a guessed package.
+
+## Default path: `nix run`
 
 ```sh
 nix run nixpkgs#jq -- --version
 nix run nixpkgs#ripgrep -- --glob '*.rs' TODO
-nix shell nixpkgs#git nixpkgs#jq
-nix develop --command cargo test
+nix run nixpkgs#hello -- --greeting=hi
 ```
 
-Do not globally install a tool when Nix or the project's declared environment can provide it. Inspect the repository and its documentation first; an existing project command takes precedence over a guessed package command.
+The `--` separator is not optional. Without it, Nix consumes flags meant for
+the program: `nix run nixpkgs#jq -r .name` fails, `nix run nixpkgs#jq -- -r .name` works.
 
-## Nix references
+`nix run` executes the package's `meta.mainProgram`, which is often not the
+attribute name (`ripgrep` runs `rg`). When a package ships several binaries, or
+the one you want is not the main program, use `nix shell` instead.
 
-Use `nix search nixpkgs <term>` or inspect a package with `nix eval` before guessing an attribute name. Use explicit flake references and the `--` separator when passing arguments to the executed program.
-
-Remote flakes can execute arbitrary code. Before using an unfamiliar `github:` or URL flake, consider its provenance, lock revision, requested permissions, and whether the project actually needs it.
-
-## Validate changes
-
-For changes to Nix expressions, prefer the project's formatter and checks. Common commands are:
+## Several tools: `nix shell --command`
 
 ```sh
-nix fmt
-nix flake check
-nix build .#<output>
+nix shell nixpkgs#git nixpkgs#gh --command sh -c 'git log --oneline -5 && gh pr status'
+nix shell nixpkgs#gnumake nixpkgs#gcc --command make -C src
 ```
 
-Preserve the existing `flake.lock` unless updating inputs is intentional and requested.
+Always pass `--command`. A bare `nix shell` opens an interactive subshell that
+a non-interactive agent session cannot use and cannot exit cleanly.
+
+## Find the attribute name
+
+Guess and verify — it is far faster than searching:
+
+```sh
+nix eval --raw nixpkgs#ripgrep.meta.mainProgram   # => rg
+nix eval nixpkgs#<pkg>.version
+```
+
+If the attribute does not exist, the eval fails immediately and cheaply.
+`nix search nixpkgs '^ripgrep$'` works but evaluates all of nixpkgs and can take
+minutes on first run — anchor the regex and expect the wait, or use
+`search.nixos.org` when the sandbox allows the network.
+
+## Gotchas
+
+- **Unfree or insecure packages** need an explicit opt-in:
+  `NIXPKGS_ALLOW_UNFREE=1 nix run --impure nixpkgs#<pkg>`.
+- **Pin when the version matters**: `nix run nixpkgs/nixos-25.05#<pkg>`, or a
+  revision: `nix run nixpkgs/<rev>#<pkg>`. Plain `nixpkgs#` follows the local
+  registry, which may be stale; `--refresh` re-resolves it.
+- **Remote flakes execute arbitrary code.** Before `nix run github:owner/repo#x`,
+  weigh provenance and whether the project actually needs it.
+- **Nothing persists.** Ad-hoc store paths have no GC root and can be collected.
+  Do not hard-code a `/nix/store/...` path into scripts or config.
+- **Editing Nix expressions** is a different task: validate with `nix fmt`,
+  `nix flake check`, and `nix build .#<output>`, and leave `flake.lock` alone
+  unless updating inputs was requested.
+
+## More
+
+`reference.md` covers ad-hoc language environments with packages (Python,
+Node), one-off derivations and overrides via `--expr`, `nix-shell` shebang
+scripts, store inspection and debugging, and offline or cache-constrained use.
