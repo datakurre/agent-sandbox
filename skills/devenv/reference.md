@@ -127,8 +127,36 @@ enterTest = ''
 '';
 ```
 
-Give any service the test depends on a readiness probe (above) rather than
-sleeping or polling by hand inside `enterTest`.
+`devenv test` starts every declared `processes`/`services` entry before running
+`enterTest` and stops them after. Call `wait_for_port <port> [timeout]` at the
+top of `enterTest` before touching a service — it blocks until the port
+accepts connections, so the test never races a service that is still starting:
+
+```nix
+{ pkgs, ... }:
+{
+  services.nginx = {
+    enable = true;
+    httpConfig = ''
+      server {
+        listen 8080;
+        location / { return 200 "Hello, world!"; }
+      }
+    '';
+  };
+
+  enterTest = ''
+    wait_for_port 8080
+    curl -sf localhost:8080 | grep "Hello, world!"
+  '';
+}
+```
+
+`wait_for_port` is a shell function devenv injects only for `enterTest`, not a
+general-purpose script — it is not available in `enterShell` or plain
+`devenv shell`. For a process with a `readiness_probe` (above), prefer
+`devenv processes wait` in scripts/CI outside of `enterTest`; inside
+`enterTest`, `wait_for_port` is the simpler equivalent for a TCP/HTTP port.
 
 ```sh
 devenv test                        # enterTest + git hooks
