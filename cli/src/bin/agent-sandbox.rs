@@ -1300,6 +1300,43 @@ fn run() -> Result<i32> {
 
     // ── Sidecar proxy ───────────────────────────────────────────────────────
 
+    let mut policy_file_content = String::new();
+    let mut proxy_configured = false;
+    let mut secrets_configured = false;
+
+    if agents_md_path.exists() {
+        if let Ok(text) = fs::read_to_string(&agents_md_path) {
+            match parse_proxy(&text) {
+                Ok(policy) => {
+                    policy_file_content = format_proxy_policy(&policy, &agents_md_path.to_string_lossy());
+                    proxy_configured = !policy.allow_domains.is_empty()
+                        || !policy.allow_ips.is_empty()
+                        || !policy.allow_ports.is_empty()
+                        || !policy.allow_l7.is_empty();
+                    secrets_configured = !policy.secret_domains.is_empty();
+                }
+                Err(e) => {
+                    if want_proxy {
+                        eprintln!("agent-sandbox: {}", e);
+                        return refuse("agent-sandbox: refusing to launch on an invalid [network] block (use --no-proxy to skip).");
+                    } else {
+                        eprintln!("agent-sandbox: warning: invalid [network] block in AGENTS.md: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    if !want_proxy && (proxy_configured || secrets_configured) {
+        eprintln!("agent-sandbox: warning: [network] rules or secrets are configured in AGENTS.md, but proxy is not active.");
+        eprintln!("               Launch with --proxy to enforce them.");
+    }
+
+    if want_proxy && !want_secrets && secrets_configured {
+        eprintln!("agent-sandbox: warning: secrets are configured in AGENTS.md [[network.rules]], but --secrets is not active.");
+        eprintln!("               Launch with --secrets to enable them.");
+    }
+
     let mut cleanup_guard = CleanupGuard::new();
     let mut proxy_env_vars: Vec<String> = Vec::new();
     let image = env::var("AGENT_SANDBOX_IMAGE").unwrap_or_default();
@@ -1371,20 +1408,6 @@ fn run() -> Result<i32> {
         // proxy.  Written into a directory mounted ro into the sidecar and NOT
         // into the sandbox: the agent must not be able to widen the firewall
         // that contains it.
-        let mut policy_file_content = String::new();
-        if agents_md_path.exists() {
-            if let Ok(text) = fs::read_to_string(&agents_md_path) {
-                match parse_proxy(&text) {
-                    Ok(policy) => {
-                        policy_file_content = format_proxy_policy(&policy, &agents_md_path.to_string_lossy());
-                    }
-                    Err(e) => {
-                        eprintln!("agent-sandbox: {}", e);
-                        return refuse("agent-sandbox: refusing to launch on an invalid [network] block (use --no-proxy to skip).");
-                    }
-                }
-            }
-        }
 
         let mut baseline_content = String::new();
         for cidr in launch::BASELINE_DENY_IPS {
