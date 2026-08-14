@@ -99,9 +99,11 @@ Points that matter:
 - `inputsFrom` gives the shell the package's own build inputs — do not restate
   dependencies in two places.
 - Set `meta.mainProgram` on a package so `nix run` picks the right binary.
-- Use the ecosystem's builder rather than raw `stdenv.mkDerivation`:
-  `rustPlatform.buildRustPackage`, `buildGoModule`, `buildNpmPackage`,
-  `python3Packages.buildPythonApplication`, `pkgs.writeShellApplication`.
+- Use the ecosystem's builder rather than raw `stdenv.mkDerivation`, and pick it
+  by the project's lockfile: `Cargo.lock` → `rustPlatform.buildRustPackage`,
+  `go.sum` → `buildGoModule`, `package-lock.json` → `buildNpmPackage`,
+  **`uv.lock` → uv2nix (see `uv2nix.md`)**, otherwise
+  `python3Packages.buildPythonApplication` or `pkgs.writeShellApplication`.
 
 ## Validate before reporting done
 
@@ -132,7 +134,14 @@ them all (it cannot build foreign systems without a remote builder).
 
 ## More
 
-`reference.md` covers per-language packaging skeletons with the fixed-output
-hash workflow, `apps` vs `packages`, multiple devShells, overlays and
-`follows`/`--override-input`, writing `checks`, templates, `nix repl` debugging,
-and direnv.
+- `reference.md` — per-language packaging skeletons with the fixed-output hash
+  workflow, `apps` vs `packages`, multiple devShells, overlays and
+  `follows`/`--override-input`, writing `checks`, templates, `nix repl`
+  debugging, and direnv.
+- `uv2nix.md` — Python projects with a `uv.lock`: the workspace/overlay/pythonSet
+  pipeline, venv vs application outputs, editable development shells, build-system
+  overrides, tests as checks, PEP 723 scripts, and sharing the boilerplate as a
+  flake `lib` output.
+- `images.md` — OCI container images from a flake package with
+  `dockerTools.streamLayeredImage`: non-root user, `tini` entry point, labels,
+  layer count, and verifying an image without a container runtime.

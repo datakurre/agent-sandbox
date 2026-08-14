@@ -202,8 +202,10 @@ The image includes three OpenCode skills at `/home/user/.agents/skills`:
 - `devenv` for `devenv.nix`: declarative environments with language toolchains
   and supporting services, entered with `devenv shell -- <command>`.
 
-Each skill is a `SKILL.md` with the common path plus a `reference.md` with
-advanced patterns.
+Each skill is a `SKILL.md` with the common path plus reference files with
+advanced patterns. `nix-flake` additionally carries `uv2nix.md` (packaging
+Python projects that have a `uv.lock`) and `images.md` (building OCI container
+images from a flake package).
 
 They are bundled into the image rather than mounted by the launcher. To use
 user-owned skills instead, mount a replacement tree with

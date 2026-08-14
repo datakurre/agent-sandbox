@@ -1,6 +1,8 @@
 # Flakes — advanced patterns
 
-Read `SKILL.md` first.
+Read `SKILL.md` first. Two topics have their own files: `uv2nix.md` for Python
+projects with a `uv.lock`, and `images.md` for turning a package into an OCI
+container image.
 
 ## Packaging skeletons
 
@@ -47,6 +49,12 @@ buildNpmPackage {
 ```
 
 ### Python
+
+**If the project has a `uv.lock`, stop and read `uv2nix.md`** — the lockfile is
+the source of truth there, and hand-translating it into `python3Packages`
+attributes throws away the resolution `uv` already did.
+
+For a Python project without `uv.lock`, package it the nixpkgs way:
 
 ```nix
 { lib, python3Packages }:
