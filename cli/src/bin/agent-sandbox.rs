@@ -350,7 +350,7 @@ Integrations (use --X to enable, --no-X to disable):
                          Kept logs land in the current directory.  Without this
                          flag a session that had denials offers to save one.
   --secrets         {secrets} Resolves secrets with secretspec and injects them into the
-                         proxied requests each [[network.allow_routes]] rule authorizes.
+                         proxied requests each [[network.allowed_routes]] rule authorizes.
                          Requires --proxy.
   --krun            {krun} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
                          Adds a guest-kernel boundary inside the existing container boundary.
@@ -1606,7 +1606,7 @@ fn run() -> Result<i32> {
     }
 
     if want_proxy && !want_secrets && secrets_configured {
-        eprintln!("agent-sandbox: warning: secrets are configured in AGENTS.md [[network.allow_routes]], but --secrets is not active.");
+        eprintln!("agent-sandbox: warning: secrets are configured in AGENTS.md [[network.allowed_routes]], but --secrets is not active.");
         eprintln!("               Launch with --secrets to enable them.");
     }
 

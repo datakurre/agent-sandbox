@@ -137,8 +137,8 @@ from `AGENTS.md` and any explicitly selected host-owned profiles. `--proxy`
 selects the workspace block, `--proxy-profile NAME` selects only that profile,
 and supplying both merges them additively. Profiles are plain TOML files under
 `$XDG_CONFIG_HOME/agent-sandbox/profiles/` (or `~/.config/agent-sandbox/profiles/`).
-`[network].allow_hosts` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
-`[[network.allow_routes]]` configures L7 paths and optional secret injection.
+`[network].allowed_hosts` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
+`[[network.allowed_routes]]` configures L7 paths and optional secret injection.
 Those two keys are the whole surface: there is no `deny`, and an unknown key
 refuses the launch.
 
@@ -151,7 +151,7 @@ changes the set.  The same host on two ports is two `allow_host` lines with
 the same pattern; the proxy unions the ports of every line tied at the winning
 specificity.
 
-An `allow_hosts` entry on port 22 also populates `allow_signing`, which is what
+An `allowed_hosts` entry on port 22 also populates `allow_signing`, which is what
 authorizes the SSH/GPG relay: under `--proxy` the host agent sockets go to the
 sidecar, not the sandbox, and the relay refuses everything until that list is
 non-empty.
@@ -163,7 +163,7 @@ implementation to drift.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
 The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`).
-To authorize secret injection, the operator pastes the exact same `[[network.allow_routes]]` block from `AGENTS.md` into it; every field must match, port included.
+To authorize secret injection, the operator pastes the exact same `[[network.allowed_routes]]` block from `AGENTS.md` into it; every field must match, port included.
 The launcher calls the resolver in `cli/src/secrets.rs`, which cross-references this config with the policy's `secret_route` routes, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are written 0600 into `/sidecar_secrets/bindings`, which only the sidecar mounts, as `domain<TAB>method<TAB>path<TAB>header<TAB>value`. A `secret` field on a rule populates `secret_route` automatically, so there is nothing to duplicate.
 
 Injection is scoped to the **route**, not the domain, and resolved **per

@@ -397,7 +397,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(row) = denied_list.get(selected_idx) {
                             if row.method.as_deref() == Some("CONNECT") {
                                 text.push_str(&format!(
-                                    "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.allow_routes]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
+                                    "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.allowed_routes]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
                                     row.host, row.port
                                 ));
                             }

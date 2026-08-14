@@ -53,7 +53,7 @@ pub fn run(args: RelayArgs) -> Result<()> {
     if rules.is_empty() {
         println!("  allow_signing  (none) -- ssh and gpg through the relay are refused");
         println!(
-            "                 Declare an SSH port in AGENTS.md, e.g. allow_hosts = [\"github.com:22\"]."
+            "                 Declare an SSH port in AGENTS.md, e.g. allowed_hosts = [\"github.com:22\"]."
         );
     } else {
         for rule in &rules {

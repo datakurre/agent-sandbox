@@ -131,7 +131,7 @@ fn requested_rules_from_toml(content: &str) -> Vec<SecretRule> {
     let mut requested_rules = Vec::new();
     if let Ok(block_data) = content.parse::<toml::Value>() {
         if let Some(network) = block_data.get("network").and_then(|v| v.as_table()) {
-            if let Some(rules) = network.get("allow_routes").and_then(|v| v.as_array()) {
+            if let Some(rules) = network.get("allowed_routes").and_then(|v| v.as_array()) {
                 for rule in rules {
                     if let Some(rule_table) = rule.as_table() {
                         if let (Some(secret_val), Some(host_val)) =
@@ -321,9 +321,9 @@ pub fn resolve_secrets_logic_with_profiles(
                 }
             };
 
-            // manually extract [[network.allow_routes]] and add to bindings
+            // manually extract [[network.allowed_routes]] and add to bindings
             if let Some(network) = val.get("network").and_then(|v| v.as_table()) {
-                if let Some(rules) = network.get("allow_routes").and_then(|v| v.as_array()) {
+                if let Some(rules) = network.get("allowed_routes").and_then(|v| v.as_array()) {
                     for rule in rules {
                         if let Ok(hb) = rule.clone().try_into::<HostBinding>() {
                             host_config.bindings.push(hb);
@@ -430,14 +430,16 @@ pub fn resolve_secrets_logic_with_profiles(
                 config.display()
             ));
             err_msg.push_str(&format!("               To authorize this secret definition, add the following block to {}:\n\n", config.display()));
-            err_msg.push_str("               [[network.allow_routes]]\n");
-            err_msg.push_str(&format!("               host = \"{}\"\n", req.host));
-            err_msg.push_str(&format!("               method = \"{}\"\n", req.method));
-            err_msg.push_str(&format!("               path = \"{}\"\n", req.path));
-            err_msg.push_str(&format!("               secret = \"{}\"\n", req.secret));
-            err_msg.push_str(&format!("               header = \"{}\"\n", req.header));
-            err_msg.push_str(&format!("               prefix = \"{}\"\n\n", req.prefix));
-            err_msg.push_str("               Or remove 'secret' from the [[network.allow_routes]] rule if it is not trusted.\n\n");
+            // Keep the suggested TOML block flush-left so it can be copied
+            // directly into secrets.toml without removing prompt indentation.
+            err_msg.push_str("[[network.allowed_routes]]\n");
+            err_msg.push_str(&format!("host = \"{}\"\n", req.host));
+            err_msg.push_str(&format!("method = \"{}\"\n", req.method));
+            err_msg.push_str(&format!("path = \"{}\"\n", req.path));
+            err_msg.push_str(&format!("secret = \"{}\"\n", req.secret));
+            err_msg.push_str(&format!("header = \"{}\"\n", req.header));
+            err_msg.push_str(&format!("prefix = \"{}\"\n\n", req.prefix));
+            err_msg.push_str("               Or remove 'secret' from the [[network.allowed_routes]] rule if it is not trusted.\n\n");
         }
         anyhow::bail!("{}", err_msg.trim_end());
     }
@@ -602,9 +604,9 @@ mod tests {
     const AGENTS_TWO_RULES: &str = r#"
 ```agent-sandbox
 [network]
-allow_hosts = ["api.github.com:443"]
+allowed_hosts = ["api.github.com:443"]
 
-[[network.allow_routes]]
+[[network.allowed_routes]]
 host = "api.github.com:443"
 method = "GET"
 path = "/user/repos"
@@ -612,7 +614,7 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
-[[network.allow_routes]]
+[[network.allowed_routes]]
 host = "api.github.com:443"
 method = "POST"
 path = "/graphql"
@@ -623,7 +625,7 @@ prefix = "Bearer "
 "#;
 
     const SECRETS_TOML_TWO_RULES: &str = r#"
-[[network.allow_routes]]
+[[network.allowed_routes]]
 host = "api.github.com:443"
 method = "GET"
 path = "/user/repos"
@@ -631,7 +633,7 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
-[[network.allow_routes]]
+[[network.allowed_routes]]
 host = "api.github.com:443"
 method = "POST"
 path = "/graphql"
@@ -688,7 +690,7 @@ prefix = "Bearer "
             ),
             (
                 "secrets.toml",
-                "[[network.allow_routes]]\n\
+                "[[network.allowed_routes]]\n\
                  host = \"api.github.com:443\"\n\
                  method = \"GET\"\n\
                  path = \"/user/repos\"\n\
@@ -711,6 +713,12 @@ prefix = "Bearer "
         assert!(
             err.contains("/graphql"),
             "the message names the offending route: {err}"
+        );
+        assert!(
+            err.contains(
+                "\n[[network.allowed_routes]]\nhost = \"api.github.com:443\"\nmethod = \"POST\""
+            ),
+            "the suggested TOML block must be flush-left: {err}"
         );
     }
 
@@ -737,9 +745,9 @@ prefix = "Bearer "
         let content = r#"
 ```agent-sandbox
 [network]
-allow_hosts = ["github.com:443"]
+allowed_hosts = ["github.com:443"]
 
-[[network.allow_routes]]
+[[network.allowed_routes]]
 host = "api.github.com:443"
 method = "POST"
 path = "/graphql"
@@ -747,7 +755,7 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
-[[network.allow_routes]]
+[[network.allowed_routes]]
 host = "registry.npmjs.org:443"
 method = "GET"
 path = "/*"

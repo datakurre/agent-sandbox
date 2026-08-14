@@ -144,8 +144,8 @@ log of what it did. Changing policy is therefore a host-side operation
 
 **Policy format.** The proxy enforces the merged declarative `[network]` blocks
 from `AGENTS.md` and any explicitly selected host-owned profiles.
-`[network].allow_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
-with a port or port range.  `[[network.allow_routes]]` configures L7 routes and
+`[network].allowed_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
+with a port or port range.  `[[network.allowed_routes]]` configures L7 routes and
 optional secret injection.  Those two keys are the whole surface: an unknown key
 under `[network]` refuses the launch rather than being ignored.
 
