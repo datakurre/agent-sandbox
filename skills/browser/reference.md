@@ -134,3 +134,4 @@ codex mcp add playwright-nix --env DISPLAY=:0 -- nix run nixpkgs#playwright-mcp 
 | "Failed to move to new namespace" / renderer crash | container can't create Chromium's own sandbox | add `--no-sandbox` to `launch(args=[...])` |
 | Renderer crashes under load, blank/partial screenshot | `/dev/shm` too small (often 64 MB in containers) | add `--disable-dev-shm-usage` |
 | `browserType.launch` complains about a missing executable | `PLAYWRIGHT_BROWSERS_PATH` unset or wrong | re-export it, see `SKILL.md` |
+| `connect_over_cdp` to a host loopback address refuses/times out | sandbox not on host networking, or Chrome not bound to `127.0.0.1` on that port | relaunch with `agent-sandbox --no-proxy --podman-args --network=host -- ...`, see `SKILL.md` |

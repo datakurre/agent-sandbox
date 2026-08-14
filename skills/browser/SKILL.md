@@ -131,6 +131,60 @@ A denied host is policy working as configured — ask the user to run
 `agent-sandbox` skill teaches. Don't unset the proxy or add `--no-proxy-server`
 to route around it.
 
+## A visible browser: attach to Chrome on the host
+
+Headless-in-container is the default because there's no X server here (see
+above), but a headed browser is still reachable — as a *client*, over CDP, to
+a browser the user launches on the **host**. Ask them to start it with a
+fixed debugging port bound to loopback:
+
+```sh
+google-chrome --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1
+# or
+chromium --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1
+```
+
+Keep `--remote-debugging-address` on `127.0.0.1`, never `0.0.0.0` — CDP has no
+authentication, so reachability is the only thing standing between "the
+sandbox can drive this tab" and "anything on the network can read every
+cookie and run arbitrary JS in it."
+
+This only works if the sandbox itself is on **host networking**, since that's
+what makes the container's `127.0.0.1` the same loopback as the host's:
+
+```sh
+agent-sandbox --podman-args --network=host -- bash
+```
+
+If the launcher has `--proxy` on by default (e.g. a Nix-wrapped default per
+`docs/usage.md`'s "Configuring Defaults" section), override it explicitly —
+`--proxy` and `--network=host` are mutually exclusive, and flags are evaluated
+in order:
+
+```sh
+agent-sandbox --no-proxy --podman-args --network=host -- bash
+```
+
+Check the endpoint is actually reachable before attaching:
+
+```sh
+curl -s http://127.0.0.1:9222/json/version
+```
+
+A connection refused means either the sandbox isn't on host networking, or
+Chrome isn't listening on that address. Then attach as a CDP client — this is
+a remote connection, not a local launch, so `PLAYWRIGHT_BROWSERS_PATH` and
+`FONTCONFIG_FILE` aren't needed:
+
+```python
+from playwright.sync_api import sync_playwright
+
+p = sync_playwright().start()
+browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+page = browser.contexts[0].pages[0]     # the host's already-open tab
+page.goto("https://example.com")
+```
+
 ## Skip the script: playwright-mcp
 
 nixpkgs also packages Microsoft's official Playwright MCP server
