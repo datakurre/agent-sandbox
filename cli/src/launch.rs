@@ -279,6 +279,17 @@ pub fn policy_has_allow_rules(policy: &str) -> bool {
         .any(|l| l.starts_with("allow_domains ") || l.starts_with("allow_ips "))
 }
 
+/// Whether any host in this policy is subject to TLS interception.
+///
+/// The proxy only terminates TLS for a host carrying an L7 rule, so with none
+/// the session CA is never used -- `skip_l7` is true for every host and the
+/// leaf issuer is never reached.  Gating the CA mount on this keeps ordinary
+/// HTTPS end-to-end authenticated: without the CA in its trust store, the
+/// sandbox would notice if the proxy started intercepting.
+pub fn policy_has_l7_rules(policy: &str) -> bool {
+    policy.lines().any(|l| l.starts_with("allow_l7\t"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +436,19 @@ mod tests {
         assert!(policy_has_allow_rules("allow_domains github.com\n"));
         assert!(policy_has_allow_rules("deny_ips 10.0.0.0/8\nallow_ips 1.2.3.4\n"));
         assert!(!policy_has_allow_rules("allow_ports 443\ndefault deny\n"));
+    }
+
+    #[test]
+    fn l7_rules_are_what_gate_the_session_ca() {
+        // Only `allow_l7` makes the proxy intercept TLS.  A secret route always
+        // comes with one, so it is covered; an ordinary allow list is not, and
+        // must not pull a CA into the sandbox's trust store.
+        assert!(policy_has_l7_rules(
+            "allow_domains api.github.com\nallow_l7\tapi.github.com\tGET\t/user\n"
+        ));
+        assert!(!policy_has_l7_rules(
+            "allow_domains github.com\nallow_ports 443\ndefault deny\n"
+        ));
+        assert!(!policy_has_l7_rules(""));
     }
 }

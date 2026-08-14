@@ -1584,8 +1584,14 @@ fn run() -> Result<i32> {
         // certificate validation.  The file only, never /sidecar_shared
         // itself: the agent must not be able to rewrite the log of what it
         // did.
+        //
+        // Gated on the policy actually having an L7 rule.  With none, nothing
+        // is ever intercepted, so handing the sandbox a CA that can mint any
+        // name would grant trust for no purpose.  The cost is that an L7 rule
+        // added mid-session has no CA to go with it -- `ctl proxy allow --l7`
+        // and the TUI's `h` say so rather than failing silently.
         let ca_pem = format!("{}/ca.pem", sidecar_shared);
-        if Path::new(&ca_pem).exists() {
+        if launch::policy_has_l7_rules(&policy_file_content) && Path::new(&ca_pem).exists() {
             mounts.push("-v".to_string());
             mounts.push(format!("{}:/run/agent-sandbox-proxy-ca.pem:ro", ca_pem));
             env_args.push("-e".to_string());

@@ -211,6 +211,25 @@ fn show(args: TargetArgs) -> Result<()> {
     Ok(())
 }
 
+/// An L7 rule makes the proxy terminate TLS for that host, which only works if
+/// the sandbox trusts the session CA -- and the CA is bound in at launch, only
+/// when the launch policy already had an L7 rule.  Adding the first one to a
+/// running sandbox therefore cannot work, so say it plainly instead of leaving
+/// the operator with unexplained certificate errors.
+pub(crate) fn warn_if_no_session_ca(policy_dir: &str, host: &str) {
+    let launched_with_l7 = fs::read_to_string(format!("{}/policy.base", policy_dir))
+        .map(|s| s.lines().any(|l| l.starts_with("allow_l7\t")))
+        .unwrap_or(true);
+    if !launched_with_l7 {
+        eprintln!(
+            "  warning     this sandbox launched with no L7 rule, so it does not trust the\n\
+             \x20             proxy's session CA; TLS to {} will fail certificate validation.\n\
+             \x20             Declare the rule in AGENTS.md and relaunch to make it effective.",
+            host
+        );
+    }
+}
+
 fn allow(args: AllowArgs) -> Result<()> {
     let (_, dir) = policy_dir(&args.word, &args.container)?;
     let mut lines = load_policy_lines(&dir);
@@ -219,6 +238,7 @@ fn allow(args: AllowArgs) -> Result<()> {
             eprintln!("agent-sandbox ctl proxy: --l7 needs a domain, not an IP/CIDR ('{}')", args.target);
             std::process::exit(1);
         }
+        warn_if_no_session_ca(&dir, &args.target);
         lines.push(format!("allow_l7\t{}\t{}\t{}", args.target, method, args.path));
         println!("  allowed     {:<34} {}", format!("{} {} {}", args.target, method, args.path), "http route");
     } else {

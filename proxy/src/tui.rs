@@ -496,6 +496,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             "No HTTP method known yet for this row — allow the domain first with 'a'; 'h' becomes available once a real request is seen"
                                                 .to_string(),
                                         );
+                                    } else if !base_lines.iter().any(|l| l.starts_with("allow_l7\t")) {
+                                        // An L7 rule means the proxy terminates TLS for
+                                        // that host, and the session CA is bound into the
+                                        // sandbox only when the launch policy already had
+                                        // one.  Adding the first one here cannot work.
+                                        guard_msg = Some(format!(
+                                            "This sandbox launched with no L7 rule, so it does not trust the proxy's session CA — TLS to {} would fail. Declare the rule in AGENTS.md and relaunch.",
+                                            host
+                                        ));
                                     } else {
                                         let m = method.unwrap();
                                         detail = format!("allow_l7 {} {}", host, m);

@@ -38,6 +38,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "tempfile",
  "webpki-roots 0.26.11",
 ]
 

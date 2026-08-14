@@ -62,7 +62,6 @@ impl<T: std::fmt::Display> std::fmt::Display for TargetRule<T> {
 #[derive(Debug)]
 pub struct ProxyConfig {
     pub allow_domains: Vec<TargetRule<String>>,
-    pub deny_domains: Vec<TargetRule<String>>,
     /// Routes -- host *and* method *and* path -- that a secret may be injected
     /// into.  Route-scoped rather than domain-scoped on purpose: AGENTS.md is
     /// untrusted and controls the other rules on a host, so a domain-wide
@@ -84,7 +83,6 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     pub fn new(
         allow_domains: Vec<TargetRule<String>>,
-        deny_domains: Vec<TargetRule<String>>,
         secret_routes: Vec<L7Rule>,
         allow_signing: Vec<String>,
         allow_ips: Vec<TargetRule<IpNet>>,
@@ -101,7 +99,6 @@ impl ProxyConfig {
         };
         ProxyConfig {
             allow_domains,
-            deny_domains,
             secret_routes,
             allow_signing,
             allow_ips,
@@ -159,9 +156,6 @@ impl ProxyConfig {
         let mut out = Vec::new();
         for d in &self.allow_domains {
             out.push(format!("allow_domains {}", d));
-        }
-        for d in &self.deny_domains {
-            out.push(format!("deny_domains {}", d));
         }
         for r in &self.secret_routes {
             out.push(format!("secret_l7\t{}\t{}\t{}", r.domain, r.method, r.path_pattern));
@@ -296,7 +290,6 @@ fn parse_l7_fields(key: &str, lineno: usize, value: &str) -> Result<L7Rule, Stri
 
 pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
     let mut allow_domains = Vec::new();
-    let mut deny_domains = Vec::new();
     let mut secret_routes = Vec::new();
     let mut allow_signing = Vec::new();
     let mut allow_ips = Vec::new();
@@ -329,7 +322,6 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
 
         match key {
             "allow_domains" => allow_domains.push(parse_domain_target(value).map_err(|e| format!("{}: allow_domains: {}", lineno, e))?),
-            "deny_domains" => deny_domains.push(parse_domain_target(value).map_err(|e| format!("{}: deny_domains: {}", lineno, e))?),
             "secret_l7" => secret_routes.push(parse_l7_fields("secret_l7", lineno, value)?),
             "allow_signing" => allow_signing.push(value.to_ascii_lowercase()),
             "allow_ips" => allow_ips
@@ -356,7 +348,6 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
 
     Ok(ProxyConfig::new(
         allow_domains,
-        deny_domains,
         secret_routes,
         allow_signing,
         allow_ips,
@@ -480,37 +471,31 @@ fn is_port_in_target_ports(port: u16, target_ports: Option<&Vec<PortRange>>, glo
 
 impl ProxyConfig {
     /// Longest-pattern-wins, with the ports of *every* rule tied at that
-    /// length unioned together (see `union_ports`).  Deny needs a strictly
-    /// longer pattern to take the tier, so an equal-length allow wins.
+    /// length unioned together (see `union_ports`).
+    ///
+    /// There is no domain deny list: denies are built-in only, and the
+    /// built-in baseline is expressed as `deny_ips`.  A name that resolves
+    /// into a denied range is refused by `is_denied_address` after
+    /// resolution, which is where a hostname pointing at the host or the LAN
+    /// actually gets caught.
     pub fn check_domain(&self, domain: &str) -> (bool, Option<Vec<PortRange>>) {
         let mut best_len: i32 = -1;
         let mut allowed = self.default_allow;
-        let mut from_deny = false;
 
         for rule in &self.allow_domains {
             let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
                 allowed = true;
-                from_deny = false;
-            }
-        }
-
-        for rule in &self.deny_domains {
-            let p = &rule.target;
-            if domain_match(domain, p) && p.len() as i32 > best_len {
-                best_len = p.len() as i32;
-                allowed = false;
-                from_deny = true;
             }
         }
 
         if best_len < 0 {
             return (allowed, None);
         }
-        let tier = if from_deny { &self.deny_domains } else { &self.allow_domains };
         let ports = union_ports(
-            tier.iter()
+            self.allow_domains
+                .iter()
                 .filter(|r| r.target.len() as i32 == best_len && domain_match(domain, &r.target))
                 .map(|r| r.ports.as_ref()),
         );
@@ -635,24 +620,16 @@ impl ProxyConfig {
     /// invoke this once denial is already confirmed.
     fn why_domain_denied(&self, domain: &str) -> String {
         let mut best_len: i32 = -1;
-        let mut winner: Option<(&str, bool)> = None;
+        let mut winner: Option<&str> = None;
         for rule in &self.allow_domains {
             let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
-                winner = Some((p.as_str(), false));
-            }
-        }
-        for rule in &self.deny_domains {
-            let p = &rule.target;
-            if domain_match(domain, p) && p.len() as i32 > best_len {
-                best_len = p.len() as i32;
-                winner = Some((p.as_str(), true));
+                winner = Some(p.as_str());
             }
         }
         match winner {
-            Some((pattern, true)) => format!("matches deny_domains {:?}", pattern),
-            Some((pattern, false)) => format!("matches allow_domains {:?}", pattern),
+            Some(pattern) => format!("matches allow_domains {:?}", pattern),
             None => format!("no allow_domains rule matches {:?}; default is deny", domain),
         }
     }
@@ -895,12 +872,24 @@ mod tests {
     }
 
     #[test]
-    fn why_target_denied_names_the_winning_deny_domains_pattern() {
-        let cfg = parse_policy("allow_domains *.example.com\ndeny_domains internal.example.com\n").unwrap();
-        assert!(!cfg.is_allowed_target("internal.example.com"));
-        let reason = cfg.why_target_denied("internal.example.com");
-        assert!(reason.contains("deny_domains"), "{reason}");
-        assert!(reason.contains("internal.example.com"), "{reason}");
+    fn a_domain_deny_rule_is_not_a_key_at_all() {
+        // Denies are built-in only.  A policy carrying a hand-written domain
+        // deny refuses to load rather than taking effect, so there is no way
+        // to express one that half-works.
+        let err = parse_policy("allow_domains *.example.com\ndeny_domains internal.example.com\n")
+            .unwrap_err();
+        assert!(err.contains("unknown key"), "{err}");
+        assert!(err.contains("deny_domains"), "{err}");
+    }
+
+    #[test]
+    fn a_name_resolving_into_a_built_in_range_is_still_refused() {
+        // What the domain deny list was reached for.  The check that matters
+        // runs after resolution, on the address, and the baseline is what it
+        // consults -- so dropping deny_domains removes no protection.
+        let cfg = parse_policy("allow_domains internal.example.com\ndeny_ips 10.0.0.0/8\n").unwrap();
+        assert!(cfg.is_allowed("internal.example.com", 443), "the name itself is allowed");
+        assert!(cfg.is_denied_address("10.1.2.3".parse().unwrap()), "the address it resolves to is not");
     }
 
     #[test]

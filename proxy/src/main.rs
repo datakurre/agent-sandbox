@@ -3,8 +3,7 @@
 //! Forward proxy for the agent-sandbox sidecar.
 //!
 //! Usage: agent-sandbox-proxy [--policy FILE] [--log FILE] [--listen ADDR]
-//!                            [--allow-domains LIST] [--deny-domains LIST]
-//!                            [--allow-ips LIST] [--deny-ips LIST]
+//!                            [--allow-domains LIST] [--allow-ips LIST]
 //!                            [--allow-ports LIST] [--check-policy FILE]
 //!
 //! Policy comes from a file (one `KEY VALUE` per line, see `parse_policy`) or
@@ -1269,10 +1268,11 @@ Usage: agent-sandbox-proxy [OPTIONS]
   --listen ADDR          listen address (default 0.0.0.0:8888)
   --secret-fd FD         internal: read startup secret bindings from FD
   --allow-domains LIST   comma-separated; mutually exclusive with --policy
-  --deny-domains LIST
   --allow-ips LIST
-  --deny-ips LIST
   --allow-ports LIST     ports and ranges, e.g. 443,8000-8100
+
+Deny rules are built-in only: the launcher writes the baseline deny_ips into
+the policy file and there is no flag, and no `ctl` command, that adds another.
 ";
 
 /// Exit codes: 2 for anything wrong with the policy, so the sidecar and the
@@ -1289,9 +1289,7 @@ struct Options {
     listen: String,
     secret_fd: Option<i32>,
     allow_domains: String,
-    deny_domains: String,
     allow_ips: String,
-    deny_ips: String,
     allow_ports: String,
 }
 
@@ -1303,9 +1301,7 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
         listen: "0.0.0.0:8888".to_string(),
         secret_fd: None,
         allow_domains: String::new(),
-        deny_domains: String::new(),
         allow_ips: String::new(),
-        deny_ips: String::new(),
         allow_ports: String::new(),
     };
     let mut check = None;
@@ -1335,10 +1331,12 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
                 o.secret_fd = Some(fd);
             }
             "--allow-domains" => o.allow_domains = value(),
-            "--deny-domains" => o.deny_domains = value(),
             "--allow-ips" => o.allow_ips = value(),
-            "--deny-ips" => o.deny_ips = value(),
             "--allow-ports" => o.allow_ports = value(),
+            "--deny-domains" | "--deny-ips" => {
+                let _ = value();
+                fail("deny rules are built-in only: the launcher writes the baseline deny_ips and nothing else may add one. Narrow an allow rule instead.");
+            }
             "--proxy-train" => {
                 let _ = value();
                 fail("'--proxy-train' was removed. Run with a policy 'default deny' and watch denied requests via `agent-sandbox ctl tui`.");
@@ -1358,19 +1356,13 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
 /// exclusive rather than one falling back to the other: a fallback means a failed
 /// load can quietly become an empty policy, which is allow-everything.
 fn initial_config(o: &Options) -> ProxyConfig {
-    let inline = [
-        &o.allow_domains,
-        &o.deny_domains,
-        &o.allow_ips,
-        &o.deny_ips,
-        &o.allow_ports,
-    ]
+    let inline = [&o.allow_domains, &o.allow_ips, &o.allow_ports]
     .iter()
     .any(|s| !s.is_empty());
 
     if !o.policy.is_empty() {
         if inline {
-            fail("--policy and --allow-domains/--deny-domains/--allow-ips/--deny-ips/--allow-ports are mutually exclusive");
+            fail("--policy and --allow-domains/--allow-ips/--allow-ports are mutually exclusive");
         }
         match load_policy(&o.policy) {
             Ok(c) => c,
@@ -1380,10 +1372,6 @@ fn initial_config(o: &Options) -> ProxyConfig {
         let allow_ips = match parse_csv_ips(&o.allow_ips) {
             Ok(v) => v,
             Err(e) => fail(&format!("--allow-ips: {}", e)),
-        };
-        let deny_ips = match parse_csv_ips(&o.deny_ips) {
-            Ok(v) => v,
-            Err(e) => fail(&format!("--deny-ips: {}", e)),
         };
         let allow_ports = if o.allow_ports.is_empty() {
             None
@@ -1397,18 +1385,14 @@ fn initial_config(o: &Options) -> ProxyConfig {
             Ok(v) => v,
             Err(e) => fail(&format!("--allow-domains: {}", e)),
         };
-        let deny_domains = match parse_csv_domains(&o.deny_domains) {
-            Ok(v) => v,
-            Err(e) => fail(&format!("--deny-domains: {}", e)),
-        };
-
         ProxyConfig::new(
             allow_domains,
-            deny_domains,
             Vec::new(),
             Vec::new(),
             allow_ips,
-            deny_ips,
+            // Denies are built-in only; the inline lists are a dev path and
+            // carry none.
+            Vec::new(),
             allow_ports,
             None,
             Vec::new(),
@@ -1564,14 +1548,16 @@ mod tests {
         super::reload_once(path, shared)
     }
 
+    /// `deny_d` is gone: there is no domain deny list.  `deny_i` stands in for
+    /// the launcher's built-in baseline, which is the only source of denies.
     fn cfg(allow_d: &str, deny_d: &str, allow_i: &str, deny_i: &str) -> ProxyConfig {
+        assert!(deny_d.is_empty(), "domain denies no longer exist");
         ProxyConfig::new(
             parse_csv_domains(allow_d).expect("test allow_domains"),
-            parse_csv_domains(deny_d).expect("test deny_domains"),
             Vec::new(),
             Vec::new(),
             parse_csv_ips(allow_i).expect("test allow_ips"),
-            parse_csv_ips(deny_i).expect("test deny_ips"),
+            parse_csv_ips(deny_i).expect("test baseline deny_ips"),
             None,
             None,
             Vec::new(),
@@ -1599,17 +1585,23 @@ mod tests {
     }
 
     #[test]
-    fn deny_list_alone_leaves_policy_deny_by_default() {
-        let c = cfg("", "example.com", "", "");
+    fn a_baseline_only_policy_is_still_deny_by_default() {
+        // The built-in deny_ips baseline is not an allow list: it narrows, it
+        // never opens.
+        let c = cfg("", "", "", "10.0.0.0/8");
         assert!(!c.is_allowed("github.com", 443));
         assert!(!c.is_allowed("example.com", 443));
     }
 
     #[test]
     fn more_specific_domain_wins() {
-        let c = cfg("api.github.com", "*.github.com", "", "");
-        assert!(c.is_allowed("api.github.com", 443));
-        assert!(!c.is_allowed("gist.github.com", 443));
+        // Longest pattern decides, so the exact host's port set beats the
+        // wildcard's for that host and only for that host.
+        let c = cfg("*.github.com:443 api.github.com:8443", "", "", "");
+        assert!(c.is_allowed("api.github.com", 8443));
+        assert!(!c.is_allowed("api.github.com", 443));
+        assert!(c.is_allowed("gist.github.com", 443));
+        assert!(!c.is_allowed("gist.github.com", 8443));
     }
 
     #[test]
@@ -1635,8 +1627,9 @@ mod tests {
 
     #[test]
     fn trailing_dot_is_stripped_before_matching() {
-        let c = cfg("", "github.com", "", "");
-        assert!(!c.is_allowed("github.com.", 443));
+        let c = cfg("github.com", "", "", "");
+        assert!(c.is_allowed("github.com.", 443));
+        assert!(!c.is_allowed("evil.com.", 443));
     }
 
     #[test]
@@ -1910,7 +1903,6 @@ mod tests {
              \n\
              allow_domains github.com\n\
              allow_domains *.githubusercontent.com\n\
-             deny_domains telemetry.example.com\n\
              secret_l7\tapi.github.com\tGET\t/user\n\
              allow_signing github.com\n\
              allow_ips 10.0.0.0/8\n\
@@ -1919,7 +1911,6 @@ mod tests {
         )
         .expect("policy");
         assert_eq!(config.allow_domains.len(), 2);
-        assert_eq!(config.deny_domains.len(), 1);
         assert_eq!(config.secret_routes.len(), 1);
         assert_eq!(config.allow_signing.len(), 1);
         assert_eq!(config.allow_ips.len(), 2);
@@ -1951,7 +1942,7 @@ mod tests {
     #[test]
     fn explicit_default_overrides_the_derivation() {
         // Deny lists alone would normally leave the policy allow-by-default.
-        let config = parse_policy("deny_domains bad.example.com\ndefault deny\n").unwrap();
+        let config = parse_policy("deny_ips 10.0.0.0/8\ndefault deny\n").unwrap();
         assert!(!config.default_allow);
         assert!(!config.is_allowed("anything.example.com", 443));
 
@@ -1966,7 +1957,7 @@ mod tests {
         // `proxy show` and the startup log render policy with describe(), and
         // the host writes policy files; the two formats must not diverge.
         let original = parse_policy(
-            "allow_domains github.com\ndeny_domains bad.example.com\n\
+            "allow_domains github.com\n\
              secret_l7\tapi.github.com\tGET\t/user\n\
              allow_signing github.com\n\
              allow_l7\tapi.github.com\t*\t/**\n\
@@ -2008,7 +1999,7 @@ mod tests {
 
     #[test]
     fn deny_only_policy_is_denied_by_default() {
-        let config = parse_policy("deny_domains bad.example.com\n").unwrap();
+        let config = parse_policy("deny_ips 10.0.0.0/8\n").unwrap();
         assert!(!config.is_allowed("github.com", 61234));
     }
 
