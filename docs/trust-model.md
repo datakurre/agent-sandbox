@@ -110,6 +110,7 @@ The `[network]` block supports `allow` and `[[network.rules]]` for granular cont
   Saved logs are named `agent-sandbox-connections-<session>-<timestamp>.jsonl`, and the summary prints the path as a terminal hyperlink. `agent-sandbox-network-summary <log>` re-renders a saved log. `--proxy-log` implies `--proxy`.
 - Neither the policy nor the log is reachable from inside the sandbox, so the agent can neither widen its own firewall nor edit the record of its traffic.
 - The connection log is bounded at 16 MiB during a session. When a limit is reached, the oldest log contents are discarded; this prevents a busy or long-lived container from accumulating unbounded logs.
+- To inspect an HTTPS method and path after a domain is denied at `CONNECT`, the operator may temporarily add an L7 placeholder rule such as `host = "pypi.org:443"`, `method = "GET"`, `path = "/noop"`. This permits the CONNECT/MITM inspection stage but keeps `/noop` and every other unmatched path denied. The operator should replace it with the observed path pattern or remove it after training.
 
 ### What the policy covers
 

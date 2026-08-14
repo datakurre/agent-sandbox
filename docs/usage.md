@@ -127,6 +127,17 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
 
 The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Press `d` on a row to inspect the latest sanitized request head, including its method, target, path, and non-sensitive headers. The detail stream is ephemeral, capped at 4 MiB, and the TUI retains at most 200 rows with one bounded detail per row. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
 
+For an HTTPS domain denied at `CONNECT`, the encrypted method and path are not available yet. The TUI detail view suggests a temporary placeholder L7 rule to let the proxy terminate TLS and observe the real request:
+
+```toml
+[[network.rules]]
+host = "pypi.org:443"
+method = "GET"
+path = "/noop"
+```
+
+Retry the request, inspect the resulting L7 denial, then replace `/noop` with the required path or path pattern. The placeholder path itself remains denied; remove the temporary rule when training is complete.
+
 ### Git Integration Details
 
 When using Git inside the sandbox, be aware of how the integration flags interact:

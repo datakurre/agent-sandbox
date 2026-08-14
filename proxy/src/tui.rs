@@ -38,9 +38,8 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// A line from `connections.jsonl`. Only the id-less lines with
-/// `verdict:"deny"` matter here — an outright deny before any tunnel opened
-/// (see the doc comment on `MetricsLog` in `main.rs`).
+/// A line from `connections.jsonl`. Denials can be id-less when rejected before
+/// a tunnel opens, or `close` events when an L7 request is rejected after MITM.
 #[derive(Deserialize, Debug, Clone)]
 struct ConnEvent {
     ev: Option<String>,
@@ -55,6 +54,11 @@ struct ConnEvent {
     pub path: Option<String>,
     pub status: Option<u16>,
     ts: Option<u64>,
+}
+
+fn is_denied_event(ev: &ConnEvent) -> bool {
+    ev.verdict.as_deref() == Some("deny")
+        && (ev.ev.is_none() || ev.ev.as_deref() == Some("close"))
 }
 
 #[derive(Deserialize, Debug)]
@@ -200,11 +204,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 if let Ok(ev) = serde_json::from_str::<ConnEvent>(&line) {
-                    // An outright deny before any tunnel opened: no `ev`/`id`
-                    // on the line (see the doc comment on `MetricsLog` in
-                    // main.rs). Open/close events are filtered out by
-                    // requiring `ev` to be absent.
-                    if ev.ev.is_none() && ev.verdict.as_deref() == Some("deny") {
+                    // Include pre-tunnel denials and L7 denials emitted as a
+                    // terminal close event. Allowed close events remain out.
+                    if is_denied_event(&ev) {
                         if let (Some(host), Some(port)) = (ev.host.clone(), ev.port) {
                             let ts = ev.ts.unwrap_or_else(now_secs);
                             let key = (host.clone(), port);
@@ -312,9 +314,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match view {
                 View::Requests => {
                     if show_detail {
-                        let text = denied_list.get(selected_idx)
-                            .and_then(|d| d.detail.as_deref())
-                            .unwrap_or("No detailed request is available for this denial yet.");
+                        let mut text = denied_list.get(selected_idx)
+                            .and_then(|d| d.detail.clone())
+                            .unwrap_or_else(|| "No detailed request is available for this denial yet.".to_string());
+                        if let Some(row) = denied_list.get(selected_idx) {
+                            if row.method.as_deref() == Some("CONNECT") {
+                                text.push_str(&format!(
+                                    "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.rules]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
+                                    row.host, row.port
+                                ));
+                            }
+                        }
                         let detail = Paragraph::new(text)
                             .scroll((detail_scroll, 0))
                             .block(Block::default().borders(Borders::ALL).title("Denied Request Details (redacted)"));
@@ -552,4 +562,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_denied_event, ConnEvent};
+
+    fn event(ev: Option<&str>, verdict: Option<&str>) -> ConnEvent {
+        ConnEvent {
+            ev: ev.map(str::to_string),
+            verdict: verdict.map(str::to_string),
+            host: None,
+            port: None,
+            err: None,
+            up: None,
+            down: None,
+            ms: None,
+            method: None,
+            path: None,
+            status: None,
+            ts: None,
+        }
+    }
+
+    #[test]
+    fn includes_l7_denial_close_events() {
+        assert!(is_denied_event(&event(Some("close"), Some("deny"))));
+        assert!(is_denied_event(&event(None, Some("deny"))));
+        assert!(!is_denied_event(&event(Some("close"), Some("allow"))));
+        assert!(!is_denied_event(&event(Some("open"), Some("deny"))));
+    }
 }

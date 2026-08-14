@@ -290,6 +290,18 @@ impl MetricsLog {
         }
     }
 
+    fn denied_http_detail(
+        &self,
+        host: &str,
+        port: u16,
+        reason: &str,
+        method: &str,
+        path: &str,
+    ) {
+        let request = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, host);
+        self.denied_detail(host, port, reason, &request);
+    }
+
     fn next_id(&self) -> String {
         format!("{}-{}", self.boot, self.next_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -431,6 +443,19 @@ impl Shared {
     fn denied_detail(&self, host: &str, port: u16, reason: &str, request_head: &str) {
         if let Some(m) = &self.metrics {
             m.denied_detail(host, port, reason, request_head);
+        }
+    }
+
+    fn denied_http_detail(
+        &self,
+        host: &str,
+        port: u16,
+        reason: &str,
+        method: &str,
+        path: &str,
+    ) {
+        if let Some(m) = &self.metrics {
+            m.denied_http_detail(host, port, reason, method, path);
         }
     }
 
@@ -793,7 +818,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 }
                 Err(inject::ProxyHttpError::L7Denied { method, path, reason }) => {
                     eprintln!("proxy: deny {}:{} ({})", host, port, reason);
-                    shared.denied_detail(&host, port, &format!("L7 denied: {}", reason), &req_str);
+                    shared.denied_http_detail(&host, port, &format!("L7 denied: {}", reason), &method, &path);
                     shared.record(
                         id.as_deref(),
                         &host,
@@ -1039,7 +1064,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 }
                     Err(inject::ProxyHttpError::L7Denied { method, path, reason }) => {
                         eprintln!("proxy: deny {}:{} ({})", host, port, reason);
-                        shared.denied_detail(&host, port, &format!("L7 denied: {}", reason), &req_str);
+                        shared.denied_http_detail(&host, port, &format!("L7 denied: {}", reason), &method, &path);
                     shared.record(
                         id.as_deref(),
                         &host,
@@ -1866,6 +1891,17 @@ mod tests {
         });
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("\"method\":\"GET\""), "{}", lines[0]);
+    }
+
+    #[test]
+    fn denied_http_detail_records_the_decrypted_request_line() {
+        let path = std::env::temp_dir().join("agent-sandbox-detail-log.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let log = MetricsLog::open(path.to_str().unwrap(), Some(path.to_str().unwrap())).unwrap();
+        log.denied_http_detail("pypi.org", 443, "path denied", "GET", "/simple/");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("GET /simple/ HTTP/1.1"), "{}", body);
+        let _ = std::fs::remove_file(path);
     }
 
     // ── policy parsing ──────────────────────────────────────────────────────
