@@ -3,8 +3,8 @@
 //! Forward proxy for the agent-sandbox sidecar.
 //!
 //! Usage: agent-sandbox-proxy [--policy FILE] [--log FILE] [--listen ADDR]
-//!                            [--allow-domains LIST] [--allow-ips LIST]
-//!                            [--allow-ports LIST] [--check-policy FILE]
+//!                            [--allow-domains LIST] [--allow-ipss LIST]
+//!                            [--allow-portss LIST] [--check-policy FILE]
 //!
 //! Policy comes from a file (one `KEY VALUE` per line, see `parse_policy`) or
 //! from the inline lists, never both.  Anything wrong with it exits 2 before the
@@ -1383,10 +1383,10 @@ Usage: agent-sandbox-proxy [OPTIONS]
   --listen ADDR          listen address (default 0.0.0.0:8888)
   --secret-fd FD         internal: read startup secret bindings from FD
   --allow-domains LIST   comma-separated; mutually exclusive with --policy
-  --allow-ips LIST
-  --allow-ports LIST     ports and ranges, e.g. 443,8000-8100
+  --allow-ipss LIST
+  --allow-portss LIST     ports and ranges, e.g. 443,8000-8100
 
-Deny rules are built-in only: the launcher writes the baseline deny_ips into
+Deny rules are built-in only: the launcher writes the baseline deny_ip into
 the policy file and there is no flag, and no `ctl` command, that adds another.
 ";
 
@@ -1455,7 +1455,7 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
             "--allow-ports" => o.allow_ports = value(),
             "--deny-domains" | "--deny-ips" => {
                 let _ = value();
-                fail("deny rules are built-in only: the launcher writes the baseline deny_ips and nothing else may add one. Narrow an allow rule instead.");
+                fail("deny rules are built-in only: the launcher writes the baseline deny_ip and nothing else may add one. Narrow an allow rule instead.");
             }
             "--proxy-train" => {
                 let _ = value();
@@ -1489,11 +1489,11 @@ fn initial_config(o: &Options) -> ProxyConfig {
             Err(e) => fail(&e),
         }
     } else {
-        let allow_ips = match parse_csv_ips(&o.allow_ips) {
+        let allow_ip = match parse_csv_ips(&o.allow_ips) {
             Ok(v) => v,
             Err(e) => fail(&format!("--allow-ips: {}", e)),
         };
-        let allow_ports = if o.allow_ports.is_empty() {
+        let allow_port = if o.allow_ports.is_empty() {
             None
         } else {
             match parse_csv_ports(&o.allow_ports) {
@@ -1501,19 +1501,19 @@ fn initial_config(o: &Options) -> ProxyConfig {
                 Err(e) => fail(&format!("--allow-ports: {}", e)),
             }
         };
-        let allow_domains = match parse_csv_domains(&o.allow_domains) {
+        let allow_host = match parse_csv_domains(&o.allow_domains) {
             Ok(v) => v,
             Err(e) => fail(&format!("--allow-domains: {}", e)),
         };
         ProxyConfig::new(
-            allow_domains,
+            allow_host,
             Vec::new(),
             Vec::new(),
-            allow_ips,
+            allow_ip,
             // Denies are built-in only; the inline lists are a dev path and
             // carry none.
             Vec::new(),
-            allow_ports,
+            allow_port,
             None,
             Vec::new(),
         )
@@ -1636,7 +1636,7 @@ fn main() {
 
 #[cfg(test)]
 pub(crate) fn dummy_shared() -> Arc<Shared> {
-    Arc::new(shared_with("allow_domains example.com"))
+    Arc::new(shared_with("allow_host example.com"))
 }
 
 #[cfg(test)]
@@ -1676,11 +1676,11 @@ mod tests {
     fn cfg(allow_d: &str, deny_d: &str, allow_i: &str, deny_i: &str) -> ProxyConfig {
         assert!(deny_d.is_empty(), "domain denies no longer exist");
         ProxyConfig::new(
-            parse_csv_domains(allow_d).expect("test allow_domains"),
+            parse_csv_domains(allow_d).expect("test allow_host"),
             Vec::new(),
             Vec::new(),
-            parse_csv_ips(allow_i).expect("test allow_ips"),
-            parse_csv_ips(deny_i).expect("test baseline deny_ips"),
+            parse_csv_ips(allow_i).expect("test allow_ip"),
+            parse_csv_ips(deny_i).expect("test baseline deny_ip"),
             None,
             None,
             Vec::new(),
@@ -1709,7 +1709,7 @@ mod tests {
 
     #[test]
     fn a_baseline_only_policy_is_still_deny_by_default() {
-        // The built-in deny_ips baseline is not an allow list: it narrows, it
+        // The built-in deny_ip baseline is not an allow list: it narrows, it
         // never opens.
         let c = cfg("", "", "", "10.0.0.0/8");
         assert!(!c.is_allowed("github.com", 443));
@@ -1791,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_address_check_honours_explicit_deny_ips() {
+    fn resolved_address_check_honours_explicit_deny_ip() {
         let c = cfg("internal.example.com", "", "", "169.254.0.0/16");
         assert!(c.is_denied_address("169.254.169.254".parse().unwrap()));
         assert!(!c.is_denied_address("140.82.121.4".parse().unwrap()));
@@ -1806,10 +1806,10 @@ mod tests {
 
     // ── baseline private/loopback deny (F2) ────────────────────────────────
     // These ranges are not compiled into the proxy -- the launcher writes them
-    // into the policy file as ordinary deny_ips entries, so what actually needs
+    // into the policy file as ordinary deny_ip entries, so what actually needs
     // testing here is the *mechanism* the baseline depends on: that any
-    // deny_ips range denies both a literal target and a resolved address, and
-    // that an equally-specific allow_ips overrides it in both paths.
+    // deny_ip range denies both a literal target and a resolved address, and
+    // that an equally-specific allow_ip overrides it in both paths.
 
     #[test]
     fn each_baseline_range_is_denied() {
@@ -1853,7 +1853,7 @@ mod tests {
     fn equal_prefix_allow_ip_overrides_a_baseline_deny_for_resolved_addresses() {
         // Regression test for the is_denied_address tie-break fix: without it,
         // this is the one case where F2's own documented migration path (an
-        // allow_ips override at the identical prefix) silently did not work.
+        // allow_ip override at the identical prefix) silently did not work.
         let c = cfg("", "", "10.0.0.0/8", "10.0.0.0/8");
         assert!(!c.is_denied_address("10.1.2.3".parse().unwrap()));
     }
@@ -2075,8 +2075,8 @@ mod tests {
     fn a_bare_address_is_a_host_route() {
         // The AGENTS.md parser accepts these (python ip_network calls it /32) and
         // IpNet on its own does not, so they used to be dropped in silence.
-        let config = parse_policy("deny_ips 8.8.8.8\ndeny_ips 2001:db8::1\n").unwrap();
-        assert_eq!(config.deny_ips.len(), 2);
+        let config = parse_policy("deny_ip 8.8.8.8\ndeny_ip 2001:db8::1\n").unwrap();
+        assert_eq!(config.deny_ip.len(), 2);
         assert!(config.is_denied_address("8.8.8.8".parse().unwrap()));
         assert!(!config.is_denied_address("8.8.4.4".parse().unwrap()));
         assert!(config.is_denied_address("2001:db8::1".parse().unwrap()));
@@ -2087,53 +2087,53 @@ mod tests {
         let config = parse_policy(
             "# comment\n\
              \n\
-             allow_domains github.com\n\
-             allow_domains *.githubusercontent.com\n\
-             secret_l7\tapi.github.com\tGET\t/user\n\
+             allow_host github.com\n\
+             allow_host *.githubusercontent.com\n\
+             secret_route\tapi.github.com\tGET\t/user\n\
              allow_signing github.com\n\
-             allow_ips 10.0.0.0/8\n\
-             allow_ips 192.168.1.0/24\n\
-             deny_ips 10.1.0.0/24\n",
+             allow_ip 10.0.0.0/8\n\
+             allow_ip 192.168.1.0/24\n\
+             deny_ip 10.1.0.0/24\n",
         )
         .expect("policy");
-        assert_eq!(config.allow_domains.len(), 2);
+        assert_eq!(config.allow_host.len(), 2);
         assert_eq!(config.secret_routes.len(), 1);
         assert_eq!(config.allow_signing.len(), 1);
-        assert_eq!(config.allow_ips.len(), 2);
-        assert_eq!(config.deny_ips.len(), 1);
+        assert_eq!(config.allow_ip.len(), 2);
+        assert_eq!(config.deny_ip.len(), 1);
         assert!(!config.default_allow, "the policy is deny by default");
     }
 
     #[test]
     fn policy_rejects_the_old_space_separated_encoding() {
         // Exactly what the launcher used to pass as one argument.
-        let err = parse_policy("allow_ips 10.0.0.0/8 192.168.1.0/24\n").unwrap_err();
+        let err = parse_policy("allow_ip 10.0.0.0/8 192.168.1.0/24\n").unwrap_err();
         assert!(err.contains("whitespace"), "{}", err);
     }
 
     #[test]
     fn policy_rejects_unknown_keys_and_bad_values() {
         assert!(parse_policy("allow_domians github.com\n").is_err());
-        assert!(parse_policy("allow_ips not-an-ip\n").is_err());
+        assert!(parse_policy("allow_ip not-an-ip\n").is_err());
         assert!(parse_policy("default maybe\n").is_err());
-        assert!(parse_policy("allow_domains\n").is_err());
+        assert!(parse_policy("allow_host\n").is_err());
     }
 
     #[test]
     fn policy_errors_name_the_line() {
-        let err = parse_policy("allow_domains ok.example.com\nallow_ips nope\n").unwrap_err();
+        let err = parse_policy("allow_host ok.example.com\nallow_ip nope\n").unwrap_err();
         assert!(err.starts_with("2:"), "{}", err);
     }
 
     #[test]
     fn explicit_default_overrides_the_derivation() {
         // Deny lists alone would normally leave the policy allow-by-default.
-        let config = parse_policy("deny_ips 10.0.0.0/8\ndefault deny\n").unwrap();
+        let config = parse_policy("deny_ip 10.0.0.0/8\ndefault deny\n").unwrap();
         assert!(!config.default_allow);
         assert!(!config.is_allowed("anything.example.com", 443));
 
         // And the other direction: an allow list with an explicit allow default.
-        let config = parse_policy("allow_domains good.example.com\ndefault allow\n").unwrap();
+        let config = parse_policy("allow_host good.example.com\ndefault allow\n").unwrap();
         assert!(config.default_allow);
         assert!(config.is_allowed("anything.example.com", 443));
     }
@@ -2143,11 +2143,11 @@ mod tests {
         // `proxy show` and the startup log render policy with describe(), and
         // the host writes policy files; the two formats must not diverge.
         let original = parse_policy(
-            "allow_domains github.com\n\
-             secret_l7\tapi.github.com\tGET\t/user\n\
+            "allow_host github.com\n\
+             secret_route\tapi.github.com\tGET\t/user\n\
              allow_signing github.com\n\
-             allow_l7\tapi.github.com\t*\t/**\n\
-             allow_ips 10.0.0.0/8\ndeny_ips 10.1.0.0/24\nallow_ports 8000-8100\n",
+             allow_route\tapi.github.com\t*\t/**\n\
+             allow_ip 10.0.0.0/8\ndeny_ip 10.1.0.0/24\nallow_port 8000-8100\n",
         )
         .unwrap();
         let reparsed = parse_policy(&original.describe().join("\n")).unwrap();
@@ -2160,7 +2160,7 @@ mod tests {
         assert!(!config.default_allow);
     }
 
-    // ── allow_ports ─────────────────────────────────────────────────────────
+    // ── allow_port ─────────────────────────────────────────────────────────
 
     #[test]
     fn single_port_and_range_parse() {
@@ -2186,7 +2186,7 @@ mod tests {
 
     #[test]
     fn allow_list_derives_the_default_allow_ports() {
-        let config = parse_policy("allow_domains github.com\n").unwrap();
+        let config = parse_policy("allow_host github.com\n").unwrap();
         assert!(config.is_allowed("github.com", 443));
         assert!(config.is_allowed("github.com", 22));
         assert!(!config.is_allowed("github.com", 8443));
@@ -2194,20 +2194,20 @@ mod tests {
 
     #[test]
     fn deny_only_policy_is_denied_by_default() {
-        let config = parse_policy("deny_ips 10.0.0.0/8\n").unwrap();
+        let config = parse_policy("deny_ip 10.0.0.0/8\n").unwrap();
         assert!(!config.is_allowed("github.com", 61234));
     }
 
     #[test]
     fn explicit_allow_ports_overrides_the_derived_default() {
-        let config = parse_policy("allow_domains github.com\nallow_ports 8443\n").unwrap();
+        let config = parse_policy("allow_host github.com\nallow_port 8443\n").unwrap();
         assert!(!config.is_allowed("github.com", 443));
         assert!(config.is_allowed("github.com", 8443));
     }
 
     #[test]
     fn port_range_is_inclusive() {
-        let config = parse_policy("allow_domains github.com\nallow_ports 8000-8100\n").unwrap();
+        let config = parse_policy("allow_host github.com\nallow_port 8000-8100\n").unwrap();
         assert!(config.is_allowed("github.com", 8000));
         assert!(config.is_allowed("github.com", 8100));
         assert!(!config.is_allowed("github.com", 7999));
@@ -2216,7 +2216,7 @@ mod tests {
 
     #[test]
     fn port_deny_is_distinguishable_from_host_deny() {
-        let config = parse_policy("allow_domains github.com\nallow_ports 443\n").unwrap();
+        let config = parse_policy("allow_host github.com\nallow_port 443\n").unwrap();
         assert!(config.is_allowed_target("github.com"));
         assert!(!config.is_allowed_port(8443));
         assert!(!config.is_allowed("github.com", 8443));
@@ -2226,7 +2226,7 @@ mod tests {
     fn domain_specific_port_isolation() {
         // A target-bound port rule must not leak to other targets: jyu.fi is
         // restricted to 443, github.com keeps the default ports (80, 443, 22).
-        let config = parse_policy("allow_domains jyu.fi:443\nallow_domains github.com\n").unwrap();
+        let config = parse_policy("allow_host jyu.fi:443\nallow_host github.com\n").unwrap();
         assert!(config.is_allowed("jyu.fi", 443));
         assert!(!config.is_allowed("jyu.fi", 22));
         assert!(config.is_allowed("github.com", 443));
@@ -2243,7 +2243,7 @@ mod tests {
         // per-target port matching by checking the host and the (global) port
         // independently — which let a domain allowed only on one port through on
         // any default port too.
-        let shared = shared_with("allow_domains github.com:22\n");
+        let shared = shared_with("allow_host github.com:22\n");
         assert!(shared.is_allowed("github.com", 22));
         assert!(!shared.is_allowed("github.com", 443));
     }
@@ -2254,7 +2254,7 @@ mod tests {
         assert!(shared.config().is_allowed("anything.example.com", 443));
 
         let path = policy_path("reload-default");
-        std::fs::write(&path, "allow_ips 10.0.0.0/8\nallow_ips 192.168.1.0/24\n").unwrap();
+        std::fs::write(&path, "allow_ip 10.0.0.0/8\nallow_ip 192.168.1.0/24\n").unwrap();
         assert!(reload_once(path.to_str().unwrap(), &shared));
         let _ = std::fs::remove_file(&path);
 
@@ -2267,7 +2267,7 @@ mod tests {
     #[test]
     fn secret_injection_requires_both_policy_and_provider() {
         const POLICY: &str =
-            "allow_domains api.example.com\nsecret_l7\tapi.example.com\tGET\t/user\n";
+            "allow_host api.example.com\nsecret_route\tapi.example.com\tGET\t/user\n";
         const PROVIDER: &str = "api.example.com\tGET\t/user\tAuthorization\tBearer provider-token\n";
 
         let with_both = shared_with_secrets(POLICY, PROVIDER);
@@ -2282,7 +2282,7 @@ mod tests {
             .secret_for_request("api.example.com", "GET", "/user")
             .is_none());
 
-        let provider_only = shared_with_secrets("allow_domains api.example.com\n", PROVIDER);
+        let provider_only = shared_with_secrets("allow_host api.example.com\n", PROVIDER);
         assert!(provider_only
             .secret_for_request("api.example.com", "GET", "/user")
             .is_none());
@@ -2294,8 +2294,8 @@ mod tests {
         // so no other route on the same host resolves a binding -- however the
         // repo's AGENTS.md widened the L7 rules.
         let shared = shared_with_secrets(
-            "allow_domains api.example.com\n\
-             secret_l7\tapi.example.com\tGET\t/user\n",
+            "allow_host api.example.com\n\
+             secret_route\tapi.example.com\tGET\t/user\n",
             "api.example.com\tGET\t/user\tAuthorization\tBearer tok\n",
         );
         assert!(shared.secret_for_request("api.example.com", "GET", "/user").is_some());
@@ -2307,7 +2307,7 @@ mod tests {
     #[test]
     fn a_secret_host_is_recognised_whatever_the_route() {
         // The coarse predicate, which is what refuses cleartext to the host.
-        let cfg = parse_policy("secret_l7\tapi.example.com\tGET\t/user\n").expect("policy");
+        let cfg = parse_policy("secret_route\tapi.example.com\tGET\t/user\n").expect("policy");
         assert!(cfg.is_secret_host("api.example.com"));
         assert!(!cfg.is_secret_host("other.example.com"));
         assert!(cfg.is_secret_route("api.example.com", "GET", "/user"));
@@ -2316,7 +2316,7 @@ mod tests {
 
     #[test]
     fn backed_secret_routes_require_pattern_overlap() {
-        let cfg = parse_policy("secret_l7\tapi.example.com\tGET\t/user\n").expect("policy");
+        let cfg = parse_policy("secret_route\tapi.example.com\tGET\t/user\n").expect("policy");
         let unrelated =
             SecretBindings::parse("other.example.com\tGET\t/user\tAuthorization\tone\n")
                 .expect("secrets");
@@ -2330,10 +2330,10 @@ mod tests {
 
     #[test]
     fn a_rejected_reload_keeps_the_previous_policy() {
-        let shared = shared_with("allow_domains github.com\n");
+        let shared = shared_with("allow_host github.com\n");
         let path = policy_path("reload-rejected");
 
-        std::fs::write(&path, "allow_ips 10.0.0.0/8 192.168.1.0/24\n").unwrap();
+        std::fs::write(&path, "allow_ip 10.0.0.0/8 192.168.1.0/24\n").unwrap();
         assert!(!reload_once(path.to_str().unwrap(), &shared));
         let _ = std::fs::remove_file(&path);
 
@@ -2345,7 +2345,7 @@ mod tests {
     fn a_vanished_policy_keeps_the_previous_one() {
         // Deleting the file must not read as "no rules": that would be a silent
         // widening to allow-everything.
-        let shared = shared_with("allow_domains github.com\n");
+        let shared = shared_with("allow_host github.com\n");
         assert!(!reload_once(
             policy_path("definitely-absent").to_str().unwrap(),
             &shared
@@ -2355,18 +2355,18 @@ mod tests {
 
     #[test]
     fn a_reload_widens_and_narrows() {
-        let shared = shared_with("allow_domains github.com\n");
+        let shared = shared_with("allow_host github.com\n");
         let path = policy_path("reload-widen");
 
         std::fs::write(
             &path,
-            "allow_domains github.com\nallow_domains api.openai.com\n",
+            "allow_host github.com\nallow_host api.openai.com\n",
         )
         .unwrap();
         assert!(reload_once(path.to_str().unwrap(), &shared));
         assert!(shared.config().is_allowed("api.openai.com", 443));
 
-        std::fs::write(&path, "allow_domains github.com\n").unwrap();
+        std::fs::write(&path, "allow_host github.com\n").unwrap();
         assert!(reload_once(path.to_str().unwrap(), &shared));
         assert!(!shared.config().is_allowed("api.openai.com", 443));
         let _ = std::fs::remove_file(&path);

@@ -79,9 +79,9 @@ pub struct RmArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RmKind {
-    #[command(about = "Remove an allow_domains/allow_ips/allow_ports rule")]
+    #[command(about = "Remove an allow_host/allow_ip/allow_port rule")]
     Allow(RmTargetArgs),
-    #[command(about = "Remove an allow_l7 rule")]
+    #[command(about = "Remove an allow_route rule")]
     L7(RmL7Args),
 }
 
@@ -215,7 +215,7 @@ fn show(args: TargetArgs) -> Result<()> {
             continue;
         }
         let value = value.trim();
-        let display_value = if key == "allow_l7" {
+        let display_value = if key == "allow_route" {
             value.replace('\t', " ")
         } else {
             value.to_string()
@@ -237,7 +237,7 @@ fn show(args: TargetArgs) -> Result<()> {
 /// the operator with unexplained certificate errors.
 pub(crate) fn warn_if_no_session_ca(policy_dir: &str, host: &str) {
     let launched_with_l7 = fs::read_to_string(format!("{}/policy.base", policy_dir))
-        .map(|s| s.lines().any(|l| l.starts_with("allow_l7\t")))
+        .map(|s| s.lines().any(|l| l.starts_with("allow_route\t")))
         .unwrap_or(true);
     if !launched_with_l7 {
         eprintln!(
@@ -262,7 +262,7 @@ fn allow(args: AllowArgs) -> Result<()> {
         }
         warn_if_no_session_ca(&dir, &args.target);
         lines.push(format!(
-            "allow_l7\t{}\t{}\t{}",
+            "allow_route\t{}\t{}\t{}",
             args.target, method, args.path
         ));
         println!(
@@ -273,9 +273,9 @@ fn allow(args: AllowArgs) -> Result<()> {
     } else {
         let kind = target_kind(&args.target);
         let key = match kind {
-            "ips" => "allow_ips",
-            "ports" => "allow_ports",
-            _ => "allow_domains",
+            "ips" => "allow_ip",
+            "ports" => "allow_port",
+            _ => "allow_host",
         };
         lines.push(format!("{} {}", key, args.target));
         println!("  allowed     {:<34} {}", args.target, kind);
@@ -300,9 +300,9 @@ fn rm(args: RmArgs) -> Result<()> {
             let (_, dir) = policy_dir(&a.word, &a.container)?;
             let mut lines = load_policy_lines(&dir);
             let key = match target_kind(&a.target) {
-                "ips" => "allow_ips",
-                "ports" => "allow_ports",
-                _ => "allow_domains",
+                "ips" => "allow_ip",
+                "ports" => "allow_port",
+                _ => "allow_host",
             };
             let removed = remove_matching(&mut lines, |l| l == format!("{} {}", key, a.target));
             (dir, lines, removed, format!("{} {}", key, a.target))
@@ -310,13 +310,13 @@ fn rm(args: RmArgs) -> Result<()> {
         RmKind::L7(a) => {
             let (_, dir) = policy_dir(&a.word, &a.container)?;
             let mut lines = load_policy_lines(&dir);
-            let needle = format!("allow_l7\t{}\t{}\t{}", a.host, a.method, a.path);
+            let needle = format!("allow_route\t{}\t{}\t{}", a.host, a.method, a.path);
             let removed = remove_matching(&mut lines, |l| l == needle);
             (
                 dir,
                 lines,
                 removed,
-                format!("allow_l7 {} {} {}", a.host, a.method, a.path),
+                format!("allow_route {} {} {}", a.host, a.method, a.path),
             )
         }
     };
@@ -350,7 +350,7 @@ fn reset(args: TargetArgs) -> Result<()> {
 
 fn export(args: TargetArgs) -> Result<()> {
     let (_, dir) = policy_dir(&args.word, &args.container)?;
-    // The baseline private/loopback deny_ips ranges are enforced
+    // The baseline private/loopback deny_ip ranges are enforced
     // unconditionally regardless of AGENTS.md (see `policy.baseline`,
     // written once at launch with exactly that set), so round-tripping them
     // into an exported config would just be noise.

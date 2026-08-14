@@ -743,7 +743,7 @@ mod tests {
     /// `route` secret-bearing, with a provider binding behind it.
     fn shared_injecting(route: &str, header: &str, value: &str) -> std::sync::Arc<crate::Shared> {
         std::sync::Arc::new(crate::shared_with_secrets(
-            &format!("allow_domains example.com\nsecret_l7\t{route}\n"),
+            &format!("allow_host example.com\nsecret_route\t{route}\n"),
             &format!("{route}\t{header}\t{value}\n"),
         ))
     }
@@ -820,9 +820,9 @@ mod tests {
         let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none\
                             HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
         let shared = std::sync::Arc::new(crate::shared_with_secrets(
-            "allow_domains api.example.com\n\
-             allow_l7\tapi.example.com\t*\t/**\n\
-             secret_l7\tapi.example.com\tGET\t/user/repos\n",
+            "allow_host api.example.com\n\
+             allow_route\tapi.example.com\t*\t/**\n\
+             secret_route\tapi.example.com\tGET\t/user/repos\n",
             "api.example.com\tGET\t/user/repos\tAuthorization\tBearer tok\n",
         ));
 
@@ -846,9 +846,9 @@ mod tests {
             b"GET /user/repos/../../zen HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
         let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         let shared = std::sync::Arc::new(crate::shared_with_secrets(
-            "allow_domains api.example.com\n\
-             allow_l7\tapi.example.com\t*\t/**\n\
-             secret_l7\tapi.example.com\tGET\t/user/**\n",
+            "allow_host api.example.com\n\
+             allow_route\tapi.example.com\t*\t/**\n\
+             secret_route\tapi.example.com\tGET\t/user/**\n",
             "api.example.com\tGET\t/user/**\tAuthorization\tBearer tok\n",
         ));
 

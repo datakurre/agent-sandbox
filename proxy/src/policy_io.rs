@@ -12,11 +12,11 @@ pub fn load_policy_lines(policy_dir: &str) -> Vec<String> {
     }
 }
 
-/// Every `deny_ips` line in a policy, as written.
+/// Every `deny_ip` line in a policy, as written.
 fn deny_ip_lines(text: &str) -> std::collections::BTreeSet<String> {
     text.lines()
         .map(str::trim)
-        .filter(|l| l.starts_with("deny_ips "))
+        .filter(|l| l.starts_with("deny_ip "))
         .map(str::to_string)
         .collect()
 }
@@ -27,10 +27,10 @@ fn deny_ip_lines(text: &str) -> std::collections::BTreeSet<String> {
 ///
 /// Denies are built-in only.  This is the single writer behind every
 /// `agent-sandbox ctl proxy` mutation and every TUI edit, so refusing any
-/// change to the `deny_ips` set here is what fixes the baseline at launch:
+/// change to the `deny_ip` set here is what fixes the baseline at launch:
 /// the ranges protecting the host and its LAN can be neither removed nor
 /// added to for the life of the sandbox.  Widening is still possible, and
-/// still an *allow*: an `allow_ips` entry of equal or greater specificity
+/// still an *allow*: an `allow_ip` entry of equal or greater specificity
 /// beats a baseline range at the proxy and in the routing table.
 pub fn install_policy(policy_dir: &str, entries: &[String]) -> Result<(), String> {
     let policy_path = format!("{}/policy", policy_dir);
@@ -55,7 +55,7 @@ pub fn install_policy(policy_dir: &str, entries: &[String]) -> Result<(), String
             }
             return Err(format!(
                 "deny rules are built-in only and cannot be changed while the sandbox runs ({}). \
-                 Allow a range back with an allow_ips entry of equal or greater specificity instead.",
+                 Allow a range back with an allow_ip entry of equal or greater specificity instead.",
                 detail.join("; ")
             ));
         }
@@ -76,14 +76,14 @@ pub fn install_policy(policy_dir: &str, entries: &[String]) -> Result<(), String
 mod tests {
     use super::*;
 
-    const BASELINE: &str = "deny_ips 127.0.0.0/8\ndeny_ips 10.0.0.0/8\n";
+    const BASELINE: &str = "deny_ip 127.0.0.0/8\ndeny_ip 10.0.0.0/8\n";
 
     fn sandbox_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("policy.baseline"), BASELINE).expect("baseline");
         fs::write(
             dir.path().join("policy"),
-            format!("allow_domains github.com\n{BASELINE}"),
+            format!("allow_host github.com\n{BASELINE}"),
         )
         .expect("policy");
         dir
@@ -100,10 +100,10 @@ mod tests {
         install(
             &dir,
             &[
-                "allow_domains github.com",
-                "allow_domains api.openai.com",
-                "deny_ips 127.0.0.0/8",
-                "deny_ips 10.0.0.0/8",
+                "allow_host github.com",
+                "allow_host api.openai.com",
+                "deny_ip 127.0.0.0/8",
+                "deny_ip 10.0.0.0/8",
             ],
         )
         .expect("adding an allow rule must work");
@@ -116,13 +116,13 @@ mod tests {
         // The whole point of "denies are built-in only": no live edit, from
         // `ctl proxy` or the TUI, can take a baseline range out.
         let dir = sandbox_dir();
-        let err = install(&dir, &["allow_domains github.com", "deny_ips 127.0.0.0/8"])
+        let err = install(&dir, &["allow_host github.com", "deny_ip 127.0.0.0/8"])
             .expect_err("removing a baseline deny must be refused");
         assert!(err.contains("built-in only"), "{err}");
         assert!(err.contains("10.0.0.0/8"), "the message names what went missing: {err}");
         // ...and the live policy is untouched.
         let written = fs::read_to_string(dir.path().join("policy")).expect("read");
-        assert!(written.contains("deny_ips 10.0.0.0/8"), "{written}");
+        assert!(written.contains("deny_ip 10.0.0.0/8"), "{written}");
     }
 
     #[test]
@@ -131,10 +131,10 @@ mod tests {
         let err = install(
             &dir,
             &[
-                "allow_domains github.com",
-                "deny_ips 127.0.0.0/8",
-                "deny_ips 10.0.0.0/8",
-                "deny_ips 8.8.8.8/32",
+                "allow_host github.com",
+                "deny_ip 127.0.0.0/8",
+                "deny_ip 10.0.0.0/8",
+                "deny_ip 8.8.8.8/32",
             ],
         )
         .expect_err("adding a deny must be refused");
@@ -150,13 +150,13 @@ mod tests {
         install(
             &dir,
             &[
-                "allow_domains github.com",
-                "allow_ips 10.0.0.0/8",
-                "deny_ips 127.0.0.0/8",
-                "deny_ips 10.0.0.0/8",
+                "allow_host github.com",
+                "allow_ip 10.0.0.0/8",
+                "deny_ip 127.0.0.0/8",
+                "deny_ip 10.0.0.0/8",
             ],
         )
-        .expect("an equal-specificity allow_ips must install");
+        .expect("an equal-specificity allow_ip must install");
     }
 
     #[test]

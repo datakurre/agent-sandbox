@@ -322,7 +322,7 @@ pub fn container_name(workspace_slug: &str, session_word: &str) -> String {
 // ── Policy ──────────────────────────────────────────────────────────────────
 
 /// Refused in every mode, so a proxy with no rules cannot be used to reach the
-/// host or its LAN.  Written as ordinary `deny_ips` entries into the same file
+/// host or its LAN.  Written as ordinary `deny_ip` entries into the same file
 /// the proxy reads and the sidecar mirrors into kernel blackhole routes, so
 /// this is the only place the list is written down.
 pub const BASELINE_DENY_IPS: &[&str] = &[
@@ -338,12 +338,12 @@ pub const BASELINE_DENY_IPS: &[&str] = &[
     "fe80::/10",
 ];
 
-/// `allow_ports` alone does not make a policy deny-by-default -- only
-/// `allow_domains`/`allow_ips` do -- so those are what this looks for.
+/// `allow_port` alone does not make a policy deny-by-default -- only
+/// `allow_host`/`allow_ip` do -- so those are what this looks for.
 pub fn policy_has_allow_rules(policy: &str) -> bool {
     policy
         .lines()
-        .any(|l| l.starts_with("allow_domains ") || l.starts_with("allow_ips "))
+        .any(|l| l.starts_with("allow_host ") || l.starts_with("allow_ip "))
 }
 
 /// Whether any host in this policy is subject to TLS interception.
@@ -354,7 +354,7 @@ pub fn policy_has_allow_rules(policy: &str) -> bool {
 /// HTTPS end-to-end authenticated: without the CA in its trust store, the
 /// sandbox would notice if the proxy started intercepting.
 pub fn policy_has_l7_rules(policy: &str) -> bool {
-    policy.lines().any(|l| l.starts_with("allow_l7\t"))
+    policy.lines().any(|l| l.starts_with("allow_route\t"))
 }
 
 #[cfg(test)]
@@ -512,23 +512,23 @@ mod tests {
 
     #[test]
     fn allow_rules_are_detected_only_from_domains_and_ips() {
-        assert!(policy_has_allow_rules("allow_domains github.com\n"));
+        assert!(policy_has_allow_rules("allow_host github.com\n"));
         assert!(policy_has_allow_rules(
-            "deny_ips 10.0.0.0/8\nallow_ips 1.2.3.4\n"
+            "deny_ip 10.0.0.0/8\nallow_ip 1.2.3.4\n"
         ));
-        assert!(!policy_has_allow_rules("allow_ports 443\ndefault deny\n"));
+        assert!(!policy_has_allow_rules("allow_port 443\ndefault deny\n"));
     }
 
     #[test]
     fn l7_rules_are_what_gate_the_session_ca() {
-        // Only `allow_l7` makes the proxy intercept TLS.  A secret route always
+        // Only `allow_route` makes the proxy intercept TLS.  A secret route always
         // comes with one, so it is covered; an ordinary allow list is not, and
         // must not pull a CA into the sandbox's trust store.
         assert!(policy_has_l7_rules(
-            "allow_domains api.github.com\nallow_l7\tapi.github.com\tGET\t/user\n"
+            "allow_host api.github.com\nallow_route\tapi.github.com\tGET\t/user\n"
         ));
         assert!(!policy_has_l7_rules(
-            "allow_domains github.com\nallow_ports 443\ndefault deny\n"
+            "allow_host github.com\nallow_port 443\ndefault deny\n"
         ));
         assert!(!policy_has_l7_rules(""));
     }

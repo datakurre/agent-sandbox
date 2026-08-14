@@ -112,7 +112,7 @@ pub fn get_requested_rules(workspace: &Path) -> Vec<SecretRule> {
         for block in blocks {
             if let Ok(block_data) = block.parse::<toml::Value>() {
                 if let Some(network) = block_data.get("network").and_then(|v| v.as_table()) {
-                    if let Some(rules) = network.get("rules").and_then(|v| v.as_array()) {
+                    if let Some(rules) = network.get("allow_routes").and_then(|v| v.as_array()) {
                         for rule in rules {
                             if let Some(rule_table) = rule.as_table() {
                                 if let (Some(secret_val), Some(host_val)) = (rule_table.get("secret"), rule_table.get("host")) {
@@ -189,14 +189,14 @@ struct SecretRoute {
     path: String,
 }
 
-/// Read the `secret_l7` routes out of a compiled policy file.
+/// Read the `secret_route` routes out of a compiled policy file.
 fn policy_secret_routes(policy: &Path) -> Vec<SecretRoute> {
     let mut routes = Vec::new();
     let Ok(text) = std::fs::read_to_string(policy) else {
         return routes;
     };
     for line in text.lines() {
-        let Some(rest) = line.trim_end().strip_prefix("secret_l7\t") else {
+        let Some(rest) = line.trim_end().strip_prefix("secret_route\t") else {
             continue;
         };
         let parts: Vec<&str> = rest.splitn(3, '\t').collect();
@@ -211,7 +211,7 @@ fn policy_secret_routes(policy: &Path) -> Vec<SecretRoute> {
     routes
 }
 
-/// Resolve the bindings the policy's `secret_l7` routes authorize, returning
+/// Resolve the bindings the policy's `secret_route` routes authorize, returning
 /// one `domain\tmethod\tpath\theader\tvalue` line per binding.  The caller
 /// decides where those go: the launcher writes them straight into the
 /// sidecar's `bindings` file rather than through a pipe, so the values never
@@ -251,9 +251,9 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
                 }
             };
             
-            // manually extract [[network.rules]] and add to bindings
+            // manually extract [[network.allow_routes]] and add to bindings
             if let Some(network) = val.get("network").and_then(|v| v.as_table()) {
-                if let Some(rules) = network.get("rules").and_then(|v| v.as_array()) {
+                if let Some(rules) = network.get("allow_routes").and_then(|v| v.as_array()) {
                     for rule in rules {
                         if let Ok(hb) = rule.clone().try_into::<HostBinding>() {
                             host_config.bindings.push(hb);
@@ -338,14 +338,14 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
             err_msg.push_str(&format!("               host = \"{}\", method = \"{}\", path = \"{}\"\n", req.host, req.method, req.path));
             err_msg.push_str(&format!("               but this secret definition is not authorized in {}.\n\n", config.display()));
             err_msg.push_str(&format!("               To authorize this secret definition, add the following block to {}:\n\n", config.display()));
-            err_msg.push_str("               [[network.rules]]\n");
+            err_msg.push_str("               [[network.allow_routes]]\n");
             err_msg.push_str(&format!("               host = \"{}\"\n", req.host));
             err_msg.push_str(&format!("               method = \"{}\"\n", req.method));
             err_msg.push_str(&format!("               path = \"{}\"\n", req.path));
             err_msg.push_str(&format!("               secret = \"{}\"\n", req.secret));
             err_msg.push_str(&format!("               header = \"{}\"\n", req.header));
             err_msg.push_str(&format!("               prefix = \"{}\"\n\n", req.prefix));
-            err_msg.push_str("               Or remove 'secret' from the [[network.rules]] in AGENTS.md if untrusted.\n\n");
+            err_msg.push_str("               Or remove 'secret' from the [[network.allow_routes]] in AGENTS.md if untrusted.\n\n");
         }
         anyhow::bail!("{}", err_msg.trim_end());
     }
@@ -496,9 +496,9 @@ mod tests {
     const AGENTS_TWO_RULES: &str = r#"
 ```agent-sandbox
 [network]
-allow = ["api.github.com:443"]
+allow_hosts = ["api.github.com:443"]
 
-[[network.rules]]
+[[network.allow_routes]]
 host = "api.github.com:443"
 method = "GET"
 path = "/user/repos"
@@ -506,7 +506,7 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
-[[network.rules]]
+[[network.allow_routes]]
 host = "api.github.com:443"
 method = "POST"
 path = "/graphql"
@@ -517,7 +517,7 @@ prefix = "Bearer "
 "#;
 
     const SECRETS_TOML_TWO_RULES: &str = r#"
-[[network.rules]]
+[[network.allow_routes]]
 host = "api.github.com:443"
 method = "GET"
 path = "/user/repos"
@@ -525,7 +525,7 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
-[[network.rules]]
+[[network.allow_routes]]
 host = "api.github.com:443"
 method = "POST"
 path = "/graphql"
@@ -545,9 +545,9 @@ prefix = "Bearer "
         let dir = scratch(&[
             (
                 "policy",
-                "allow_domains api.github.com:443\n\
-                 secret_l7\tapi.github.com\tGET\t/user/repos\n\
-                 secret_l7\tapi.github.com\tPOST\t/graphql\n",
+                "allow_host api.github.com:443\n\
+                 secret_route\tapi.github.com\tGET\t/user/repos\n\
+                 secret_route\tapi.github.com\tPOST\t/graphql\n",
             ),
             ("secrets.toml", SECRETS_TOML_TWO_RULES),
             ("AGENTS.md", AGENTS_TWO_RULES),
@@ -573,13 +573,13 @@ prefix = "Bearer "
         let dir = scratch(&[
             (
                 "policy",
-                "allow_domains api.github.com:443\n\
-                 secret_l7\tapi.github.com\tGET\t/user/repos\n\
-                 secret_l7\tapi.github.com\tPOST\t/graphql\n",
+                "allow_host api.github.com:443\n\
+                 secret_route\tapi.github.com\tGET\t/user/repos\n\
+                 secret_route\tapi.github.com\tPOST\t/graphql\n",
             ),
             (
                 "secrets.toml",
-                "[[network.rules]]\n\
+                "[[network.allow_routes]]\n\
                  host = \"api.github.com:443\"\n\
                  method = \"GET\"\n\
                  path = \"/user/repos\"\n\
@@ -605,7 +605,7 @@ prefix = "Bearer "
     #[test]
     fn a_policy_with_no_secret_routes_resolves_nothing() {
         let dir = scratch(&[
-            ("policy", "allow_domains api.github.com:443\n"),
+            ("policy", "allow_host api.github.com:443\n"),
             ("secrets.toml", SECRETS_TOML_TWO_RULES),
             ("AGENTS.md", AGENTS_TWO_RULES),
             ("secretspec.toml", ""),
@@ -625,9 +625,9 @@ prefix = "Bearer "
         let content = r#"
 ```agent-sandbox
 [network]
-allow = ["github.com:443"]
+allow_hosts = ["github.com:443"]
 
-[[network.rules]]
+[[network.allow_routes]]
 host = "api.github.com:443"
 method = "POST"
 path = "/graphql"
@@ -635,7 +635,7 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
-[[network.rules]]
+[[network.allow_routes]]
 host = "registry.npmjs.org:443"
 method = "GET"
 path = "/*"

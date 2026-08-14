@@ -387,7 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(row) = denied_list.get(selected_idx) {
                             if row.method.as_deref() == Some("CONNECT") {
                                 text.push_str(&format!(
-                                    "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.rules]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
+                                    "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.allow_routes]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
                                     row.host, row.port
                                 ));
                             }
@@ -519,7 +519,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rows = policy_lines.iter().enumerate().map(|(i, line)| {
                             let style = if i == rules_selected_idx { selected_style } else { normal_style };
                             let (key, value) = line.split_once(char::is_whitespace).unwrap_or((line.as_str(), ""));
-                            let display_value = if key == "allow_l7" {
+                            let display_value = if key == "allow_route" {
                                 value.trim().replace('\t', " ")
                             } else {
                                 value.trim().to_string()
@@ -639,7 +639,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             match key.code {
                                 KeyCode::Char('a') => {
-                                    detail = format!("allow_domains {}", host);
+                                    detail = format!("allow_host {}", host);
                                     policy.push(detail.clone());
                                 }
                                 KeyCode::Char('A') => {
@@ -649,7 +649,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             host
                                         ));
                                     } else {
-                                        detail = format!("allow_ips {}", host);
+                                        detail = format!("allow_ip {}", host);
                                         policy.push(detail.clone());
                                     }
                                 }
@@ -659,7 +659,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             "No HTTP method known yet for this row — allow the domain first with 'a'; 'h' becomes available once a real request is seen"
                                                 .to_string(),
                                         );
-                                    } else if !base_lines.iter().any(|l| l.starts_with("allow_l7\t")) {
+                                    } else if !base_lines.iter().any(|l| l.starts_with("allow_route\t")) {
                                         // An L7 rule means the proxy terminates TLS for
                                         // that host, and the session CA is bound into the
                                         // sandbox only when the launch policy already had
@@ -670,8 +670,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         ));
                                     } else {
                                         let m = method.unwrap();
-                                        detail = format!("allow_l7 {} {}", host, m);
-                                        policy.push(format!("allow_l7\t{}\t{}\t/*", host, m));
+                                        detail = format!("allow_route {} {}", host, m);
+                                        policy.push(format!("allow_route\t{}\t{}\t/*", host, m));
                                     }
                                 }
                                 _ => {}

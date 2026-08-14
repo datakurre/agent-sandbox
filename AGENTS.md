@@ -124,20 +124,20 @@ log of what it did. Changing policy is therefore a host-side operation
 
 **Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
 `[network].allow` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
-`[[network.rules]]` configures L7 paths and optional secret injection.
+`[[network.allow_hosts_routes]]` configures L7 paths and optional secret injection.
 Those two keys are the whole surface: there is no `deny`, and an unknown key
 refuses the launch.
 
-The compiled policy file has one `KEY VALUE` line each for `allow_domains`,
-`allow_ips`, `allow_ports`, `allow_l7`, `secret_l7`, `allow_signing`,
-`deny_ips` and `default`.  `allow_l7` and `secret_l7` are tab-separated
-(`domain<TAB>method<TAB>path`).  `deny_ips` is written only by the launcher --
+The compiled policy file has one `KEY VALUE` line each for `allow_host`,
+`allow_ip`, `allow_port`, `allow_route`, `secret_route`, `allow_signing`,
+`deny_ip` and `default`.  `allow_route` and `secret_route` are tab-separated
+(`domain<TAB>method<TAB>path`).  `deny_ip` is written only by the launcher --
 denies are built-in only, and `install_policy` refuses any live edit that
-changes the set.  The same host on two ports is two `allow_domains` lines with
+changes the set.  The same host on two ports is two `allow_host` lines with
 the same pattern; the proxy unions the ports of every line tied at the winning
 specificity.
 
-An `allow` entry on port 22 also populates `allow_signing`, which is what
+An `allow_hosts` entry on port 22 also populates `allow_signing`, which is what
 authorizes the SSH/GPG relay: under `--proxy` the host agent sockets go to the
 sidecar, not the sandbox, and the relay refuses everything until that list is
 non-empty.
@@ -149,8 +149,8 @@ implementation to drift.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
 The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`).
-To authorize secret injection, the operator pastes the exact same `[[network.rules]]` block from `AGENTS.md` into it; every field must match, port included.
-The launcher calls the resolver in `cli/src/secrets.rs`, which cross-references this config with the policy's `secret_l7` routes, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are written 0600 into `/sidecar_secrets/bindings`, which only the sidecar mounts, as `domain<TAB>method<TAB>path<TAB>header<TAB>value`. A `secret` field on a rule populates `secret_l7` automatically, so there is nothing to duplicate.
+To authorize secret injection, the operator pastes the exact same `[[network.allow_hosts_routes]]` block from `AGENTS.md` into it; every field must match, port included.
+The launcher calls the resolver in `cli/src/secrets.rs`, which cross-references this config with the policy's `secret_route` routes, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are written 0600 into `/sidecar_secrets/bindings`, which only the sidecar mounts, as `domain<TAB>method<TAB>path<TAB>header<TAB>value`. A `secret` field on a rule populates `secret_route` automatically, so there is nothing to duplicate.
 
 Injection is scoped to the **route**, not the domain, and resolved **per
 request** in `inject::proxy_http1_with_injection` rather than once per
@@ -164,32 +164,32 @@ Matching runs on the same normalized path the L7 check uses, so
 routes could match, the more specific wins: longest domain, then longest path,
 then an exact method over `*`.
 
-The proxy terminates TLS for hosts carrying an L7 rule, so its per-session CA (`/sidecar_shared/ca.pem`) is bound into the sandbox as a single file and pointed at by `AGENT_SANDBOX_PROXY_CA_FILE`; the entrypoint merges it into the trust bundle.  The mount is gated on the launch policy having an `allow_l7` line: with none nothing is intercepted, so trusting a CA that can mint any name would buy nothing.  An L7 rule added mid-session therefore has no CA behind it, which `ctl proxy allow --l7` and the TUI's `h` warn about.
+The proxy terminates TLS for hosts carrying an L7 rule, so its per-session CA (`/sidecar_shared/ca.pem`) is bound into the sandbox as a single file and pointed at by `AGENT_SANDBOX_PROXY_CA_FILE`; the entrypoint merges it into the trust bundle.  The mount is gated on the launch policy having an `allow_route` line: with none nothing is intercepted, so trusting a CA that can mint any name would buy nothing.  An L7 rule added mid-session therefore has no CA behind it, which `ctl proxy allow --l7` and the TUI's `h` warn about.
 
-The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
+The launcher appends a baseline `deny_ip` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
-ordinary `deny_ips` entries rather than compiling it into the proxy means one
+ordinary `deny_ip` entries rather than compiling it into the proxy means one
 list, visible in `proxy show`, restored by `reset`, and mirrored into the
 kernel routes by the same `sync_routes` that handles user rules.
-An `allow_ips` entry of equal or greater specificity overrides one of them; that
+An `allow_ip` entry of equal or greater specificity overrides one of them; that
 is why `is_denied_address` breaks prefix ties toward allow.
 
-`sync_routes` mirrors that whole rule, not `deny_ips` alone.  The kernel's
+`sync_routes` mirrors that whole rule, not `deny_ip` alone.  The kernel's
 longest-prefix match *is* the specificity comparison the proxy makes, so every
-`allow_ips` entry gets a route via the default gateway and beats a shorter
+`allow_ip` entry gets a route via the default gateway and beats a shorter
 blackhole by itself; the one case a routing table cannot express is the
 equal-prefix tie, there being room for a single route per prefix, and that is
 handled by not installing the blackhole at all.  Until it did this, a re-allowed
-range -- including the README's own `allow_ips = ["10.0.0.0/8"]` against the
+range -- including the README's own `allow_ip = ["10.0.0.0/8"]` against the
 baseline -- was permitted by the proxy and then dropped on the floor by the
 route, with `proxy show` reporting the rule as in force.
 
 The sidecar's nameservers, read from its own `/etc/resolv.conf`, are exempted
 unconditionally.  Resolution happens in the sidecar via libc, before any rule is
-consulted, so a `deny_ips` range containing the resolver blackholes DNS itself
+consulted, so a `deny_ip` range containing the resolver blackholes DNS itself
 and fails every request rather than only the ones aimed at that range -- and the
 baseline's `192.168.0.0/16` does exactly that to a home router.  This is not a
 way out: the sandbox has no route into this netns, its only egress is CONNECT to

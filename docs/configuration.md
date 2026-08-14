@@ -64,18 +64,18 @@ Fields when using a table:
 
 The `[network]` table configures the egress proxy's firewall policy. The sandbox is **deny-by-default**, meaning all traffic is blocked unless explicitly allowed.
 
-- **`allow`** (optional): A list of IP addresses, CIDR blocks, or domains along with their port to allow (e.g., `"github.com:443"`, `"10.0.0.0/8:80"`). Wildcard domains (e.g., `"*.github.com:443"`) are supported. To allow all traffic (wildcard allow), you can use `"*"` or `"*:port"`.
+- **`allow_hosts`** (optional): A list of IP addresses, CIDR blocks, or domains along with their port to allow (e.g., `"github.com:443"`, `"10.0.0.0/8:80"`). Wildcard domains (e.g., `"*.github.com:443"`) are supported. To allow all traffic (wildcard allow), you can use `"*"` or `"*:port"`.
 
-An `allow` entry on port `22` does double duty: it is also what authorizes the
+An `allow_hosts` entry on port `22` does double duty: it is also what authorizes the
 SSH/GPG relay for that host. Under `--proxy` the host agent sockets are held by
 the proxy sidecar rather than mounted into the sandbox, and the relay refuses
 every request until at least one such entry exists — so `"github.com:22"` is
 what makes `git push` and commit signing work in a proxied sandbox. See
 [Usage](usage.md#git-integration-details).
 
-#### L7 HTTP Rules (`[[network.rules]]`)
+#### L7 HTTP Rules (`[[network.allow_hosts_routes]]`)
 
-For finer-grained HTTP proxy control and secret injection, you can specify an array of tables under `[[network.rules]]`.
+For finer-grained HTTP proxy control and secret injection, you can specify an array of tables under `[[network.allow_hosts_routes]]`.
 
 - **`host`** (required): The target host and port to match (e.g., `"api.github.com:443"`).
 - **`method`** (required): The HTTP method (e.g., `"GET"`, `"POST"`, or `"*"`) in uppercase.
@@ -95,14 +95,14 @@ its route.
 
 ```toml agent-sandbox
 [network]
-allow = [
+allow_hosts = [
     "github.com:443",
     "*.pypi.org:443",
     "10.0.0.0/8:80"
 ]
 
 # Allow GET requests to specific GitHub API endpoints and inject a secret token
-[[network.rules]]
+[[network.allow_hosts_routes]]
 host = "api.github.com:443"
 method = "GET"
 path = "/user/repos"
@@ -110,7 +110,7 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
-[[network.rules]]
+[[network.allow_hosts_routes]]
 host = "registry.npmjs.org:443"
 method = "*"
 path = "/"
@@ -129,7 +129,7 @@ the host-side entry is the `AGENTS.md` rule with nothing changed:
 
 ```toml
 # ~/.config/agent-sandbox/secrets.toml
-[[network.rules]]
+[[network.allow_hosts_routes]]
 host = "api.github.com:443"
 method = "GET"
 path = "/user/repos"
@@ -145,7 +145,7 @@ has one.
 
 The authorization is what scopes the injection. The secret reaches the proxy
 bound to that host, method and path, and is injected only into requests matching
-it — so a second `[[network.rules]]` entry in `AGENTS.md`, on the same host and
+it — so a second `[[network.allow_hosts_routes]]` entry in `AGENTS.md`, on the same host and
 without a `secret`, grants plain access and nothing more. You can authorize
 several routes on one host; where two of them could match the same request, the
 more specific wins (longest domain pattern, then longest path pattern, then an
@@ -166,10 +166,10 @@ sandbox.
 launch rather than starting with a policy that allows more than you wrote.
 Besides malformed values, these combinations are rejected:
 
-- an unknown key under `[network]` (only `allow` and `rules` exist) or an unknown
+- an unknown key under `[network]` (only `allow_hosts` and `allow_routes` exist) or an unknown
   field on a rule;
-- a duplicate entry in `allow`;
-- a host allowed outright in `allow` that also carries a `[[network.rules]]`
+- a duplicate entry in `allow_hosts`;
+- a host allowed outright in `allow_hosts` that also carries a `[[network.allow_hosts_routes]]`
   entry *without* a secret — the broad allow makes the narrower rule pointless,
   so one of the two is a mistake. The same applies to a wildcard allow (`"*"`,
   `"*:port"`).

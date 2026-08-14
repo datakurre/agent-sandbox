@@ -61,7 +61,7 @@ impl<T: std::fmt::Display> std::fmt::Display for TargetRule<T> {
 
 #[derive(Debug)]
 pub struct ProxyConfig {
-    pub allow_domains: Vec<TargetRule<String>>,
+    pub allow_host: Vec<TargetRule<String>>,
     /// Routes -- host *and* method *and* path -- that a secret may be injected
     /// into.  Route-scoped rather than domain-scoped on purpose: AGENTS.md is
     /// untrusted and controls the other rules on a host, so a domain-wide
@@ -73,38 +73,38 @@ pub struct ProxyConfig {
     /// has to *parse* it, because `relay-server` and `agent-sandbox ctl relay`
     /// read the same file and an unknown key here aborts the whole sidecar.
     pub allow_signing: Vec<String>,
-    pub allow_ips: Vec<TargetRule<IpNet>>,
-    pub deny_ips: Vec<TargetRule<IpNet>>,
+    pub allow_ip: Vec<TargetRule<IpNet>>,
+    pub deny_ip: Vec<TargetRule<IpNet>>,
     pub default_allow: bool,
-    pub allow_ports: Option<Vec<PortRange>>,
+    pub allow_port: Option<Vec<PortRange>>,
     pub l7_rules: Vec<L7Rule>,
 }
 
 impl ProxyConfig {
     pub fn new(
-        allow_domains: Vec<TargetRule<String>>,
+        allow_host: Vec<TargetRule<String>>,
         secret_routes: Vec<L7Rule>,
         allow_signing: Vec<String>,
-        allow_ips: Vec<TargetRule<IpNet>>,
-        deny_ips: Vec<TargetRule<IpNet>>,
-        allow_ports_override: Option<Vec<PortRange>>,
+        allow_ip: Vec<TargetRule<IpNet>>,
+        deny_ip: Vec<TargetRule<IpNet>>,
+        allow_port_override: Option<Vec<PortRange>>,
         default_override: Option<bool>,
         l7_rules: Vec<L7Rule>,
     ) -> ProxyConfig {
         let default_allow = default_override.unwrap_or(false);
-        let allow_ports = match allow_ports_override {
+        let allow_port = match allow_port_override {
             Some(v) => Some(v),
             None if default_allow => None,
             None => Some(DEFAULT_ALLOW_PORTS.to_vec()),
         };
         ProxyConfig {
-            allow_domains,
+            allow_host,
             secret_routes,
             allow_signing,
-            allow_ips,
-            deny_ips,
+            allow_ip,
+            deny_ip,
             default_allow,
-            allow_ports,
+            allow_port,
             l7_rules,
         }
     }
@@ -154,28 +154,28 @@ impl ProxyConfig {
 
     pub fn describe(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for d in &self.allow_domains {
-            out.push(format!("allow_domains {}", d));
+        for d in &self.allow_host {
+            out.push(format!("allow_host {}", d));
         }
         for r in &self.secret_routes {
-            out.push(format!("secret_l7\t{}\t{}\t{}", r.domain, r.method, r.path_pattern));
+            out.push(format!("secret_route\t{}\t{}\t{}", r.domain, r.method, r.path_pattern));
         }
         for h in &self.allow_signing {
             out.push(format!("allow_signing {}", h));
         }
-        for n in &self.allow_ips {
-            out.push(format!("allow_ips {}", n));
+        for n in &self.allow_ip {
+            out.push(format!("allow_ip {}", n));
         }
-        for n in &self.deny_ips {
-            out.push(format!("deny_ips {}", n));
+        for n in &self.deny_ip {
+            out.push(format!("deny_ip {}", n));
         }
-        if let Some(ranges) = &self.allow_ports {
+        if let Some(ranges) = &self.allow_port {
             for r in ranges {
-                out.push(format!("allow_ports {}", r));
+                out.push(format!("allow_port {}", r));
             }
         }
         for r in &self.l7_rules {
-            out.push(format!("allow_l7\t{}\t{}\t{}", r.domain, r.method, r.path_pattern));
+            out.push(format!("allow_route\t{}\t{}\t{}", r.domain, r.method, r.path_pattern));
         }
         out.push(format!(
             "default {}",
@@ -270,7 +270,7 @@ pub fn parse_domain_target(s: &str) -> Result<TargetRule<String>, String> {
     Ok(TargetRule { target: host.to_ascii_lowercase(), ports })
 }
 
-/// `domain<TAB>method<TAB>path`, shared by `allow_l7` and `secret_l7` so the
+/// `domain<TAB>method<TAB>path`, shared by `allow_route` and `secret_route` so the
 /// route a rule allows and the route it may inject into can never be written
 /// in two different dialects.
 fn parse_l7_fields(key: &str, lineno: usize, value: &str) -> Result<L7Rule, String> {
@@ -289,12 +289,12 @@ fn parse_l7_fields(key: &str, lineno: usize, value: &str) -> Result<L7Rule, Stri
 }
 
 pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
-    let mut allow_domains = Vec::new();
+    let mut allow_host = Vec::new();
     let mut secret_routes = Vec::new();
     let mut allow_signing = Vec::new();
-    let mut allow_ips = Vec::new();
-    let mut deny_ips = Vec::new();
-    let mut allow_ports_override: Option<Vec<PortRange>> = None;
+    let mut allow_ip = Vec::new();
+    let mut deny_ip = Vec::new();
+    let mut allow_port_override: Option<Vec<PortRange>> = None;
     let mut default_override = None;
     let mut l7_rules = Vec::new();
 
@@ -312,28 +312,28 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
             return Err(format!("{}: {} has no value", lineno, key));
         }
 
-        // allow_l7 and secret_l7 are intentionally tab-separated
+        // allow_route and secret_route are intentionally tab-separated
         // (domain<TAB>method<TAB>path), so they are exempt from the "no
         // whitespace in values" rule that guards every other key against the
         // old space-separated encoding.
-        if !matches!(key, "allow_l7" | "secret_l7") && value.chars().any(char::is_whitespace) {
+        if !matches!(key, "allow_route" | "secret_route") && value.chars().any(char::is_whitespace) {
             return Err(format!("{}: {}: {:?} contains whitespace", lineno, key, value));
         }
 
         match key {
-            "allow_domains" => allow_domains.push(parse_domain_target(value).map_err(|e| format!("{}: allow_domains: {}", lineno, e))?),
-            "secret_l7" => secret_routes.push(parse_l7_fields("secret_l7", lineno, value)?),
+            "allow_host" => allow_host.push(parse_domain_target(value).map_err(|e| format!("{}: allow_host: {}", lineno, e))?),
+            "secret_route" => secret_routes.push(parse_l7_fields("secret_route", lineno, value)?),
             "allow_signing" => allow_signing.push(value.to_ascii_lowercase()),
-            "allow_ips" => allow_ips
-                .push(parse_ip_target(value).map_err(|e| format!("{}: allow_ips: {}", lineno, e))?),
-            "deny_ips" => deny_ips
-                .push(parse_ip_target(value).map_err(|e| format!("{}: deny_ips: {}", lineno, e))?),
-            "allow_ports" => {
+            "allow_ip" => allow_ip
+                .push(parse_ip_target(value).map_err(|e| format!("{}: allow_ip: {}", lineno, e))?),
+            "deny_ip" => deny_ip
+                .push(parse_ip_target(value).map_err(|e| format!("{}: deny_ip: {}", lineno, e))?),
+            "allow_port" => {
                 let r = parse_port_range(value)
-                    .map_err(|e| format!("{}: allow_ports: {}", lineno, e))?;
-                allow_ports_override.get_or_insert_with(Vec::new).push(r);
+                    .map_err(|e| format!("{}: allow_port: {}", lineno, e))?;
+                allow_port_override.get_or_insert_with(Vec::new).push(r);
             }
-            "allow_l7" => l7_rules.push(parse_l7_fields("allow_l7", lineno, value)?),
+            "allow_route" => l7_rules.push(parse_l7_fields("allow_route", lineno, value)?),
             "default" => match value {
                 "allow" | "deny" => default_override = Some(value == "allow"),
                 "ask" => return Err(format!(
@@ -347,12 +347,12 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
     }
 
     Ok(ProxyConfig::new(
-        allow_domains,
+        allow_host,
         secret_routes,
         allow_signing,
-        allow_ips,
-        deny_ips,
-        allow_ports_override,
+        allow_ip,
+        deny_ip,
+        allow_port_override,
         default_override,
         l7_rules,
     ))
@@ -439,12 +439,12 @@ pub fn has_backed_secret_routes(config: &ProxyConfig, secrets: &SecretBindings) 
 
 /// Union the port sets of every rule tied at the winning specificity.
 ///
-/// A tie is not a mistake: `allow = ["github.com:443", "github.com:22"]`
-/// compiles to two `allow_domains` lines carrying the *same* pattern with
+/// A tie is not a mistake: `allow_hosts = ["github.com:443", "github.com:22"]`
+/// compiles to two `allow_host` lines carrying the *same* pattern with
 /// different port sets, and taking only the first silently dropped the second
 /// port -- which denied SSH on a host the operator had explicitly allowed it
 /// on.  `None` from any tied rule means that rule carries no port constraint
-/// of its own, which widens the union back to the global `allow_ports`.
+/// of its own, which widens the union back to the global `allow_port`.
 fn union_ports<'a>(
     rules: impl Iterator<Item = Option<&'a Vec<PortRange>>>,
 ) -> Option<Vec<PortRange>> {
@@ -474,7 +474,7 @@ impl ProxyConfig {
     /// length unioned together (see `union_ports`).
     ///
     /// There is no domain deny list: denies are built-in only, and the
-    /// built-in baseline is expressed as `deny_ips`.  A name that resolves
+    /// built-in baseline is expressed as `deny_ip`.  A name that resolves
     /// into a denied range is refused by `is_denied_address` after
     /// resolution, which is where a hostname pointing at the host or the LAN
     /// actually gets caught.
@@ -482,7 +482,7 @@ impl ProxyConfig {
         let mut best_len: i32 = -1;
         let mut allowed = self.default_allow;
 
-        for rule in &self.allow_domains {
+        for rule in &self.allow_host {
             let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
@@ -494,7 +494,7 @@ impl ProxyConfig {
             return (allowed, None);
         }
         let ports = union_ports(
-            self.allow_domains
+            self.allow_host
                 .iter()
                 .filter(|r| r.target.len() as i32 == best_len && domain_match(domain, &r.target))
                 .map(|r| r.ports.as_ref()),
@@ -508,7 +508,7 @@ impl ProxyConfig {
         let mut allowed = self.default_allow;
         let mut from_deny = false;
 
-        for rule in &self.allow_ips {
+        for rule in &self.allow_ip {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
@@ -517,7 +517,7 @@ impl ProxyConfig {
             }
         }
 
-        for rule in &self.deny_ips {
+        for rule in &self.deny_ip {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
@@ -529,7 +529,7 @@ impl ProxyConfig {
         if best_prefix < 0 {
             return (allowed, None);
         }
-        let tier = if from_deny { &self.deny_ips } else { &self.allow_ips };
+        let tier = if from_deny { &self.deny_ip } else { &self.allow_ip };
         let ports = union_ports(
             tier.iter()
                 .filter(|r| r.target.prefix_len() as i32 == best_prefix && r.target.contains(&ip))
@@ -550,7 +550,7 @@ impl ProxyConfig {
         let mut best_prefix: i32 = -1;
         let mut denied = false;
 
-        for rule in &self.deny_ips {
+        for rule in &self.deny_ip {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
@@ -558,7 +558,7 @@ impl ProxyConfig {
             }
         }
 
-        for rule in &self.allow_ips {
+        for rule in &self.allow_ip {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) >= best_prefix {
                 best_prefix = net.prefix_len() as i32;
@@ -581,7 +581,7 @@ impl ProxyConfig {
     }
 
     pub fn is_allowed_port(&self, port: u16) -> bool {
-        self.allow_ports
+        self.allow_port
             .as_ref()
             .map_or(true, |ranges| ranges.iter().any(|r| r.contains(port)))
     }
@@ -598,7 +598,7 @@ impl ProxyConfig {
                     && is_port_in_target_ports(
                         port,
                         winner_ports.as_ref(),
-                        self.allow_ports.as_deref(),
+                        self.allow_port.as_deref(),
                     )
             }
             Err(_) => {
@@ -607,7 +607,7 @@ impl ProxyConfig {
                     && is_port_in_target_ports(
                         port,
                         winner_ports.as_ref(),
-                        self.allow_ports.as_deref(),
+                        self.allow_port.as_deref(),
                     )
             }
         }
@@ -621,7 +621,7 @@ impl ProxyConfig {
     fn why_domain_denied(&self, domain: &str) -> String {
         let mut best_len: i32 = -1;
         let mut winner: Option<&str> = None;
-        for rule in &self.allow_domains {
+        for rule in &self.allow_host {
             let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
@@ -629,8 +629,8 @@ impl ProxyConfig {
             }
         }
         match winner {
-            Some(pattern) => format!("matches allow_domains {:?}", pattern),
-            None => format!("no allow_domains rule matches {:?}; default is deny", domain),
+            Some(pattern) => format!("matches allow_host {:?}", pattern),
+            None => format!("no allow_host rule matches {:?}; default is deny", domain),
         }
     }
 
@@ -639,14 +639,14 @@ impl ProxyConfig {
     fn why_ip_denied(&self, ip: IpAddr) -> String {
         let mut best_prefix: i32 = -1;
         let mut winner: Option<(&IpNet, bool)> = None;
-        for rule in &self.allow_ips {
+        for rule in &self.allow_ip {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 winner = Some((net, false));
             }
         }
-        for rule in &self.deny_ips {
+        for rule in &self.deny_ip {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
@@ -654,9 +654,9 @@ impl ProxyConfig {
             }
         }
         match winner {
-            Some((net, true)) => format!("matches deny_ips {}", net),
-            Some((net, false)) => format!("matches allow_ips {}", net),
-            None => format!("no allow_ips rule matches {}; default is deny", ip),
+            Some((net, true)) => format!("matches deny_ip {}", net),
+            Some((net, false)) => format!("matches allow_ip {}", net),
+            None => format!("no allow_ip rule matches {}; default is deny", ip),
         }
     }
 
@@ -676,10 +676,10 @@ impl ProxyConfig {
 
     /// Explains why `is_allowed_port` returned false for `port`.
     pub fn why_port_denied(&self, port: u16) -> String {
-        match &self.allow_ports {
+        match &self.allow_port {
             Some(ranges) => {
                 let list: Vec<String> = ranges.iter().map(|r| r.to_string()).collect();
-                format!("port {} is not in allow_ports (configured: {})", port, list.join(", "))
+                format!("port {} is not in allow_port (configured: {})", port, list.join(", "))
             }
             None => format!("port {} is not allowed", port),
         }
@@ -687,7 +687,7 @@ impl ProxyConfig {
 
     /// Explains why `is_denied_address` returned true for a *resolved*
     /// address. Distinct algorithm from `why_ip_denied`/`is_allowed_ip`: a
-    /// `deny_ips` entry wins on a strictly greater prefix, but an `allow_ips`
+    /// `deny_ip` entry wins on a strictly greater prefix, but an `allow_ip`
     /// entry of *equal or greater* specificity overrides it (see
     /// `is_denied_address`'s own comment for why the tie-break is
     /// asymmetric). Mirrors that exact algorithm so the explanation can't
@@ -695,14 +695,14 @@ impl ProxyConfig {
     pub fn why_address_denied(&self, ip: IpAddr) -> String {
         let mut best_prefix: i32 = -1;
         let mut winner: Option<&IpNet> = None;
-        for rule in &self.deny_ips {
+        for rule in &self.deny_ip {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 winner = Some(net);
             }
         }
-        for rule in &self.allow_ips {
+        for rule in &self.allow_ip {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) >= best_prefix {
                 best_prefix = net.prefix_len() as i32;
@@ -710,8 +710,8 @@ impl ProxyConfig {
             }
         }
         match winner {
-            Some(net) => format!("resolved address {} matches deny_ips {}", ip, net),
-            None => format!("resolved address {} has no matching deny_ips rule", ip),
+            Some(net) => format!("resolved address {} matches deny_ip {}", ip, net),
+            None => format!("resolved address {} has no matching deny_ip rule", ip),
         }
     }
 
@@ -736,16 +736,16 @@ impl ProxyConfig {
 
         if !allowed {
             why_target
-        } else if !is_port_in_target_ports(port, winner_ports.as_ref(), self.allow_ports.as_deref()) {
+        } else if !is_port_in_target_ports(port, winner_ports.as_ref(), self.allow_port.as_deref()) {
             match &winner_ports {
                 Some(ports) => {
                     let list: Vec<String> = ports.iter().map(|r| r.to_string()).collect();
                     format!("port {} is not in target's allowed ports (configured: {})", port, list.join(", "))
                 }
-                None => match &self.allow_ports {
+                None => match &self.allow_port {
                     Some(global_ports) => {
                         let list: Vec<String> = global_ports.iter().map(|r| r.to_string()).collect();
-                        format!("port {} is not in global allow_ports (configured: {})", port, list.join(", "))
+                        format!("port {} is not in global allow_port (configured: {})", port, list.join(", "))
                     }
                     None => format!("port {} is not allowed", port),
                 }
@@ -800,8 +800,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_policy_reads_allow_l7_rules() {
-        let text = "default deny\nallow_l7\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
+    fn parse_policy_reads_allow_route_rules() {
+        let text = "default deny\nallow_route\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
         let cfg = parse_policy(text).expect("parse should succeed");
         assert_eq!(cfg.l7_rules.len(), 1);
         assert_eq!(cfg.l7_rules[0].domain, "repo.kopla.jyu.fi");
@@ -816,7 +816,7 @@ mod tests {
         // The launcher writes this for every `allow` entry on port 22.  Until
         // it was a known key the proxy exited 2 on its own policy file, so a
         // single `github.com:22` in AGENTS.md stopped the sandbox launching.
-        let cfg = parse_policy("allow_domains github.com:22\nallow_signing GitHub.com\n")
+        let cfg = parse_policy("allow_host github.com:22\nallow_signing GitHub.com\n")
             .expect("allow_signing must be a known key");
         assert_eq!(cfg.allow_signing, vec!["github.com".to_string()]);
     }
@@ -830,14 +830,14 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_whitespace_in_other_values() {
-        let text = "allow_ips 10.0.0.0/8 192.168.0.0/16\n";
+        let text = "allow_ip 10.0.0.0/8 192.168.0.0/16\n";
         let err = parse_policy(text).unwrap_err();
         assert!(err.contains("whitespace"), "unexpected error: {err}");
     }
 
     #[test]
     fn why_l7_denied_explains_no_rules_for_domain() {
-        let text = "default deny\nallow_l7\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
+        let text = "default deny\nallow_route\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
         let cfg = parse_policy(text).expect("parse should succeed");
         let reason = cfg.why_l7_denied("other.example.com", "GET", "/");
         assert!(reason.contains("no L7 allow rules for domain"), "{reason}");
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn why_l7_denied_explains_method_mismatch() {
-        let text = "default deny\nallow_l7\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
+        let text = "default deny\nallow_route\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
         let cfg = parse_policy(text).expect("parse should succeed");
         let reason = cfg.why_l7_denied("repo.kopla.jyu.fi", "POST", "/api/pypi/pypi");
         assert!(reason.contains("none allow method"), "{reason}");
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn why_l7_denied_explains_path_mismatch() {
-        let text = "default deny\nallow_l7\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
+        let text = "default deny\nallow_route\trepo.kopla.jyu.fi\tGET\t/api/pypi/pypi\n";
         let cfg = parse_policy(text).expect("parse should succeed");
         let reason = cfg.why_l7_denied("repo.kopla.jyu.fi", "GET", "/packages/wheel.whl");
         assert!(reason.contains("path"), "{reason}");
@@ -876,7 +876,7 @@ mod tests {
         // Denies are built-in only.  A policy carrying a hand-written domain
         // deny refuses to load rather than taking effect, so there is no way
         // to express one that half-works.
-        let err = parse_policy("allow_domains *.example.com\ndeny_domains internal.example.com\n")
+        let err = parse_policy("allow_host *.example.com\ndeny_domains internal.example.com\n")
             .unwrap_err();
         assert!(err.contains("unknown key"), "{err}");
         assert!(err.contains("deny_domains"), "{err}");
@@ -887,36 +887,36 @@ mod tests {
         // What the domain deny list was reached for.  The check that matters
         // runs after resolution, on the address, and the baseline is what it
         // consults -- so dropping deny_domains removes no protection.
-        let cfg = parse_policy("allow_domains internal.example.com\ndeny_ips 10.0.0.0/8\n").unwrap();
+        let cfg = parse_policy("allow_host internal.example.com\ndeny_ip 10.0.0.0/8\n").unwrap();
         assert!(cfg.is_allowed("internal.example.com", 443), "the name itself is allowed");
         assert!(cfg.is_denied_address("10.1.2.3".parse().unwrap()), "the address it resolves to is not");
     }
 
     #[test]
     fn why_target_denied_explains_the_implicit_default_deny() {
-        let cfg = parse_policy("allow_domains github.com\n").unwrap();
+        let cfg = parse_policy("allow_host github.com\n").unwrap();
         assert!(!cfg.is_allowed_target("evil.example.com"));
         let reason = cfg.why_target_denied("evil.example.com");
-        assert!(reason.contains("no allow_domains rule matches"), "{reason}");
+        assert!(reason.contains("no allow_host rule matches"), "{reason}");
         assert!(reason.contains("default is deny"), "{reason}");
     }
 
     #[test]
-    fn why_target_denied_names_the_winning_deny_ips_pattern() {
-        let cfg = parse_policy("allow_ips 10.0.0.0/8\ndeny_ips 10.5.0.0/16\n").unwrap();
+    fn why_target_denied_names_the_winning_deny_ip_pattern() {
+        let cfg = parse_policy("allow_ip 10.0.0.0/8\ndeny_ip 10.5.0.0/16\n").unwrap();
         let ip: IpAddr = "10.5.1.1".parse().unwrap();
         assert!(!cfg.is_allowed_target("10.5.1.1"));
         let reason = cfg.why_target_denied("10.5.1.1");
-        assert!(reason.contains("deny_ips"), "{reason}");
+        assert!(reason.contains("deny_ip"), "{reason}");
         assert!(reason.contains(&ip.to_string()) || reason.contains("10.5.0.0/16"), "{reason}");
     }
 
     #[test]
     fn one_host_on_two_ports_keeps_both() {
-        // `allow = ["github.com:443", "github.com:22"]` compiles to two lines
+        // `allow_hosts = ["github.com:443", "github.com:22"]` compiles to two lines
         // with the same pattern.  The tie used to go to whichever came first,
         // so the SSH port the operator asked for was quietly denied.
-        let cfg = parse_policy("allow_domains github.com:443\nallow_domains github.com:22\n")
+        let cfg = parse_policy("allow_host github.com:443\nallow_host github.com:22\n")
             .unwrap();
         assert!(cfg.is_allowed("github.com", 443));
         assert!(cfg.is_allowed("github.com", 22));
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn one_cidr_on_two_ports_keeps_both() {
-        let cfg = parse_policy("allow_ips 10.0.0.0/8:80\nallow_ips 10.0.0.0/8:443\n").unwrap();
+        let cfg = parse_policy("allow_ip 10.0.0.0/8:80\nallow_ip 10.0.0.0/8:443\n").unwrap();
         assert!(cfg.is_allowed("10.1.2.3", 80));
         assert!(cfg.is_allowed("10.1.2.3", 443));
         assert!(!cfg.is_allowed("10.1.2.3", 22));
@@ -935,7 +935,7 @@ mod tests {
     fn an_unconstrained_tied_rule_widens_to_the_global_ports() {
         // `github.com` alone means "the default ports"; a tied `github.com:22`
         // must not narrow it back down to 22.
-        let cfg = parse_policy("allow_domains github.com\nallow_domains github.com:22\n").unwrap();
+        let cfg = parse_policy("allow_host github.com\nallow_host github.com:22\n").unwrap();
         assert!(cfg.is_allowed("github.com", 80));
         assert!(cfg.is_allowed("github.com", 443));
         assert!(cfg.is_allowed("github.com", 22));
@@ -945,7 +945,7 @@ mod tests {
     fn a_longer_pattern_still_beats_a_tied_pair() {
         // The union applies within one specificity tier, not across tiers.
         let cfg = parse_policy(
-            "allow_domains *.github.com:443\nallow_domains *.github.com:22\nallow_domains api.github.com:8443\n",
+            "allow_host *.github.com:443\nallow_host *.github.com:22\nallow_host api.github.com:8443\n",
         )
         .unwrap();
         assert!(cfg.is_allowed("api.github.com", 8443));
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn why_denied_survives_a_tied_pair() {
-        let cfg = parse_policy("allow_domains github.com:443\nallow_domains github.com:22\n")
+        let cfg = parse_policy("allow_host github.com:443\nallow_host github.com:22\n")
             .unwrap();
         let reason = cfg.why_denied("github.com", 8443);
         assert!(reason.contains("8443"), "{reason}");
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn why_port_denied_lists_the_configured_ranges() {
-        let cfg = parse_policy("allow_domains github.com\nallow_ports 443\n").unwrap();
+        let cfg = parse_policy("allow_host github.com\nallow_port 443\n").unwrap();
         assert!(!cfg.is_allowed_port(8443));
         let reason = cfg.why_port_denied(8443);
         assert!(reason.contains("8443"), "{reason}");
@@ -973,17 +973,17 @@ mod tests {
 
     #[test]
     fn why_address_denied_names_the_matching_baseline_range() {
-        let cfg = parse_policy("allow_domains github.com\ndeny_ips 169.254.0.0/16\n").unwrap();
+        let cfg = parse_policy("allow_host github.com\ndeny_ip 169.254.0.0/16\n").unwrap();
         let ip: IpAddr = "169.254.169.254".parse().unwrap();
         assert!(cfg.is_denied_address(ip));
         let reason = cfg.why_address_denied(ip);
-        assert!(reason.contains("deny_ips"), "{reason}");
+        assert!(reason.contains("deny_ip"), "{reason}");
         assert!(reason.contains("169.254.0.0/16"), "{reason}");
     }
 
     #[test]
     fn why_denied_prioritizes_the_port_reason_over_the_domain_reason() {
-        let cfg = parse_policy("allow_domains github.com\nallow_ports 443\n").unwrap();
+        let cfg = parse_policy("allow_host github.com\nallow_port 443\n").unwrap();
         assert!(cfg.is_allowed_target("github.com"));
         assert!(!cfg.is_allowed("github.com", 8443));
         let reason = cfg.why_denied("github.com", 8443);

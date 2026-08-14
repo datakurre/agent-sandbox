@@ -104,7 +104,7 @@ fn resolv_nameservers(file: &str) -> Vec<String> {
 /// not routable (unparseable, or a default route we must not touch).
 ///
 /// Parsing rather than string-slicing is the point: since per-target ports
-/// landed, an `allow_ips` value carries a `:port` suffix, and the documented
+/// landed, an `allow_ip` value carries a `:port` suffix, and the documented
 /// `allow = ["10.0.0.0/8:80"]` reached `ip` verbatim.  That failed on every
 /// reconcile pass *and* left the baseline blackhole for the range installed,
 /// so the re-allowed range was permitted by the proxy and then dropped on the
@@ -133,7 +133,7 @@ fn want_exemptions(config: &Config) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
 
-    let mut entries = policy_values(&config.policy_file, "allow_ips");
+    let mut entries = policy_values(&config.policy_file, "allow_ip");
     entries.extend(resolv_nameservers(&config.resolv_conf));
 
     for entry in entries {
@@ -153,7 +153,7 @@ fn want_blackholes(config: &Config) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
 
-    let entries = policy_values(&config.policy_file, "deny_ips");
+    let entries = policy_values(&config.policy_file, "deny_ip");
     for entry in entries {
         let Some(prefix) = route_prefix(&entry) else {
             continue;
@@ -541,7 +541,7 @@ mod tests {
         // baseline deny, and the blackhole stayed installed -- so the range was
         // allowed by the proxy and unreachable by the route.
         let (config, _dir) = config_for(
-            "allow_ips 10.0.0.0/8:80\ndeny_ips 10.0.0.0/8\ndeny_ips 192.168.0.0/16\n",
+            "allow_ip 10.0.0.0/8:80\ndeny_ip 10.0.0.0/8\ndeny_ip 192.168.0.0/16\n",
             "nameserver 192.168.1.1\n",
         );
         assert!(want_exemptions(&config).contains(&"10.0.0.0/8".to_string()));
@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn the_resolver_is_exempt_whatever_the_policy_says() {
         let (config, _dir) = config_for(
-            "deny_ips 192.168.0.0/16\n",
+            "deny_ip 192.168.0.0/16\n",
             "nameserver 192.168.1.1\nsearch example.com\n",
         );
         assert!(want_exemptions(&config).contains(&"192.168.1.1".to_string()));

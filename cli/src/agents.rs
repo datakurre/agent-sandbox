@@ -480,16 +480,16 @@ pub fn parse_host_port(s: &str) -> (String, Option<String>) {
 
 #[derive(Default, Debug)]
 pub struct ProxyPolicy {
-    pub allow_domains: Vec<String>,
+    pub allow_host: Vec<String>,
     /// `domain\tmethod\tpath` per rule that names a secret.  Route-scoped, not
     /// domain-scoped: the proxy injects only into requests matching one of
     /// these, so a secret-less rule elsewhere on the same host cannot collect
     /// the token.
-    pub secret_l7: Vec<String>,
+    pub secret_route: Vec<String>,
     pub allow_signing: Vec<String>,
-    pub allow_ips: Vec<String>,
-    pub allow_ports: Vec<String>,
-    pub allow_l7: Vec<String>,
+    pub allow_ip: Vec<String>,
+    pub allow_port: Vec<String>,
+    pub allow_route: Vec<String>,
     pub default: Vec<String>,
 }
 
@@ -524,13 +524,13 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 .as_table()
                 .ok_or_else(|| ConfigError::msg("[network] must be a table"))?;
 
-            let allowed_net: HashSet<&str> = ["allow", "rules"].iter().cloned().collect();
+            let allowed_net: HashSet<&str> = ["allow_hosts", "allow_routes"].iter().cloned().collect();
             let unknown: Vec<_> = net_table
                 .keys()
                 .filter(|k| !allowed_net.contains(k.as_str()))
                 .collect();
             if let Some(first_unknown) = unknown.first() {
-                return Err(ConfigError::msg(format!("[network]: unknown key '{}'. Valid keys under [network] are 'allow' and 'rules' ([[network.rules]]).", first_unknown)));
+                return Err(ConfigError::msg(format!("[network]: unknown key '{}'. Valid keys under [network] are 'allow_hosts' and 'allow_routes' ([[network.allow_routes]]).", first_unknown)));
             }
 
             let mut allow_set = HashSet::new();
@@ -539,13 +539,13 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
             let mut rules_hosts_with_secret = HashSet::new();
             let mut has_non_secret_rule = false;
 
-            if let Some(rules) = net_table.get("rules") {
+            if let Some(rules) = net_table.get("allow_routes") {
                 let rules_arr = rules.as_array().ok_or_else(|| {
-                    ConfigError::msg("[network].rules must be an array of tables")
+                    ConfigError::msg("[network].allow_hosts_routes must be an array of tables")
                 })?;
                 for (i, rule_val) in rules_arr.iter().enumerate() {
                     let rule = rule_val.as_table().ok_or_else(|| {
-                        ConfigError::msg(format!("[[network.rules]][{}]: must be a table", i))
+                        ConfigError::msg(format!("[[network.allow_routes]][{}]: must be a table", i))
                     })?;
 
                     let allowed_rule_keys: HashSet<&str> =
@@ -557,20 +557,20 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                         .keys()
                         .find(|k| !allowed_rule_keys.contains(k.as_str()))
                     {
-                        return Err(ConfigError::msg(format!("[[network.rules]][{}]: unknown field '{}'. Valid keys under [[network.rules]] are 'host', 'method', 'path', 'secret', 'header', and 'prefix'.", i, unknown_key)));
+                        return Err(ConfigError::msg(format!("[[network.allow_routes]][{}]: unknown field '{}'. Valid keys under [[network.allow_routes]] are 'host', 'method', 'path', 'secret', 'header', and 'prefix'.", i, unknown_key)));
                     }
 
-                    let host_val = rule.get("host").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.rules]][{}]: missing required field 'host'. Example: host = \"registry.npmjs.org:443\".", i)))?;
-                    let method = rule.get("method").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.rules]][{}]: missing required field 'method'. Specify an HTTP method (e.g. method = \"GET\", method = \"POST\", or method = \"*\").", i)))?;
-                    let path = rule.get("path").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.rules]][{}]: missing required field 'path'. Example: path = \"/api/*\" or path = \"/\".", i)))?;
+                    let host_val = rule.get("host").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allow_routes]][{}]: missing required field 'host'. Example: host = \"registry.npmjs.org:443\".", i)))?;
+                    let method = rule.get("method").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allow_routes]][{}]: missing required field 'method'. Specify an HTTP method (e.g. method = \"GET\", method = \"POST\", or method = \"*\").", i)))?;
+                    let path = rule.get("path").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allow_routes]][{}]: missing required field 'path'. Example: path = \"/api/*\" or path = \"/\".", i)))?;
 
                     if method != "*"
                         && (!method.chars().all(|c| c.is_ascii_uppercase()) || method.is_empty())
                     {
-                        return Err(ConfigError::msg(format!("[[network.rules]][{}].method: '{}' must be uppercase (e.g. method = \"GET\" or method = \"*\").", i, method)));
+                        return Err(ConfigError::msg(format!("[[network.allow_routes]][{}].method: '{}' must be uppercase (e.g. method = \"GET\" or method = \"*\").", i, method)));
                     }
                     if !path.starts_with('/') {
-                        return Err(ConfigError::msg(format!("[[network.rules]][{}].path: 'path' must start with '/'. Change to path = \"/{}\".", i, path.trim_start_matches('/'))));
+                        return Err(ConfigError::msg(format!("[[network.allow_routes]][{}].path: 'path' must start with '/'. Change to path = \"/{}\".", i, path.trim_start_matches('/'))));
                     }
 
                     if rule.contains_key("secret") {
@@ -582,12 +582,12 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 }
             }
 
-            if let Some(allow) = net_table.get("allow") {
-                let items = _proxy_list("allow", allow, |_, _| Ok(()), "[network].")?;
+            if let Some(allow) = net_table.get("allow_hosts") {
+                let items = _proxy_list("allow_hosts", allow, |_, _| Ok(()), "[network].")?;
                 for item in items {
                     if !allow_set.insert(item.clone()) {
                         return Err(ConfigError::msg(format!(
-                            "[network].allow: duplicate entry '{}'. Remove the redundant entry.",
+                            "[network].allow_hosts: duplicate entry '{}'. Remove the redundant entry.",
                             item
                         )));
                     }
@@ -595,13 +595,13 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                         allow_has_wildcard = true;
                     }
                     if rules_hosts_no_secret.contains(&item) {
-                        return Err(ConfigError::msg(format!("[network]: host '{}' is allowed broadly, making the non-secret [[network.rules]] ineffective. Remove the rule or add a secret.", item)));
+                        return Err(ConfigError::msg(format!("[network]: host '{}' is allowed broadly, making the non-secret [[network.allow_routes]] ineffective. Remove the rule or add a secret.", item)));
                     }
                 }
             }
 
             if allow_has_wildcard && has_non_secret_rule {
-                return Err(ConfigError::msg("[network]: wildcard allow makes non-secret [[network.rules]] ineffective. Remove the rule or add a secret."));
+                return Err(ConfigError::msg("[network]: wildcard allow makes non-secret [[network.allow_routes]] ineffective. Remove the rule or add a secret."));
             }
 
             if allow_has_wildcard {
@@ -616,23 +616,23 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                         None => host_part.clone(),
                     };
                     if is_ip_or_cidr(&host_part) {
-                        if !policy.allow_ips.contains(&combined) {
-                            policy.allow_ips.push(combined);
+                        if !policy.allow_ip.contains(&combined) {
+                            policy.allow_ip.push(combined);
                         }
                     } else {
-                        _proxy_domain("[network].allow", &host_part)?;
+                        _proxy_domain("[network].allow_hosts", &host_part)?;
                         // One line per host:port pair, so `ctl proxy show` and
                         // `rm allow` operate on the entry as it was written.
                         // The proxy unions the ports of every line sharing a
                         // pattern (`union_ports`), so two ports on one host are
                         // two lines and both are in force.
-                        if !policy.allow_domains.contains(&combined) {
-                            policy.allow_domains.push(combined);
+                        if !policy.allow_host.contains(&combined) {
+                            policy.allow_host.push(combined);
                         }
                     }
                 }
                 if let Some(port) = port_part {
-                    _proxy_port("[network].allow", &port)?;
+                    _proxy_port("[network].allow_hosts", &port)?;
                     // An allow entry on the SSH port is also what authorizes
                     // the relay to reach that host, and -- because gpg has no
                     // destination of its own -- what enables signing at all.
@@ -645,12 +645,12 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                         policy.allow_signing.push(host_part.clone());
                     }
                     if host_part == "*" {
-                        policy.allow_ports.push(port);
+                        policy.allow_port.push(port);
                     }
                 }
             }
 
-            if let Some(rules) = net_table.get("rules") {
+            if let Some(rules) = net_table.get("allow_routes") {
                 let rules_arr = rules.as_array().unwrap();
                 for (i, rule_val) in rules_arr.iter().enumerate() {
                     let rule = rule_val.as_table().unwrap();
@@ -666,40 +666,40 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                             None => host_part.clone(),
                         };
                         if is_ip_or_cidr(&host_part) {
-                            if !policy.allow_ips.contains(&combined) {
-                                policy.allow_ips.push(combined);
+                            if !policy.allow_ip.contains(&combined) {
+                                policy.allow_ip.push(combined);
                             }
                         } else {
-                            _proxy_domain(&format!("[[network.rules]][{}].host", i), &host_part)?;
-                            if !policy.allow_domains.contains(&combined) {
-                                policy.allow_domains.push(combined);
+                            _proxy_domain(&format!("[[network.allow_routes]][{}].host", i), &host_part)?;
+                            if !policy.allow_host.contains(&combined) {
+                                policy.allow_host.push(combined);
                             }
                         }
                     }
 
                     if let Some(port) = port_part {
-                        _proxy_port(&format!("[[network.rules]][{}].host", i), &port)?;
-                        if host_part == "*" && !policy.allow_ports.contains(&port) {
-                            policy.allow_ports.push(port.clone());
+                        _proxy_port(&format!("[[network.allow_routes]][{}].host", i), &port)?;
+                        if host_part == "*" && !policy.allow_port.contains(&port) {
+                            policy.allow_port.push(port.clone());
                         }
                     }
 
                     policy
-                        .allow_l7
+                        .allow_route
                         .push(format!("{}\t{}\t{}", host_part, method, path));
 
                     if let Some(secret) = rule.get("secret") {
                         if !secret.is_str() {
                             return Err(ConfigError::msg(format!(
-                                "[[network.rules]][{}].secret: must be a string",
+                                "[[network.allow_routes]][{}].secret: must be a string",
                                 i
                             )));
                         }
                         // The route, not just the host: this is what the proxy
                         // matches a request against before injecting.
                         let route = format!("{}\t{}\t{}", host_part, method, path);
-                        if !policy.secret_l7.contains(&route) {
-                            policy.secret_l7.push(route);
+                        if !policy.secret_route.contains(&route) {
+                            policy.secret_route.push(route);
                         }
                     }
                 }
@@ -716,24 +716,24 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
         source
     )];
 
-    for val in &policy.allow_domains {
-        lines.push(format!("allow_domains {}", val));
+    for val in &policy.allow_host {
+        lines.push(format!("allow_host {}", val));
     }
-    for val in &policy.secret_l7 {
-        lines.push(format!("secret_l7\t{}", val));
+    for val in &policy.secret_route {
+        lines.push(format!("secret_route\t{}", val));
     }
     for val in &policy.allow_signing {
         lines.push(format!("allow_signing {}", val));
     }
-    for val in &policy.allow_ips {
-        lines.push(format!("allow_ips {}", val));
+    for val in &policy.allow_ip {
+        lines.push(format!("allow_ip {}", val));
     }
-    for val in &policy.allow_ports {
-        lines.push(format!("allow_ports {}", val));
+    for val in &policy.allow_port {
+        lines.push(format!("allow_port {}", val));
     }
 
-    for val in &policy.allow_l7 {
-        lines.push(format!("allow_l7\t{}", val));
+    for val in &policy.allow_route {
+        lines.push(format!("allow_route\t{}", val));
     }
     for val in &policy.default {
         lines.push(format!("default {}", val));
@@ -747,11 +747,11 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
 /// for `agent-sandbox ctl proxy export`.
 ///
 /// Not fully round-trippable: `[network]` only supports `allow` (bare
-/// host/IP entries) and `[[network.rules]]` (`allow_l7`), so a non-default
-/// `allow_ports` — which can only be added live, via the TUI or
+/// host/IP entries) and `[[network.allow_routes]]` (`allow_route`), so a non-default
+/// `allow_port` — which can only be added live, via the TUI or
 /// `ctl proxy allow`, never declared in AGENTS.md — is emitted as a trailing
 /// advisory comment instead of being silently dropped or invented as an
-/// unsupported TOML key.  `deny_ips` is omitted entirely: the baseline is
+/// unsupported TOML key.  `deny_ip` is omitted entirely: the baseline is
 /// built-in, enforced whatever AGENTS.md says, and cannot be changed, so
 /// round-tripping it would be noise.  A `secret = true` on an exported rule
 /// is a placeholder too: the policy file records which *route* takes a
@@ -759,16 +759,16 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
 pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
     let mut out = String::from("[network]\n");
 
-    let mut allow_items: Vec<String> = cfg.allow_domains.iter().map(|r| r.to_string()).collect();
-    allow_items.extend(cfg.allow_ips.iter().map(|n| n.to_string()));
+    let mut allow_items: Vec<String> = cfg.allow_host.iter().map(|r| r.to_string()).collect();
+    allow_items.extend(cfg.allow_ip.iter().map(|n| n.to_string()));
     if !allow_items.is_empty() {
         let quoted: Vec<String> = allow_items.iter().map(|s| format!("{:?}", s)).collect();
-        out.push_str(&format!("allow = [{}]\n", quoted.join(", ")));
+        out.push_str(&format!("allow_hosts = [{}]\n", quoted.join(", ")));
     }
 
     for r in &cfg.l7_rules {
         out.push('\n');
-        out.push_str("[[network.rules]]\n");
+        out.push_str("[[network.allow_routes]]\n");
         out.push_str(&format!("host = {:?}\n", r.domain));
         out.push_str(&format!("method = {:?}\n", r.method));
         out.push_str(&format!("path = {:?}\n", r.path_pattern));
@@ -781,18 +781,18 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
     }
 
     let mut advisory: Vec<String> = Vec::new();
-    if let Some(ranges) = &cfg.allow_ports {
+    if let Some(ranges) = &cfg.allow_port {
         if ranges.as_slice() != agent_sandbox_proxy::policy::DEFAULT_ALLOW_PORTS.as_slice() {
             for r in ranges {
-                advisory.push(format!("allow_ports {}", r));
+                advisory.push(format!("allow_port {}", r));
             }
         }
     }
     if !advisory.is_empty() {
         out.push_str(
-            "\n# The following have no [network] TOML equivalent (it only supports 'allow'\n",
+            "\n# The following have no [network] TOML equivalent (it only supports 'allow_hosts'\n",
         );
-        out.push_str("# and 'rules') and were left out of the block above. Re-apply them after\n");
+        out.push_str("# and 'allow_routes') and were left out of the block above. Re-apply them after\n");
         out.push_str("# relaunching with `agent-sandbox ctl proxy allow`:\n");
         for line in advisory {
             out.push_str(&format!("# {}\n", line));
@@ -810,19 +810,19 @@ mod export_tests {
     #[test]
     fn exports_allow_entries_and_l7_rules_as_toml() {
         let cfg = parse_policy(
-            "allow_domains github.com\n\
-             allow_ips 10.0.0.0/8\n\
-             secret_l7\tapi.github.com\tGET\t/repos/*\n\
-             allow_l7\tapi.github.com\tGET\t/repos/*\n",
+            "allow_host github.com\n\
+             allow_ip 10.0.0.0/8\n\
+             secret_route\tapi.github.com\tGET\t/repos/*\n\
+             allow_route\tapi.github.com\tGET\t/repos/*\n",
         )
         .unwrap();
         let toml = format_policy_as_network_toml(&cfg);
         assert!(toml.contains("[network]\n"), "{toml}");
         assert!(
-            toml.contains("allow = [\"github.com\", \"10.0.0.0/8\"]"),
+            toml.contains("allow_hosts = [\"github.com\", \"10.0.0.0/8\"]"),
             "{toml}"
         );
-        assert!(toml.contains("[[network.rules]]"), "{toml}");
+        assert!(toml.contains("[[network.allow_routes]]"), "{toml}");
         assert!(toml.contains("host = \"api.github.com\""), "{toml}");
         assert!(toml.contains("method = \"GET\""), "{toml}");
         assert!(toml.contains("path = \"/repos/*\""), "{toml}");
@@ -835,10 +835,10 @@ mod export_tests {
         // per domain, so both rules came back marked -- which is exactly the
         // over-broad model this replaces.
         let cfg = parse_policy(
-            "allow_domains api.github.com\n\
-             secret_l7\tapi.github.com\tGET\t/user/repos\n\
-             allow_l7\tapi.github.com\tGET\t/user/repos\n\
-             allow_l7\tapi.github.com\tGET\t/zen\n",
+            "allow_host api.github.com\n\
+             secret_route\tapi.github.com\tGET\t/user/repos\n\
+             allow_route\tapi.github.com\tGET\t/user/repos\n\
+             allow_route\tapi.github.com\tGET\t/zen\n",
         )
         .unwrap();
         let toml = format_policy_as_network_toml(&cfg);
@@ -850,21 +850,21 @@ mod export_tests {
 
     #[test]
     fn roundtrip_allow_with_ports() {
-        let cfg = parse_policy("allow_domains *.jyu.fi:443\n").unwrap();
+        let cfg = parse_policy("allow_host *.jyu.fi:443\n").unwrap();
         let toml = format_policy_as_network_toml(&cfg);
-        assert!(toml.contains("allow = [\"*.jyu.fi:443\"]"), "{toml}");
-        assert!(!toml.contains("allow_ports"), "{toml}");
+        assert!(toml.contains("allow_hosts = [\"*.jyu.fi:443\"]"), "{toml}");
+        assert!(!toml.contains("allow_port"), "{toml}");
     }
 
     #[test]
     fn exports_a_non_default_port_range_as_an_advisory_comment() {
-        let cfg = parse_policy("allow_ports 8000-8100\n").unwrap();
+        let cfg = parse_policy("allow_port 8000-8100\n").unwrap();
         let toml = format_policy_as_network_toml(&cfg);
         assert!(
             !toml.contains("deny ="),
             "deny has no [network] TOML key: {toml}"
         );
-        assert!(toml.contains("# allow_ports 8000-8100"), "{toml}");
+        assert!(toml.contains("# allow_port 8000-8100"), "{toml}");
     }
 
     #[test]
@@ -872,7 +872,7 @@ mod export_tests {
         // Built-in denies are enforced whatever AGENTS.md says and cannot be
         // changed, so exporting them would only be noise the operator has to
         // delete before pasting.
-        let cfg = parse_policy("allow_domains github.com\ndeny_ips 169.254.169.254/32\n").unwrap();
+        let cfg = parse_policy("allow_host github.com\ndeny_ip 169.254.169.254/32\n").unwrap();
         let toml = format_policy_as_network_toml(&cfg);
         assert!(!toml.contains("169.254"), "{toml}");
     }
@@ -886,9 +886,9 @@ mod export_tests {
     fn every_key_the_launcher_writes_is_a_key_the_proxy_parses() {
         let agents_md = "```agent-sandbox\n\
              [network]\n\
-             allow = [\"github.com:443\", \"github.com:22\", \"10.0.0.0/8:80\"]\n\
+             allow_hosts = [\"github.com:443\", \"github.com:22\", \"10.0.0.0/8:80\"]\n\
              \n\
-             [[network.rules]]\n\
+             [[network.allow_routes]]\n\
              host = \"api.github.com:443\"\n\
              method = \"GET\"\n\
              path = \"/user/repos\"\n\

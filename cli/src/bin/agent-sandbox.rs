@@ -350,7 +350,7 @@ Integrations (use --X to enable, --no-X to disable):
                          Kept logs land in the current directory.  Without this
                          flag a session that had denials offers to save one.
   --secrets         {secrets} Resolves secrets with secretspec and injects them into the
-                         proxied requests each [[network.rules]] rule authorizes.
+                         proxied requests each [[network.allow_routes]] rule authorizes.
                          Requires --proxy.
   --krun            {krun} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
                          Adds a guest-kernel boundary inside the existing container boundary.
@@ -1443,11 +1443,11 @@ fn run() -> Result<i32> {
                 Ok(policy) => {
                     policy_file_content =
                         format_proxy_policy(&policy, &agents_md_path.to_string_lossy());
-                    proxy_configured = !policy.allow_domains.is_empty()
-                        || !policy.allow_ips.is_empty()
-                        || !policy.allow_ports.is_empty()
-                        || !policy.allow_l7.is_empty();
-                    secrets_configured = !policy.secret_l7.is_empty();
+                    proxy_configured = !policy.allow_host.is_empty()
+                        || !policy.allow_ip.is_empty()
+                        || !policy.allow_port.is_empty()
+                        || !policy.allow_route.is_empty();
+                    secrets_configured = !policy.secret_route.is_empty();
                 }
                 Err(e) => {
                     if want_proxy {
@@ -1470,7 +1470,7 @@ fn run() -> Result<i32> {
     }
 
     if want_proxy && !want_secrets && secrets_configured {
-        eprintln!("agent-sandbox: warning: secrets are configured in AGENTS.md [[network.rules]], but --secrets is not active.");
+        eprintln!("agent-sandbox: warning: secrets are configured in AGENTS.md [[network.allow_routes]], but --secrets is not active.");
         eprintln!("               Launch with --secrets to enable them.");
     }
 
@@ -1568,7 +1568,7 @@ fn run() -> Result<i32> {
 
         let mut baseline_content = String::new();
         for cidr in launch::BASELINE_DENY_IPS {
-            let line = format!("deny_ips {}\n", cidr);
+            let line = format!("deny_ip {}\n", cidr);
             policy_file_content.push_str(&line);
             // policy.baseline records just the launcher-added entries, so that
             // `ctl proxy export` can omit them: they are always enforced
@@ -1628,7 +1628,7 @@ fn run() -> Result<i32> {
             .args(["run", "-d", "--name", &sidecar_id])
             .args(["--network", "bridge", "--network", &sidecar_id])
             .args(sidecar_dns_args())
-            // NET_ADMIN backs the blackhole routes installed for deny_ips.
+            // NET_ADMIN backs the blackhole routes installed for deny_ip.
             .arg("--cap-add=NET_ADMIN")
             // The sidecar is infrastructure, not agent workload: keep its
             // policy/log mounts SELinux-safe regardless of --selinux, so proxy
