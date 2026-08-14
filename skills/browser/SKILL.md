@@ -149,41 +149,68 @@ authentication, so reachability is the only thing standing between "the
 sandbox can drive this tab" and "anything on the network can read every
 cookie and run arbitrary JS in it."
 
-This only works if the sandbox itself is on **host networking**, since that's
-what makes the container's `127.0.0.1` the same loopback as the host's:
+By default the sandbox has **no route to the host's loopback at all**, so this
+needs one flag at launch. Podman's rootless pasta setup passes `--no-map-gw`,
+which disables the gateway-to-loopback translation, and wires
+`host.containers.internal` with `--map-guest-addr` — that lands on the host's
+*LAN* address, not `127.0.0.1`. Neither one reaches a loopback-bound Chrome.
+Ask pasta for the mapping explicitly instead:
 
 ```sh
-agent-sandbox --podman-args --network=host -- bash
+agent-sandbox --podman-args --network=pasta:--map-host-loopback,169.254.1.3 -- bash
 ```
 
-If the launcher has `--proxy` on by default (e.g. a Nix-wrapped default per
-`docs/usage.md`'s "Configuring Defaults" section), override it explicitly —
-`--proxy` and `--network=host` are mutually exclusive, and flags are evaluated
-in order:
+Now anything the sandbox sends to `169.254.1.3` arrives on the host as
+`127.0.0.1 → 127.0.0.1`. Chrome stays bound to loopback, one address reaches
+it, and nothing else on the network can. The address is arbitrary — any unused
+link-local will do; `169.254.1.1` and `169.254.1.2` are already taken by
+podman's DNS forwarder and `host.containers.internal`.
+
+Check the endpoint before attaching:
 
 ```sh
-agent-sandbox --no-proxy --podman-args --network=host -- bash
+curl -s http://169.254.1.3:9222/json/version
 ```
 
-Check the endpoint is actually reachable before attaching:
+A refusal means Chrome isn't listening on the host's `127.0.0.1:9222`, or the
+sandbox was launched without that `--network` spec. Note that an already-running
+Chrome ignores `--remote-debugging-port`; the user needs a separate
+`--user-data-dir` for the flag to take effect.
 
-```sh
-curl -s http://127.0.0.1:9222/json/version
-```
-
-A connection refused means either the sandbox isn't on host networking, or
-Chrome isn't listening on that address. Then attach as a CDP client — this is
-a remote connection, not a local launch, so `PLAYWRIGHT_BROWSERS_PATH` and
-`FONTCONFIG_FILE` aren't needed:
+Then attach as a CDP client — this is a remote connection, not a local launch,
+so `PLAYWRIGHT_BROWSERS_PATH` and `FONTCONFIG_FILE` aren't needed:
 
 ```python
 from playwright.sync_api import sync_playwright
 
 p = sync_playwright().start()
-browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+browser = p.chromium.connect_over_cdp("http://169.254.1.3:9222")
 page = browser.contexts[0].pages[0]     # the host's already-open tab
 page.goto("https://example.com")
 ```
+
+Dialing the literal address also sidesteps Chrome's DevTools host check, which
+rejects a `Host:` header that is not an IP or `localhost`.
+
+To point that browser at a server running *in* the sandbox, publish a port as
+well — the two compose, since publishing no longer changes the network mode:
+
+```sh
+agent-sandbox --ports \
+  --podman-args --network=pasta:--map-host-loopback,169.254.1.3 -- bash
+```
+
+The host's Chrome then reaches it over the host's own loopback, e.g.
+`http://127.0.0.1:8000` for a `[ports]` entry publishing 8000. Bind that server
+to `0.0.0.0` inside the sandbox: publishing forwards to the sandbox's interface
+address, so a loopback-bound one is reachable from inside and dead from the
+host.
+
+Two modes have no route to the host and cannot do any of this: `--proxy`
+(deliberately — the sandbox is on an `--internal` network) and
+`--shared-network` (a bridge, where pasta options do not apply). The last-resort
+fallback remains `agent-sandbox --no-proxy --podman-args --network=host --
+bash`, which shares the host's entire network stack to obtain the one port.
 
 ## Skip the script: playwright-mcp
 

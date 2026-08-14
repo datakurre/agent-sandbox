@@ -85,6 +85,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into the proxied requests each `[[network.allowed_routes]]` rule authorises — that rule's host, method and path, and no others. Requires `--proxy`. See [Configuration](configuration.md#secrets). |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
+| Ports & mounts | `--shared-network` | Joins the shared bridge network so other containers can reach this one by name. Costs access to the host's loopback — see below. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
 
@@ -99,7 +100,35 @@ A few flags are one-off pass-throughs rather than persistent toggles, so they ha
 
 There is no `--port` flag: declare ports in `AGENTS.md` and pass `--ports`, or
 publish one directly with `--podman-args -p HOST:CONTAINER --`. Either way,
-publishing a port cannot be combined with `--proxy`.
+publishing a port cannot be combined with `--proxy`. Prefer `--ports`: it
+defaults each bind to loopback and refuses a wider one unless
+`--ports-any-interface` is given, while a raw `-p HOST:CONTAINER` binds
+`0.0.0.0` and exposes the port to the LAN.
+
+Whichever you use, the server *inside* the sandbox must bind `0.0.0.0`.
+Publishing forwards to the sandbox's interface address, so a server bound to the
+sandbox's own `127.0.0.1` answers from inside and refuses from the host.
+
+Publishing does not change the network mode, which matters for reaching back to
+the host. Rootless podman leaves the sandbox on pasta, and pasta can be asked to
+translate one address to the host's loopback:
+
+```sh
+agent-sandbox --podman-args --network=pasta:--map-host-loopback,169.254.1.3 -- bash
+```
+
+Packets the sandbox sends to `169.254.1.3` then arrive on the host as
+`127.0.0.1 → 127.0.0.1`, which is how a sandbox reaches a service the user runs
+on the host without exposing it — a browser's CDP port, say (see the `browser`
+skill). This is not on by default: podman passes pasta `--no-map-gw`, and the
+`host.containers.internal` entry it does set up points at the host's *LAN*
+address, not its loopback.
+
+`--shared-network` gives that up. It puts the sandbox on a bridge so sibling
+containers can reach it by name, and pasta options do not apply there — the two
+are mutually exclusive at the podman level. So the shared network is opt-in and
+most sandboxes should leave it off. `AGENT_SANDBOX_NETWORK` names the network
+when the flag is on.
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
@@ -234,7 +263,7 @@ and `~/.gemini/skills` for tools that use those discovery paths.
 | Command | What it does |
 | --- | --- |
 | `load` | build the image and import it into podman |
-| `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows sidecars and forwarders |
+| `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows the proxy sidecars |
 | `status [WORD] [--sandbox WORD]` | one screen per sandbox, pointing at the commands below |
 | `net [-f] [WORD] [--sandbox WORD]` | connection summary, or a live feed |
 | `logs [-f] [--tail N] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
@@ -263,7 +292,7 @@ $ agent-sandbox ctl mounts ls --sandbox silent
 $ agent-sandbox ctl attach silent -- bash
 ```
 
-`purge` defaults to leftovers only: exited sandboxes, forwarders and sidecars
-whose sandbox is gone, per-session networks nothing is attached to, and temp
-directories from a launcher that was killed before it could clean up. `-n` shows
-what it would remove.
+`purge` defaults to leftovers only: exited sandboxes, sidecars whose sandbox is
+gone, per-session networks nothing is attached to, and temp directories from a
+launcher that was killed before it could clean up. `-n` shows what it would
+remove.

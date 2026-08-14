@@ -17,7 +17,7 @@ If you want the agent to be able to run its own containers, `agent-sandbox` supp
 
 ## A guest kernel: `--krun`
 
-`--krun` runs the sandbox as a KVM microVM. Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar and the port forwarders stay ordinary containers, so `--proxy` and every `agent-sandbox ctl` subcommand that works by label are unaffected.
+`--krun` runs the sandbox as a KVM microVM. Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar stays an ordinary container, so `--proxy` and every `agent-sandbox ctl` subcommand that works by label are unaffected.
 
 - `agent-sandbox ctl attach` and `agent-sandbox ctl mounts` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `--podman-args -v ... --`.
 - `--podman` is refused under `--krun`; `--privileged` and `--selinux` are accepted with a warning that they are unverified against a guest.
@@ -77,7 +77,7 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
 - An invalid `[network]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote. See [Configuration](configuration.md#rules-the-launcher-refuses) for the combinations that are rejected.
 - `--proxy` with no `AGENTS.md` defaults to deny all. Profile-only launches likewise default to deny all when the selected profiles contain no allow rules.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
-- **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around.
+- **Cannot be combined with publishing a port, or with `--shared-network`.** Publishing needs a network mode that routes around the proxy's internal network, and the shared bridge is such a route in its own right; either one would leave the policy advisory. The launcher refuses both combinations rather than filtering some traffic and letting the rest around.
 - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
 - The traffic summary ranks hosts by volume, collapses the tail beyond 15 hosts, and lists denied and failed connections separately:
 

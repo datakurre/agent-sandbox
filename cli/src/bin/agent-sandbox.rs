@@ -292,6 +292,7 @@ fn print_usage(
     want_secrets: bool,
     want_krun: bool,
     want_ports: bool,
+    want_shared_network: bool,
     want_mounts: bool,
     want_agent_mounts_mode: &AgentMountsMode,
 ) {
@@ -362,6 +363,12 @@ Ports:
   --ports-any-interface                    Permits port binds outside of loopback interfaces.
                                            An undeclared port is published with
                                            --podman-args -p HOST:CONTAINER --
+  --shared-network                   {shared_network} Joins the shared bridge network, so other
+                                           containers can reach this one by name.  Replaces
+                                           pasta, so pasta options no longer apply -- including
+                                           --map-host-loopback, the only way to reach a service
+                                           bound to the host's 127.0.0.1.
+                                           --no-shared-network turns it back off.
 
 Mounts:
   --mounts / --no-mounts             {mounts} Honors [mounts] declarations from AGENTS.md.
@@ -405,6 +412,7 @@ before. It is not a substitute for leaving the three flags off."#,
         secrets = fmt(want_secrets),
         krun = fmt(want_krun),
         ports = fmt(want_ports),
+        shared_network = fmt(want_shared_network),
         mounts = fmt(want_mounts),
         agent_mounts = fmt(agent_mounts_all)
     );
@@ -741,6 +749,7 @@ fn run() -> Result<i32> {
     let mut want_selinux = false;
     let mut want_ports = false;
     let mut want_ports_any_interface = false;
+    let mut want_shared_network = false;
     let mut want_mounts = false;
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
     let mut want_proxy = false;
@@ -899,6 +908,8 @@ fn run() -> Result<i32> {
             "--ports" => want_ports = true,
             "--no-ports" => want_ports = false,
             "--ports-any-interface" => want_ports_any_interface = true,
+            "--shared-network" => want_shared_network = true,
+            "--no-shared-network" => want_shared_network = false,
             "--mounts" => want_mounts = true,
             "--no-mounts" => want_mounts = false,
             "--agent-mounts" => want_agent_mounts_mode = AgentMountsMode::All,
@@ -1045,6 +1056,7 @@ fn run() -> Result<i32> {
             want_secrets,
             want_krun,
             want_ports,
+            want_shared_network,
             want_mounts,
             &want_agent_mounts_mode,
         );
@@ -1056,11 +1068,11 @@ fn run() -> Result<i32> {
     }
 
     // Publishing a port and running a proxy are mutually exclusive, because the
-    // two network topologies contradict each other: a published port puts the
-    // sandbox on a NAT bridge *as well as* the proxy's --internal network,
-    // giving it a route to the internet that does not pass through the proxy at
-    // all.  Checked for podman-args here, and for [ports] once that block has
-    // been parsed.
+    // two network topologies contradict each other: podman can only publish
+    // from pasta or a bridge, and either one displaces or supplements the
+    // proxy's --internal network, giving the sandbox a route to the internet
+    // that does not pass through the proxy at all.  Checked for podman-args
+    // here, and for [ports] once that block has been parsed.
     if want_proxy {
         let mut idx = 0;
         while idx < podman_args.len() {
@@ -1079,9 +1091,26 @@ fn run() -> Result<i32> {
                 || arg.starts_with("-p=")
                 || arg.starts_with("--publish=")
             {
-                fail("agent-sandbox: --proxy cannot be combined with a published port.\n               A published port puts the sandbox on the shared bridge network,\n               which routes to the internet around the proxy, so the policy\n               would only be advisory.\n               Drop the port, or drop --proxy.");
+                fail("agent-sandbox: --proxy cannot be combined with a published port.\n               Publishing needs a network mode that routes around the proxy's\n               internal network, so the policy would only be advisory.\n               Drop the port, or drop --proxy.");
             }
             idx += 1;
+        }
+    }
+
+    // Both --network flags would reach podman, which can only report the
+    // contradiction in its own words, long after the launcher had a chance to
+    // say something useful.  Worth catching because the documented way to reach
+    // a service on the host's loopback is a --network spec of exactly this
+    // shape, and a bridge is what cannot honour it.
+    if want_shared_network {
+        for arg in &podman_args {
+            if arg == "--network"
+                || arg == "--net"
+                || arg.starts_with("--network=")
+                || arg.starts_with("--net=")
+            {
+                fail("agent-sandbox: --shared-network cannot be combined with a --network of your own.\n               The shared network is a bridge, and pasta options -- including\n               --map-host-loopback, the only route to the host's loopback -- do\n               not apply there.\n               Drop --shared-network, or drop the --network argument.");
+            }
         }
     }
 
@@ -1443,16 +1472,34 @@ fn run() -> Result<i32> {
     // so the refusal leaves nothing behind.
     if want_proxy && !published.is_empty() {
         fail(&format!(
-            "agent-sandbox: --proxy cannot be combined with a published port ({}).\n               A published port puts the sandbox on the shared bridge network,\n               which routes to the internet around the proxy, so the policy\n               would only be advisory.\n               Drop the port, or drop --proxy.",
+            "agent-sandbox: --proxy cannot be combined with a published port ({}).\n               Publishing needs a network mode that routes around the proxy's\n               internal network, so the policy would only be advisory.\n               Drop the port, or drop --proxy.",
             published[0]
         ));
     }
 
+    // Refused for the same reason a published port is: joining the shared
+    // bridge *as well as* the proxy's --internal network would hand the sandbox
+    // a route to the internet that never passes the proxy, leaving the policy
+    // advisory.  Checked separately because the flag no longer needs a port.
+    if want_proxy && want_shared_network {
+        fail(
+            "agent-sandbox: --proxy cannot be combined with --shared-network.\n               The shared bridge routes around the proxy's internal network,\n               so the policy would only be advisory.\n               Drop --shared-network, or drop --proxy.",
+        );
+    }
+
     // A shared network is what lets anything else reach this container by name
-    // later.  Created lazily, so a launch with no ports at all keeps podman's
-    // default rootless networking untouched.
+    // later, and it is opt-in because it is not free: it replaces podman's
+    // rootless default (pasta) with a bridge, and pasta options are the only
+    // route to the host's loopback.  Podman passes --no-map-gw and points
+    // host.containers.internal at the host's *LAN* address, so reaching a
+    // service on the host's 127.0.0.1 means asking for it by hand with
+    // --podman-args --network=pasta:--map-host-loopback,ADDR -- which a bridge
+    // cannot honour.  Publishing needs neither -- podman publishes under pasta
+    // just as well -- so the two decisions are kept apart, and the flag stands
+    // on its own: being reachable by name is useful without publishing
+    // anything to the host.
     let mut network_args: Vec<String> = Vec::new();
-    if !published.is_empty() {
+    if want_shared_network {
         let network =
             env::var("AGENT_SANDBOX_NETWORK").unwrap_or_else(|_| "agent-sandbox".to_string());
         let exists = ProcessCommand::new("podman")
@@ -1475,7 +1522,11 @@ fn run() -> Result<i32> {
         }
         network_args.push("--network".to_string());
         network_args.push(network);
+    }
 
+    // Outside the block above: a port is published in either network mode, and
+    // saying so is not the shared network's business.
+    if !published.is_empty() {
         eprintln!("agent-sandbox: publishing {}", published.join(" "));
         eprintln!("               (a server inside must bind 0.0.0.0, not 127.0.0.1)");
     }
@@ -1904,6 +1955,15 @@ fn run() -> Result<i32> {
         proxy_env_vars.push(format!("HTTPS_PROXY=http://{}:8888", sidecar_ip));
         proxy_env_vars.push(format!("http_proxy=http://{}:8888", sidecar_ip));
         proxy_env_vars.push(format!("https_proxy=http://{}:8888", sidecar_ip));
+        // Loopback is exempt because proxying it can only fail: curl and
+        // requests do not special-case it, so a request to a server the agent
+        // just started in its own container would go to the sidecar, resolve to
+        // 127.0.0.1, and be refused by the baseline deny.  This grants nothing
+        // -- the sandbox already owns its netns, and NO_PROXY is a hint to
+        // clients, not a route.  Literal entries only: wildcard and CIDR syntax
+        // disagree across curl, requests, Go and undici.
+        proxy_env_vars.push("NO_PROXY=localhost,127.0.0.1,::1".to_string());
+        proxy_env_vars.push("no_proxy=localhost,127.0.0.1,::1".to_string());
         if want_relay_ssh || want_relay_gpg {
             proxy_env_vars.push(format!("AGENT_SANDBOX_RELAY_ADDRESS={}:8889", sidecar_ip));
         }
