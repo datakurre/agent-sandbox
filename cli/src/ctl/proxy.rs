@@ -28,7 +28,7 @@ pub enum ProxyCommand {
     #[command(about = "Reset the policy back to how the sandbox was launched")]
     Reset(TargetArgs),
     #[command(about = "Print the current policy as an AGENTS.md [network] TOML block")]
-    Export(TargetArgs),
+    Export(ExportArgs),
     #[command(
         about = "Check whether a host (and optionally port) would be allowed under the current policy"
     )]
@@ -37,6 +37,21 @@ pub enum ProxyCommand {
 
 #[derive(Parser, Debug)]
 pub struct TargetArgs {
+    #[arg(help = "Sandbox name (positional)")]
+    pub word: Option<String>,
+    #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
+    pub container: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct ExportArgs {
+    /// A profile is a plain TOML file, so it wants the block without the
+    /// Markdown fence `AGENTS.md` needs.
+    #[arg(
+        long,
+        help = "Print bare TOML, without the ```toml agent-sandbox fence (for a --proxy-profile file)"
+    )]
+    pub plain: bool,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
     #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
@@ -348,7 +363,7 @@ fn reset(args: TargetArgs) -> Result<()> {
     apply(&dir, lines)
 }
 
-fn export(args: TargetArgs) -> Result<()> {
+fn export(args: ExportArgs) -> Result<()> {
     let (_, dir) = policy_dir(&args.word, &args.container)?;
     // The baseline private/loopback deny_ip ranges are enforced
     // unconditionally regardless of AGENTS.md (see `policy.baseline`,
@@ -362,7 +377,15 @@ fn export(args: TargetArgs) -> Result<()> {
         .filter(|l| !baseline.contains(l))
         .collect();
     let cfg = parse_lines(&lines)?;
-    print!("{}", format_policy_as_network_toml(&cfg));
+    let toml = format_policy_as_network_toml(&cfg);
+    if args.plain {
+        print!("{}", toml);
+    } else {
+        // Fenced by default, like `ctl mounts export`: the launcher only reads
+        // configuration inside a ```toml agent-sandbox block, so bare TOML
+        // appended to AGENTS.md would be silently ignored.
+        print!("```toml agent-sandbox\n{}```\n", toml);
+    }
     Ok(())
 }
 

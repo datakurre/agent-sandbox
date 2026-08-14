@@ -152,6 +152,65 @@ fn ip_available(host: &str) -> bool {
     }
 }
 
+const NO_CONNECTION_DETAIL: &str = "No connection is selected.";
+
+/// What `d` shows for a row in the Connections view.
+///
+/// Request heads are captured for *denials* only — the proxy never reads the
+/// body of an allowed tunnel — so a row without one gets that stated rather
+/// than an empty pane that reads like a bug.
+fn connection_detail_text(
+    ev: &ConnEvent,
+    denied_reqs: &HashMap<(String, u16), DeniedEntry>,
+) -> String {
+    let host = ev.host.clone().unwrap_or_else(|| "?".to_string());
+    let port = ev.port.unwrap_or(0);
+    let state = if ev.ev.as_deref() == Some("open") {
+        "in flight".to_string()
+    } else {
+        ev.verdict.as_deref().unwrap_or("?").to_string()
+    };
+
+    let mut out = format!("{} {}:{}", state, host, port);
+    if let Some(method) = ev.method.as_deref() {
+        out.push_str(&format!("\nmethod    {}", method));
+    }
+    if let Some(path) = ev.path.as_deref() {
+        out.push_str(&format!("\npath      {}", path));
+    }
+    if let Some(status) = ev.status {
+        out.push_str(&format!("\nstatus    HTTP {}", status));
+    }
+    if let Some(err) = ev.err.as_deref() {
+        out.push_str(&format!("\nerror     {}", err));
+    }
+    if ev.ev.as_deref() != Some("open") {
+        out.push_str(&format!(
+            "\ntraffic   up {} / down {} / {}ms",
+            ev.up.unwrap_or(0),
+            ev.down.unwrap_or(0),
+            ev.ms.unwrap_or(0)
+        ));
+    }
+
+    match denied_reqs
+        .get(&(host, port))
+        .and_then(|entry| entry.detail.clone())
+    {
+        Some(detail) => {
+            out.push_str("\n\n── last denied request head (redacted) ──\n");
+            out.push_str(&detail);
+        }
+        None => out.push_str(
+            "\n\nNo request head was recorded for this destination. \
+             The proxy captures heads for denied requests only; an allowed \
+             HTTPS tunnel is not decrypted unless a route or secret rule \
+             covers it.",
+        ),
+    }
+    out
+}
+
 fn clear_allowed_request(
     denied_reqs: &mut HashMap<(String, u16), DeniedEntry>,
     host: &str,
@@ -454,7 +513,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 View::Connections => {
-                    if connections_list.is_empty() {
+                    if show_detail && !connections_list.is_empty() {
+                        let selected = connections_list
+                            .get(connections_selected_idx.min(connections_list.len() - 1));
+                        let text = selected
+                            .map(|ev| connection_detail_text(ev, &denied_reqs))
+                            .unwrap_or_else(|| NO_CONNECTION_DETAIL.to_string());
+                        let detail = Paragraph::new(text)
+                            .wrap(Wrap { trim: false })
+                            .scroll((detail_scroll, 0))
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title("Connection Details (redacted)"),
+                            );
+                        f.render_widget(detail, chunks[1]);
+                    } else if connections_list.is_empty() {
                         let p = Paragraph::new("No connections yet. Waiting for sandbox egress...")
                             .style(Style::default().fg(Color::DarkGray))
                             .block(Block::default().borders(Borders::ALL).title("Connections (0)"));
@@ -559,9 +633,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let legend_text = match view {
-                View::Requests if show_detail => "↑/↓ scroll   [d]/[Esc] Back   [q] Quit",
+                View::Requests | View::Connections if show_detail => "↑/↓ scroll   [d]/[Esc] Back   [q] Quit",
                 View::Requests => "↑/↓ select   [d] Details   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[v] Connections view   [r] Rules view   [c] Clear   [q]/[Esc] Quit",
-                View::Connections => "↑/↓ select   [v] Denied requests   [r] Rules view   [q]/[Esc] Quit",
+                View::Connections => "↑/↓ select   [d] Details   [v] Denied requests   [r] Rules view   [q]/[Esc] Quit",
                 View::Rules => "↑/↓ select   [x] Remove rule (blocked for built-in/AGENTS.md rules)\n[r] Requests view   [q]/[Esc] Quit",
             };
             let instructions = Paragraph::new(legend_text)
@@ -587,7 +661,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     KeyCode::Esc => break,
                     KeyCode::Up => match view {
-                        View::Requests if show_detail => {
+                        View::Requests | View::Connections if show_detail => {
                             detail_scroll = detail_scroll.saturating_sub(1)
                         }
                         View::Requests => selected_idx = selected_idx.saturating_sub(1),
@@ -597,7 +671,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         View::Rules => rules_selected_idx = rules_selected_idx.saturating_sub(1),
                     },
                     KeyCode::Down => match view {
-                        View::Requests if show_detail => {
+                        View::Requests | View::Connections if show_detail => {
                             detail_scroll = detail_scroll.saturating_add(1)
                         }
                         View::Requests => {
@@ -632,6 +706,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         selected_idx = 0;
                     }
                     KeyCode::Char('d') if view == View::Requests && !denied_list.is_empty() => {
+                        show_detail = !show_detail;
+                        detail_scroll = 0;
+                    }
+                    KeyCode::Char('d')
+                        if view == View::Connections && !connections_list.is_empty() =>
+                    {
                         show_detail = !show_detail;
                         detail_scroll = 0;
                     }
@@ -753,7 +833,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_allowed_request, ingest_connection_event, is_denied_event, ConnEvent, DeniedEntry,
+        clear_allowed_request, connection_detail_text, ingest_connection_event, is_denied_event,
+        ConnEvent, DeniedEntry,
     };
     use std::collections::HashMap;
 
@@ -823,6 +904,36 @@ mod tests {
 
         assert_eq!(connections.len(), 1);
         assert!(connections[0].id.is_none());
+    }
+
+    #[test]
+    fn connection_detail_carries_the_recorded_head_when_there_is_one() {
+        let mut denied_reqs = HashMap::new();
+        denied_reqs.insert(
+            ("example.com".to_string(), 443),
+            DeniedEntry {
+                host: "example.com".to_string(),
+                port: 443,
+                reason: Some("no matching rule".to_string()),
+                method: Some("GET".to_string()),
+                detail: Some("GET /zen HTTP/1.1\r\nAuthorization: <redacted>".to_string()),
+                count: 1,
+                last_seen: 1,
+            },
+        );
+
+        let text = connection_detail_text(&connection("close", Some("1"), 2), &denied_reqs);
+        assert!(text.contains("example.com:443"), "{text}");
+        assert!(text.contains("GET /zen"), "{text}");
+    }
+
+    /// The pane has to say why it is empty: heads exist for denials only, and
+    /// an allowed tunnel that was never decrypted has nothing to show.
+    #[test]
+    fn connection_detail_explains_an_absent_head() {
+        let text = connection_detail_text(&connection("open", Some("1"), 1), &HashMap::new());
+        assert!(text.contains("in flight"), "{text}");
+        assert!(text.contains("denied requests only"), "{text}");
     }
 
     #[test]

@@ -383,7 +383,8 @@ Podman / Environment:
 outside the sandbox. --podman forwards the host podman socket, allowing the
 agent to create sibling containers on the host (a full sandbox escape).
 To safely let the agent run containers, use --privileged instead to enable
-securely nested containers inside the sandbox. See README for details.
+securely nested containers inside the sandbox. See the trust model at
+https://datakurre.github.io/agent-sandbox/trust-model/ for details.
 
 --krun closes none of those three. It adds a guest kernel under the agent, so
 code the agent runs faces a hypervisor before it faces the host kernel, but the
