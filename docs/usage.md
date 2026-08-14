@@ -44,7 +44,7 @@ agent-sandbox = pkgs.symlinkJoin {
 
 ### Flags
 
-Every flag in the table below has a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
+Most flags in the table below have a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it — the exceptions are the ones taking a value (`--krun-memory`, `--krun-cpus`) and `--ports-any-interface`. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
 
 `--gpg-agent` and `--gpg-sign` were merged and removed; use `--gpg` / `--no-gpg`.
 
@@ -63,7 +63,7 @@ Every flag in the table below has a corresponding `--no-flag` option (e.g., `--n
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
 | Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces `AGENTS.md`'s `[network]` policy if present. Prints a per-host traffic summary when the session ends. See details below. |
-| Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into proxied traffic matching `secret_domains`. Requires `--proxy`. |
+| Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into the proxied requests each `[[network.rules]]` rule authorises — that rule's host, method and path, and no others. Requires `--proxy`. See [Configuration](configuration.md#secrets). |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
@@ -122,6 +122,7 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
    - `A`: Allow IP
    - `r`: Switch to the Rules view — the live effective policy, with `x` to remove a rule (blocked for rules that came from `AGENTS.md`)
    - `d`: Show sanitized details for the selected denial; use `↑`/`↓` to scroll and `Esc` to return
+   - `c`: Clear the list of recorded denials
    - `q` or `Esc`: Quit the TUI
 4. **Save Rules**: When you've trained the proxy to your liking, export the active rules by running `agent-sandbox ctl proxy export > AGENTS.md` (or append them to your existing `[network]` blocks).
 
@@ -145,11 +146,12 @@ When using Git inside the sandbox, be aware of how the integration flags interac
 ### Examples
 
 ```sh
-agent-sandbox opencode                           # opencode, everything on
-agent-sandbox opencode --no-ssh                  # drop an integration
-agent-sandbox copilot                            # github-copilot-cli (copilot), everything on
-agent-sandbox antigravity                        # antigravity-cli (agy), everything on
-agent-sandbox opencode --no-workspace            # no CWD mount
+agent-sandbox opencode                           # opencode, no integrations (all opt-in)
+agent-sandbox --workspace --ssh opencode         # opt in to two of them
+agent-sandbox --workspace --ssh opencode --no-ssh  # ...and back out of one
+agent-sandbox copilot                            # github-copilot-cli (copilot)
+agent-sandbox antigravity                        # antigravity-cli (agy)
+agent-sandbox codex                              # codex
 agent-sandbox opencode --selinux                 # enable :z on built-in writable binds
 agent-sandbox                                    # interactive bash (every agent's binary on PATH)
 agent-sandbox opencode -- devenv shell           # devenv shell replacing opencode cmd
@@ -166,13 +168,13 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows sidecars and forwarders |
 | `status [WORD] [--sandbox WORD]` | one screen per sandbox, pointing at the commands below |
 | `net [-f] [WORD] [--sandbox WORD]` | connection summary, or a live feed |
-| `logs [-f] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
+| `logs [-f] [--tail N] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
 | `tui [WORD] [--sandbox WORD]` | interactive terminal UI: shows recently-denied connections live so you can add the missing rule, plus a Rules view (`r`) to inspect and remove existing rules, without leaving the dashboard |
 | `proxy show\|allow\|rm\|reset\|export\|check [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as AGENTS.md TOML; `check HOST[:PORT]` dry-runs whether a target would be allowed |
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
 | `relay [-f] [WORD] [--sandbox WORD]` | show the SSH/GPG relay's `allow_signing` policy and what it has been asked for |
 | `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |
-| `purge [--all] [-n]` | reclaim leftovers; running sandboxes are kept unless `--all` |
+| `purge [--all] [-n] [-f]` | reclaim leftovers; running sandboxes are kept unless `--all`, and `-f` skips the confirmation |
 
 New sandboxes are shown by a single session word, such as `silent`. Use that
 word with any targetable command, either positionally or as `--sandbox silent`.

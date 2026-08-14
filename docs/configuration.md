@@ -79,10 +79,17 @@ For finer-grained HTTP proxy control and secret injection, you can specify an ar
 
 - **`host`** (required): The target host and port to match (e.g., `"api.github.com:443"`).
 - **`method`** (required): The HTTP method (e.g., `"GET"`, `"POST"`, or `"*"`) in uppercase.
-- **`path`** (required): The path prefix to match (must start with `/`).
-- **`secret`** (optional): The name of a secret to inject into requests matching this rule.
+- **`path`** (required): The path pattern to match (must start with `/`). `*` matches a single
+  segment, `**` matches several.
+- **`secret`** (optional): The name of a secret to inject into requests matching **this rule**.
 - **`header`** (optional): The HTTP header to inject the secret into (e.g., `"Authorization"`).
 - **`prefix`** (optional): An optional prefix for the secret value (e.g., `"Bearer "` ).
+
+A host may carry several rules, and `secret` binds to the rule it is written on —
+not to the host. Only requests matching that rule's method and path receive the
+header; every other rule on the same host is proxied without it. Matching uses the
+normalised path, so `..` segments and percent-encoding cannot carry a secret off
+its route.
 
 #### Examples
 
@@ -114,21 +121,59 @@ path = "/"
 A rule's `secret` names a secret, never its value. `AGENTS.md` is part of the
 repository and is therefore treated as untrusted: the launcher will only inject
 a secret that you have also authorized host-side, in
-`~/.config/agent-sandbox/secrets.toml`, using the same fields:
+`~/.config/agent-sandbox/secrets.toml`.
+
+**Copy the block verbatim.** Authorization matches on every field — `host`
+(including its port), `method`, `path`, `secret`, `header` and `prefix` — so
+the host-side entry is the `AGENTS.md` rule with nothing changed:
 
 ```toml
 # ~/.config/agent-sandbox/secrets.toml
 [[network.rules]]
-host = "api.github.com"
+host = "api.github.com:443"
+method = "GET"
+path = "/user/repos"
 secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 ```
 
+Omitting a field does not make it a wildcard: `method` defaults to `"GET"`,
+`path` to `"/"` and `header` to `"Authorization"`, and those defaults are then
+matched exactly. An entry without the port authorizes nothing for a rule that
+has one.
+
+The authorization is what scopes the injection. The secret reaches the proxy
+bound to that host, method and path, and is injected only into requests matching
+it — so a second `[[network.rules]]` entry in `AGENTS.md`, on the same host and
+without a `secret`, grants plain access and nothing more. You can authorize
+several routes on one host; where two of them could match the same request, the
+more specific wins (longest domain pattern, then longest path pattern, then an
+exact method over `*`).
+
 With `--secrets`, values are resolved on the host with
 [`secretspec`](https://secretspec.dev) (from the workspace's `secretspec.toml`)
 and handed to the proxy sidecar alone; they never enter the sandbox's
 environment. A rule that `AGENTS.md` requests but the host config does not
-authorize refuses the launch rather than silently injecting nothing. The proxy
-terminates TLS for hosts carrying a rule, so the sandbox trusts a per-session CA
-that exists only for the lifetime of that sandbox.
+authorize refuses the launch rather than silently injecting nothing, and prints
+the exact block to paste. The proxy terminates TLS for hosts carrying a rule, so
+the sandbox trusts a per-session CA that exists only for the lifetime of that
+sandbox.
+
+#### Rules the launcher refuses
+
+`[network]` is validated before the sandbox starts; an invalid block refuses the
+launch rather than starting with a policy that allows more than you wrote.
+Besides malformed values, these combinations are rejected:
+
+- an unknown key under `[network]` (only `allow` and `rules` exist) or an unknown
+  field on a rule;
+- a duplicate entry in `allow`;
+- a host allowed outright in `allow` that also carries a `[[network.rules]]`
+  entry *without* a secret — the broad allow makes the narrower rule pointless,
+  so one of the two is a mistake. The same applies to a wildcard allow (`"*"`,
+  `"*:port"`).
+
+There is no `deny` key. The firewall is deny-by-default, and the only deny rules
+a policy carries are the built-in private and loopback ranges the launcher adds
+to every session. See [Trust model](trust-model.md).

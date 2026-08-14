@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt;
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-sandbox-tui",
-    about = "Interactive dashboard: approve pending ask-mode requests, add rules for denied ones"
+    about = "Interactive dashboard: watch denied requests live and add rules for them"
 )]
 pub struct TuiArgs {
     #[arg(short, long, visible_aliases = ["sandbox"], help = "Container ID or name")]

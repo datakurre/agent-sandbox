@@ -41,7 +41,7 @@ enum CtlCommands {
     #[command(about = "Attach to a running sandbox and exec a command")] Attach(ctl::attach::AttachArgs),
     #[command(about = "Manage bind mounts into a running sandbox", alias = "mounts")] Mount(ctl::mount::MountArgs),
     #[command(about = "Show SSH/GPG relay policy and logs")] Relay(ctl::relay::RelayArgs),
-    #[command(about = "Interactive dashboard: approve pending ask-mode requests, add rules for denied ones")] Tui(ctl::tui::TuiArgs),
+    #[command(about = "Interactive dashboard: watch denied requests live and add rules for them")] Tui(ctl::tui::TuiArgs),
     #[command(about = "Reclaim leftover containers, networks and directories")] Purge(ctl::purge::PurgeArgs),
 }
 
@@ -329,8 +329,9 @@ Integrations (use --X to enable, --no-X to disable):
                          all    keep every session's log
                          Kept logs land in the current directory.  Without this
                          flag a session that had denials offers to save one.
-  --secrets         {secrets} Resolves secrets with secretspec and injects them into proxied
-                         requests. Requires --proxy.
+  --secrets         {secrets} Resolves secrets with secretspec and injects them into the
+                         proxied requests each [[network.rules]] rule authorizes.
+                         Requires --proxy.
   --krun            {krun} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
                          Adds a guest-kernel boundary inside the existing container boundary.
                          'agent-sandbox ctl attach' and 'ctl mounts' do not work against a
@@ -924,6 +925,19 @@ fn run() -> Result<i32> {
     if want_krun {
         if want_podman {
             fail("agent-sandbox: --krun cannot be combined with --podman.");
+        }
+        // Accepted rather than refused, but neither is verified against a
+        // guest: --krun already runs the sandbox with SELinux labeling
+        // disabled (the kernel refuses a domain transition once libkrun has
+        // spawned the VM's threads), and nested podman inside the guest does
+        // not work out of the box.  See docs/trust-model.md.
+        if want_privileged {
+            eprintln!("agent-sandbox: warning: --privileged is unverified under --krun;");
+            eprintln!("               nested podman does not work in the guest out of the box.");
+        }
+        if want_selinux {
+            eprintln!("agent-sandbox: warning: --selinux under --krun relabels the bind mounts,");
+            eprintln!("               but the sandbox process itself runs with label=disable.");
         }
         if krun_ram_mib.is_empty() {
             krun_ram_mib = "4096".to_string();

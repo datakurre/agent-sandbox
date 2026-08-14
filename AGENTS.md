@@ -58,13 +58,14 @@ unit-tested without a podman.  Call flow:
     devenv dir, podman host socket, CWD workspace) plus the state dirs of
     whichever agents are selected — the positionally-launched one by default,
     or the set chosen via `--agent-mounts`/`--agent-mounts=…` — sourced from
-    `agents.nix` (opencode, claude-code, copilot, antigravity).
+    `agents.nix` (opencode, claude-code, copilot, antigravity, codex).
 3. Build env_args array from toggles (SSH_AUTH_SOCK, git identity,
    CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
 4. Create ephemeral `/etc/passwd` and `/etc/group` with the host user's uid/gid.
 5. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
-   final command (default `opencode`, overridable via `-- …`).
+   final command (`bash` by default, the selected agent's command when one is
+   named positionally, and anything after `--` overrides both).
 
 ### Loader (`agent-sandbox ctl load`)
 
@@ -98,21 +99,24 @@ without aardvark there is nothing to resolve that name.  That also retires a rac
 nothing ever gated on -- the readiness handshake never proved aardvark had
 published the sidecar's record before the sandbox started.
 
-The proxy itself is Rust (`proxy/src/main.rs`, `ipnet` its only dependency): a
-thread-per-connection HTTP forward proxy handling `CONNECT` and absolute-form
-requests.  Policy decisions happen once per connection, before the byte pumps
+The proxy itself is Rust (`proxy/src/main.rs`; `ipnet` for CIDR matching,
+`rustls`/`rcgen`/`webpki-roots` for the MITM path, `ratatui`/`crossterm` for
+the TUI): a thread-per-connection HTTP forward proxy handling `CONNECT` and
+absolute-form requests.  Policy decisions happen once per connection, before the byte pumps
 start; an established tunnel is never re-evaluated.
 
 Three directories, and which side can see them is the design:
 
 | Path | Mounted into | Contents |
 | --- | --- | --- |
-| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base` |
-| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `connections.jsonl`, `denied-requests.jsonl` |
+| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base`, `policy.baseline` |
+| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `ca.pem`, `connections.jsonl`, `denied-requests.jsonl`, `relay.jsonl` |
 | `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
 | (host temp dirs) | — | removed by the launcher's exit trap |
 
-Neither is mounted into the sandbox. That is deliberate and load-bearing: the
+None of them is mounted into the sandbox — `ca.pem` is bound in as a single
+file, not by exposing its directory, and only when the policy carries an L7
+rule. That is deliberate and load-bearing: the
 agent must not be able to widen the firewall that contains it, nor rewrite the
 log of what it did. Changing policy is therefore a host-side operation
 (`agent-sandbox ctl proxy`), which is why the old in-container
@@ -121,6 +125,17 @@ log of what it did. Changing policy is therefore a host-side operation
 **Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
 `[network].allow` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
 `[[network.rules]]` configures L7 paths and optional secret injection.
+Those two keys are the whole surface: there is no `deny`, and an unknown key
+refuses the launch.
+
+The compiled policy file has one `KEY VALUE` line each for `allow_domains`,
+`allow_ips`, `allow_ports`, `allow_l7`, `secret_l7`, `allow_signing`,
+`deny_ips` and `default`.  `allow_l7` and `secret_l7` are tab-separated
+(`domain<TAB>method<TAB>path`).  `deny_ips` is written only by the launcher --
+denies are built-in only, and `install_policy` refuses any live edit that
+changes the set.  The same host on two ports is two `allow_domains` lines with
+the same pattern; the proxy unions the ports of every line tied at the winning
+specificity.
 
 An `allow` entry on port 22 also populates `allow_signing`, which is what
 authorizes the SSH/GPG relay: under `--proxy` the host agent sockets go to the
@@ -134,10 +149,22 @@ implementation to drift.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
 The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`).
-To authorize secret injection, the operator pastes the exact same `[[network.rules]]` block from `AGENTS.md` into `~/.config/agent-sandbox/secrets.toml`.
-The launcher calls the resolver in `cli/src/secrets.rs`, which cross-references this config with the policy's `secret_domains`, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are written 0600 into `/sidecar_secrets/bindings`, which only the sidecar mounts. The proxy handles actual header injection. When a `secret` field is provided in a `[[network.rules]]` block in `AGENTS.md`, `parse_proxy` automatically populates the `secret_domains` policy list with their domains, removing the need for manual duplication.
+To authorize secret injection, the operator pastes the exact same `[[network.rules]]` block from `AGENTS.md` into it; every field must match, port included.
+The launcher calls the resolver in `cli/src/secrets.rs`, which cross-references this config with the policy's `secret_l7` routes, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are written 0600 into `/sidecar_secrets/bindings`, which only the sidecar mounts, as `domain<TAB>method<TAB>path<TAB>header<TAB>value`. A `secret` field on a rule populates `secret_l7` automatically, so there is nothing to duplicate.
 
-The proxy terminates TLS for hosts carrying an L7 rule, so its per-session CA (`/sidecar_shared/ca.pem`) is bound into the sandbox as a single file and pointed at by `AGENT_SANDBOX_PROXY_CA_FILE`; the entrypoint merges it into the trust bundle.
+Injection is scoped to the **route**, not the domain, and resolved **per
+request** in `inject::proxy_http1_with_injection` rather than once per
+connection.  Both halves are load-bearing.  `AGENTS.md` is untrusted and
+controls the other rules on a host, so a domain-wide marker let a second,
+secret-less rule (`method = "*", path = "/**"`) collect a token the operator
+had authorized for one endpoint; and a keep-alive connection carries many
+requests, so one decision at CONNECT time put the token on all of them.
+Matching runs on the same normalized path the L7 check uses, so
+`/user/repos/../../zen` cannot carry the token to `/zen`.  Where two authorized
+routes could match, the more specific wins: longest domain, then longest path,
+then an exact method over `*`.
+
+The proxy terminates TLS for hosts carrying an L7 rule, so its per-session CA (`/sidecar_shared/ca.pem`) is bound into the sandbox as a single file and pointed at by `AGENT_SANDBOX_PROXY_CA_FILE`; the entrypoint merges it into the trust bundle.  The mount is gated on the launch policy having an `allow_l7` line: with none nothing is intercepted, so trusting a CA that can mint any name would buy nothing.  An L7 rule added mid-session therefore has no CA behind it, which `ctl proxy allow --l7` and the TUI's `h` warn about.
 
 The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.

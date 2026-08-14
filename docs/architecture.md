@@ -9,7 +9,7 @@ management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
 
 | Category      | Tools                                                |
 | ------------- | ---------------------------------------------------- |
-| AI coding     | opencode, claude-code, github-copilot-cli (copilot), antigravity-cli (agy) |
+| AI coding     | opencode, claude-code, github-copilot-cli (copilot), antigravity-cli (agy), codex |
 | Shell / tools | bash, coreutils, ripgrep, fd, jq, curl, wget, …     |
 | Languages     | python3, uv, nodejs, gnumake, gcc libs               |
 | Git / GitHub  | git, gh                                              |
@@ -67,7 +67,7 @@ are unit-tested without a podman.  Call flow:
     podman host socket, CWD workspace) plus the state dirs of whichever agents
     are selected — the positionally-launched one by default, or the set chosen
     via `--agent-mounts`/`--agent-mounts=…` — sourced from `agents.nix`
-    (opencode, claude-code, copilot, antigravity).
+    (opencode, claude-code, copilot, antigravity, codex).
 3. Build the env array from toggles (SSH_AUTH_SOCK, the flattened git config
    and identity, CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
 4. Add `[ports]` and `[mounts]` declared in `AGENTS.md` (`cli/src/agents.rs`),
@@ -77,7 +77,8 @@ are unit-tested without a podman.  Call flow:
    the selector every `ctl` command accepts.
 6. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
-   final command (default `opencode`, overridable via `-- …`).
+   final command (`bash` by default, the selected agent's command when one is
+   named positionally, and anything after `--` overrides both).
 
 `--git` passes the host's *effective* configuration as `GIT_CONFIG_*`
 environment variables rather than mounting `.gitconfig`: `[include]` directives
@@ -149,21 +150,33 @@ under `[network]` refuses the launch rather than being ignored.
 
 The launcher compiles that block into the flat, line-oriented policy file the
 proxy reads (`allow_domains`, `allow_ips`, `allow_ports`, `allow_l7`,
-`secret_domains`, `allow_signing`, `deny_ips`, `default`), which is also the
-format `agent-sandbox ctl proxy` edits in place.  `agent-sandbox-proxy
+`secret_l7`, `allow_signing`, `deny_ips`, `default`), which is also the
+format `agent-sandbox ctl proxy` edits in place.  `secret_l7` records a
+*route* -- `domain<TAB>method<TAB>path`, like `allow_l7` -- not a domain, and
+`deny_ips` is written only by the launcher: there is no domain deny list, and
+a live edit that changes the deny set is refused.  `agent-sandbox-proxy
 --check-policy FILE` validates it: the launcher writes the file, the proxy reads
 it, and the host-side `proxy` command vets its own writes with the same parser,
 so there is no second implementation to drift.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
-The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`),
-which defines the exact bindings (domain, header, secret). The launcher calls
-the resolver in `cli/src/secrets.rs`, which cross-references that config with the
-policy's `secret_domains` from `AGENTS.md`, and then runs `secretspec export` on
-the host to fetch the values. The filtered bindings are written 0600 into
-`/sidecar_secrets/bindings`, which only the sidecar mounts; the proxy handles the
-actual header injection. A `secret` field on a `[[network.rules]]` entry
-populates `secret_domains` automatically, so there is nothing to duplicate.
+The source of authority is a host-controlled TOML file
+(`~/.config/agent-sandbox/secrets.toml`), which defines the exact bindings --
+host and port, method, path, secret, header, prefix. The launcher calls the
+resolver in `cli/src/secrets.rs`, which cross-references that config with the
+policy's `secret_l7` routes from `AGENTS.md`, and then runs `secretspec export`
+on the host to fetch the values. The filtered bindings are written 0600 into
+`/sidecar_secrets/bindings`, which only the sidecar mounts, as
+`domain<TAB>method<TAB>path<TAB>header<TAB>value`.
+
+The route travels with the binding, and that is the design.  `AGENTS.md` is
+untrusted and controls the *other* rules on a host, so recording only the
+domain -- verifying the operator's method and path host-side and then throwing
+them away -- meant a second, secret-less rule (`method = "*", path = "/**"`)
+collected the same token.  `inject::proxy_http1_with_injection` now resolves the
+binding *per request*, after the L7 check and against the same normalized path,
+so a keep-alive connection carrying several requests is several decisions and
+`/user/repos/../../zen` cannot carry the token to `/zen`.
 
 **CA trust.** The proxy terminates TLS for any host carrying an L7 rule, using a
 CA it generates per session and writes to `/sidecar_shared/ca.pem`. The launcher
@@ -172,6 +185,13 @@ binds *that file alone* into the sandbox and points
 bundle into `~/.cache` and exports the result under every variable the usual
 clients read. The directory itself is never mounted into the sandbox — the
 connection log lives there.
+
+The mount is gated on the launch policy actually carrying an `allow_l7` line.
+With none, `skip_l7` is true for every host and the leaf issuer is never
+reached, so a CA in the sandbox's trust store would grant the proxy the ability
+to intercept anything for no purpose. The cost is that an L7 rule added
+mid-session has no CA behind it; `ctl proxy allow --l7` and the TUI's `h` warn
+rather than failing later at certificate validation.
 
 The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
