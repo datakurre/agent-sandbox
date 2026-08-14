@@ -14,7 +14,14 @@ This page covers how to extend `agent-sandbox`: adding launcher integrations, bu
 4. If container-side setup is needed in the entrypoint, gate it on an env
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
 5. Update `print_usage` and `docs/usage.md`.
-6. Test: `cargo test` for the fragment, then `nix flake check`.
+6. Test: `cargo test` for the fragment, then `nix flake check`. For the
+   documentation site, build it the way GitHub Pages does:
+
+   ```sh
+   nix-shell -I nixpkgs=channel:nixos-unstable \
+     -p 'python3.withPackages (ps: with ps; [ mkdocs mkdocs-material ])' \
+     --run 'mkdocs build --strict'
+   ```
 
 Note what neither can cover: podman does not run in a Nix build, so nothing
 that starts a container is tested there. The cheap end-to-end check is a stub
@@ -44,7 +51,9 @@ and Nix store registration.  No other changes needed.
 
 - The launcher, entrypoint, sidecar and proxy are Rust (`cli/`, `proxy/`); the
   remaining Nix shell wrappers exist only to put the binaries on `PATH` with the
-  image reference in the environment.
+  image reference in the environment. Those wrappers are written with
+  `writeShellScriptBin`, where the `''`-quoted bodies are Nix's
+  double-single-quote string mechanism.
 - The container runs with `--userns=keep-id`, so the uid/gid inside the
   container match the host user.  Passwd/group files are synthesized per-run.
 - Tmpfs mounts on `~/.config`, `~/.cache`, `~/.local` provide writable home

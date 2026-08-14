@@ -7,6 +7,7 @@
 ## Full Documentation
 
 Please visit the **[documentation site](https://datakurre.github.io/agent-sandbox/)** for:
+
 - [Usage & Flags](https://datakurre.github.io/agent-sandbox/usage/) — common patterns, flag reference, and `ctl` subcommands
 - [Configuration](https://datakurre.github.io/agent-sandbox/configuration/) — `AGENTS.md` syntax for ports, mounts, and network policy
 - [Trust Model](https://datakurre.github.io/agent-sandbox/trust-model/) — security implications of each flag
