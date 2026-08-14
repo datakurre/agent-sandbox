@@ -523,11 +523,47 @@ fn response_has_no_body(request_method: &str, status_code: u16) -> bool {
         || status_code == 304
 }
 
+#[derive(Debug)]
+pub struct HttpExchangeOutcome {
+    pub up_bytes: u64,
+    pub down_bytes: u64,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub status: Option<u16>,
+    pub secret_missing: bool,
+}
+
+#[derive(Debug)]
+pub enum ProxyHttpError {
+    L7Denied {
+        method: String,
+        path: String,
+        reason: String,
+    },
+    Io {
+        method: Option<String>,
+        path: Option<String>,
+        status: Option<u16>,
+        secret_missing: bool,
+        error: io::Error,
+    },
+}
+
+impl std::fmt::Display for ProxyHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyHttpError::L7Denied { reason, .. } => write!(f, "L7 denied: {}", reason),
+            ProxyHttpError::Io { error, .. } => write!(f, "{}", error),
+        }
+    }
+}
+impl std::error::Error for ProxyHttpError {}
+
 /// Forward HTTP/1.1 request/response exchanges while rewriting each request so
 /// `header_name` appears exactly once, if a secret is provided.
 /// Evaluates L7 policy rules on each request.
 ///
-/// Returns `(up_bytes, down_bytes)` measured as plaintext bytes on each side.
+/// Returns `HttpExchangeOutcome` on successful parsing (up to EOF), or `ProxyHttpError`.
 pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
     client: &mut C,
     upstream: &mut U,
@@ -535,96 +571,131 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
     expected_port: u16,
     secret: Option<(&str, &str)>,
     shared: &std::sync::Arc<crate::Shared>,
-) -> io::Result<(u64, u64)> {
+) -> Result<HttpExchangeOutcome, ProxyHttpError> {
+    let secret_missing = secret.is_none() && shared.config().is_secret_domain(expected_host);
     let mut up_bytes = 0u64;
     let mut down_bytes = 0u64;
+    let mut last_method: Option<String> = None;
+    let mut last_path: Option<String> = None;
+    let mut last_status: Option<u16> = None;
 
-    loop {
-        let Some(request_head) = read_head(client)? else {
-            return Ok((up_bytes, down_bytes));
-        };
-        let request_text = std::str::from_utf8(&request_head).map_err(|_| {
-            io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
-        })?;
-        validate_request_authority(request_text, expected_host, expected_port)?;
-        
-        let has_cl = content_length(request_text)?.is_some();
-        let has_te = is_chunked(request_text);
-        if has_cl && has_te {
-            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
-            return Err(io::Error::new(ErrorKind::InvalidData, "request has both Content-Length and Transfer-Encoding"));
-        }
-        
-        // Also check if Transfer-Encoding is something other than "chunked"
-        if has_te {
-            let te_valid = request_text.lines().skip(1).filter_map(|line| {
-                let line = line.trim_end_matches('\r');
-                if line.is_empty() { return None; }
-                line.split_once(':')
-            }).any(|(name, value)| {
-                name.eq_ignore_ascii_case("transfer-encoding") && value.trim().eq_ignore_ascii_case("chunked")
-            });
-            if !te_valid {
+    let mut io_loop = || -> io::Result<()> {
+        loop {
+            let Some(request_head) = read_head(client)? else {
+                return Ok(());
+            };
+            let request_text = std::str::from_utf8(&request_head).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
+            })?;
+            validate_request_authority(request_text, expected_host, expected_port)?;
+            
+            let has_cl = content_length(request_text)?.is_some();
+            let has_te = is_chunked(request_text);
+            if has_cl && has_te {
                 let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
-                return Err(io::Error::new(ErrorKind::InvalidData, "invalid Transfer-Encoding"));
+                return Err(io::Error::new(ErrorKind::InvalidData, "request has both Content-Length and Transfer-Encoding"));
             }
+            
+            // Also check if Transfer-Encoding is something other than "chunked"
+            if has_te {
+                let te_valid = request_text.lines().skip(1).filter_map(|line| {
+                    let line = line.trim_end_matches('\r');
+                    if line.is_empty() { return None; }
+                    line.split_once(':')
+                }).any(|(name, value)| {
+                    name.eq_ignore_ascii_case("transfer-encoding") && value.trim().eq_ignore_ascii_case("chunked")
+                });
+                if !te_valid {
+                    let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                    return Err(io::Error::new(ErrorKind::InvalidData, "invalid Transfer-Encoding"));
+                }
+            }
+
+            let method = request_method(request_text)?.to_string();
+            let path = request_path(request_text)?;
+            last_method = Some(method.clone());
+            last_path = Some(path.clone());
+
+            let (allowed, reason) = shared.l7_check(expected_host, &method, &path);
+            if !allowed {
+                let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+                let msg = reason.unwrap_or_else(|| "L7 denied".to_string());
+                return Err(io::Error::new(ErrorKind::PermissionDenied, msg));
+            }
+
+            let out_head = match secret {
+                Some((name, value)) => rewrite_head(&request_head, name, value)?,
+                None => request_head.clone(),
+            };
+
+            upstream.write_all(&out_head)?;
+            up_bytes += out_head.len() as u64;
+
+            if let Some(len) = content_length(request_text)? {
+                up_bytes += copy_exact(client, upstream, len)?;
+            } else if is_chunked(request_text) {
+                up_bytes += copy_chunked_body(client, upstream)?;
+            }
+
+            let response_head = read_head(upstream)?.ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "upstream closed before sending an HTTP response",
+                )
+            })?;
+            client.write_all(&response_head)?;
+            down_bytes += response_head.len() as u64;
+
+            let response_text = std::str::from_utf8(&response_head).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidData, "response head is not valid UTF-8")
+            })?;
+            let status = response_status_code(response_text)?;
+            last_status = Some(status);
+            
+            if response_has_no_body(&method, status) {
+                continue;
+            }
+
+            if let Some(len) = content_length(response_text)? {
+                down_bytes += copy_exact(upstream, client, len)?;
+                continue;
+            }
+            if is_chunked(response_text) {
+                down_bytes += copy_chunked_body(upstream, client)?;
+                continue;
+            }
+
+            // Close-delimited response body: once this drains, the exchange ends.
+            down_bytes += copy_to_eof(upstream, client)?;
+            return Ok(());
         }
+    };
 
-        let method = request_method(request_text)?;
-        let path = request_path(request_text)?;
-
-        let (allowed, reason) = shared.l7_check(expected_host, method, &path);
-        if !allowed {
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-            let msg = reason
-                .map(|r| format!("L7 denied: {}", r))
-                .unwrap_or_else(|| "L7 denied".to_string());
-            return Err(io::Error::new(ErrorKind::PermissionDenied, msg));
+    match io_loop() {
+        Ok(()) => Ok(HttpExchangeOutcome {
+            up_bytes,
+            down_bytes,
+            method: last_method,
+            path: last_path,
+            status: last_status,
+            secret_missing,
+        }),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            Err(ProxyHttpError::L7Denied {
+                method: last_method.unwrap_or_default(),
+                path: last_path.unwrap_or_default(),
+                reason: e.into_inner().map(|i| i.to_string()).unwrap_or_else(|| "L7 denied".to_string()),
+            })
         }
-
-        let out_head = match secret {
-            Some((name, value)) => rewrite_head(&request_head, name, value)?,
-            None => request_head.clone(),
-        };
-
-        upstream.write_all(&out_head)?;
-        up_bytes += out_head.len() as u64;
-
-        if let Some(len) = content_length(request_text)? {
-            up_bytes += copy_exact(client, upstream, len)?;
-        } else if is_chunked(request_text) {
-            up_bytes += copy_chunked_body(client, upstream)?;
+        Err(e) => {
+            Err(ProxyHttpError::Io {
+                method: last_method,
+                path: last_path,
+                status: last_status,
+                secret_missing,
+                error: e,
+            })
         }
-
-        let response_head = read_head(upstream)?.ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "upstream closed before sending an HTTP response",
-            )
-        })?;
-        client.write_all(&response_head)?;
-        down_bytes += response_head.len() as u64;
-
-        let response_text = std::str::from_utf8(&response_head).map_err(|_| {
-            io::Error::new(ErrorKind::InvalidData, "response head is not valid UTF-8")
-        })?;
-        let status = response_status_code(response_text)?;
-        if response_has_no_body(method, status) {
-            continue;
-        }
-
-        if let Some(len) = content_length(response_text)? {
-            down_bytes += copy_exact(upstream, client, len)?;
-            continue;
-        }
-        if is_chunked(response_text) {
-            down_bytes += copy_chunked_body(upstream, client)?;
-            continue;
-        }
-
-        // Close-delimited response body: once this drains, the exchange ends.
-        down_bytes += copy_to_eof(upstream, client)?;
-        return Ok((up_bytes, down_bytes));
     }
 }
 
@@ -734,7 +805,7 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        let (up, down) =
+        let outcome =
             proxy_http1_with_injection(
                 &mut client,
                 &mut upstream,
@@ -745,8 +816,8 @@ mod tests {
             )
             .expect("proxy");
 
-        assert_eq!(up as usize, upstream.written.len());
-        assert_eq!(down as usize, client.written.len());
+        assert_eq!(outcome.up_bytes as usize, upstream.written.len());
+        assert_eq!(outcome.down_bytes as usize, client.written.len());
         let upstream_rendered = String::from_utf8(upstream.written).expect("utf8");
         assert_eq!(upstream_rendered.matches("Authorization: Bearer v").count(), 2);
         assert!(!upstream_rendered.contains("Authorization: old"));
@@ -845,7 +916,7 @@ mod tests {
 
         let mut client = FixtureIo::with_read_eof_error(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        let (up, down) = proxy_http1_with_injection(
+        let outcome = proxy_http1_with_injection(
             &mut client,
             &mut upstream,
             "example.com",
@@ -855,8 +926,8 @@ mod tests {
         )
         .expect("proxy should succeed");
 
-        assert!(up > 0);
-        assert!(down > 0);
+        assert!(outcome.up_bytes > 0);
+        assert!(outcome.down_bytes > 0);
         let client_rendered = String::from_utf8(client.written).expect("utf8");
         assert!(client_rendered.contains("HTTP/1.1 200 OK"));
         assert!(client_rendered.ends_with("ok"));

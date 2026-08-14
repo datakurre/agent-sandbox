@@ -47,9 +47,14 @@ struct ConnEvent {
     verdict: Option<String>,
     host: Option<String>,
     port: Option<u16>,
-    err: Option<String>,
+    pub err: Option<String>,
+    pub up: Option<u64>,
+    pub down: Option<u64>,
+    pub ms: Option<u128>,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub status: Option<u16>,
     ts: Option<u64>,
-    method: Option<String>,
 }
 
 /// A denied host/port, deduplicated across repeats so a retrying agent

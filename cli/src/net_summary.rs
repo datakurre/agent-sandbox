@@ -20,6 +20,9 @@ pub struct ProxyRecord {
     pub ms: Option<f64>,
     pub verdict: Option<String>,
     pub err: Option<String>,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub status: Option<u16>,
 }
 
 fn format_human(bytes: u64) -> String {
@@ -226,16 +229,33 @@ pub fn process_stream<R: BufRead>(reader: R) -> Result<()> {
         };
 
         let ev = record.ev.as_deref().unwrap_or("close");
+        let mut host_port = format!("{}:{}", record.host, record.port);
+        if let Some(path) = &record.path {
+            host_port.push_str(path);
+        }
+        
         if ev == "open" {
-            let host_port = format!("{}:{}", record.host, record.port);
             println!("{}  open   {}", t, clip(&host_port, 40));
         } else {
             let verdict = record.verdict.as_deref().unwrap_or("?");
-            let host_port = format!("{}:{}", record.host, record.port);
             
             let up_str = format_human(record.up.unwrap_or(0));
             let down_str = format_human(record.down.unwrap_or(0));
             let ms_str = format_ms(record.ms.unwrap_or(0.0));
+
+            let mut info = Vec::new();
+            if let Some(status) = record.status {
+                info.push(format!("HTTP {}", status));
+            }
+            if let Some(err) = &record.err {
+                info.push(err.clone());
+            }
+            
+            let info_str = if info.is_empty() {
+                "".to_string()
+            } else {
+                format!("  ({})", info.join(", "))
+            };
 
             let out_str = format!("{}  {} {}{}{}{}{}",
                 t,
@@ -244,7 +264,7 @@ pub fn process_stream<R: BufRead>(reader: R) -> Result<()> {
                 lpad(&up_str, 11),
                 lpad(&down_str, 11),
                 lpad(&ms_str, 9),
-                if let Some(err) = &record.err { format!("  ({})", err) } else { "".to_string() }
+                info_str
             );
             println!("{}", out_str);
         }
