@@ -45,8 +45,10 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Usage: usage.md
-  - Configuration: configuration.md
-  - Trust Model: trust-model.md
-  - Architecture: architecture.md
-  - Development: development.md
+  - User Guide:
+    - Usage & Flags: usage.md
+    - Configuration: configuration.md
+    - Trust Model: trust-model.md
+  - Reference:
+    - Architecture: architecture.md
+    - Development: development.md

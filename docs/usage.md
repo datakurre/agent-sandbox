@@ -1,20 +1,22 @@
 # Usage
 
-### Bundled OpenCode skills
+`agent-sandbox` launches AI coding agents inside an isolated Podman container. All integrations — filesystem access, network, SSH keys, GPG — are **opt-in**. Run it with no flags to get a shell where nothing from your host is exposed.
 
-The image includes three OpenCode skills at `/home/user/.agents/skills`:
+### Examples
 
-- `nix` for reproducible one-off tools and temporary Nix environments.
-- `nix-flake` for `flake.nix`, `flake.lock`, outputs, development shells, and checks.
-- `devenv` for `devenv.sh`, `devenv.nix`, and declared development environments.
-
-They are bundled into the image rather than mounted by the launcher. To use
-user-owned skills instead, mount a replacement tree with
-`--podman-args -v HOST:/home/user/.agents/skills --` or declare the mount in
-`AGENTS.md` under `[mounts]`. A more specific child mount can replace only one
-bundled skill. The canonical tree is also linked from
-`~/.claude/skills`, `~/.codex/skills`, `~/.copilot/skills`, `~/.cursor/skills`,
-and `~/.gemini/skills` for tools that use those discovery paths.
+```sh
+agent-sandbox opencode                           # opencode, no integrations (all opt-in)
+agent-sandbox --workspace --ssh opencode         # opt in to workspace and SSH
+agent-sandbox --workspace --proxy opencode       # workspace + deny-by-default network firewall
+agent-sandbox --workspace --ssh opencode --no-ssh  # override: drop SSH back out
+agent-sandbox copilot                            # github-copilot-cli (copilot)
+agent-sandbox antigravity                        # antigravity-cli (agy)
+agent-sandbox codex                              # codex
+agent-sandbox opencode --selinux                 # enable :z on built-in writable binds
+agent-sandbox                                    # interactive bash (every agent's binary on PATH)
+agent-sandbox opencode -- devenv shell           # devenv shell replacing opencode cmd
+agent-sandbox --privileged opencode              # nested podman inside container
+```
 
 ### Override the container command
 
@@ -189,20 +191,21 @@ When using Git inside the sandbox, be aware of how the integration flags interac
   request; `agent-sandbox ctl relay` shows the list and the decisions made
   against it.
 
-### Examples
+### Bundled OpenCode skills
 
-```sh
-agent-sandbox opencode                           # opencode, no integrations (all opt-in)
-agent-sandbox --workspace --ssh opencode         # opt in to two of them
-agent-sandbox --workspace --ssh opencode --no-ssh  # ...and back out of one
-agent-sandbox copilot                            # github-copilot-cli (copilot)
-agent-sandbox antigravity                        # antigravity-cli (agy)
-agent-sandbox codex                              # codex
-agent-sandbox opencode --selinux                 # enable :z on built-in writable binds
-agent-sandbox                                    # interactive bash (every agent's binary on PATH)
-agent-sandbox opencode -- devenv shell           # devenv shell replacing opencode cmd
-agent-sandbox --privileged opencode              # nested podman inside container
-```
+The image includes three OpenCode skills at `/home/user/.agents/skills`:
+
+- `nix` for reproducible one-off tools and temporary Nix environments.
+- `nix-flake` for `flake.nix`, `flake.lock`, outputs, development shells, and checks.
+- `devenv` for `devenv.sh`, `devenv.nix`, and declared development environments.
+
+They are bundled into the image rather than mounted by the launcher. To use
+user-owned skills instead, mount a replacement tree with
+`--podman-args -v HOST:/home/user/.agents/skills --` or declare the mount in
+`AGENTS.md` under `[mounts]`. A more specific child mount can replace only one
+bundled skill. The canonical tree is also linked from
+`~/.claude/skills`, `~/.codex/skills`, `~/.copilot/skills`, `~/.cursor/skills`,
+and `~/.gemini/skills` for tools that use those discovery paths.
 
 ## Managing running sandboxes
 

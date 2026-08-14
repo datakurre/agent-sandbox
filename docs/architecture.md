@@ -5,6 +5,8 @@
 management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
 `list`, `status`, `net`, `logs`, `tui`, `proxy`, `mounts`, `attach`, `relay` and `purge`).
 
+This page describes the internal structure. For security implications of individual flags, see [Trust Model](trust-model.md).
+
 ## What's in the image
 
 | Category      | Tools                                                |

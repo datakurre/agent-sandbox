@@ -12,6 +12,8 @@ management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
 - **flake.nix**  – flake entry point; exposes `packages.<system>.default` and
   `apps.<system>.default`.
 
+User-facing documentation lives at `docs/` (built with MkDocs Material and published as GitHub Pages). The source of truth for flags is `cli/src/bin/agent-sandbox.rs` and `cli/src/launch.rs`.
+
 ## Architecture
 
 ### Image (`image` attr in `default.nix`)

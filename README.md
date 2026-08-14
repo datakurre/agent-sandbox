@@ -2,16 +2,15 @@
 
 [![Docs](https://img.shields.io/badge/docs-GitHub_Pages-blue.svg)](https://datakurre.github.io/agent-sandbox/)
 
-Sandboxed AI coding environment that runs inside a rootless Podman container.
-Launch `opencode` (or any other tool) and explicitly opt-in to integrations. By default, the environment is isolated and secure.
+**Sandboxed AI coding environment** built on rootless Podman and Nix. Run AI coding agents in an isolated container — `opencode`, `claude-code`, `copilot`, `codex`, `antigravity`, or any bundled tool — and opt in only to the integrations you need. All integrations are **disabled by default**.
 
 ## Full Documentation
 
-Please visit our **[documentation site](https://datakurre.github.io/agent-sandbox/)** for detailed information on:
-- Usage, flags, and configuration
-- Architecture and Trust Model
-- The internal Proxy and Firewall
-- How to add new agents and tools
+Please visit the **[documentation site](https://datakurre.github.io/agent-sandbox/)** for:
+- [Usage & Flags](https://datakurre.github.io/agent-sandbox/usage/) — common patterns, flag reference, and `ctl` subcommands
+- [Configuration](https://datakurre.github.io/agent-sandbox/configuration/) — `AGENTS.md` syntax for ports, mounts, and network policy
+- [Trust Model](https://datakurre.github.io/agent-sandbox/trust-model/) — security implications of each flag
+- [Architecture](https://datakurre.github.io/agent-sandbox/architecture/) — how the image, launcher, proxy, and relay fit together
 
 ## Quick start
 
@@ -33,19 +32,22 @@ Either way, build the container image once before first use:
 agent-sandbox ctl load
 ```
 
-Then launch a tool. For a secure, basic coding session, you typically want to mount your current directory (`--workspace`) and optionally control network access (`--proxy`):
+Then launch an agent:
 
 ```sh
-# Launch opencode with just the current directory mounted at /workspace
+# Interactive shell — every agent is on PATH, nothing from the host is exposed
+agent-sandbox
+
+# Mount your project and launch opencode
 agent-sandbox --workspace opencode
 
-# Launch opencode with the current directory and a network proxy firewall
+# Add a deny-by-default network firewall enforced by this project's AGENTS.md
 agent-sandbox --workspace --proxy opencode
 
-# Use a reusable host-owned profile instead of this project's AGENTS.md
+# Use a reusable host-owned profile instead of AGENTS.md
 agent-sandbox --workspace --proxy-profile development opencode
 
-# Merge a reusable profile with this project's AGENTS.md policy
+# Merge a reusable profile with AGENTS.md (additive)
 agent-sandbox --workspace --proxy --proxy-profile development opencode
 ```
 

@@ -1,6 +1,6 @@
-# Network Configuration Guide
+# Configuration
 
-The `agent-sandbox` launcher supports declarative configuration defined directly within the project's `AGENTS.md` file. The configuration allows you to expose ports, define volume mounts, and set fine-grained network firewall policies. Network policies can also be kept as reusable, host-owned profiles.
+`AGENTS.md` in the root of a project can contain a fenced code block tagged `agent-sandbox` with TOML configuration. The launcher reads it when starting the sandbox and uses it to expose ports, bind host paths, and enforce a network firewall policy. Network policies can also be kept as reusable host-owned profiles.
 
 Configurations must be written in TOML and placed inside a fenced code block tagged with `agent-sandbox`:
 

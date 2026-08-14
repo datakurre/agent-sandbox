@@ -1,5 +1,7 @@
 # Development
 
+This page covers how to extend `agent-sandbox`: adding launcher integrations, bundled agents, or image tools.
+
 ## How to add a new integration
 
 1. Add a `want_{name}` toggle in `cli/src/bin/agent-sandbox.rs`, after the
@@ -7,9 +9,8 @@
 2. Add `--{name}` / `--no-{name}` arms in the argument parsing loop.
 3. Put the mount/env logic in `cli/src/launch.rs` as a function returning the
    `-v`/`-e` fragments, and call it from the launcher next to the other blocks.
-   Keeping it there is what makes it testable: the flags are trivially easy to
-   parse and then never read again, which is exactly how the rewrite in
-   `0b4289a` lost every integration at once.
+   Keeping the logic in `launch.rs` is what makes it unit-testable: flags are
+   parsed once and never re-read, which is the pattern the existing fragments follow.
 4. If container-side setup is needed in the entrypoint, gate it on an env
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
 5. Update `print_usage` and `docs/usage.md`.
