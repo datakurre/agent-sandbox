@@ -1,6 +1,6 @@
-use std::process::Command;
 use anyhow::{anyhow, Result};
 use std::env;
+use std::process::Command;
 
 pub fn podman_ps_names(all: bool, filter: &str) -> Result<Vec<String>> {
     let mut cmd = Command::new("podman");
@@ -50,9 +50,9 @@ pub fn sandbox_runtime(name: &str) -> Result<String> {
 pub fn podman_inspect_label(name: &str, label: &str) -> Result<String> {
     let mut cmd = Command::new("podman");
     cmd.arg("inspect")
-       .arg("--format")
-       .arg(format!("{{{{index .Config.Labels \"{}\"}}}}", label))
-       .arg(name);
+        .arg("--format")
+        .arg(format!("{{{{index .Config.Labels \"{}\"}}}}", label))
+        .arg(name);
     let output = cmd.output()?;
     if !output.status.success() {
         return Ok(String::new());
@@ -63,7 +63,10 @@ pub fn podman_inspect_label(name: &str, label: &str) -> Result<String> {
 
 pub fn refuse_if_krun(sandbox: &str, verb: &str, msgs: &[&str]) -> Result<()> {
     if sandbox_runtime(sandbox)? == "krun" {
-        eprintln!("agent-sandbox ctl: '{}' is a --krun microVM; {} is not available.", sandbox, verb);
+        eprintln!(
+            "agent-sandbox ctl: '{}' is a --krun microVM; {} is not available.",
+            sandbox, verb
+        );
         for m in msgs {
             eprintln!("               {}", m);
         }
@@ -75,9 +78,12 @@ pub fn refuse_if_krun(sandbox: &str, verb: &str, msgs: &[&str]) -> Result<()> {
 pub fn sidecar_for_sandbox(sandbox: &str) -> Result<String> {
     let mut cmd = Command::new("podman");
     cmd.arg("ps")
-       .arg("--filter").arg("label=agent-sandbox.role=proxy")
-       .arg("--filter").arg(format!("label=agent-sandbox.target={}", sandbox))
-       .arg("--format").arg("{{.Names}}");
+        .arg("--filter")
+        .arg("label=agent-sandbox.role=proxy")
+        .arg("--filter")
+        .arg(format!("label=agent-sandbox.target={}", sandbox))
+        .arg("--format")
+        .arg("{{.Names}}");
     let output = cmd.output()?;
     if !output.status.success() {
         return Ok(String::new());
@@ -103,7 +109,10 @@ pub fn sidecar_mount(sidecar: &str, dest: &str) -> Result<String> {
 pub fn require_sidecar(sandbox: &str) -> Result<String> {
     let sidecar = sidecar_for_sandbox(sandbox)?;
     if sidecar.is_empty() {
-        eprintln!("agent-sandbox ctl: '{}' is running without a proxy.", sandbox);
+        eprintln!(
+            "agent-sandbox ctl: '{}' is running without a proxy.",
+            sandbox
+        );
         eprintln!("               Relaunch it with:  agent-sandbox --proxy");
         std::process::exit(1);
     }
@@ -115,9 +124,9 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
         // Try to inspect the explicit container ID or name
         let mut cmd = Command::new("podman");
         cmd.arg("inspect")
-           .arg("--format")
-           .arg("{{.Name}} {{index .Config.Labels \"agent-sandbox.role\"}} {{.State.Running}}")
-           .arg(explicit);
+            .arg("--format")
+            .arg("{{.Name}} {{index .Config.Labels \"agent-sandbox.role\"}} {{.State.Running}}")
+            .arg(explicit);
         let output = cmd.output()?;
         if !output.status.success() {
             // fallback for backward compatibility with suffix matching
@@ -135,20 +144,33 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
                 }
                 return Ok(valid_matches[0].clone());
             } else if valid_matches.len() > 1 {
-                eprintln!("agent-sandbox ctl: '{}' is ambiguous, matches multiple sandboxes:", explicit);
+                eprintln!(
+                    "agent-sandbox ctl: '{}' is ambiguous, matches multiple sandboxes:",
+                    explicit
+                );
                 for m in &valid_matches {
-                    eprintln!("  {}\t{}", sandbox_word(m), sandbox_workspace(m).unwrap_or_default());
+                    eprintln!(
+                        "  {}\t{}",
+                        sandbox_word(m),
+                        sandbox_workspace(m).unwrap_or_default()
+                    );
                     eprintln!("    full name: {}", m);
                 }
                 std::process::exit(1);
             }
-            eprintln!("agent-sandbox ctl: no container named or id matching '{}'", explicit);
+            eprintln!(
+                "agent-sandbox ctl: no container named or id matching '{}'",
+                explicit
+            );
             std::process::exit(1);
         }
         let stdout = String::from_utf8(output.stdout)?;
         let parts: Vec<&str> = stdout.trim().split_whitespace().collect();
         if parts.len() < 3 || parts[1] != "sandbox" {
-            eprintln!("agent-sandbox ctl: container '{}' is not an agent-sandbox", explicit);
+            eprintln!(
+                "agent-sandbox ctl: container '{}' is not an agent-sandbox",
+                explicit
+            );
             std::process::exit(1);
         }
         let is_running = parts[2] == "true";
@@ -163,7 +185,11 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
         return Ok(name.to_string());
     }
 
-    let names = if want_running { sandbox_containers()? } else { sandbox_containers_all()? };
+    let names = if want_running {
+        sandbox_containers()?
+    } else {
+        sandbox_containers_all()?
+    };
     if names.is_empty() {
         if want_running {
             eprintln!("agent-sandbox ctl: no running sandboxes.");

@@ -26,7 +26,10 @@ fn allow_signing_rules(policy_dir: &str) -> Vec<String> {
     fs::read_to_string(format!("{}/policy", policy_dir))
         .unwrap_or_default()
         .lines()
-        .filter_map(|line| line.strip_prefix("allow_signing ").map(|r| r.trim().to_string()))
+        .filter_map(|line| {
+            line.strip_prefix("allow_signing ")
+                .map(|r| r.trim().to_string())
+        })
         .filter(|r| !r.is_empty())
         .collect()
 }
@@ -38,7 +41,10 @@ pub fn run(args: RelayArgs) -> Result<()> {
 
     let policy_dir = sidecar_mount(&sidecar, "/sidecar_policy")?;
     if policy_dir.is_empty() {
-        eprintln!("agent-sandbox ctl relay: cannot find the policy mount for sandbox '{}'", sandbox);
+        eprintln!(
+            "agent-sandbox ctl relay: cannot find the policy mount for sandbox '{}'",
+            sandbox
+        );
         std::process::exit(1);
     }
 
@@ -46,7 +52,9 @@ pub fn run(args: RelayArgs) -> Result<()> {
     println!("{}", sandbox);
     if rules.is_empty() {
         println!("  allow_signing  (none) -- ssh and gpg through the relay are refused");
-        println!("                 Declare an SSH port in AGENTS.md, e.g. allow = [\"github.com:22\"].");
+        println!(
+            "                 Declare an SSH port in AGENTS.md, e.g. allow = [\"github.com:22\"]."
+        );
     } else {
         for rule in &rules {
             println!("  allow_signing  {}", rule);
@@ -63,8 +71,22 @@ pub fn run(args: RelayArgs) -> Result<()> {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    println!("  ssh agent      {}", if has_ssh { "forwarded" } else { "not forwarded (relaunch with --ssh)" });
-    println!("  gpg agent      {}", if has_gpg { "forwarded" } else { "not forwarded (relaunch with --gpg)" });
+    println!(
+        "  ssh agent      {}",
+        if has_ssh {
+            "forwarded"
+        } else {
+            "not forwarded (relaunch with --ssh)"
+        }
+    );
+    println!(
+        "  gpg agent      {}",
+        if has_gpg {
+            "forwarded"
+        } else {
+            "not forwarded (relaunch with --gpg)"
+        }
+    );
 
     // Read through the sidecar, like `ctl net` and `ctl logs`: the shared
     // directory is deliberately not mounted into the sandbox, and the host

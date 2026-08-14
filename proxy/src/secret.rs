@@ -222,8 +222,9 @@ mod tests {
 
     #[test]
     fn secret_debug_is_redacted() {
-        let binding = SecretBindings::parse("api.example.com\tAuthorization\tBearer super-secret\n")
-            .expect("parse");
+        let binding =
+            SecretBindings::parse("api.example.com\tAuthorization\tBearer super-secret\n")
+                .expect("parse");
         let dbg = format!("{:?}", binding);
         assert!(dbg.contains("<redacted>"), "{dbg}");
         assert!(!dbg.contains("super-secret"), "{dbg}");

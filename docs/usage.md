@@ -120,12 +120,13 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
    - `a`: Allow domain
    - `h`: Allow HTTP route (domain + method) (creates a `[[network.rules]]` rule)
    - `A`: Allow IP
+   - `v`: Switch between the live Connections view and denied requests
    - `r`: Switch to the Rules view — the live effective policy, with `x` to remove a rule (blocked for rules that came from `AGENTS.md`)
    - `d`: Show sanitized details for the selected denial; use `↑`/`↓` to scroll and `Esc` to return
    - `q` or `Esc`: Quit the TUI
 4. **Save Rules**: When you've trained the proxy to your liking, export the active rules by running `agent-sandbox ctl proxy export > AGENTS.md` (or append them to your existing `[network]` blocks).
 
-The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Press `d` on a row to inspect the latest sanitized request head, including its method, target, path, and non-sensitive headers. The detail stream is ephemeral, capped at 4 MiB, and the TUI retains at most 200 rows with one bounded detail per row. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
+The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Press `v` to switch to the Connections view, which shows all recent allowed, denied, failed, and currently-open connections live. Press `d` on a row to inspect the latest sanitized request head, including its method, target, path, and non-sensitive headers. The detail stream is ephemeral, capped at 4 MiB, and the TUI retains at most 200 rows in each view with one bounded detail per denied row. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
 
 For an HTTPS domain denied at `CONNECT`, the encrypted method and path are not available yet. The TUI detail view suggests a temporary placeholder L7 rule to let the proxy terminate TLS and observe the real request:
 
@@ -178,7 +179,7 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | `status [WORD] [--sandbox WORD]` | one screen per sandbox, pointing at the commands below |
 | `net [-f] [WORD] [--sandbox WORD]` | connection summary, or a live feed |
 | `logs [-f] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
-| `tui [WORD] [--sandbox WORD]` | interactive terminal UI: shows recently-denied connections live so you can add the missing rule, plus a Rules view (`r`) to inspect and remove existing rules, without leaving the dashboard |
+| `tui [WORD] [--sandbox WORD]` | interactive terminal UI: shows all recent connections live, including currently-open and denied ones, plus denied-request actions and a Rules view (`r`) |
 | `proxy show\|allow\|rm\|reset\|export\|check [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as AGENTS.md TOML; `check HOST[:PORT]` dry-runs whether a target would be allowed |
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
 | `relay [-f] [WORD] [--sandbox WORD]` | show the SSH/GPG relay's `allow_signing` policy and what it has been asked for |

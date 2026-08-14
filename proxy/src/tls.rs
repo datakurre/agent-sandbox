@@ -3,12 +3,14 @@ use rcgen::{
     KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
+};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 const LEAF_CACHE_MAX: usize = 256;
 const HTTP1_ALPN: &[u8] = b"http/1.1";
@@ -36,7 +38,9 @@ pub struct SessionCa {
 impl SessionCa {
     pub fn generate() -> Result<Self, String> {
         let mut params = CertificateParams::default();
-        params.distinguished_name.push(DnType::CommonName, "agent-sandbox session proxy CA");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "agent-sandbox session proxy CA");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
@@ -64,8 +68,7 @@ impl SessionCa {
     }
 
     pub fn write_public_cert_pem(&self, path: &str) -> Result<(), String> {
-        fs::write(path, self.public_cert_pem())
-            .map_err(|e| format!("cannot write {}: {}", path, e))
+        fs::write(path, self.public_cert_pem()).map_err(|e| format!("cannot write {}: {}", path, e))
     }
 
     pub fn issue_leaf(&self, host: &str) -> Result<IssuedLeaf, String> {
@@ -111,7 +114,10 @@ impl SessionCa {
     }
 }
 
-pub fn terminate<S>(stream: S, leaf: &IssuedLeaf) -> Result<StreamOwned<ServerConnection, S>, String>
+pub fn terminate<S>(
+    stream: S,
+    leaf: &IssuedLeaf,
+) -> Result<StreamOwned<ServerConnection, S>, String>
 where
     S: Read + Write,
 {
@@ -128,7 +134,10 @@ where
     Ok(StreamOwned::new(conn, stream))
 }
 
-pub fn originate(stream: std::net::TcpStream, host: &str) -> Result<StreamOwned<ClientConnection, std::net::TcpStream>, String> {
+pub fn originate(
+    stream: std::net::TcpStream,
+    host: &str,
+) -> Result<StreamOwned<ClientConnection, std::net::TcpStream>, String> {
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut config = ClientConfig::builder()
         .with_root_certificates(roots)

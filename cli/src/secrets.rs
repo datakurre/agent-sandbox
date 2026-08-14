@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
+use crate::agents::parse_host_port;
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
-use crate::agents::parse_host_port;
 
 #[derive(Debug, Clone)]
 pub struct SecretRule {
@@ -52,9 +52,15 @@ pub struct HostBinding {
     pub prefix: Option<String>,
 }
 
-fn default_method() -> String { "GET".to_string() }
-fn default_path() -> String { "/".to_string() }
-fn default_header() -> String { "Authorization".to_string() }
+fn default_method() -> String {
+    "GET".to_string()
+}
+fn default_path() -> String {
+    "/".to_string()
+}
+fn default_header() -> String {
+    "Authorization".to_string()
+}
 
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -73,7 +79,7 @@ pub enum ValidationError {
 }
 
 pub fn iter_tagged_blocks(content: &str) -> Vec<String> {
-    use pulldown_cmark::{Event, Parser, Tag, CodeBlockKind};
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
     let mut blocks = Vec::new();
     let parser = Parser::new(content);
     let mut current_block = String::new();
@@ -115,12 +121,28 @@ pub fn get_requested_rules(workspace: &Path) -> Vec<SecretRule> {
                     if let Some(rules) = network.get("rules").and_then(|v| v.as_array()) {
                         for rule in rules {
                             if let Some(rule_table) = rule.as_table() {
-                                if let (Some(secret_val), Some(host_val)) = (rule_table.get("secret"), rule_table.get("host")) {
-                                    if let (Some(secret), Some(host)) = (secret_val.as_str(), host_val.as_str()) {
-                                        let method = rule_table.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
-                                        let path = rule_table.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                                        let header = rule_table.get("header").and_then(|v| v.as_str()).unwrap_or("Authorization");
-                                        let prefix = rule_table.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+                                if let (Some(secret_val), Some(host_val)) =
+                                    (rule_table.get("secret"), rule_table.get("host"))
+                                {
+                                    if let (Some(secret), Some(host)) =
+                                        (secret_val.as_str(), host_val.as_str())
+                                    {
+                                        let method = rule_table
+                                            .get("method")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("GET");
+                                        let path = rule_table
+                                            .get("path")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("/");
+                                        let header = rule_table
+                                            .get("header")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("Authorization");
+                                        let prefix = rule_table
+                                            .get("prefix")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
                                         requested_rules.push(SecretRule {
                                             host: host.to_string(),
                                             method: method.to_string(),
@@ -164,7 +186,11 @@ pub fn patterns_overlap(a: &str, b: &str) -> bool {
 }
 
 pub fn validate_domain(domain: &str) -> Result<(), ValidationError> {
-    let bare = if let Some(base) = domain.strip_prefix("*.") { base } else { domain };
+    let bare = if let Some(base) = domain.strip_prefix("*.") {
+        base
+    } else {
+        domain
+    };
     if bare.is_empty() {
         return Err(ValidationError::EmptyDomain);
     }
@@ -192,7 +218,12 @@ pub fn validate_header(header: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::ContainsNonTokenCharacters);
     }
     let lower = header.to_lowercase();
-    if lower == "host" || lower == "connection" || lower == "content-length" || lower == "transfer-encoding" || lower.starts_with("proxy-") {
+    if lower == "host"
+        || lower == "connection"
+        || lower == "content-length"
+        || lower == "transfer-encoding"
+        || lower.starts_with("proxy-")
+    {
         return Err(ValidationError::ReservedHeaderName);
     }
     Ok(())
@@ -202,7 +233,12 @@ pub fn validate_header(header: &str) -> Result<(), ValidationError> {
 /// `domain\theader\tvalue` line per binding.  The caller decides where those
 /// go: the launcher writes them straight into the sidecar's `bindings` file
 /// rather than through a pipe, so the values never reach a terminal.
-pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspace: &Path) -> anyhow::Result<Vec<String>> {
+pub fn resolve_secrets_logic(
+    policy: &Path,
+    config: &Path,
+    file: &Path,
+    workspace: &Path,
+) -> anyhow::Result<Vec<String>> {
     let mut secret_domains = Vec::new();
     if let Ok(f) = std::fs::File::open(policy) {
         use std::io::BufRead;
@@ -226,7 +262,11 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
             let val: toml::Value = match toml::from_str(&c) {
                 Ok(v) => v,
                 Err(e) => {
-                    anyhow::bail!("agent-sandbox: Secrets config at {} is malformed: {}", config.display(), e);
+                    anyhow::bail!(
+                        "agent-sandbox: Secrets config at {} is malformed: {}",
+                        config.display(),
+                        e
+                    );
                 }
             };
             if let Some(bindings) = val.get("bindings") {
@@ -237,10 +277,14 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
             let mut host_config: HostConfig = match toml::from_str(&c) {
                 Ok(v) => v,
                 Err(e) => {
-                    anyhow::bail!("agent-sandbox: Secrets config at {} is malformed: {}", config.display(), e);
+                    anyhow::bail!(
+                        "agent-sandbox: Secrets config at {} is malformed: {}",
+                        config.display(),
+                        e
+                    );
                 }
             };
-            
+
             // manually extract [[network.rules]] and add to bindings
             if let Some(network) = val.get("network").and_then(|v| v.as_table()) {
                 if let Some(rules) = network.get("rules").and_then(|v| v.as_array()) {
@@ -254,11 +298,16 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
 
             (host_config, val)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (HostConfig::default(), toml::Value::Table(Default::default()))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            HostConfig::default(),
+            toml::Value::Table(Default::default()),
+        ),
         Err(e) => {
-            anyhow::bail!("agent-sandbox: Secrets config at {} is malformed: {}", config.display(), e);
+            anyhow::bail!(
+                "agent-sandbox: Secrets config at {} is malformed: {}",
+                config.display(),
+                e
+            );
         }
     };
 
@@ -289,20 +338,35 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
         let hb_domain = hb_domain.to_lowercase();
 
         if let Err(e) = validate_domain(&hb_domain) {
-            anyhow::bail!("agent-sandbox: Invalid domain '{}' in binding: {}", hb_domain, e);
+            anyhow::bail!(
+                "agent-sandbox: Invalid domain '{}' in binding: {}",
+                hb_domain,
+                e
+            );
         }
 
         if let Err(e) = validate_header(&hb.header) {
-            anyhow::bail!("agent-sandbox: Invalid header '{}' in binding: {}", hb.header, e);
+            anyhow::bail!(
+                "agent-sandbox: Invalid header '{}' in binding: {}",
+                hb.header,
+                e
+            );
         }
 
         for seen in &seen_domains {
             if patterns_overlap(&hb_domain, seen) {
-                anyhow::bail!("agent-sandbox: domain '{}' overlaps with existing binding domain '{}'", hb_domain, seen);
+                anyhow::bail!(
+                    "agent-sandbox: domain '{}' overlaps with existing binding domain '{}'",
+                    hb_domain,
+                    seen
+                );
             }
         }
 
-        if secret_domains.iter().any(|pd| patterns_overlap(&hb_domain, pd)) {
+        if secret_domains
+            .iter()
+            .any(|pd| patterns_overlap(&hb_domain, pd))
+        {
             filtered_bindings.push(hb);
             seen_domains.push(hb_domain.clone());
         }
@@ -311,9 +375,18 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
     if !missing_rules.is_empty() {
         let mut err_msg = String::new();
         for req in missing_rules {
-            err_msg.push_str(&format!("agent-sandbox: AGENTS.md requests secret '{}' for rule:\n", req.secret));
-            err_msg.push_str(&format!("               host = \"{}\", method = \"{}\", path = \"{}\"\n", req.host, req.method, req.path));
-            err_msg.push_str(&format!("               but this secret definition is not authorized in {}.\n\n", config.display()));
+            err_msg.push_str(&format!(
+                "agent-sandbox: AGENTS.md requests secret '{}' for rule:\n",
+                req.secret
+            ));
+            err_msg.push_str(&format!(
+                "               host = \"{}\", method = \"{}\", path = \"{}\"\n",
+                req.host, req.method, req.path
+            ));
+            err_msg.push_str(&format!(
+                "               but this secret definition is not authorized in {}.\n\n",
+                config.display()
+            ));
             err_msg.push_str(&format!("               To authorize this secret definition, add the following block to {}:\n\n", config.display()));
             err_msg.push_str("               [[network.rules]]\n");
             err_msg.push_str(&format!("               host = \"{}\"\n", req.host));
@@ -334,7 +407,12 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
     let mut cmd = Command::new("secretspec");
     cmd.args(["export", "--file"]);
     cmd.arg(file);
-    cmd.args(["--format", "json", "--reason", "agent-sandbox secret injection"]);
+    cmd.args([
+        "--format",
+        "json",
+        "--reason",
+        "agent-sandbox secret injection",
+    ]);
 
     if let Some(profile) = &host_config.profile {
         cmd.args(["--profile", profile]);
@@ -357,14 +435,20 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
     };
 
     if !output.status.success() {
-        anyhow::bail!("agent-sandbox: secretspec export failed:\n{}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "agent-sandbox: secretspec export failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let secrets_data: serde_json::Value = match serde_json::from_str(&stdout_str) {
         Ok(v) => v,
         Err(e) => {
-            anyhow::bail!("agent-sandbox: secretspec output was not valid JSON: {}\n", e);
+            anyhow::bail!(
+                "agent-sandbox: secretspec output was not valid JSON: {}\n",
+                e
+            );
         }
     };
 
@@ -392,7 +476,10 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
             };
             lines.push(format!("{}\t{}\t{}{}", domain, header, prefix, val_str));
         } else {
-            anyhow::bail!("agent-sandbox: secretspec output missing required secret '{}'\n", secret_name);
+            anyhow::bail!(
+                "agent-sandbox: secretspec output missing required secret '{}'\n",
+                secret_name
+            );
         }
     }
 
@@ -402,8 +489,8 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_secret_rule_matches() {
@@ -499,4 +586,3 @@ secret = "NPM_TOKEN"
         assert_eq!(rules[1].prefix, "");
     }
 }
-

@@ -42,7 +42,10 @@ const MAX_HEADER_COUNT: usize = 256;
 fn read_bytes<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as usize;
     if len > MAX_BYTES_LEN {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Payload length exceeds limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Payload length exceeds limit",
+        ));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
@@ -81,11 +84,19 @@ impl RelayHeader {
         let cmd = match cmd_val {
             1 => CommandType::Gpg,
             2 => CommandType::Ssh,
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown command type")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Unknown command type",
+                ))
+            }
         };
         let arg_count = read_u32(r)? as usize;
         if arg_count > MAX_HEADER_COUNT {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Too many arguments"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Too many arguments",
+            ));
         }
         let mut args = Vec::with_capacity(arg_count);
         for _ in 0..arg_count {
@@ -93,7 +104,10 @@ impl RelayHeader {
         }
         let env_count = read_u32(r)? as usize;
         if env_count > MAX_HEADER_COUNT {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Too many environment variables"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Too many environment variables",
+            ));
         }
         let mut envs = Vec::with_capacity(env_count);
         for _ in 0..env_count {
@@ -133,6 +147,9 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Frame> {
         2 => Ok(Frame::Stdout(read_bytes(r)?)),
         3 => Ok(Frame::Stderr(read_bytes(r)?)),
         4 => Ok(Frame::Exit(read_u32(r)? as i32)),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown frame type")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unknown frame type",
+        )),
     }
 }

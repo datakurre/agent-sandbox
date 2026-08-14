@@ -35,7 +35,6 @@
       "."
     ];
     state = [
-      ".local/share/opencode"
       ".local/share/antigravity-cli"
       ".config/antigravity-cli"
       ".cache/antigravity-cli"

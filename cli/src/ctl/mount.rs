@@ -17,11 +17,17 @@ pub struct MountArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum MountCommand {
-    #[command(about = "Show the bind mounts added on top of the launcher's own", alias = "list")]
+    #[command(
+        about = "Show the bind mounts added on top of the launcher's own",
+        alias = "list"
+    )]
     Ls(TargetArgs),
     #[command(about = "Bind-mount a host directory into a running sandbox")]
     Add(AddArgs),
-    #[command(about = "Unmount a container path from a running sandbox", alias = "remove")]
+    #[command(
+        about = "Unmount a container path from a running sandbox",
+        alias = "remove"
+    )]
     Rm(RmArgs),
     #[command(about = "Print the sandbox's mounts as an AGENTS.md [mounts] TOML block")]
     Export(TargetArgs),
@@ -140,7 +146,10 @@ fn container_pid(sandbox: &str) -> Result<String> {
         .output()?;
     let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || pid.is_empty() || pid == "0" {
-        eprintln!("agent-sandbox ctl mounts: '{}' has no running process", sandbox);
+        eprintln!(
+            "agent-sandbox ctl mounts: '{}' has no running process",
+            sandbox
+        );
         std::process::exit(1);
     }
     Ok(pid)
@@ -161,7 +170,10 @@ fn run_ls(args: TargetArgs) -> Result<()> {
 
     for sandbox in names {
         println!("{}", sandbox);
-        println!("  workspace   {}", sandbox_workspace(&sandbox).unwrap_or_default());
+        println!(
+            "  workspace   {}",
+            sandbox_workspace(&sandbox).unwrap_or_default()
+        );
         let mounts = added_mounts(&sandbox)?;
         if mounts.is_empty() {
             println!("  mount       (none)");
@@ -170,7 +182,12 @@ fn run_ls(args: TargetArgs) -> Result<()> {
             if m.options.is_empty() {
                 println!("  mount       {} -> {}", m.source, m.destination);
             } else {
-                println!("  mount       {} -> {} ({})", m.source, m.destination, m.options.join(","));
+                println!(
+                    "  mount       {} -> {} ({})",
+                    m.source,
+                    m.destination,
+                    m.options.join(",")
+                );
             }
         }
     }
@@ -259,7 +276,12 @@ fn run_add(args: AddArgs) -> Result<()> {
     // Launched with --selinux: use podman's own relabeling rather than
     // guessing chcon arguments.
     let modes = Command::new("podman")
-        .args(["inspect", "--format", "{{range .Mounts}}{{.Mode}} {{end}}", &sandbox])
+        .args([
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{.Mode}} {{end}}",
+            &sandbox,
+        ])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
@@ -278,18 +300,34 @@ fn run_add(args: AddArgs) -> Result<()> {
         .args(["exec", &sandbox, "mkdir", "-p", &args.container_path])
         .status()?;
     if !made.success() {
-        eprintln!("agent-sandbox ctl mounts: could not create {} in {}", args.container_path, sandbox);
+        eprintln!(
+            "agent-sandbox ctl mounts: could not create {} in {}",
+            args.container_path, sandbox
+        );
         std::process::exit(1);
     }
 
     let bound = Command::new("podman")
-        .args(["unshare", "nsenter", "-t", &pid, "-m", "mount", "--bind", &host_path, &args.container_path])
+        .args([
+            "unshare",
+            "nsenter",
+            "-t",
+            &pid,
+            "-m",
+            "mount",
+            "--bind",
+            &host_path,
+            &args.container_path,
+        ])
         .status()?;
     if !bound.success() {
         eprintln!("agent-sandbox ctl mounts: bind mount failed");
         std::process::exit(1);
     }
-    println!("Mounted {} to {}:{}", host_path, sandbox, args.container_path);
+    println!(
+        "Mounted {} to {}:{}",
+        host_path, sandbox, args.container_path
+    );
     Ok(())
 }
 
@@ -306,10 +344,21 @@ fn run_rm(args: RmArgs) -> Result<()> {
     )?;
     let pid = container_pid(&sandbox)?;
     let status = Command::new("podman")
-        .args(["unshare", "nsenter", "-t", &pid, "-m", "umount", &args.container_path])
+        .args([
+            "unshare",
+            "nsenter",
+            "-t",
+            &pid,
+            "-m",
+            "umount",
+            &args.container_path,
+        ])
         .status()?;
     if !status.success() {
-        eprintln!("agent-sandbox ctl mounts: could not unmount {}", args.container_path);
+        eprintln!(
+            "agent-sandbox ctl mounts: could not unmount {}",
+            args.container_path
+        );
         std::process::exit(1);
     }
     println!("Unmounted {}:{}", sandbox, args.container_path);
@@ -344,10 +393,18 @@ mod tests {
             "/home/user/.local/share/opencode",
             "/home/user/.local/share/devenv",
         ] {
-            assert!(is_launcher_bind(baseline, "/workspace/repo"), "{} should be filtered", baseline);
+            assert!(
+                is_launcher_bind(baseline, "/workspace/repo"),
+                "{} should be filtered",
+                baseline
+            );
         }
         for added in ["/data", "/var/log/app", "/tmp/cache", "/home/user/scratch"] {
-            assert!(!is_launcher_bind(added, "/workspace/repo"), "{} should be listed", added);
+            assert!(
+                !is_launcher_bind(added, "/workspace/repo"),
+                "{} should be listed",
+                added
+            );
         }
     }
 

@@ -3,9 +3,9 @@
 use anyhow::Result;
 use chrono::{Local, TimeZone};
 use serde::Deserialize;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, IsTerminal};
-use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize, Clone)]
@@ -44,9 +44,17 @@ fn format_dur(secs: f64) -> String {
     if secs < 60.0 {
         format!("{}s", secs.floor() as u64)
     } else if secs < 3600.0 {
-        format!("{}m {}s", (secs / 60.0).floor() as u64, (secs % 60.0).floor() as u64)
+        format!(
+            "{}m {}s",
+            (secs / 60.0).floor() as u64,
+            (secs % 60.0).floor() as u64
+        )
     } else {
-        format!("{}h {}m", (secs / 3600.0).floor() as u64, ((secs % 3600.0) / 60.0).floor() as u64)
+        format!(
+            "{}h {}m",
+            (secs / 3600.0).floor() as u64,
+            ((secs % 3600.0) / 60.0).floor() as u64
+        )
     }
 }
 
@@ -217,7 +225,9 @@ pub fn read_records<R: BufRead>(reader: R) -> Vec<ProxyRecord> {
 pub fn process_stream<R: BufRead>(reader: R) -> Result<()> {
     for line in reader.lines() {
         let line = line?;
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let record: ProxyRecord = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(_) => continue,
@@ -233,12 +243,12 @@ pub fn process_stream<R: BufRead>(reader: R) -> Result<()> {
         if let Some(path) = &record.path {
             host_port.push_str(path);
         }
-        
+
         if ev == "open" {
             println!("{}  open   {}", t, clip(&host_port, 40));
         } else {
             let verdict = record.verdict.as_deref().unwrap_or("?");
-            
+
             let up_str = format_human(record.up.unwrap_or(0));
             let down_str = format_human(record.down.unwrap_or(0));
             let ms_str = format_ms(record.ms.unwrap_or(0.0));
@@ -250,14 +260,15 @@ pub fn process_stream<R: BufRead>(reader: R) -> Result<()> {
             if let Some(err) = &record.err {
                 info.push(err.clone());
             }
-            
+
             let info_str = if info.is_empty() {
                 "".to_string()
             } else {
                 format!("  ({})", info.join(", "))
             };
 
-            let out_str = format!("{}  {} {}{}{}{}{}",
+            let out_str = format!(
+                "{}  {} {}{}{}{}{}",
                 t,
                 pad(verdict, 6),
                 pad(&clip(&host_port, 40), 40),
@@ -301,10 +312,17 @@ pub fn render_summary(records: Vec<ProxyRecord>, style: Style) -> Vec<String> {
         }
     }
 
-    let all: Vec<&ProxyRecord> = records.iter().filter(|r| r.ev.as_deref().unwrap_or("close") == "close").collect();
-    let live: Vec<&ProxyRecord> = records.iter().filter(|r| {
-        r.ev.as_deref().unwrap_or("close") == "open" && r.id.as_ref().map_or(false, |id| !closed_ids.contains(id))
-    }).collect();
+    let all: Vec<&ProxyRecord> = records
+        .iter()
+        .filter(|r| r.ev.as_deref().unwrap_or("close") == "close")
+        .collect();
+    let live: Vec<&ProxyRecord> = records
+        .iter()
+        .filter(|r| {
+            r.ev.as_deref().unwrap_or("close") == "open"
+                && r.id.as_ref().map_or(false, |id| !closed_ids.contains(id))
+        })
+        .collect();
 
     let mut ok = Vec::new();
     let mut den = Vec::new();
@@ -343,7 +361,11 @@ pub fn render_summary(records: Vec<ProxyRecord>, style: Style) -> Vec<String> {
     }
     let mut hosts_map: HashMap<String, HostStats> = HashMap::new();
     for r in &ok {
-        let entry = hosts_map.entry(r.host.clone()).or_insert(HostStats { conns: 0, up: 0, down: 0 });
+        let entry = hosts_map.entry(r.host.clone()).or_insert(HostStats {
+            conns: 0,
+            up: 0,
+            down: 0,
+        });
         entry.conns += 1;
         entry.up += r.up.unwrap_or(0);
         entry.down += r.down.unwrap_or(0);
@@ -351,35 +373,67 @@ pub fn render_summary(records: Vec<ProxyRecord>, style: Style) -> Vec<String> {
     let mut hosts_list: Vec<(String, HostStats)> = hosts_map.into_iter().collect();
     hosts_list.sort_by(|a, b| (b.1.up + b.1.down).cmp(&(a.1.up + a.1.down)));
 
-    let shown = if hosts_list.len() > 15 { &hosts_list[0..15] } else { &hosts_list[..] };
-    let rest = if hosts_list.len() > 15 { &hosts_list[15..] } else { &[] };
+    let shown = if hosts_list.len() > 15 {
+        &hosts_list[0..15]
+    } else {
+        &hosts_list[..]
+    };
+    let rest = if hosts_list.len() > 15 {
+        &hosts_list[15..]
+    } else {
+        &[]
+    };
 
     let mut w0 = 20;
-    for (h, _) in shown { w0 = w0.max(h.chars().count()); }
-    for (h, _) in &den_list { w0 = w0.max(h.chars().count()); }
-    for ((h, _), _) in &fail_list { w0 = w0.max(h.chars().count()); }
-    for r in &live { w0 = w0.max(format!("{}:{}", r.host, r.port).chars().count()); }
+    for (h, _) in shown {
+        w0 = w0.max(h.chars().count());
+    }
+    for (h, _) in &den_list {
+        w0 = w0.max(h.chars().count());
+    }
+    for ((h, _), _) in &fail_list {
+        w0 = w0.max(h.chars().count());
+    }
+    for r in &live {
+        w0 = w0.max(format!("{}:{}", r.host, r.port).chars().count());
+    }
 
     let w = if w0 > 40 { 40 } else { w0 };
 
     let mut min_ts = f64::MAX;
     let mut max_ts = f64::MIN;
     for r in &records {
-        if r.ts < min_ts { min_ts = r.ts; }
-        if r.ts > max_ts { max_ts = r.ts; }
+        if r.ts < min_ts {
+            min_ts = r.ts;
+        }
+        if r.ts > max_ts {
+            max_ts = r.ts;
+        }
     }
-    let span = if max_ts >= min_ts { max_ts - min_ts } else { 0.0 };
+    let span = if max_ts >= min_ts {
+        max_ts - min_ts
+    } else {
+        0.0
+    };
 
     let tup: u64 = ok.iter().map(|r| r.up.unwrap_or(0)).sum();
     let tdown: u64 = ok.iter().map(|r| r.down.unwrap_or(0)).sum();
 
     out.push(String::new());
 
-    let mut header = format!("{}  {} · {} connection{}",
+    let mut header = format!(
+        "{}  {} · {} connection{}",
         style.bold("=== Network Summary ==="),
-        format_dur(span), all.len(), if all.len() == 1 { "" } else { "s" });
+        format_dur(span),
+        all.len(),
+        if all.len() == 1 { "" } else { "s" }
+    );
     if !ok.is_empty() {
-        header.push_str(&format!(" · {} in / {} out", format_human(tdown), format_human(tup)));
+        header.push_str(&format!(
+            " · {} in / {} out",
+            format_human(tdown),
+            format_human(tup)
+        ));
     }
     if !live.is_empty() {
         header.push_str(&format!(" · {} in flight", live.len()));
@@ -399,16 +453,26 @@ pub fn render_summary(records: Vec<ProxyRecord>, style: Style) -> Vec<String> {
         if style.enabled() {
             out.push(style.dim(&"─".repeat(2 + w + 7 + 11 + 11 + extra)));
         }
-        out.push(style.bold(&format!("  {}{}{}{}",
-            pad("HOST", w), lpad("CONNS", 7), lpad("SENT", 11), lpad("RECV", 11))));
+        out.push(style.bold(&format!(
+            "  {}{}{}{}",
+            pad("HOST", w),
+            lpad("CONNS", 7),
+            lpad("SENT", 11),
+            lpad("RECV", 11)
+        )));
         for (h, stats) in shown {
-            let row = format!("  {}{}{}{}",
+            let row = format!(
+                "  {}{}{}{}",
                 pad(&clip(h, w), w),
                 lpad(&stats.conns.to_string(), 7),
                 style.unit(&lpad(&format_human(stats.up), 11)),
                 style.unit(&lpad(&format_human(stats.down), 11))
             );
-            let b = if bars { bar(stats.up + stats.down, max_total, BAR_WIDTH) } else { String::new() };
+            let b = if bars {
+                bar(stats.up + stats.down, max_total, BAR_WIDTH)
+            } else {
+                String::new()
+            };
             if b.is_empty() {
                 out.push(row);
             } else {
@@ -421,7 +485,8 @@ pub fn render_summary(records: Vec<ProxyRecord>, style: Style) -> Vec<String> {
             let rest_down: u64 = rest.iter().map(|(_, s)| s.down).sum();
             // No bar: the collapsed tail is an aggregate, not a host, and a
             // bar there would read as one host outweighing the ones above it.
-            out.push(format!("  {}{}{}{}",
+            out.push(format!(
+                "  {}{}{}{}",
                 pad(&clip(&format!("… and {} more hosts", rest.len()), w), w),
                 lpad(&rest_conns.to_string(), 7),
                 style.unit(&lpad(&format_human(rest_up), 11)),
@@ -432,34 +497,56 @@ pub fn render_summary(records: Vec<ProxyRecord>, style: Style) -> Vec<String> {
 
     if !den_list.is_empty() {
         out.push(String::new());
-        out.push(format!("  {}", style.red(&format!("── denied {}", "─".repeat(w + 19 + extra)))));
+        out.push(format!(
+            "  {}",
+            style.red(&format!("── denied {}", "─".repeat(w + 19 + extra)))
+        ));
         for (h, conns) in &den_list {
-            out.push(format!("  {}{}", style.red(&pad(&clip(h, w), w)), lpad(&conns.to_string(), 7)));
+            out.push(format!(
+                "  {}{}",
+                style.red(&pad(&clip(h, w), w)),
+                lpad(&conns.to_string(), 7)
+            ));
         }
     }
 
     if !fail_list.is_empty() {
         out.push(String::new());
-        out.push(format!("  {}", style.yellow(&format!("── failed {}", "─".repeat(w + 19 + extra)))));
+        out.push(format!(
+            "  {}",
+            style.yellow(&format!("── failed {}", "─".repeat(w + 19 + extra)))
+        ));
         for ((h, err), conns) in &fail_list {
-            out.push(format!("  {}{}  {}",
+            out.push(format!(
+                "  {}{}  {}",
                 style.yellow(&pad(&clip(h, w), w)),
                 lpad(&conns.to_string(), 7),
-                style.dim(&format!("({})", err))));
+                style.dim(&format!("({})", err))
+            ));
         }
     }
 
     if !live.is_empty() {
         out.push(String::new());
-        out.push(format!("  {}", style.dim(&format!("── still open {}", "─".repeat(w + 15 + extra)))));
+        out.push(format!(
+            "  {}",
+            style.dim(&format!("── still open {}", "─".repeat(w + 15 + extra)))
+        ));
         let mut sorted_live = live.clone();
         sorted_live.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(Ordering::Equal));
-        
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
         for r in sorted_live {
             let hp = format!("{}:{}", r.host, r.port);
             let dur_secs = (now.floor() - r.ts).max(0.0);
-            out.push(format!("  {}{}", pad(&clip(&hp, w), w), style.dim(&lpad(&format_dur(dur_secs), 9))));
+            out.push(format!(
+                "  {}{}",
+                pad(&clip(&hp, w), w),
+                style.dim(&lpad(&format_dur(dur_secs), 9))
+            ));
         }
     }
 
@@ -486,9 +573,11 @@ mod tests {
     #[test]
     fn read_records_skips_blank_and_torn_lines() {
         let log = concat!(
-            r#"{"ev":"close","id":"1-1","ts":100.0,"host":"a.example","port":443,"up":10,"down":20,"ms":5.0,"verdict":"allow"}"#, "\n",
+            r#"{"ev":"close","id":"1-1","ts":100.0,"host":"a.example","port":443,"up":10,"down":20,"ms":5.0,"verdict":"allow"}"#,
             "\n",
-            r#"{"ev":"close","id":"1-2","ts":101.0,"host":"b.exam"#, "\n",
+            "\n",
+            r#"{"ev":"close","id":"1-2","ts":101.0,"host":"b.exam"#,
+            "\n",
         );
         let records = read_records(log.as_bytes());
         assert_eq!(records.len(), 1);
@@ -510,8 +599,12 @@ mod tests {
     #[test]
     fn styling_does_not_change_column_positions() {
         let records = vec![
-            rec(r#"{"ev":"close","id":"1-1","ts":100.0,"host":"api.anthropic.com","port":443,"up":1024,"down":1048576,"ms":5.0,"verdict":"allow"}"#),
-            rec(r#"{"ev":"close","id":"1-2","ts":110.0,"host":"telemetry.example.com","port":443,"up":0,"down":0,"ms":1.0,"verdict":"deny"}"#),
+            rec(
+                r#"{"ev":"close","id":"1-1","ts":100.0,"host":"api.anthropic.com","port":443,"up":1024,"down":1048576,"ms":5.0,"verdict":"allow"}"#,
+            ),
+            rec(
+                r#"{"ev":"close","id":"1-2","ts":110.0,"host":"telemetry.example.com","port":443,"up":0,"down":0,"ms":1.0,"verdict":"deny"}"#,
+            ),
         ];
 
         let plain = render_summary(records.clone(), Style::plain());
@@ -558,21 +651,42 @@ mod tests {
     #[test]
     fn plain_render_matches_the_documented_table() {
         let records = vec![
-            rec(r#"{"ev":"close","id":"1-1","ts":100.0,"host":"api.anthropic.com","port":443,"up":1024,"down":2048,"ms":5.0,"verdict":"allow"}"#),
-            rec(r#"{"ev":"close","id":"1-2","ts":160.0,"host":"proxy.example.com","port":443,"up":0,"down":0,"ms":1.0,"verdict":"error","err":"dns"}"#),
+            rec(
+                r#"{"ev":"close","id":"1-1","ts":100.0,"host":"api.anthropic.com","port":443,"up":1024,"down":2048,"ms":5.0,"verdict":"allow"}"#,
+            ),
+            rec(
+                r#"{"ev":"close","id":"1-2","ts":160.0,"host":"proxy.example.com","port":443,"up":0,"down":0,"ms":1.0,"verdict":"error","err":"dns"}"#,
+            ),
         ];
         let out = render_summary(records, Style::plain());
-        assert!(out.iter().all(|l| !l.contains('\x1b')), "no escapes when plain");
+        assert!(
+            out.iter().all(|l| !l.contains('\x1b')),
+            "no escapes when plain"
+        );
         assert!(out.iter().all(|l| !l.contains('█')), "no bars when plain");
-        assert_eq!(out[1], "=== Network Summary ===  1m 0s · 2 connections · 2 KiB in / 1 KiB out");
-        assert_eq!(out[3], "  HOST                  CONNS       SENT       RECV");
-        assert_eq!(out[4], "  api.anthropic.com         1      1 KiB      2 KiB");
-        assert!(out.iter().any(|l| l == "  proxy.example.com         1  (dns)"));
+        assert_eq!(
+            out[1],
+            "=== Network Summary ===  1m 0s · 2 connections · 2 KiB in / 1 KiB out"
+        );
+        assert_eq!(
+            out[3],
+            "  HOST                  CONNS       SENT       RECV"
+        );
+        assert_eq!(
+            out[4],
+            "  api.anthropic.com         1      1 KiB      2 KiB"
+        );
+        assert!(out
+            .iter()
+            .any(|l| l == "  proxy.example.com         1  (dns)"));
     }
 
     #[test]
     fn hyperlink_is_a_bare_path_when_plain() {
-        assert_eq!(hyperlink("log.jsonl", "/tmp/log.jsonl", Style::plain()), "log.jsonl");
+        assert_eq!(
+            hyperlink("log.jsonl", "/tmp/log.jsonl", Style::plain()),
+            "log.jsonl"
+        );
         let linked = hyperlink("log.jsonl", "/tmp/a b/log.jsonl", Style { on: true });
         assert!(linked.contains("file:///tmp/a%20b/log.jsonl"), "{}", linked);
         assert!(linked.contains("log.jsonl\x1b]8;;"), "{}", linked);

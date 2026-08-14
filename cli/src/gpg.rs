@@ -40,14 +40,14 @@ pub fn scan_gnupg_home(gnupg_home: &Path) -> Result<GpgScanStatus, GpgScanError>
                 if let Ok(mut f) = fs::File::open(&path) {
                     let bytes_read = f.read(&mut buf).unwrap_or(0);
                     let content = &buf[..bytes_read];
-                    
+
                     let mut header = String::with_capacity(bytes_read);
                     for &b in content {
                         if b != 0 {
                             header.push(b as char);
                         }
                     }
-                    
+
                     // Equivalent to `tr -s ' \t\n' ' '`
                     let mut squeezed = String::with_capacity(header.len());
                     let mut last_was_space = false;
@@ -73,7 +73,7 @@ pub fn scan_gnupg_home(gnupg_home: &Path) -> Result<GpgScanStatus, GpgScanError>
                         is_unsafe = true; // Anything unrecognised counts as unsafe
                     }
                 }
-                
+
                 if is_unsafe {
                     offenders.push(path);
                 }

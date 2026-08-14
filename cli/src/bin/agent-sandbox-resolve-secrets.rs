@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
+use agent_sandbox_cli::secrets::resolve_secrets_logic;
 use clap::Parser;
 use std::path::PathBuf;
-use agent_sandbox_cli::secrets::resolve_secrets_logic;
 
 #[derive(Parser, Debug)]
 #[command(name = "agent-sandbox-resolve-secrets")]

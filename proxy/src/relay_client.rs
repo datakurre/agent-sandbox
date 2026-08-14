@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use std::process::exit;
 use std::thread;
 
-use crate::relay_protocol::{write_frame, read_frame, CommandType, Frame, RelayHeader};
+use crate::relay_protocol::{read_frame, write_frame, CommandType, Frame, RelayHeader};
 
 pub fn run_client(cmd_type: CommandType) {
     let relay_addr = env::var("AGENT_SANDBOX_RELAY_ADDRESS")

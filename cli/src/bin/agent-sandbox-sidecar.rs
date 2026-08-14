@@ -367,7 +367,11 @@ fn main() -> Result<()> {
         "--log".to_string(),
         config.metrics_log.clone(),
         "--detail-log".to_string(),
-        if config.dry_run { "/dev/null".to_string() } else { DETAIL_LOG.to_string() },
+        if config.dry_run {
+            "/dev/null".to_string()
+        } else {
+            DETAIL_LOG.to_string()
+        },
         "--policy".to_string(),
         config.policy_file.clone(),
     ];

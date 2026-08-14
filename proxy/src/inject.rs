@@ -7,7 +7,13 @@ fn read_head<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut byte = [0u8; 1];
     loop {
         match reader.read(&mut byte) {
-            Ok(0) => return if buf.is_empty() { Ok(None) } else { Ok(Some(buf)) },
+            Ok(0) => {
+                return if buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(buf))
+                }
+            }
             Ok(1) => {
                 buf.push(byte[0]);
                 if buf.ends_with(b"\r\n\r\n") {
@@ -21,9 +27,19 @@ fn read_head<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
                 }
             }
             Ok(_) => unreachable!("single-byte buffer"),
-            Err(ref e) if e.kind() == ErrorKind::Interrupted || e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+            Err(ref e)
+                if e.kind() == ErrorKind::Interrupted
+                    || e.kind() == ErrorKind::WouldBlock
+                    || e.kind() == ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => {
-                return if buf.is_empty() { Ok(None) } else { Ok(Some(buf)) };
+                return if buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(buf))
+                };
             }
             Err(e) => return Err(e),
         }
@@ -52,7 +68,13 @@ fn read_line_crlf<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
                 }
             }
             Ok(_) => unreachable!("single-byte buffer"),
-            Err(ref e) if e.kind() == ErrorKind::Interrupted || e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+            Err(ref e)
+                if e.kind() == ErrorKind::Interrupted
+                    || e.kind() == ErrorKind::WouldBlock
+                    || e.kind() == ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => {
                 return if line.is_empty() {
                     Err(io::Error::new(
@@ -116,10 +138,12 @@ fn is_chunked(head: &str) -> bool {
 }
 
 fn request_method(head: &str) -> io::Result<&str> {
-    let request_line = head
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
+    let request_line = head.lines().next().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "request head is missing request line",
+        )
+    })?;
     request_line
         .split_whitespace()
         .next()
@@ -127,16 +151,18 @@ fn request_method(head: &str) -> io::Result<&str> {
 }
 
 fn request_path(head: &str) -> io::Result<String> {
-    let request_line = head
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
+    let request_line = head.lines().next().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "request head is missing request line",
+        )
+    })?;
     let mut parts = request_line.split_whitespace();
     parts.next(); // skip method
     let target = parts
         .next()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request target is missing"))?;
-    
+
     // Target could be absolute URI (http://host/path) or absolute path (/path)
     let path = if let Some(idx) = target.find("://") {
         let after_scheme = &target[idx + 3..];
@@ -151,10 +177,15 @@ fn request_path(head: &str) -> io::Result<String> {
     // Strip query string and fragment
     let path = path.split('?').next().unwrap_or(path);
     let path = path.split('#').next().unwrap_or(path);
-    
+
     // Percent decode
-    let decoded = percent_decode(path).map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("invalid percent encoding: {}", e)))?;
-    
+    let decoded = percent_decode(path).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid percent encoding: {}", e),
+        )
+    })?;
+
     // Dot segment removal
     let mut segments = Vec::new();
     for seg in decoded.split('/') {
@@ -162,25 +193,30 @@ fn request_path(head: &str) -> io::Result<String> {
             continue;
         } else if seg == ".." {
             if segments.is_empty() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "invalid path: unresolved '..'"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid path: unresolved '..'",
+                ));
             }
             segments.pop();
         } else {
             segments.push(seg);
         }
     }
-    
+
     let mut normalized = segments.join("/");
     if decoded.starts_with('/') && !normalized.starts_with('/') {
         normalized.insert(0, '/');
     }
-    if (decoded.ends_with('/') || decoded.ends_with("/.") || decoded.ends_with("/..")) && !normalized.ends_with('/') {
+    if (decoded.ends_with('/') || decoded.ends_with("/.") || decoded.ends_with("/.."))
+        && !normalized.ends_with('/')
+    {
         normalized.push('/');
     }
     if normalized.is_empty() {
         normalized.push('/');
     }
-    
+
     Ok(normalized)
 }
 
@@ -263,7 +299,10 @@ fn authority_host_port(authority: &str, default_port: u16) -> io::Result<(String
     Ok((host.trim_end_matches('.').to_ascii_lowercase(), port))
 }
 
-fn request_target_authority(request_target: &str, default_port: u16) -> io::Result<Option<(String, u16)>> {
+fn request_target_authority(
+    request_target: &str,
+    default_port: u16,
+) -> io::Result<Option<(String, u16)>> {
     let Some((scheme, rest)) = request_target.split_once("://") else {
         return Ok(None);
     };
@@ -308,10 +347,12 @@ fn validate_request_authority(
     expected_host: &str,
     expected_port: u16,
 ) -> io::Result<()> {
-    let request_line = head
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
+    let request_line = head.lines().next().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "request head is missing request line",
+        )
+    })?;
     let mut parts = request_line.split_whitespace();
     let _method = parts
         .next()
@@ -320,7 +361,10 @@ fn validate_request_authority(
         .next()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request target is missing"))?;
 
-    let expected = (expected_host.trim_end_matches('.').to_ascii_lowercase(), expected_port);
+    let expected = (
+        expected_host.trim_end_matches('.').to_ascii_lowercase(),
+        expected_port,
+    );
     let target_authority = request_target_authority(target, expected_port)?;
     let host_authority = host_header_authority(head, expected_port)?;
 
@@ -353,10 +397,12 @@ fn validate_request_authority(
 }
 
 fn response_status_code(head: &str) -> io::Result<u16> {
-    let status_line = head
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "response head is missing status line"))?;
+    let status_line = head.lines().next().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "response head is missing status line",
+        )
+    })?;
     let mut parts = status_line.split_whitespace();
     let _http = parts
         .next()
@@ -378,7 +424,10 @@ fn rewrite_head(head: &[u8], header_name: &str, header_value: &str) -> io::Resul
 
     let mut lines = head_str.split("\r\n");
     let request_line = lines.next().ok_or_else(|| {
-        io::Error::new(ErrorKind::InvalidData, "request head is missing request line")
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "request head is missing request line",
+        )
     })?;
     if request_line.split_whitespace().count() < 3 {
         return Err(io::Error::new(
@@ -423,12 +472,23 @@ fn copy_exact<R: Read, W: Write>(reader: &mut R, writer: &mut W, len: usize) -> 
         let mut chunk_pos = 0;
         while chunk_left > 0 {
             match reader.read(&mut buf[chunk_pos..chunk_pos + chunk_left]) {
-                Ok(0) => return Err(io::Error::new(ErrorKind::UnexpectedEof, "unexpected EOF in copy_exact")),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "unexpected EOF in copy_exact",
+                    ))
+                }
                 Ok(n) => {
                     chunk_left -= n;
                     chunk_pos += n;
                 }
-                Err(ref e) if e.kind() == ErrorKind::Interrupted || e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+                Err(ref e)
+                    if e.kind() == ErrorKind::Interrupted
+                        || e.kind() == ErrorKind::WouldBlock
+                        || e.kind() == ErrorKind::TimedOut =>
+                {
+                    continue
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -479,7 +539,13 @@ fn copy_to_eof<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<
                 writer.write_all(&buf[..n])?;
                 copied += n as u64;
             }
-            Err(ref e) if e.kind() == ErrorKind::Interrupted || e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+            Err(ref e)
+                if e.kind() == ErrorKind::Interrupted
+                    || e.kind() == ErrorKind::WouldBlock
+                    || e.kind() == ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(copied),
             Err(e) => return Err(e),
         }
@@ -588,26 +654,39 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
                 io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
             })?;
             validate_request_authority(request_text, expected_host, expected_port)?;
-            
+
             let has_cl = content_length(request_text)?.is_some();
             let has_te = is_chunked(request_text);
             if has_cl && has_te {
                 let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
-                return Err(io::Error::new(ErrorKind::InvalidData, "request has both Content-Length and Transfer-Encoding"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "request has both Content-Length and Transfer-Encoding",
+                ));
             }
-            
+
             // Also check if Transfer-Encoding is something other than "chunked"
             if has_te {
-                let te_valid = request_text.lines().skip(1).filter_map(|line| {
-                    let line = line.trim_end_matches('\r');
-                    if line.is_empty() { return None; }
-                    line.split_once(':')
-                }).any(|(name, value)| {
-                    name.eq_ignore_ascii_case("transfer-encoding") && value.trim().eq_ignore_ascii_case("chunked")
-                });
+                let te_valid = request_text
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| {
+                        let line = line.trim_end_matches('\r');
+                        if line.is_empty() {
+                            return None;
+                        }
+                        line.split_once(':')
+                    })
+                    .any(|(name, value)| {
+                        name.eq_ignore_ascii_case("transfer-encoding")
+                            && value.trim().eq_ignore_ascii_case("chunked")
+                    });
                 if !te_valid {
                     let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
-                    return Err(io::Error::new(ErrorKind::InvalidData, "invalid Transfer-Encoding"));
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "invalid Transfer-Encoding",
+                    ));
                 }
             }
 
@@ -651,7 +730,7 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             })?;
             let status = response_status_code(response_text)?;
             last_status = Some(status);
-            
+
             if response_has_no_body(&method, status) {
                 continue;
             }
@@ -680,22 +759,21 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             status: last_status,
             secret_missing,
         }),
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-            Err(ProxyHttpError::L7Denied {
-                method: last_method.unwrap_or_default(),
-                path: last_path.unwrap_or_default(),
-                reason: e.into_inner().map(|i| i.to_string()).unwrap_or_else(|| "L7 denied".to_string()),
-            })
-        }
-        Err(e) => {
-            Err(ProxyHttpError::Io {
-                method: last_method,
-                path: last_path,
-                status: last_status,
-                secret_missing,
-                error: e,
-            })
-        }
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => Err(ProxyHttpError::L7Denied {
+            method: last_method.unwrap_or_default(),
+            path: last_path.unwrap_or_default(),
+            reason: e
+                .into_inner()
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "L7 denied".to_string()),
+        }),
+        Err(e) => Err(ProxyHttpError::Io {
+            method: last_method,
+            path: last_path,
+            status: last_status,
+            secret_missing,
+            error: e,
+        }),
     }
 }
 
@@ -768,7 +846,12 @@ mod tests {
         .expect("pump");
         assert_eq!(written as usize, output.len());
         let rendered = String::from_utf8(output).expect("utf8 output");
-        assert_eq!(rendered.matches("Authorization: Bearer injected-secret").count(), 2);
+        assert_eq!(
+            rendered
+                .matches("Authorization: Bearer injected-secret")
+                .count(),
+            2
+        );
         assert!(!rendered.contains("Authorization: old"));
         assert!(!rendered.contains("authorization: old2"));
     }
@@ -786,7 +869,8 @@ mod tests {
 
     #[test]
     fn keeps_chunked_body() {
-        let input = b"POST /chunk HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n\
+        let input =
+            b"POST /chunk HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n\
                       4\r\ntest\r\n0\r\n\r\n";
         let mut reader: &[u8] = input;
         let mut output = Vec::new();
@@ -805,21 +889,23 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        let outcome =
-            proxy_http1_with_injection(
-                &mut client,
-                &mut upstream,
-                "example.com",
-                80,
-                Some(("Authorization", "Bearer v")),
-                &crate::dummy_shared(),
-            )
-            .expect("proxy");
+        let outcome = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            Some(("Authorization", "Bearer v")),
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
 
         assert_eq!(outcome.up_bytes as usize, upstream.written.len());
         assert_eq!(outcome.down_bytes as usize, client.written.len());
         let upstream_rendered = String::from_utf8(upstream.written).expect("utf8");
-        assert_eq!(upstream_rendered.matches("Authorization: Bearer v").count(), 2);
+        assert_eq!(
+            upstream_rendered.matches("Authorization: Bearer v").count(),
+            2
+        );
         assert!(!upstream_rendered.contains("Authorization: old"));
 
         let client_rendered = String::from_utf8(client.written).expect("utf8");

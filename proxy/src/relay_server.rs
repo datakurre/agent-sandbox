@@ -47,9 +47,8 @@ fn extract_ssh_destination(args: &[String]) -> Option<String> {
     // Options whose next argument is a value (not a host).
     // Complete list from ssh(1) man page.
     const TAKES_ARG: &[&str] = &[
-        "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i",
-        "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R",
-        "-S", "-W", "-w",
+        "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o",
+        "-p", "-Q", "-R", "-S", "-W", "-w",
     ];
 
     let mut skip_next = false;
@@ -103,15 +102,20 @@ fn validate_gpg_args(args: &[String]) -> bool {
     let mut has_signing_intent = false;
     for arg in args {
         let lower = arg.to_ascii_lowercase();
-        if lower.starts_with("--homedir") 
-            || lower.contains("export") 
-            || lower.contains("decrypt") 
-            || lower == "-d" 
+        if lower.starts_with("--homedir")
+            || lower.contains("export")
+            || lower.contains("decrypt")
+            || lower == "-d"
         {
             return false;
         }
-        
-        if lower == "--sign" || lower == "--detach-sign" || lower == "--clearsign" || lower == "--verify" || lower == "--clear-sign" {
+
+        if lower == "--sign"
+            || lower == "--detach-sign"
+            || lower == "--clearsign"
+            || lower == "--verify"
+            || lower == "--clear-sign"
+        {
             has_signing_intent = true;
         } else if lower.starts_with('-') && !lower.starts_with("--") {
             if lower.contains('s') || lower.contains('b') || lower.contains('v') {
@@ -154,13 +158,25 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
         CommandType::Gpg => {
             let allowed = !allow_signing_rules.is_empty();
             let safe_args = validate_gpg_args(&req.args);
-            
-            log_relay("gpg", None, allowed && safe_args, if !allowed { "no allow_signing rules" } else if !safe_args { "disallowed gpg arguments" } else { "" });
+
+            log_relay(
+                "gpg",
+                None,
+                allowed && safe_args,
+                if !allowed {
+                    "no allow_signing rules"
+                } else if !safe_args {
+                    "disallowed gpg arguments"
+                } else {
+                    ""
+                },
+            );
             if !allowed || !safe_args {
                 let msg = if !allowed {
                     b"agent-sandbox: gpg denied: no allow_signing rules in policy\n".as_slice()
                 } else {
-                    b"agent-sandbox: gpg denied: disallowed or dangerous arguments detected\n".as_slice()
+                    b"agent-sandbox: gpg denied: disallowed or dangerous arguments detected\n"
+                        .as_slice()
                 };
                 let _ = write_frame(&mut stream, &Frame::Stderr(msg.to_vec()));
                 let _ = write_frame(&mut stream, &Frame::Exit(255));
@@ -169,16 +185,25 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
             // Resolved through PATH: the image is a Nix closure, where the
             // only thing under /usr/bin is `env`.
             ("gpg", false)
-        },
+        }
         CommandType::Ssh => {
             let host = extract_ssh_destination(&req.args);
-            
+
             // Check for dangerous SSH arguments
             for arg in &req.args {
                 let lower = arg.to_ascii_lowercase();
-                if lower.contains("proxycommand") || lower.contains("proxyusefdpass") || lower.contains("localcommand") || lower.contains("permitlocalcommand") {
+                if lower.contains("proxycommand")
+                    || lower.contains("proxyusefdpass")
+                    || lower.contains("localcommand")
+                    || lower.contains("permitlocalcommand")
+                {
                     eprintln!("relay-server: ssh command contains dangerous options");
-                    let _ = write_frame(&mut stream, &Frame::Stderr(b"agent-sandbox: ssh denied: dangerous options detected\n".to_vec()));
+                    let _ = write_frame(
+                        &mut stream,
+                        &Frame::Stderr(
+                            b"agent-sandbox: ssh denied: dangerous options detected\n".to_vec(),
+                        ),
+                    );
                     let _ = write_frame(&mut stream, &Frame::Exit(255));
                     return;
                 }
@@ -193,20 +218,45 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
                         }
                     }
 
-                    log_relay("ssh", Some(&dest), allowed, if allowed { "" } else { "denied by allow_signing policy" });
+                    log_relay(
+                        "ssh",
+                        Some(&dest),
+                        allowed,
+                        if allowed {
+                            ""
+                        } else {
+                            "denied by allow_signing policy"
+                        },
+                    );
 
                     if !allowed {
-                        eprintln!("relay-server: ssh to {} denied by allow_signing policy", dest);
-                        let _ = write_frame(&mut stream, &Frame::Stderr(format!("agent-sandbox: ssh to {} denied by allow_signing policy\n", dest).into_bytes()));
+                        eprintln!(
+                            "relay-server: ssh to {} denied by allow_signing policy",
+                            dest
+                        );
+                        let _ = write_frame(
+                            &mut stream,
+                            &Frame::Stderr(
+                                format!(
+                                    "agent-sandbox: ssh to {} denied by allow_signing policy\n",
+                                    dest
+                                )
+                                .into_bytes(),
+                            ),
+                        );
                         let _ = write_frame(&mut stream, &Frame::Exit(255));
                         return;
                     }
                 }
                 None => {
                     log_relay("ssh", None, false, "could not determine destination");
-                    let _ = write_frame(&mut stream, &Frame::Stderr(
-                        b"agent-sandbox: ssh denied: could not determine destination host\n".to_vec()
-                    ));
+                    let _ = write_frame(
+                        &mut stream,
+                        &Frame::Stderr(
+                            b"agent-sandbox: ssh denied: could not determine destination host\n"
+                                .to_vec(),
+                        ),
+                    );
                     let _ = write_frame(&mut stream, &Frame::Exit(255));
                     return;
                 }
@@ -217,7 +267,7 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
 
     let mut cmd = Command::new(bin);
     cmd.args(&req.args);
-    
+
     // Only pass through a strict whitelist of safe environment variables from the sandbox
     for (k, v) in req.envs {
         let k_str = k.as_str();
@@ -239,7 +289,12 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = write_frame(&mut stream, &Frame::Stderr(format!("relay-server: failed to spawn {}: {}\n", bin, e).into_bytes()));
+            let _ = write_frame(
+                &mut stream,
+                &Frame::Stderr(
+                    format!("relay-server: failed to spawn {}: {}\n", bin, e).into_bytes(),
+                ),
+            );
             let _ = write_frame(&mut stream, &Frame::Exit(255));
             return;
         }
@@ -284,7 +339,9 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
             match child_stdout.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if write_frame(&mut stream_write_stdout, &Frame::Stdout(buf[..n].to_vec())).is_err() {
+                    if write_frame(&mut stream_write_stdout, &Frame::Stdout(buf[..n].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -299,7 +356,9 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
             match child_stderr.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if write_frame(&mut stream_write_stderr, &Frame::Stderr(buf[..n].to_vec())).is_err() {
+                    if write_frame(&mut stream_write_stderr, &Frame::Stderr(buf[..n].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -420,7 +479,8 @@ mod tests {
     fn real_git_ssh_invocation() {
         // git push typically does: ssh [-p port] [user@]host git-upload-pack 'repo'
         let args = vec![
-            "-o".into(), "SendEnv=GIT_PROTOCOL".into(),
+            "-o".into(),
+            "SendEnv=GIT_PROTOCOL".into(),
             "git@github.com".into(),
             "git-upload-pack".into(),
             "user/repo.git".into(),

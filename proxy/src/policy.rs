@@ -1,6 +1,6 @@
+use crate::secret::SecretBindings;
 use ipnet::IpNet;
 use std::net::IpAddr;
-use crate::secret::SecretBindings;
 
 /// A single port, or an inclusive range (`8000-8100`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +105,9 @@ impl ProxyConfig {
     }
 
     pub fn is_l7_allowed(&self, host: &str, method: &str, path: &str) -> bool {
-        let matching_rules: Vec<_> = self.l7_rules.iter()
+        let matching_rules: Vec<_> = self
+            .l7_rules
+            .iter()
             .filter(|r| domain_match(host, &r.domain))
             .collect();
         if matching_rules.is_empty() {
@@ -120,23 +122,31 @@ impl ProxyConfig {
     /// empty string when the request is actually allowed, but callers should
     /// only invoke this after `is_l7_allowed` has already returned false.
     pub fn why_l7_denied(&self, host: &str, method: &str, path: &str) -> String {
-        let matching_rules: Vec<_> = self.l7_rules.iter()
+        let matching_rules: Vec<_> = self
+            .l7_rules
+            .iter()
             .filter(|r| domain_match(host, &r.domain))
             .collect();
         if matching_rules.is_empty() {
             return format!("no L7 allow rules for domain {:?}", host);
         }
-        let method_matches: Vec<_> = matching_rules.iter()
+        let method_matches: Vec<_> = matching_rules
+            .iter()
             .filter(|r| r.method == method || r.method == "*")
             .collect();
         if method_matches.is_empty() {
             let methods: Vec<_> = matching_rules.iter().map(|r| r.method.as_str()).collect();
             return format!(
                 "domain {:?} has L7 rules but none allow method {:?}; configured methods: {}",
-                host, method, methods.join(", ")
+                host,
+                method,
+                methods.join(", ")
             );
         }
-        let patterns: Vec<_> = method_matches.iter().map(|r| r.path_pattern.as_str()).collect();
+        let patterns: Vec<_> = method_matches
+            .iter()
+            .map(|r| r.path_pattern.as_str())
+            .collect();
         format!(
             "domain {:?} allows method {:?} but path {:?} does not match any configured pattern; configured patterns: {}",
             host, method, path, patterns.join(", ")
@@ -166,7 +176,10 @@ impl ProxyConfig {
             }
         }
         for r in &self.l7_rules {
-            out.push(format!("allow_l7\t{}\t{}\t{}", r.domain, r.method, r.path_pattern));
+            out.push(format!(
+                "allow_l7\t{}\t{}\t{}",
+                r.domain, r.method, r.path_pattern
+            ));
         }
         out.push(format!(
             "default {}",
@@ -191,10 +204,7 @@ pub fn parse_net(s: &str) -> Result<IpNet, String> {
     }
     match s.parse::<IpAddr>() {
         Ok(ip) => Ok(IpNet::from(ip)),
-        Err(e) => Err(format!(
-            "{:?} is not an IP address or CIDR block: {}",
-            s, e
-        )),
+        Err(e) => Err(format!("{:?} is not an IP address or CIDR block: {}", s, e)),
     }
 }
 
@@ -233,16 +243,20 @@ fn parse_target_with_ports(s: &str) -> Result<(String, Option<Vec<PortRange>>), 
     if let Some(pos) = s.rfind(':') {
         let left = &s[..pos];
         let right = &s[pos + 1..];
-        
-        let looks_like_port = !right.is_empty() && right.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '-');
+
+        let looks_like_port = !right.is_empty()
+            && right
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ',' || c == '-');
         let is_unbracketed_ipv6 = left.contains(':') && !left.starts_with('[');
-        
+
         if looks_like_port && !is_unbracketed_ipv6 {
             let host = if left.starts_with('[') && left.ends_with(']') {
-                &left[1..left.len()-1]
+                &left[1..left.len() - 1]
             } else {
                 left
-            }.to_string();
+            }
+            .to_string();
             let ports = parse_csv_ports(right)?;
             return Ok((host, Some(ports)));
         }
@@ -258,7 +272,10 @@ pub fn parse_ip_target(s: &str) -> Result<TargetRule<IpNet>, String> {
 
 pub fn parse_domain_target(s: &str) -> Result<TargetRule<String>, String> {
     let (host, ports) = parse_target_with_ports(s)?;
-    Ok(TargetRule { target: host.to_ascii_lowercase(), ports })
+    Ok(TargetRule {
+        target: host.to_ascii_lowercase(),
+        ports,
+    })
 }
 
 pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
@@ -289,7 +306,10 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
         // so it is exempt from the "no whitespace in values" rule that guards
         // every other key against the old space-separated encoding.
         if key != "allow_l7" && value.chars().any(char::is_whitespace) {
-            return Err(format!("{}: {}: {:?} contains whitespace", lineno, key, value));
+            return Err(format!(
+                "{}: {}: {:?} contains whitespace",
+                lineno, key, value
+            ));
         }
 
         match key {
@@ -341,8 +361,8 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
 }
 
 pub fn load_policy(path: &str) -> Result<ProxyConfig, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read policy {}: {}", path, e))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read policy {}: {}", path, e))?;
     parse_policy(&text).map_err(|e| format!("{}:{}", path, e))
 }
 
@@ -417,7 +437,11 @@ pub fn has_backed_secret_domains(config: &ProxyConfig, secrets: &SecretBindings)
     })
 }
 
-fn is_port_in_target_ports(port: u16, target_ports: Option<&Vec<PortRange>>, global_ports: Option<&[PortRange]>) -> bool {
+fn is_port_in_target_ports(
+    port: u16,
+    target_ports: Option<&Vec<PortRange>>,
+    global_ports: Option<&[PortRange]>,
+) -> bool {
     match target_ports {
         Some(ports) => ports.iter().any(|r| r.contains(port)),
         None => global_ports.map_or(true, |ranges| ranges.iter().any(|r| r.contains(port))),
@@ -513,7 +537,10 @@ impl ProxyConfig {
             Some(h) => h,
             None => return false,
         };
-        match host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        match host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<IpAddr>()
+        {
             Ok(ip) => self.is_allowed_ip(ip),
             Err(_) => self.is_allowed_domain(&host),
         }
@@ -530,7 +557,10 @@ impl ProxyConfig {
             Some(h) => h,
             None => return false,
         };
-        match host_normalized.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        match host_normalized
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<IpAddr>()
+        {
             Ok(ip) => {
                 let (allowed, winner_ports) = self.check_ip(ip);
                 allowed && is_port_in_target_ports(port, winner_ports, self.allow_ports.as_deref())
@@ -567,7 +597,10 @@ impl ProxyConfig {
         match winner {
             Some((pattern, true)) => format!("matches deny_domains {:?}", pattern),
             Some((pattern, false)) => format!("matches allow_domains {:?}", pattern),
-            None => format!("no allow_domains rule matches {:?}; default is deny", domain),
+            None => format!(
+                "no allow_domains rule matches {:?}; default is deny",
+                domain
+            ),
         }
     }
 
@@ -605,7 +638,10 @@ impl ProxyConfig {
             Some(h) => h,
             None => return format!("{:?} is not a valid host", host),
         };
-        match normalized.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        match normalized
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<IpAddr>()
+        {
             Ok(ip) => self.why_ip_denied(ip),
             Err(_) => self.why_domain_denied(&normalized),
         }
@@ -616,7 +652,11 @@ impl ProxyConfig {
         match &self.allow_ports {
             Some(ranges) => {
                 let list: Vec<String> = ranges.iter().map(|r| r.to_string()).collect();
-                format!("port {} is not in allow_ports (configured: {})", port, list.join(", "))
+                format!(
+                    "port {} is not in allow_ports (configured: {})",
+                    port,
+                    list.join(", ")
+                )
             }
             None => format!("port {} is not allowed", port),
         }
@@ -660,14 +700,21 @@ impl ProxyConfig {
             Some(h) => h,
             None => return format!("{:?} is not a valid host", host),
         };
-        let (allowed, winner_ports, why_target) = match host_normalized.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        let (allowed, winner_ports, why_target) = match host_normalized
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<IpAddr>()
+        {
             Ok(ip) => {
                 let (allowed, winner_ports) = self.check_ip(ip);
                 (allowed, winner_ports, self.why_ip_denied(ip))
             }
             Err(_) => {
                 let (allowed, winner_ports) = self.check_domain(&host_normalized);
-                (allowed, winner_ports, self.why_domain_denied(&host_normalized))
+                (
+                    allowed,
+                    winner_ports,
+                    self.why_domain_denied(&host_normalized),
+                )
             }
         };
 
@@ -677,15 +724,24 @@ impl ProxyConfig {
             match winner_ports {
                 Some(ports) => {
                     let list: Vec<String> = ports.iter().map(|r| r.to_string()).collect();
-                    format!("port {} is not in target's allowed ports (configured: {})", port, list.join(", "))
+                    format!(
+                        "port {} is not in target's allowed ports (configured: {})",
+                        port,
+                        list.join(", ")
+                    )
                 }
                 None => match &self.allow_ports {
                     Some(global_ports) => {
-                        let list: Vec<String> = global_ports.iter().map(|r| r.to_string()).collect();
-                        format!("port {} is not in global allow_ports (configured: {})", port, list.join(", "))
+                        let list: Vec<String> =
+                            global_ports.iter().map(|r| r.to_string()).collect();
+                        format!(
+                            "port {} is not in global allow_ports (configured: {})",
+                            port,
+                            list.join(", ")
+                        )
                     }
                     None => format!("port {} is not allowed", port),
-                }
+                },
             }
         } else {
             "unknown denial reason".to_string()
@@ -697,7 +753,11 @@ impl ProxyConfig {
             Some(h) => h,
             None => return false,
         };
-        if host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().is_ok() {
+        if host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<IpAddr>()
+            .is_ok()
+        {
             return false;
         }
         self.secret_domains
@@ -767,7 +827,8 @@ mod tests {
 
     #[test]
     fn why_target_denied_names_the_winning_deny_domains_pattern() {
-        let cfg = parse_policy("allow_domains *.example.com\ndeny_domains internal.example.com\n").unwrap();
+        let cfg = parse_policy("allow_domains *.example.com\ndeny_domains internal.example.com\n")
+            .unwrap();
         assert!(!cfg.is_allowed_target("internal.example.com"));
         let reason = cfg.why_target_denied("internal.example.com");
         assert!(reason.contains("deny_domains"), "{reason}");
@@ -790,7 +851,10 @@ mod tests {
         assert!(!cfg.is_allowed_target("10.5.1.1"));
         let reason = cfg.why_target_denied("10.5.1.1");
         assert!(reason.contains("deny_ips"), "{reason}");
-        assert!(reason.contains(&ip.to_string()) || reason.contains("10.5.0.0/16"), "{reason}");
+        assert!(
+            reason.contains(&ip.to_string()) || reason.contains("10.5.0.0/16"),
+            "{reason}"
+        );
     }
 
     #[test]
