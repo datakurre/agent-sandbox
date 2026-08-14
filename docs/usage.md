@@ -121,10 +121,11 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
    - `h`: Allow HTTP route (domain + method) (creates a `[[network.rules]]` rule)
    - `A`: Allow IP
    - `r`: Switch to the Rules view — the live effective policy, with `x` to remove a rule (blocked for rules that came from `AGENTS.md`)
+   - `d`: Show sanitized details for the selected denial; use `↑`/`↓` to scroll and `Esc` to return
    - `q` or `Esc`: Quit the TUI
 4. **Save Rules**: When you've trained the proxy to your liking, export the active rules by running `agent-sandbox ctl proxy export > AGENTS.md` (or append them to your existing `[network]` blocks).
 
-The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `d`/`D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
+The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Press `d` on a row to inspect the latest sanitized request head, including its method, target, path, and non-sensitive headers. The detail stream is ephemeral, capped at 4 MiB, and the TUI retains at most 200 rows with one bounded detail per row. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
 
 ### Git Integration Details
 

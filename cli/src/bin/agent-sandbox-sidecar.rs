@@ -14,6 +14,7 @@ use std::time::Duration;
 const POLICY_FILE: &str = "/sidecar_policy/policy";
 const SECRET_BINDINGS_FILE: &str = "/sidecar_secrets/bindings";
 const METRICS_LOG: &str = "/sidecar_shared/connections.jsonl";
+const DETAIL_LOG: &str = "/sidecar_shared/denied-requests.jsonl";
 const EXEMPT_PROTO: &str = "200";
 const RESOLV_CONF: &str = "/etc/resolv.conf";
 
@@ -365,6 +366,8 @@ fn main() -> Result<()> {
     let mut proxy_args = vec![
         "--log".to_string(),
         config.metrics_log.clone(),
+        "--detail-log".to_string(),
+        if config.dry_run { "/dev/null".to_string() } else { DETAIL_LOG.to_string() },
         "--policy".to_string(),
         config.policy_file.clone(),
     ];

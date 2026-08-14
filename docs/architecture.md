@@ -130,7 +130,7 @@ Three directories, and which side can see them is the design:
 | Path | Mounted into | Contents |
 | --- | --- | --- |
 | `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base`, `policy.baseline` |
-| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `ca.pem`, `connections.jsonl`, `relay.jsonl` |
+| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `ca.pem`, `connections.jsonl`, `denied-requests.jsonl`, `relay.jsonl` |
 | `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
 | (host temp dirs) | — | removed when the launcher exits |
 

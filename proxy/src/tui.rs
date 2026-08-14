@@ -57,6 +57,14 @@ struct ConnEvent {
     ts: Option<u64>,
 }
 
+#[derive(Deserialize, Debug)]
+struct DetailEvent {
+    host: String,
+    port: u16,
+    reason: String,
+    request: String,
+}
+
 /// A denied host/port, deduplicated across repeats so a retrying agent
 /// doesn't spam the list with one row per attempt.
 #[derive(Debug, Clone)]
@@ -65,6 +73,7 @@ struct DeniedEntry {
     port: u16,
     reason: Option<String>,
     method: Option<String>,
+    detail: Option<String>,
     count: u32,
     last_seen: u64,
 }
@@ -84,6 +93,7 @@ impl DeniedEntry {
 /// `connections.jsonl` has no size cap, so the in-memory denied set doesn't
 /// either unless bounded here.
 const MAX_DENIED_ROWS: usize = 200;
+const MAX_DETAIL_BYTES_PER_ROW: usize = 16 * 1024;
 
 /// Whether `h` (allow HTTP route) makes sense for this row: only once a real
 /// HTTP method is known. A domain/IP-level deny before any L7 check ran
@@ -137,6 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sidecar_policy = &args[2];
     let sidecar_shared = &args[3];
     let connections_log = format!("{}/connections.jsonl", sidecar_shared);
+    let details_log = format!("{}/denied-requests.jsonl", sidecar_shared);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -158,6 +169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut conn_file = None;
     let mut conn_pos = 0;
+    let mut details_file = None;
+    let mut details_pos = 0;
+    let mut show_detail = false;
+    let mut detail_scroll = 0;
 
     loop {
         if let Some(until) = status_until {
@@ -173,6 +188,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if let Some(ref mut reader) = conn_file {
+            if let Ok(meta) = reader.get_ref().metadata() {
+                if meta.len() < conn_pos { conn_pos = 0; }
+            }
             let _ = reader.seek(SeekFrom::Start(conn_pos));
             let mut line = String::new();
             while let Ok(n) = reader.read_line(&mut line) {
@@ -196,6 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 port,
                                 reason: None,
                                 method: None,
+                                detail: None,
                                 count: 0,
                                 last_seen: ts,
                             });
@@ -220,6 +239,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(pos) = reader.stream_position() {
                 conn_pos = pos;
             }
+        }
+
+        if details_file.is_none() {
+            if let Ok(f) = fs::File::open(&details_log) {
+                details_file = Some(io::BufReader::new(f));
+            }
+        }
+        if let Some(ref mut reader) = details_file {
+            if let Ok(meta) = reader.get_ref().metadata() {
+                if meta.len() < details_pos { details_pos = 0; }
+            }
+            let _ = reader.seek(SeekFrom::Start(details_pos));
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line) {
+                if n == 0 { break; }
+                if !line.ends_with('\n') {
+                    let _ = reader.seek(SeekFrom::Current(-(line.len() as i64)));
+                    break;
+                }
+                if let Ok(ev) = serde_json::from_str::<DetailEvent>(&line) {
+                    if let Some(entry) = denied_reqs.get_mut(&(ev.host, ev.port)) {
+                        entry.detail = Some(format!("Reason: {}\n\n{}", ev.reason,
+                            ev.request.chars().take(MAX_DETAIL_BYTES_PER_ROW).collect::<String>()));
+                        entry.reason = Some(ev.reason.clone());
+                    }
+                }
+                line.clear();
+            }
+            if let Ok(pos) = reader.stream_position() { details_pos = pos; }
         }
 
         let mut denied_list: Vec<DeniedEntry> = denied_reqs.values().cloned().collect();
@@ -263,7 +311,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match view {
                 View::Requests => {
-                    if denied_list.is_empty() {
+                    if show_detail {
+                        let text = denied_list.get(selected_idx)
+                            .and_then(|d| d.detail.as_deref())
+                            .unwrap_or("No detailed request is available for this denial yet.");
+                        let detail = Paragraph::new(text)
+                            .scroll((detail_scroll, 0))
+                            .block(Block::default().borders(Borders::ALL).title("Denied Request Details (redacted)"));
+                        f.render_widget(detail, chunks[1]);
+                    } else if denied_list.is_empty() {
                         let p = Paragraph::new("No denied requests yet. Waiting for sandbox egress...")
                             .style(Style::default().fg(Color::DarkGray))
                             .block(Block::default().borders(Borders::ALL).title("Denied Requests (0)"));
@@ -356,7 +412,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let legend_text = match view {
-                View::Requests => "↑/↓ select   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[r] Rules view   [c] Clear   [q]/[Esc] Quit",
+                View::Requests if show_detail => "↑/↓ scroll   [d]/[Esc] Back   [q] Quit",
+                View::Requests => "↑/↓ select   [d] Details   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[r] Rules view   [c] Clear   [q]/[Esc] Quit",
                 View::Rules => "↑/↓ select   [x] Remove rule (blocked for built-in/AGENTS.md rules)\n[r] Requests view   [q]/[Esc] Quit",
             };
             let instructions = Paragraph::new(legend_text)
@@ -375,12 +432,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') => break,
+                    KeyCode::Esc if show_detail => { show_detail = false; detail_scroll = 0; }
+                    KeyCode::Esc => break,
                     KeyCode::Up => match view {
+                        View::Requests if show_detail => detail_scroll = detail_scroll.saturating_sub(1),
                         View::Requests => selected_idx = selected_idx.saturating_sub(1),
                         View::Rules => rules_selected_idx = rules_selected_idx.saturating_sub(1),
                     },
                     KeyCode::Down => match view {
+                        View::Requests if show_detail => detail_scroll = detail_scroll.saturating_add(1),
                         View::Requests => {
                             selected_idx = (selected_idx + 1).min(denied_list.len().saturating_sub(1));
                         }
@@ -399,7 +460,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         denied_list.clear();
                         selected_idx = 0;
                     }
-                    KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('h') if view == View::Requests => {
+                    KeyCode::Char('d') if view == View::Requests && !denied_list.is_empty() => {
+                        show_detail = !show_detail;
+                        detail_scroll = 0;
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('h') if view == View::Requests && !show_detail => {
                         if !denied_list.is_empty() && selected_idx < denied_list.len() {
                             let row = &denied_list[selected_idx];
                             let host = row.host.clone();

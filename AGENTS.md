@@ -108,7 +108,7 @@ Three directories, and which side can see them is the design:
 | Path | Mounted into | Contents |
 | --- | --- | --- |
 | `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base` |
-| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `connections.jsonl` |
+| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `connections.jsonl`, `denied-requests.jsonl` |
 | `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
 | (host temp dirs) | — | removed by the launcher's exit trap |
 

@@ -97,7 +97,7 @@ The `[network]` block supports `allow` and `[[network.rules]]` for granular cont
 - `agent-sandbox ctl net` / `net -f` — the summary above for the session so far, or a live feed.
 - `agent-sandbox ctl logs [-f]` — the proxy's own log: the policy it started with, and every denial as it happens.
 - `agent-sandbox ctl proxy show|allow|rm|reset|export|check` — read and change the policy of a **running** sandbox.
-- A connection record is written when it *closes*, plus one when it opens, so a long-lived HTTPS tunnel appears as `in flight` under `── still open ──` rather than as traffic. Non-secret HTTPS stays opaque; request-level logging is still not emitted.
+- A connection record is written when it *closes*, plus one when it opens, so a long-lived HTTPS tunnel appears as `in flight` under `── still open ──` rather than as traffic. Non-secret HTTPS stays opaque. Denied request heads are available only in the ephemeral `denied-requests.jsonl` stream used by the TUI; sensitive headers are redacted, request heads are capped at 16 KiB, and the stream is capped at 4 MiB.
 - The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--proxy` always prints the summary above when the session ends; what happens to the raw log is set by `--proxy-log LEVEL`:
 
   | `--proxy-log` | at exit |
@@ -109,6 +109,7 @@ The `[network]` block supports `allow` and `[[network.rules]]` for granular cont
 
   Saved logs are named `agent-sandbox-connections-<session>-<timestamp>.jsonl`, and the summary prints the path as a terminal hyperlink. `agent-sandbox-network-summary <log>` re-renders a saved log. `--proxy-log` implies `--proxy`.
 - Neither the policy nor the log is reachable from inside the sandbox, so the agent can neither widen its own firewall nor edit the record of its traffic.
+- The connection log is bounded at 16 MiB during a session. When a limit is reached, the oldest log contents are discarded; this prevents a busy or long-lived container from accumulating unbounded logs.
 
 ### What the policy covers
 

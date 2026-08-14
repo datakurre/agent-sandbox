@@ -13,7 +13,8 @@
 //! weaker one that appears to work.
 //!
 //! `--log` appends newline-delimited JSON, one object per connection event,
-//! rendered by agent-sandbox-network-summary.
+//! rendered by agent-sandbox-network-summary. `--detail-log` is a bounded,
+//! ephemeral stream of sanitized denied request heads for the TUI.
 
 mod inject;
 mod l7;
@@ -25,7 +26,7 @@ use secret::{SecretBinding, SecretBindings};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -163,11 +164,50 @@ impl Resolver {
 /// adding anything.
 struct MetricsLog {
     file: Mutex<File>,
+    detail_file: Option<Mutex<File>>,
     /// Process start, in epoch seconds.  Ids embed it so two proxies appending
     /// to the same log cannot mint colliding ids — a correlation id that
     /// silently aliases is worse than none.
     boot: u64,
     next_id: AtomicU64,
+}
+
+const METRICS_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const DETAIL_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const DETAIL_HEAD_MAX_BYTES: usize = 16 * 1024;
+
+fn rotate_if_needed(file: &mut File, incoming: u64, max: u64) -> io::Result<()> {
+    if file.metadata()?.len().saturating_add(incoming) > max {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+    }
+    Ok(())
+}
+
+fn sensitive_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name == "authorization"
+        || name == "proxy-authorization"
+        || name == "cookie"
+        || name == "set-cookie"
+        || name.contains("api-key")
+        || name.contains("apikey")
+        || name.contains("token")
+        || name.contains("secret")
+}
+
+fn sanitize_request_head(head: &str) -> String {
+    head.lines()
+        .map(|line| {
+            if let Some((name, _)) = line.split_once(':') {
+                if sensitive_header(name) {
+                    return format!("{}: <redacted>", name.trim());
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 /// Trim the boilerplate std prepends to resolver errors so the summary stays
@@ -208,13 +248,19 @@ fn now_secs() -> u64 {
 }
 
 impl MetricsLog {
-    fn open(path: &str) -> Option<Arc<MetricsLog>> {
+    fn open(path: &str, detail_path: Option<&str>) -> Option<Arc<MetricsLog>> {
         match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(f) => Some(Arc::new(MetricsLog {
-                file: Mutex::new(f),
-                boot: now_secs(),
-                next_id: AtomicU64::new(1),
-            })),
+            Ok(f) => {
+                let detail_file = detail_path
+                    .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
+                    .map(Mutex::new);
+                Some(Arc::new(MetricsLog {
+                    file: Mutex::new(f),
+                    detail_file,
+                    boot: now_secs(),
+                    next_id: AtomicU64::new(1),
+                }))
+            }
             Err(e) => {
                 eprintln!("proxy: cannot open metrics log {}: {}", path, e);
                 None
@@ -224,7 +270,23 @@ impl MetricsLog {
 
     fn write_line(&self, line: &str) {
         if let Ok(mut f) = self.file.lock() {
+            let _ = rotate_if_needed(&mut f, line.len() as u64, METRICS_LOG_MAX_BYTES);
             let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    fn denied_detail(&self, host: &str, port: u16, reason: &str, head: &str) {
+        let Some(file) = &self.detail_file else { return; };
+        let head = sanitize_request_head(&String::from_utf8_lossy(
+            &head.as_bytes()[..head.len().min(DETAIL_HEAD_MAX_BYTES)],
+        ));
+        let line = format!(
+            "{{\"ts\":{},\"host\":\"{}\",\"port\":{},\"reason\":\"{}\",\"request\":\"{}\"}}\n",
+            now_secs(), json_escape(host), port, json_escape(reason), json_escape(&head)
+        );
+        if let Ok(mut file) = file.lock() {
+            let _ = rotate_if_needed(&mut file, line.len() as u64, DETAIL_LOG_MAX_BYTES);
+            let _ = file.write_all(line.as_bytes());
         }
     }
 
@@ -363,6 +425,12 @@ impl Shared {
         self.resolver.clear();
         if let Some(m) = &self.metrics {
             m.policy_event();
+        }
+    }
+
+    fn denied_detail(&self, host: &str, port: u16, reason: &str, request_head: &str) {
+        if let Some(m) = &self.metrics {
+            m.denied_detail(host, port, reason, request_head);
         }
     }
 
@@ -603,6 +671,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         let reason = cfg.why_denied(&host, port);
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+        shared.denied_detail(&host, port, &reason, &req_str);
         shared.record(None, &host, port, "deny", Some(&reason), 0, 0, started.elapsed().as_millis(), Some(method), None, None);
         return;
     }
@@ -636,6 +705,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         let reason = cfg.why_address_denied(bad.ip());
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+        shared.denied_detail(&host, port, &reason, &req_str);
         shared.record(None, &host, port, "deny", Some(&reason), 0, 0, started.elapsed().as_millis(), None, None, None);
         return;
     }
@@ -681,6 +751,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             if cfg.is_secret_domain(&host) {
                 let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
                 eprintln!("proxy: deny {}:{} (secret injection requires TLS)", host, port);
+                shared.denied_detail(&host, port, "cleartext-injection", &req_str);
                 shared.record(
                     None,
                     &host,
@@ -722,6 +793,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 }
                 Err(inject::ProxyHttpError::L7Denied { method, path, reason }) => {
                     eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+                    shared.denied_detail(&host, port, &format!("L7 denied: {}", reason), &req_str);
                     shared.record(
                         id.as_deref(),
                         &host,
@@ -840,6 +912,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         "proxy: deny {}:{} (MITM requires HTTP/1.1 but client negotiated {:?})",
                         host, port, String::from_utf8_lossy(proto)
                     );
+                    shared.denied_detail(&host, port, "alpn-unsupported", &req_str);
                     shared.record(
                         None,
                         &host,
@@ -860,6 +933,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 Some(name) => name.to_ascii_lowercase(),
                 None => {
                     eprintln!("proxy: TLS client sent no SNI for {}:{}", host, port);
+                    shared.denied_detail(&host, port, "sni-missing", &req_str);
                     shared.record(
                         None,
                         &host,
@@ -879,6 +953,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 Some(name) => name,
                 None => {
                     eprintln!("proxy: invalid SNI {:?} for {}:{}", sni, host, port);
+                    shared.denied_detail(&host, port, "sni-invalid", &req_str);
                     shared.record(
                         None,
                         &host,
@@ -899,6 +974,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                     "proxy: deny {}:{} (SNI {:?} does not match CONNECT authority {:?})",
                     host, port, normalized_sni, requested_host
                 );
+                shared.denied_detail(&host, port, "sni-mismatch", &req_str);
                 shared.record(
                     None,
                     &host,
@@ -961,8 +1037,9 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                         outcome.status,
                     );
                 }
-                Err(inject::ProxyHttpError::L7Denied { method, path, reason }) => {
-                    eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+                    Err(inject::ProxyHttpError::L7Denied { method, path, reason }) => {
+                        eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+                        shared.denied_detail(&host, port, &format!("L7 denied: {}", reason), &req_str);
                     shared.record(
                         id.as_deref(),
                         &host,
@@ -1005,6 +1082,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     if method == "CONNECT" && !skip_l7 {
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny CONNECT {}:{} (L7 rules require TLS interception on port 443)", host, port);
+        shared.denied_detail(&host, port, "connect-l7-unintercepted", &req_str);
         shared.record(
             None,
             &host,
@@ -1187,6 +1265,7 @@ Usage: agent-sandbox-proxy [OPTIONS]
   --policy FILE          read the policy from FILE (see parse_policy)
   --check-policy FILE    validate FILE, print the rules it yields, exit
   --log FILE             append one JSON line per connection event
+  --detail-log FILE      bounded sanitized denied-request details
   --listen ADDR          listen address (default 0.0.0.0:8888)
   --secret-fd FD         internal: read startup secret bindings from FD
   --allow-domains LIST   comma-separated; mutually exclusive with --policy
@@ -1206,6 +1285,7 @@ fn fail(msg: &str) -> ! {
 struct Options {
     policy: String,
     log: String,
+    detail_log: String,
     listen: String,
     secret_fd: Option<i32>,
     allow_domains: String,
@@ -1219,6 +1299,7 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
     let mut o = Options {
         policy: String::new(),
         log: String::new(),
+        detail_log: String::new(),
         listen: "0.0.0.0:8888".to_string(),
         secret_fd: None,
         allow_domains: String::new(),
@@ -1242,6 +1323,7 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
             "--policy" => o.policy = value(),
             "--check-policy" => check = Some(value()),
             "--log" => o.log = value(),
+            "--detail-log" => o.detail_log = value(),
             "--listen" => o.listen = value(),
             "--secret-fd" => {
                 let raw = value();
@@ -1362,7 +1444,7 @@ fn main() {
     let metrics = if opts.log.is_empty() {
         None
     } else {
-        MetricsLog::open(&opts.log)
+        MetricsLog::open(&opts.log, (!opts.detail_log.is_empty()).then_some(opts.detail_log.as_str()))
     };
 
     let secrets = match SecretBindings::from_fd(opts.secret_fd) {
@@ -1706,11 +1788,34 @@ mod tests {
         assert_eq!(json_escape("a\nb"), "a\\nb");
     }
 
+    #[test]
+    fn denied_details_redact_credentials() {
+        let head = sanitize_request_head(
+            "GET http://example.com/x HTTP/1.1\r\nAuthorization: Bearer secret\r\nX-Trace: ok",
+        );
+        assert!(head.contains("Authorization: <redacted>"));
+        assert!(head.contains("X-Trace: ok"));
+        assert!(!head.contains("Bearer secret"));
+    }
+
+    #[test]
+    fn bounded_log_resets_before_it_grows_past_limit() {
+        let path = std::env::temp_dir().join("agent-sandbox-bounded-log.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        file.write_all(b"old\n").unwrap();
+        rotate_if_needed(&mut file, 5, 8).unwrap();
+        file.write_all(b"new!!").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new!!");
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Write to a scratch log, return the lines it ended up with.
     fn metrics_lines(name: &str, f: impl FnOnce(&MetricsLog)) -> Vec<String> {
         let path = std::env::temp_dir().join(format!("agent-sandbox-metrics-{}.jsonl", name));
         let _ = std::fs::remove_file(&path);
-        let log = MetricsLog::open(path.to_str().unwrap()).expect("open metrics log");
+        let log = MetricsLog::open(path.to_str().unwrap(), None).expect("open metrics log");
         f(&log);
         let body = std::fs::read_to_string(&path).expect("read metrics log");
         let _ = std::fs::remove_file(&path);
