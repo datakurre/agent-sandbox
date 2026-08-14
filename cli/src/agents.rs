@@ -541,7 +541,7 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
 
             if let Some(rules) = net_table.get("allow_routes") {
                 let rules_arr = rules.as_array().ok_or_else(|| {
-                    ConfigError::msg("[network].allow_hosts_routes must be an array of tables")
+                    ConfigError::msg("[network].allow_routes must be an array of tables")
                 })?;
                 for (i, rule_val) in rules_arr.iter().enumerate() {
                     let rule = rule_val.as_table().ok_or_else(|| {

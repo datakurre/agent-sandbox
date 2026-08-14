@@ -63,7 +63,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
 | Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces `AGENTS.md`'s `[network]` policy if present. Prints a per-host traffic summary when the session ends. See details below. |
-| Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into the proxied requests each `[[network.allow_hosts_routes]]` rule authorises — that rule's host, method and path, and no others. Requires `--proxy`. See [Configuration](configuration.md#secrets). |
+| Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into the proxied requests each `[[network.allow_routes]]` rule authorises — that rule's host, method and path, and no others. Requires `--proxy`. See [Configuration](configuration.md#secrets). |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
@@ -118,7 +118,7 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
 2. **Open the TUI**: In a **separate terminal**, run `agent-sandbox ctl tui`. This interactive interface lists the requests the sandbox is making, including the denied ones.
 3. **Approve**: Use the following keybindings to update the policy in real time:
    - `a`: Allow domain
-   - `h`: Allow HTTP route (domain + method) (creates a `[[network.allow_hosts_routes]]` rule)
+   - `h`: Allow HTTP route (domain + method) (creates a `[[network.allow_routes]]` rule)
    - `A`: Allow IP
    - `v`: Switch between the live Connections view and denied requests
    - `r`: Switch to the Rules view — the live effective policy, with `x` to remove a rule (blocked for rules that came from `AGENTS.md`)
@@ -132,7 +132,7 @@ The TUI tails the connection log and shows recently-denied hosts live (deduplica
 For an HTTPS domain denied at `CONNECT`, the encrypted method and path are not available yet. The TUI detail view suggests a temporary placeholder L7 rule to let the proxy terminate TLS and observe the real request:
 
 ```toml
-[[network.allow_hosts_routes]]
+[[network.allow_routes]]
 host = "pypi.org:443"
 method = "GET"
 path = "/noop"

@@ -124,7 +124,7 @@ log of what it did. Changing policy is therefore a host-side operation
 
 **Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
 `[network].allow` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
-`[[network.allow_hosts_routes]]` configures L7 paths and optional secret injection.
+`[[network.allow_routes]]` configures L7 paths and optional secret injection.
 Those two keys are the whole surface: there is no `deny`, and an unknown key
 refuses the launch.
 
@@ -149,7 +149,7 @@ implementation to drift.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
 The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`).
-To authorize secret injection, the operator pastes the exact same `[[network.allow_hosts_routes]]` block from `AGENTS.md` into it; every field must match, port included.
+To authorize secret injection, the operator pastes the exact same `[[network.allow_routes]]` block from `AGENTS.md` into it; every field must match, port included.
 The launcher calls the resolver in `cli/src/secrets.rs`, which cross-references this config with the policy's `secret_route` routes, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are written 0600 into `/sidecar_secrets/bindings`, which only the sidecar mounts, as `domain<TAB>method<TAB>path<TAB>header<TAB>value`. A `secret` field on a rule populates `secret_route` automatically, so there is nothing to duplicate.
 
 Injection is scoped to the **route**, not the domain, and resolved **per

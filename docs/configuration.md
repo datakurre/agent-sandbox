@@ -73,9 +73,9 @@ every request until at least one such entry exists — so `"github.com:22"` is
 what makes `git push` and commit signing work in a proxied sandbox. See
 [Usage](usage.md#git-integration-details).
 
-#### L7 HTTP Rules (`[[network.allow_hosts_routes]]`)
+#### L7 HTTP Rules (`[[network.allow_routes]]`)
 
-For finer-grained HTTP proxy control and secret injection, you can specify an array of tables under `[[network.allow_hosts_routes]]`.
+For finer-grained HTTP proxy control and secret injection, you can specify an array of tables under `[[network.allow_routes]]`.
 
 - **`host`** (required): The target host and port to match (e.g., `"api.github.com:443"`).
 - **`method`** (required): The HTTP method (e.g., `"GET"`, `"POST"`, or `"*"`) in uppercase.
@@ -102,7 +102,7 @@ allow_hosts = [
 ]
 
 # Allow GET requests to specific GitHub API endpoints and inject a secret token
-[[network.allow_hosts_routes]]
+[[network.allow_routes]]
 host = "api.github.com:443"
 method = "GET"
 path = "/user/repos"
@@ -110,7 +110,7 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
-[[network.allow_hosts_routes]]
+[[network.allow_routes]]
 host = "registry.npmjs.org:443"
 method = "*"
 path = "/"
@@ -129,7 +129,7 @@ the host-side entry is the `AGENTS.md` rule with nothing changed:
 
 ```toml
 # ~/.config/agent-sandbox/secrets.toml
-[[network.allow_hosts_routes]]
+[[network.allow_routes]]
 host = "api.github.com:443"
 method = "GET"
 path = "/user/repos"
@@ -145,7 +145,7 @@ has one.
 
 The authorization is what scopes the injection. The secret reaches the proxy
 bound to that host, method and path, and is injected only into requests matching
-it — so a second `[[network.allow_hosts_routes]]` entry in `AGENTS.md`, on the same host and
+it — so a second `[[network.allow_routes]]` entry in `AGENTS.md`, on the same host and
 without a `secret`, grants plain access and nothing more. You can authorize
 several routes on one host; where two of them could match the same request, the
 more specific wins (longest domain pattern, then longest path pattern, then an
@@ -169,7 +169,7 @@ Besides malformed values, these combinations are rejected:
 - an unknown key under `[network]` (only `allow_hosts` and `allow_routes` exist) or an unknown
   field on a rule;
 - a duplicate entry in `allow_hosts`;
-- a host allowed outright in `allow_hosts` that also carries a `[[network.allow_hosts_routes]]`
+- a host allowed outright in `allow_hosts` that also carries a `[[network.allow_routes]]`
   entry *without* a secret — the broad allow makes the narrower rule pointless,
   so one of the two is a mistake. The same applies to a wildcard allow (`"*"`,
   `"*:port"`).
