@@ -194,18 +194,30 @@ When using Git inside the sandbox, be aware of how the integration flags interac
 
 ### Bundled OpenCode skills
 
-The image includes three OpenCode skills at `/home/user/.agents/skills`:
+The image includes five OpenCode skills at `/home/user/.agents/skills`:
 
+- `agent-sandbox` for the sandbox itself: recognising that it is running in one,
+  what the firewall, the ephemeral home directory and the opt-in flags imply, and
+  which host-side command to ask the user for when it hits a limit. It also
+  covers `secretspec.toml` and how `--secrets` injects credentials the sandbox
+  never sees.
 - `nix` for running any nixpkgs tool ad hoc, without installing it.
 - `nix-flake` for `flake.nix`: packaging software, outputs, checks, and simple
   `nix develop --command` development shells.
 - `devenv` for `devenv.nix`: declarative environments with language toolchains
   and supporting services, entered with `devenv shell -- <command>`.
+- `browser` for headless browser automation sourced from nixpkgs: screenshotting
+  a page for visual analysis and driving it via Playwright (or the packaged
+  `playwright-mcp` server), including the fontconfig fix a font-less image
+  otherwise needs.
 
 Each skill is a `SKILL.md` with the common path plus reference files with
 advanced patterns. `nix-flake` additionally carries `uv2nix.md` (packaging
 Python projects that have a `uv.lock`) and `images.md` (building OCI container
-images from a flake package).
+images from a flake package); `agent-sandbox` carries `network.md` (proxy policy
+syntax, the `ctl` loop, live-versus-relaunch changes) and `secretspec.md`;
+`browser` carries `reference.md` (form filling, the raw CDP fallback, and a
+debugging checklist).
 
 They are bundled into the image rather than mounted by the launcher. To use
 user-owned skills instead, mount a replacement tree with
