@@ -4,6 +4,7 @@ use agent_sandbox_proxy::policy::ProxyConfig;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
 use std::collections::HashSet;
 use std::net::{IpAddr, TcpListener, UdpSocket};
+use serde::Serialize;
 use thiserror::Error;
 use toml::Value;
 
@@ -746,7 +747,7 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
 /// (possibly live-edited) policy back as an AGENTS.md `[network]` TOML block,
 /// for `agent-sandbox ctl proxy export`.
 ///
-/// Not fully round-trippable: `[network]` only supports `allow` (bare
+/// Not fully round-trippable: `[network]` only supports `allow_hosts` (bare
 /// host/IP entries) and `[[network.allow_routes]]` (`allow_route`), so a non-default
 /// `allow_port` — which can only be added live, via the TUI or
 /// `ctl proxy allow`, never declared in AGENTS.md — is emitted as a trailing
@@ -756,29 +757,99 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
 /// round-tripping it would be noise.  A `secret = true` on an exported rule
 /// is a placeholder too: the policy file records which *route* takes a
 /// secret, never which one, so the reference has to be filled in by hand.
+#[derive(Serialize)]
+struct NetworkDocument {
+    network: NetworkToml,
+}
+
+#[derive(Serialize)]
+struct NetworkToml {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    allow_hosts: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    allow_routes: Vec<RouteToml>,
+}
+
+#[derive(Serialize)]
+struct RouteToml {
+    host: String,
+    method: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret: Option<bool>,
+}
+
+/// Return compiled policy lines that were added after the sandbox launched.
+/// Exact line matching is intentional: policy files contain canonical lines,
+/// and it prevents repeated live edits from producing duplicate output.
+pub fn policy_delta_lines(
+    active: &[String],
+    base: &HashSet<String>,
+    baseline: &HashSet<String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    active
+        .iter()
+        .filter(|line| !base.contains(*line) && !baseline.contains(*line))
+        .filter(|line| seen.insert((*line).clone()))
+        .cloned()
+        .collect()
+}
+
+pub fn format_policy_lines_as_network_toml(lines: &[String]) -> Option<String> {
+    let text = lines.join("\n") + "\n";
+    let cfg = agent_sandbox_proxy::policy::parse_policy(&text).ok()?;
+    Some(format_policy_as_network_toml(&cfg))
+}
+
 pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
-    let mut out = String::from("[network]\n");
+    let mut allow_hosts: Vec<String> = cfg
+        .allow_host
+        .iter()
+        .map(|r| r.to_string())
+        .chain(cfg.allow_ip.iter().map(|n| n.to_string()))
+        .collect();
+    allow_hosts.sort();
+    allow_hosts.dedup();
 
-    let mut allow_items: Vec<String> = cfg.allow_host.iter().map(|r| r.to_string()).collect();
-    allow_items.extend(cfg.allow_ip.iter().map(|n| n.to_string()));
-    if !allow_items.is_empty() {
-        let quoted: Vec<String> = allow_items.iter().map(|s| format!("{:?}", s)).collect();
-        out.push_str(&format!("allow_hosts = [{}]\n", quoted.join(", ")));
-    }
+    let mut allow_routes: Vec<RouteToml> = cfg
+        .l7_rules
+        .iter()
+        .map(|r| RouteToml {
+            host: r.domain.clone(),
+            method: r.method.clone(),
+            path: r.path_pattern.clone(),
+            // The compiled policy records that a route is secret, not
+            // the host-side secret reference.
+            secret: cfg
+                .secret_routes
+                .iter()
+                .any(|s| {
+                    s.domain == r.domain
+                        && s.method == r.method
+                        && s.path_pattern == r.path_pattern
+                })
+                .then_some(true),
+        })
+        .collect();
+    allow_routes.sort_by(|a, b| {
+        (&a.host, &a.method, &a.path, &a.secret).cmp(&(&b.host, &b.method, &b.path, &b.secret))
+    });
+    allow_routes.dedup_by(|a, b| {
+        a.host == b.host
+            && a.method == b.method
+            && a.path == b.path
+            && a.secret == b.secret
+    });
 
-    for r in &cfg.l7_rules {
-        out.push('\n');
-        out.push_str("[[network.allow_routes]]\n");
-        out.push_str(&format!("host = {:?}\n", r.domain));
-        out.push_str(&format!("method = {:?}\n", r.method));
-        out.push_str(&format!("path = {:?}\n", r.path_pattern));
-        let carries_secret = cfg.secret_routes.iter().any(|s| {
-            s.domain == r.domain && s.method == r.method && s.path_pattern == r.path_pattern
-        });
-        if carries_secret {
-            out.push_str("secret = true # placeholder -- fill in the real secret reference; the policy file doesn't retain it\n");
-        }
-    }
+    let mut out = toml::to_string_pretty(&NetworkDocument {
+        network: NetworkToml {
+            allow_hosts,
+            allow_routes,
+        },
+    })
+    .expect("network TOML serialization cannot fail");
+    out.push('\n');
 
     let mut advisory: Vec<String> = Vec::new();
     if let Some(ranges) = &cfg.allow_port {
@@ -819,7 +890,7 @@ mod export_tests {
         let toml = format_policy_as_network_toml(&cfg);
         assert!(toml.contains("[network]\n"), "{toml}");
         assert!(
-            toml.contains("allow_hosts = [\"github.com\", \"10.0.0.0/8\"]"),
+            toml.contains("allow_hosts = [\n    \"10.0.0.0/8\",\n    \"github.com\",\n]"),
             "{toml}"
         );
         assert!(toml.contains("[[network.allow_routes]]"), "{toml}");
@@ -854,6 +925,40 @@ mod export_tests {
         let toml = format_policy_as_network_toml(&cfg);
         assert!(toml.contains("allow_hosts = [\"*.jyu.fi:443\"]"), "{toml}");
         assert!(!toml.contains("allow_port"), "{toml}");
+    }
+
+    #[test]
+    fn delta_contains_only_live_rules_and_deduplicates_them() {
+        let active = vec![
+            "allow_host github.com".to_string(),
+            "allow_host api.github.com".to_string(),
+            "allow_host api.github.com".to_string(),
+            "allow_route\tapi.github.com\tGET\t/repos/*".to_string(),
+            "deny_ip 127.0.0.0/8".to_string(),
+        ];
+        let base = HashSet::from(["allow_host github.com".to_string()]);
+        let baseline = HashSet::from(["deny_ip 127.0.0.0/8".to_string()]);
+
+        assert_eq!(
+            policy_delta_lines(&active, &base, &baseline),
+            vec![
+                "allow_host api.github.com".to_string(),
+                "allow_route\tapi.github.com\tGET\t/repos/*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn formatted_policy_is_valid_toml() {
+        let lines = vec![
+            "allow_host github.com".to_string(),
+            "allow_route\tapi.github.com\tGET\t/repos/*".to_string(),
+        ];
+        let output = format_policy_lines_as_network_toml(&lines).expect("policy should parse");
+        let value: Value = output.parse().expect("formatted output should be TOML");
+        assert!(value.get("network").is_some(), "{output}");
+        assert!(output.contains("allow_hosts"), "{output}");
+        assert!(output.contains("[[network.allow_routes]]"), "{output}");
     }
 
     #[test]

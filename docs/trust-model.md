@@ -148,7 +148,7 @@ range back explicitly when you need it:
 allow_hosts = ["10.0.0.0/8"]   # corporate git over the VPN
 ```
 
-An IP CIDR block in `[network].allow` of equal or greater specificity than a deny wins, at the proxy *and* in
+An IP CIDR block in `[network].allow_hosts` of equal or greater specificity than a deny wins, at the proxy *and* in
 the sidecar's routing table: the kernel's longest-prefix match is the same rule the proxy
 applies, so a re-allowed range is genuinely reachable rather than permitted by the policy and
 then dropped by a route.
@@ -216,7 +216,7 @@ The baseline ranges appear in `show` as ordinary `deny_ip` rules attributed to `
 `reset`. `proxy export` omits them, since they are always enforced regardless of what
 `AGENTS.md` declares and round-tripping them into a new config would be redundant.
 
-An IP CIDR block in `[network].allow` of equal or greater specificity is the only way to
+An IP CIDR block in `[network].allow_hosts` of equal or greater specificity is the only way to
 reach one of those ranges — and it is an *allow*, not a deny, which is why it remains
 available: it is how a corporate git server over a VPN is reached.
 

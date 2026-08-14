@@ -457,6 +457,33 @@ impl CleanupGuard {
     /// Where the connection log lands, if anywhere.  Everything here runs from
     /// `Drop`, so nothing may panic or exit: the network reclaim and the
     /// directory removal still have to happen.
+    fn print_live_rules(&self) {
+        if self.sidecar_policy.is_empty() {
+            return;
+        }
+
+        let read_lines = |name: &str| -> Vec<String> {
+            fs::read_to_string(format!("{}/{}", self.sidecar_policy, name))
+                .map(|text| text.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        let active = read_lines("policy");
+        let base: HashSet<String> = read_lines("policy.base").into_iter().collect();
+        let baseline: HashSet<String> = read_lines("policy.baseline").into_iter().collect();
+        let delta = agents::policy_delta_lines(&active, &base, &baseline);
+        if delta.is_empty() {
+            return;
+        }
+        let Some(toml) = agents::format_policy_lines_as_network_toml(&delta) else {
+            return;
+        };
+
+        println!("\n  live network rules added during this session:");
+        println!("  Copy this TOML into AGENTS.md if these rules should persist:\n");
+        print!("{}", toml);
+        println!();
+    }
+
     fn save_log(&self, log: &str, had_failures: bool) {
         let contents = match fs::read_to_string(log) {
             Ok(c) if !c.trim().is_empty() => c,
@@ -590,6 +617,7 @@ impl Drop for CleanupGuard {
                 .iter()
                 .any(|r| matches!(r.verdict.as_deref(), Some("deny") | Some("error")));
             net_summary::process_summary(records);
+            self.print_live_rules();
 
             // The removal below would take the per-connection timings with it,
             // and those are what distinguish "failed instantly" from "burned

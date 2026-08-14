@@ -143,7 +143,7 @@ log of what it did. Changing policy is therefore a host-side operation
 `agent-sandbox-allow` was deleted rather than repaired.
 
 **Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
-`[network].allow` contains domains, wildcard domains, IPs, or CIDR blocks, each
+`[network].allow_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
 with a port or port range.  `[[network.allow_routes]]` configures L7 routes and
 optional secret injection.  Those two keys are the whole surface: an unknown key
 under `[network]` refuses the launch rather than being ignored.

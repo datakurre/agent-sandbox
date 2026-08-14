@@ -123,7 +123,7 @@ log of what it did. Changing policy is therefore a host-side operation
 `agent-sandbox-allow` was deleted rather than repaired.
 
 **Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
-`[network].allow` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
+`[network].allow_hosts` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
 `[[network.allow_routes]]` configures L7 paths and optional secret injection.
 Those two keys are the whole surface: there is no `deny`, and an unknown key
 refuses the launch.
