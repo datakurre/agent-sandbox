@@ -1016,8 +1016,7 @@ fn run() -> Result<i32> {
                 fail(&format!(
                     "agent-sandbox: malformed command specification for agent '{}'",
                     agent
-                ));
-                Vec::new()
+                ))
             });
         }
     }
