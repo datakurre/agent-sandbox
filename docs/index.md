@@ -1,0 +1,68 @@
+# agent-sandbox
+
+**Sandboxed AI coding environment** built on rootless Podman and Nix. Run AI coding agents — `opencode`, `claude-code`, `copilot`, `codex`, `antigravity`, or any bundled tool — in an isolated container. All host integrations are **disabled by default**; you opt in only to what you need.
+
+## What it provides
+
+- **Isolated container** — the agent runs in a minimal Nix-built image with no access to your host filesystem unless you pass `--workspace`.
+- **Deny-by-default network firewall** — `--proxy` puts the sandbox behind an HTTP proxy that enforces a declarative `[network]` policy from your project's `AGENTS.md`. No rules means no outbound traffic.
+- **Secrets injection** — `--secrets` resolves credentials with `secretspec` and injects them as HTTP headers, scoped to the exact route you authorize. Secrets never enter the sandbox environment.
+- **SSH / GPG forwarding** — `--ssh` and `--gpg` forward host agent sockets; under `--proxy` they travel through a relay that keeps the firewall intact.
+- **Management CLI** — `agent-sandbox ctl` manages running sandboxes: inspect traffic, update policies live, attach a shell, and clean up leftovers.
+
+## Prerequisites
+
+- **Nix** with [flakes enabled](https://nixos.wiki/wiki/Flakes)
+- **Rootless Podman** on the host
+
+## Installation
+
+```sh
+# Install from a local clone
+git clone https://github.com/datakurre/agent-sandbox
+cd agent-sandbox
+nix profile add .#
+
+# Or install directly (no clone needed)
+nix profile add github:datakurre/agent-sandbox
+```
+
+Build the container image once after installation:
+
+```sh
+agent-sandbox ctl load
+```
+
+## Quick start
+
+```sh
+# Interactive shell — every agent binary is on PATH, nothing else is exposed
+agent-sandbox
+
+# Mount your project and launch opencode
+agent-sandbox --workspace opencode
+
+# Add a network firewall enforced by this project's AGENTS.md [network] block
+agent-sandbox --workspace --proxy opencode
+
+# Use a reusable host-owned profile instead of AGENTS.md
+agent-sandbox --workspace --proxy-profile development opencode
+
+# Merge a profile with AGENTS.md (additive)
+agent-sandbox --workspace --proxy --proxy-profile development opencode
+```
+
+## Choosing your launch flags
+
+| Goal | Flags to add |
+|------|-------------|
+| Expose current directory at `/workspace/<name>` | `--workspace` |
+| Allow specific outbound network traffic | `--proxy` + `[network]` in `AGENTS.md` |
+| Use a reusable host-owned network profile | `--proxy-profile NAME` |
+| Forward SSH keys (e.g. for `git push`) | `--ssh` |
+| Forward GPG agent (e.g. for signed commits) | `--gpg` |
+| Run nested containers inside the sandbox | `--privileged` |
+| Add a hardware VM boundary | `--krun` (requires `/dev/kvm`) |
+| Inject API credentials scoped to a route | `--secrets` + `--proxy` |
+
+See [Usage & Flags](usage.md) for the complete flags reference, [Configuration](configuration.md) for `AGENTS.md` syntax, and [Trust Model](trust-model.md) for the security implications of each flag.

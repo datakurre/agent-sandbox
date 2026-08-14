@@ -54,12 +54,12 @@
         in
         {
           default = { type = "app"; program = "${package}/bin/agent-sandbox"; meta = { description = "Sandboxed AI coding environment via podman"; }; };
-          ctl = { type = "app"; program = "${package}/bin/agent-sandbox-ctl"; meta = { description = "agent-sandbox utility for managing running sandboxes"; }; };
         }
       );
 
-      # `nix flake check` runs the parser and gnupg-classifier test suites and
-      # shellchecks every script, without building the container image.
+      # `nix flake check` builds the Rust workspace, which runs `cargo test`
+      # over the launcher, parser and policy suites, without building the
+      # container image.
       checks = lib.genAttrs systems (system: (packageFor system).passthru.checks);
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);

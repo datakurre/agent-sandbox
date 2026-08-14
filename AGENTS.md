@@ -4,20 +4,23 @@
 
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
 ("agent-sandbox") together with a launcher binary (`agent-sandbox`) and a
-management multiplexer (`agent-sandbox-ctl`, with the subcommands `load`,
-`list`, `status`, `net`, `logs`, `proxy`, `ports`, `mounts`, `attach` and `purge`).
+management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
+`list`, `status`, `net`, `logs`, `tui`, `proxy`, `mounts`, `attach`, `relay` and `purge`).
 
 - **default.nix** – single Nix module; builds the image and every host script.
 - **agents.nix** – agent catalog (command + persisted state paths per agent).
 - **flake.nix**  – flake entry point; exposes `packages.<system>.default` and
   `apps.<system>.default`.
 
+User-facing documentation lives at `docs/` (built with MkDocs Material and published as GitHub Pages). The source of truth for flags is `cli/src/bin/agent-sandbox.rs` and `cli/src/launch.rs`.
+
 ## Architecture
 
 ### Image (`image` attr in `default.nix`)
 
-Built with `pkgs.dockerTools.streamLayeredImage`.  All tools are baked into a
-`buildEnv` and registered in the Nix store database so `nix` / `devenv` / Nix
+Built with `pkgs.dockerTools.streamLayeredImage` (`maxLayers = 2`).  All tools are baked into a
+`buildEnv` and compressed into a minimal number of layers (2) to optimize `podman load` speed and container
+startup latency. They are registered in the Nix store database so `nix` / `devenv` / Nix
 builtins inside the container work without re-substituting store paths.
 
 Key layers:
@@ -29,7 +32,17 @@ Key layers:
 | `/usr/bin/env`        | Symlink to coreutils `env` for generic shebangs        |
 | `/lib64/ld-linux-*`   | ELF interpreter for prebuilt npm binaries              |
 | `/home/user`          | Home directory (uid/gid mapped at runtime)             |
+| `/home/user/.agents/skills` | Bundled OpenCode skills for Nix and devenv workflows |
 | `/workspace`          | Default working directory                              |
+
+The image bundles `nix`, `nix-flake`, and `devenv` OpenCode skills at
+`/home/user/.agents/skills`. They are image content, not launcher-managed
+mounts. A user-owned skill tree can replace them with
+`--podman-args -v HOST:/home/user/.agents/skills --` or an `AGENTS.md`
+`[mounts]` declaration; Podman overlay semantics determine which files win.
+The image also links the canonical tree from
+`~/.claude/skills`, `~/.codex/skills`, `~/.copilot/skills`, `~/.cursor/skills`,
+and `~/.gemini/skills` for tool-specific discovery.
 
 ### Entrypoint (`agent-sandbox-entrypoint`)
 
@@ -47,24 +60,26 @@ Key layers:
 
 ### Launcher (`agent-sandbox`)
 
-A bash script that wraps `podman run`.  Call flow:
+A Rust binary (`cli/src/bin/agent-sandbox.rs`) that wraps `podman run`; the
+per-integration mount/env fragments live in `cli/src/launch.rs`, where they are
+unit-tested without a podman.  Call flow:
 
 1. Parse flags: consume known flags (`--ssh`, `--no-git`, `--no-workspace`,
-   etc.), pass through `-v` volume mounts (with relative-path expansion),
-   stop at `--` sentinel.
- 2. Build mounts array from toggles (ssh socket, git config, gpg socket,
+   etc.), collect `--podman-args` up to the `--` sentinel, stop at `--`.
+ 2. Build mounts array from toggles (ssh socket, gpg socket,
     devenv dir, podman host socket, CWD workspace) plus the state dirs of
     whichever agents are selected — the positionally-launched one by default,
     or the set chosen via `--agent-mounts`/`--agent-mounts=…` — sourced from
-    `agents.nix` (opencode, claude-code, copilot, antigravity).
+    `agents.nix` (opencode, claude-code, copilot, antigravity, codex).
 3. Build env_args array from toggles (SSH_AUTH_SOCK, git identity,
    CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
 4. Create ephemeral `/etc/passwd` and `/etc/group` with the host user's uid/gid.
 5. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
-   final command (default `opencode`, overridable via `-- …`).
+   final command (`bash` by default, the selected agent's command when one is
+   named positionally, and anything after `--` overrides both).
 
-### Loader (`agent-sandbox-ctl load`)
+### Loader (`agent-sandbox ctl load`)
 
 `podman load < ${image}`
 
@@ -96,62 +111,101 @@ without aardvark there is nothing to resolve that name.  That also retires a rac
 nothing ever gated on -- the readiness handshake never proved aardvark had
 published the sidecar's record before the sandbox started.
 
-The proxy itself is Rust (`proxy/src/main.rs`, `ipnet` its only dependency): a
-thread-per-connection HTTP forward proxy handling `CONNECT` and absolute-form
-requests.  Policy decisions happen once per connection, before the byte pumps
+The proxy itself is Rust (`proxy/src/main.rs`; `ipnet` for CIDR matching,
+`rustls`/`rcgen`/`webpki-roots` for the MITM path, `ratatui`/`crossterm` for
+the TUI): a thread-per-connection HTTP forward proxy handling `CONNECT` and
+absolute-form requests.  Policy decisions happen once per connection, before the byte pumps
 start; an established tunnel is never re-evaluated.
 
 Three directories, and which side can see them is the design:
 
 | Path | Mounted into | Contents |
 | --- | --- | --- |
-| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base` |
-| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `connections.jsonl` |
+| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base`, `policy.baseline` |
+| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `ca.pem`, `connections.jsonl`, `denied-requests.jsonl`, `relay.jsonl` |
+| `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
 | (host temp dirs) | — | removed by the launcher's exit trap |
 
-Neither is mounted into the sandbox. That is deliberate and load-bearing: the
+None of them is mounted into the sandbox — `ca.pem` is bound in as a single
+file, not by exposing its directory, and only when the policy carries an L7
+rule. That is deliberate and load-bearing: the
 agent must not be able to widen the firewall that contains it, nor rewrite the
 log of what it did. Changing policy is therefore a host-side operation
-(`agent-sandbox-ctl proxy`), which is why the old in-container
+(`agent-sandbox ctl proxy`), which is why the old in-container
 `agent-sandbox-allow` was deleted rather than repaired.
 
-**Policy format.** One `KEY VALUE` per line (`allow_domains`, `deny_domains`,
-`allow_ips`, `deny_ips`, `allow_ports`, `default`).  A value containing whitespace
-is a hard error.  This replaced four differently-encoded arguments -- allow_domains as argv
-words, the rest as space-joined env vars, all parsed as CSV -- where every entry
-past the first was silently dropped, and an emptied allow list means allowing
-everything.  One entry per line means any fixture with two entries exercises the
-case that used to break.
+**Policy format.** The proxy enforces the merged declarative `[network]` blocks
+from `AGENTS.md` and any explicitly selected host-owned profiles. `--proxy`
+selects the workspace block, `--proxy-profile NAME` selects only that profile,
+and supplying both merges them additively. Profiles are plain TOML files under
+`$XDG_CONFIG_HOME/agent-sandbox/profiles/` (or `~/.config/agent-sandbox/profiles/`).
+`[network].allowed_hosts` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
+`[[network.allowed_routes]]` configures L7 paths and optional secret injection.
+Those two keys are the whole surface: there is no `deny`, and an unknown key
+refuses the launch.
+
+The compiled policy file has one `KEY VALUE` line each for `allow_host`,
+`allow_ip`, `allow_port`, `allow_route`, `secret_route`, `allow_signing`,
+`deny_ip` and `default`.  `allow_route` and `secret_route` are tab-separated
+(`domain<TAB>method<TAB>path`).  `deny_ip` is written only by the launcher --
+denies are built-in only, and `install_policy` refuses any live edit that
+changes the set.  The same host on two ports is two `allow_host` lines with
+the same pattern; the proxy unions the ports of every line tied at the winning
+specificity.
+
+An `allowed_hosts` entry on port 22 also populates `allow_signing`, which is what
+authorizes the SSH/GPG relay: under `--proxy` the host agent sockets go to the
+sidecar, not the sandbox, and the relay refuses everything until that list is
+non-empty.
 
 `agent-sandbox-proxy --check-policy FILE` is the single reference validator:
-`parse_agents.py` writes the file, the proxy reads it, the host-side `proxy`
-command vets its own writes with the same binary, and `checks.firewall-policy`
-tests the whole chain.  There is no second implementation to drift.
+`cli/src/agents.rs` writes the file, the proxy reads it, and the host-side
+`proxy` command vets its own writes with the same parser.  There is no second
+implementation to drift.
 
-The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
+**Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
+The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`).
+To authorize secret injection, the operator pastes the exact same `[[network.allowed_routes]]` block from `AGENTS.md` into it; every field must match, port included.
+The launcher calls the resolver in `cli/src/secrets.rs`, which cross-references this config with the policy's `secret_route` routes, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are written 0600 into `/sidecar_secrets/bindings`, which only the sidecar mounts, as `domain<TAB>method<TAB>path<TAB>header<TAB>value`. A `secret` field on a rule populates `secret_route` automatically, so there is nothing to duplicate.
+
+Injection is scoped to the **route**, not the domain, and resolved **per
+request** in `inject::proxy_http1_with_injection` rather than once per
+connection.  Both halves are load-bearing.  `AGENTS.md` is untrusted and
+controls the other rules on a host, so a domain-wide marker let a second,
+secret-less rule (`method = "*", path = "/**"`) collect a token the operator
+had authorized for one endpoint; and a keep-alive connection carries many
+requests, so one decision at CONNECT time put the token on all of them.
+Matching runs on the same normalized path the L7 check uses, so
+`/user/repos/../../zen` cannot carry the token to `/zen`.  Where two authorized
+routes could match, the more specific wins: longest domain, then longest path,
+then an exact method over `*`.
+
+The proxy terminates TLS for hosts carrying an L7 rule, so its per-session CA (`/sidecar_shared/ca.pem`) is bound into the sandbox as a single file and pointed at by `AGENT_SANDBOX_PROXY_CA_FILE`; the entrypoint merges it into the trust bundle.  The mount is gated on the launch policy having an `allow_route` line: with none nothing is intercepted, so trusting a CA that can mint any name would buy nothing.  An L7 rule added mid-session therefore has no CA behind it, which `ctl proxy allow --l7` and the TUI's `h` warn about.
+
+The launcher appends a baseline `deny_ip` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
-ordinary `deny_ips` entries rather than compiling it into the proxy means one
+ordinary `deny_ip` entries rather than compiling it into the proxy means one
 list, visible in `proxy show`, restored by `reset`, and mirrored into the
 kernel routes by the same `sync_routes` that handles user rules.
-An `allow_ips` entry of equal or greater specificity overrides one of them; that
+An `allow_ip` entry of equal or greater specificity overrides one of them; that
 is why `is_denied_address` breaks prefix ties toward allow.
 
-`sync_routes` mirrors that whole rule, not `deny_ips` alone.  The kernel's
+`sync_routes` mirrors that whole rule, not `deny_ip` alone.  The kernel's
 longest-prefix match *is* the specificity comparison the proxy makes, so every
-`allow_ips` entry gets a route via the default gateway and beats a shorter
+`allow_ip` entry gets a route via the default gateway and beats a shorter
 blackhole by itself; the one case a routing table cannot express is the
 equal-prefix tie, there being room for a single route per prefix, and that is
 handled by not installing the blackhole at all.  Until it did this, a re-allowed
-range -- including the README's own `allow_ips = ["10.0.0.0/8"]` against the
+range -- including the README's own `allow_ip = ["10.0.0.0/8"]` against the
 baseline -- was permitted by the proxy and then dropped on the floor by the
 route, with `proxy show` reporting the rule as in force.
 
 The sidecar's nameservers, read from its own `/etc/resolv.conf`, are exempted
 unconditionally.  Resolution happens in the sidecar via libc, before any rule is
-consulted, so a `deny_ips` range containing the resolver blackholes DNS itself
+consulted, so a `deny_ip` range containing the resolver blackholes DNS itself
 and fails every request rather than only the ones aimed at that range -- and the
 baseline's `192.168.0.0/16` does exactly that to a home router.  This is not a
 way out: the sandbox has no route into this netns, its only egress is CONNECT to
@@ -162,6 +216,8 @@ Because the sidecar is on that bridge, the proxy binds only the address it holds
 on the internal network, selected by subnet membership from `SIDECAR_SUBNET`
 rather than by interface name -- podman's eth0/eth1 assignment follows the order
 of the `--network` flags and is not something to depend on.
+
+**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol.
 
 **Startup ordering** matters and is why there are two readiness markers: the
 proxy validates policy, probes egress and writes `proxy-ready`; the sidecar then
@@ -191,19 +247,22 @@ New connections see the change within a second; established ones do not.
 
 ## How to add a new integration
 
-1. Add a `want_{name}=1` toggle after the existing toggles (see integration toggles).
-2. Add `--{name}` / `--no-{name}` cases in the argument parsing loop.
-3. Add the mount/env logic after the existing blocks.
+1. Add a `want_{name}` toggle in `cli/src/bin/agent-sandbox.rs`, after the
+   existing toggles.
+2. Add `--{name}` / `--no-{name}` arms in the argument parsing loop.
+3. Put the mount/env logic in `cli/src/launch.rs` as a function returning the
+   `-v`/`-e` fragments, and call it from the launcher next to the other blocks.
 4. If container-side setup is needed in the entrypoint, gate it on an env
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
-5. Update the usage comment.
-6. Test: `nix flake check`
+5. Update `print_usage` and `docs/usage.md`.
+6. Test: `cargo test`, then `nix flake check`. For the GitHub Pages site, run
+   `nix-shell -I nixpkgs=channel:nixos-unstable -p 'python3.withPackages (ps: with ps; [ mkdocs mkdocs-material ])' --run 'mkdocs build --strict'`.
 
-Note what `nix flake check` cannot cover: podman does not run in a Nix build, so
-nothing that starts a container is tested there.  `checks.ctl-args` drives the
-`ctl` scripts against a stub podman, and `lib/smoke-firewall.sh` is the hand-run
-procedure for the rest (`bash lib/smoke-firewall.sh`, needs a real podman and
-network egress).
+Note what neither can cover: podman does not run in a Nix build, so nothing
+that starts a container is tested there. The cheap end-to-end check is a stub
+`podman` earlier on `PATH` that records its argv, which covers the whole
+flag -> `podman run` mapping; anything past that (proxy egress, relays, krun)
+needs a real podman and network access.
 
 ## How to add a new agent
 

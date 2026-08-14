@@ -11,8 +11,9 @@ let
   # podman namespaces locally loaded images under localhost/.
   imageRef = "localhost/${imageName}:${imageTag}";
 
-  # Shared network for port forwarding.  Only created when a sandbox actually
-  # publishes something; see lib/agent-sandbox-port.sh for why it exists.
+  # Shared network for published ports.  Only created when a sandbox actually
+  # publishes something, so a launch with no ports keeps podman's default
+  # rootless networking untouched.
   networkName = "agent-sandbox";
 
   # Scripts in ./lib keep their own shebang so they can be run and linted in
@@ -36,15 +37,31 @@ let
   # `docker` alias so anything calling docker hits podman.
   dockerAlias = pkgs.writeShellScriptBin "docker" ''exec ${pkgs.podman}/bin/podman "$@"'';
 
-  sidecarScript = pkgs.writeShellScriptBin "agent-sandbox-sidecar" (scriptBody ./lib/agent-sandbox-sidecar.sh);
-  proxyScript = pkgs.rustPlatform.buildRustPackage {
-    pname = "agent-sandbox-proxy";
+  # Build the entire Cargo workspace containing proxy and cli binaries
+  agentSandboxRust = pkgs.rustPlatform.buildRustPackage {
+    pname = "agent-sandbox-rust";
     version = "0.1.0";
-    src = lib.cleanSource ./proxy;
+    src = lib.cleanSource ./.;
     cargoLock = {
-      lockFile = ./proxy/Cargo.lock;
+      lockFile = ./Cargo.lock;
     };
   };
+
+  sidecarScript = pkgs.writeShellScriptBin "agent-sandbox-sidecar" ''
+    exec ${agentSandboxRust}/bin/agent-sandbox-sidecar "$@"
+  '';
+  proxyScript = pkgs.writeShellScriptBin "agent-sandbox-proxy" ''
+    exec ${agentSandboxRust}/bin/agent-sandbox-proxy "$@"
+  '';
+
+  # The SSH/GPG relay, in both halves: relay-server runs in the sidecar next to
+  # the forwarded host sockets, relay-ssh/relay-gpg run in the sandbox, which
+  # has no socket of its own under --proxy.  Individually wrapped rather than
+  # putting the whole Rust closure on the image PATH, which would also hand the
+  # agent the launcher and the ctl commands.
+  relayScripts = map (
+    name: pkgs.writeShellScriptBin name ''exec ${agentSandboxRust}/bin/${name} "$@"''
+  ) [ "relay-server" "relay-ssh" "relay-gpg" ];
   unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
   defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
   agentTools = map (a: a.package) agents;
@@ -124,8 +141,9 @@ let
     ++ podmanStack
     # No agent-sandbox-allow: policy now lives on a volume the sandbox cannot
     # see, so widening the firewall is a host-side operation
-    # (agent-sandbox-ctl proxy allow) by design.
-    ++ [ dockerAlias sidecarScript proxyScript ];
+    # (agent-sandbox ctl proxy allow) by design.
+    ++ [ dockerAlias sidecarScript proxyScript ]
+    ++ relayScripts;
 
   tools = baseTools ++ agentTools;
 
@@ -224,14 +242,19 @@ let
     .${pkgs.stdenv.hostPlatform.system}
       or (throw "agent-sandbox: no ELF interpreter mapping for ${pkgs.stdenv.hostPlatform.system}");
 
-  entrypoint = pkgs.writeShellScript "agent-sandbox-entrypoint" (scriptBody ./lib/entrypoint.sh);
+  entrypoint = pkgs.writeShellScript "agent-sandbox-entrypoint" ''
+    exec ${agentSandboxRust}/bin/agent-sandbox-entrypoint "$@"
+  '';
 
-  # streamLayeredImage rather than buildImage: layers are shared between
-  # rebuilds and nothing materialises a multi-gigabyte tarball in the store.
-  # The result is an executable that writes the tar to stdout.
+  # streamLayeredImage with maxLayers = 2 (minimum allowed): produces a minimal-layer image stream
+  # to minimize podman load extraction overhead, overlayfs mount parameter
+  # sizes, and VFS dentry lookup latency during container startup, while still
+  # streaming the tar output to stdout without materializing a multi-gigabyte
+  # tarball in the host Nix store.
   image = pkgs.dockerTools.streamLayeredImage {
     name = imageName;
     tag = imageTag;
+    maxLayers = 2;
 
     contents = [ rootEnv ];
 
@@ -245,6 +268,19 @@ let
 
       mkdir -p home/user
       chmod 1777 home/user
+      mkdir -p home/user/.agents/skills
+      mkdir -p home/user/.agents/skills/nix
+      mkdir -p home/user/.agents/skills/nix-flake
+      mkdir -p home/user/.agents/skills/devenv
+      cp ${./skills/nix/SKILL.md} home/user/.agents/skills/nix/SKILL.md
+      cp ${./skills/nix-flake/SKILL.md} home/user/.agents/skills/nix-flake/SKILL.md
+      cp ${./skills/devenv/SKILL.md} home/user/.agents/skills/devenv/SKILL.md
+      # Several agent tools discover skills from their own home directory.
+      # Keep one canonical tree and expose it through compatibility symlinks.
+      for tool in claude codex copilot cursor gemini; do
+        mkdir -p "home/user/.$tool"
+        ln -s /home/user/.agents/skills "home/user/.$tool/skills"
+      done
       mkdir -p workspace
       chmod 1777 workspace
       mkdir -p tmp
@@ -303,34 +339,14 @@ let
     )
   );
 
-  # ── Host-side helpers ─────────────────────────────────────────────────────
 
-  # Kept out of the launcher so it can be unit-tested against fixture
-  # keyrings, and because "is this GnuPG home card-only?" is a useful question
-  # to be able to ask directly.
-  gnupgScan = pkgs.writeShellApplication {
-    name = "agent-sandbox-gnupg-scan";
-    runtimeInputs = with pkgs; [
-      coreutils
-      findutils
-    ];
-    text = scriptBody ./lib/gnupg-scan.sh;
-  };
-
-  # Wrapper rather than an inlined script: the Python stays a real file that
-  # `python3 -m unittest` can import directly.
-  parseAgents = pkgs.writeShellApplication {
-    name = "agent-sandbox-parse-agents";
-    runtimeInputs = [ pkgs.python3 ];
-    text = ''exec python3 ${./lib/parse_agents.py} "$@"'';
-  };
 
   # Every launcher-adjacent script gets its image/network identifiers from
   # here rather than hard-coding them, and writeShellApplication runs
   # shellcheck over the result at build time.
   preamble = ''
-    AGENT_SANDBOX_IMAGE="${imageRef}"
-    AGENT_SANDBOX_NETWORK="${networkName}"
+    export AGENT_SANDBOX_IMAGE="${imageRef}"
+    export AGENT_SANDBOX_NETWORK="${networkName}"
   '';
 
   # An absolute store path rather than a bare "krun", because podman resolves a
@@ -344,309 +360,37 @@ let
   # withLibkrun off, the launcher's preflight catches it at first use -- probing
   # for it here would mean running crun during evaluation.
   launcherPreamble = preamble + ''
-    AGENT_SANDBOX_AGENT_SPECS=${lib.escapeShellArg agentSpecs}
-    AGENT_SANDBOX_KRUN_RUNTIME="${pkgs.crun}/bin/krun"
+    export AGENT_SANDBOX_AGENT_SPECS=${lib.escapeShellArg agentSpecs}
+    export AGENT_SANDBOX_KRUN_RUNTIME="${pkgs.crun}/bin/krun"
+    export AGENT_SANDBOX_IMAGE_STREAM="${image}"
   '';
 
   launcher = pkgs.writeShellApplication {
     name = "agent-sandbox";
     runtimeInputs = with pkgs; [
-      podman
-      git
-      coreutils
-      jq
-      gnupg       # gpgconf --list-dir agent-socket
-    ]
-    ++ [
-      gnupgScan
-      parseAgents
-      networkSummary
+      agentSandboxRust podman git coreutils jq gnupg util-linux findutils gnugrep gawk secretspec
     ];
-    text = launcherPreamble + scriptBody ./lib/agent-sandbox.sh;
+    text = launcherPreamble + ''
+      exec ${agentSandboxRust}/bin/agent-sandbox "$@"
+    '';
   };
 
-  portScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-port";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      gnugrep
-    ];
-    text = preamble + sandboxResolve + scriptBody ./lib/agent-sandbox-port.sh;
-  };
-
-  mountScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-mount";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      jq
-    ];
-    text = preamble + sandboxResolve + scriptBody ./lib/agent-sandbox-mount.sh;
-  };
-
-  purgeScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-purge";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      findutils
-    ];
-    text = preamble + scriptBody ./lib/agent-sandbox-purge.sh;
-  };
-
-  # No `preamble`: selection is by role label now, so neither the image nor the
-  # network name is needed -- which also retires the `: "${AGENT_SANDBOX_NETWORK:?}"`
-  # line that existed only to keep shellcheck quiet about the unused one.
-  listScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-list";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      util-linux # column, for the table alignment podman's `table` cannot do
-    ];
-    text = scriptBody ./lib/agent-sandbox-list.sh;
-  };
-
-  # Rendering the connection log lives here rather than inside the launcher so
-  # that `agent-sandbox-ctl net` prints the identical report for a running
-  # sandbox, and so a log kept after a failed session can be re-rendered.
-  networkSummary = pkgs.writeShellApplication {
-    name = "agent-sandbox-network-summary";
-    runtimeInputs = with pkgs; [
-      jq
-      coreutils
-    ];
-    text = scriptBody ./lib/agent-sandbox-network-summary.sh;
-  };
-
-  # Inlined into each consumer instead of being its own binary, so that its
-  # error messages carry the calling script's name.  Same trick as `preamble`.
-  sandboxResolve = scriptBody ./lib/agent-sandbox-resolve.sh;
-
-  statusScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-status";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      gnugrep
-      gawk
-    ];
-    text = sandboxResolve + scriptBody ./lib/agent-sandbox-status.sh;
-  };
-
-  logsScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-logs";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      gnugrep
-    ];
-    text = sandboxResolve + scriptBody ./lib/agent-sandbox-logs.sh;
-  };
-
-  attachScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-attach";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      gnugrep
-    ];
-    text = sandboxResolve + scriptBody ./lib/agent-sandbox-attach.sh;
-  };
-
-  # proxyScript in runtimeInputs so the host validates a policy with the very
-  # binary that will enforce it -- one implementation, no drift.
-  firewallScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-firewall";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      gnugrep
-      gawk
-    ]
-    ++ [ proxyScript ];
-    text = sandboxResolve + scriptBody ./lib/agent-sandbox-firewall.sh;
-  };
-
-  netScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-net";
-    runtimeInputs = with pkgs; [
-      podman
-      coreutils
-      gnugrep
-    ]
-    ++ [ networkSummary ];
-    # No `preamble`: this script needs neither the image nor the network name,
-    # and writeShellApplication's shellcheck rejects the unused assignment.
-    text = sandboxResolve + scriptBody ./lib/agent-sandbox-net.sh;
-  };
-
-  loadScript = pkgs.writeShellApplication {
-    name = "agent-sandbox-load";
-    runtimeInputs = [ pkgs.podman ];
-    text = ''
-      AGENT_SANDBOX_IMAGE="${imageRef}"
-      AGENT_SANDBOX_IMAGE_STREAM="${image}"
-    ''
-    + scriptBody ./lib/agent-sandbox-load.sh;
-  };
-
-  ctlScript = pkgs.writeShellApplication {
+  ctlLauncher = pkgs.writeShellApplication {
     name = "agent-sandbox-ctl";
-    runtimeInputs = [
-      loadScript
-      portScript
-      mountScript
-      purgeScript
-      listScript
-      netScript
-      statusScript
-      logsScript
-      attachScript
-      firewallScript
+    runtimeInputs = with pkgs; [
+      agentSandboxRust podman git coreutils jq gnupg util-linux findutils gnugrep gawk secretspec
     ];
-    text = scriptBody ./lib/agent-sandbox-ctl.sh;
+    text = launcherPreamble + ''
+      exec ${agentSandboxRust}/bin/agent-sandbox ctl "$@"
+    '';
   };
 
-  # ── Checks ────────────────────────────────────────────────────────────────
-  # Building the launcher already runs shellcheck (writeShellApplication), so
-  # these cover what that cannot: the parser's behaviour, the gnupg
-  # classifier's verdicts, and the entrypoint, which is a plain script.
-
+  # `rust` is the whole workspace: buildRustPackage runs `cargo test` in its
+  # check phase, so this is what makes `nix flake check` cover the launcher's
+  # argument handling, the AGENTS.md parsers and the policy format.
   checks = {
-    parser = pkgs.runCommand "agent-sandbox-parser-tests" { nativeBuildInputs = [ pkgs.python3 ]; } ''
-      cp ${./lib/parse_agents.py} parse_agents.py
-      cp ${./lib/test_parse_agents.py} test_parse_agents.py
-      python3 -m unittest test_parse_agents -v
-      touch "$out"
-    '';
-
-    gnupg-scan =
-      pkgs.runCommand "agent-sandbox-gnupg-tests"
-        {
-          nativeBuildInputs = with pkgs; [
-            bash
-            coreutils
-            gnugrep
-          ];
-        }
-        ''
-          bash ${./lib/test-gnupg-scan.sh} ${gnupgScan}/bin/agent-sandbox-gnupg-scan
-          touch "$out"
-        '';
-
-    entrypoint =
-      pkgs.runCommand "agent-sandbox-entrypoint-tests"
-        {
-          nativeBuildInputs = with pkgs; [
-            bash
-            coreutils
-            gnugrep
-          ];
-        }
-        ''
-          bash ${./lib/test-entrypoint.sh} ${entrypoint}
-          touch "$out"
-        '';
-
-    shellcheck = pkgs.runCommand "agent-sandbox-shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
-      shellcheck --shell=bash ${./lib}/*.sh
-      touch "$out"
-    '';
-
-    # The renderer is the only consumer of the proxy's log format, and the two
-    # are versioned independently: a log written before open/close events
-    # existed must still render exactly as it did.
-    network-summary =
-      pkgs.runCommand "agent-sandbox-network-summary-tests"
-        {
-          nativeBuildInputs = with pkgs; [
-            bash
-            coreutils
-            gnugrep
-            jq
-          ];
-        }
-        ''
-          bash ${./lib/test-network-summary.sh} ${networkSummary}/bin/agent-sandbox-network-summary
-          touch "$out"
-        '';
-
-    # The AGENTS.md -> policy file -> proxy hop, which had no coverage at all and
-    # is where the fail-open separator bug lived.  Every list in the fixture has
-    # two entries, since one cannot distinguish a working handoff from a broken
-    # one.
-    firewall-policy =
-      pkgs.runCommand "agent-sandbox-firewall-policy-tests"
-        {
-          nativeBuildInputs = with pkgs; [
-            bash
-            coreutils
-            gnugrep
-            gnused
-          ];
-        }
-        ''
-          bash ${./lib/test-firewall-policy.sh} \
-            ${parseAgents}/bin/agent-sandbox-parse-agents \
-            ${proxyScript}/bin/agent-sandbox-proxy \
-            ${./lib/agent-sandbox-sidecar.sh}
-          touch "$out"
-        '';
-
-    # First behavioural coverage of the ctl subcommands.  Runs against the built
-    # scripts because resolve_sandbox is inlined at build time, and against a
-    # stub podman because a real one cannot run in a nix build.
-    ctl-args =
-      pkgs.runCommand "agent-sandbox-ctl-args-tests"
-        {
-          nativeBuildInputs = with pkgs; [
-            bash
-            coreutils
-            gnugrep
-            gnused
-            # The tests run the composed lib/ scripts rather than the built ones,
-            # so whatever a script would find through runtimeInputs has to be
-            # here too -- `column`, for agent-sandbox-list, and `jq`, for
-            # agent-sandbox-mount's export subcommand.
-            util-linux
-            jq
-          ];
-        }
-        ''
-          bash ${./lib/test-ctl-args.sh} ${./lib} \
-            ${proxyScript}/bin/agent-sandbox-proxy
-          touch "$out"
-        '';
-
-    # buildRustPackage runs cargo test in its check phase; the proxy is
-    # otherwise only reachable through the image, which `nix flake check`
-    # deliberately does not build.
+    rust = agentSandboxRust;
     proxy = proxyScript;
-
-    # Builds every host-side script, which is what runs shellcheck over the
-    # generated (preamble + body) text.  Deliberately excludes the load
-    # script, so `nix flake check` does not have to build the image.
-    scripts = pkgs.symlinkJoin {
-      name = "agent-sandbox-scripts";
-      paths = [
-        launcher
-        portScript
-        mountScript
-        purgeScript
-        listScript
-        ctlScript
-        netScript
-        statusScript
-        logsScript
-        attachScript
-        firewallScript
-        networkSummary
-        gnupgScan
-        parseAgents
-      ];
-    };
   };
 
 in
@@ -654,7 +398,7 @@ pkgs.symlinkJoin {
   name = "agent-sandbox";
   paths = [
     launcher
-    ctlScript
+    ctlLauncher
     imageStorePaths
   ];
   passthru = {
@@ -664,18 +408,6 @@ pkgs.symlinkJoin {
       image
       checks
       launcher
-      loadScript
-      portScript
-      mountScript
-      purgeScript
-      listScript
-      ctlScript
-      netScript
-      statusScript
-      logsScript
-      attachScript
-      firewallScript
-      networkSummary
       ;
   };
   meta = {

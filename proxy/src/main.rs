@@ -3,9 +3,8 @@
 //! Forward proxy for the agent-sandbox sidecar.
 //!
 //! Usage: agent-sandbox-proxy [--policy FILE] [--log FILE] [--listen ADDR]
-//!                            [--allow-domains LIST] [--deny-domains LIST]
-//!                            [--allow-ips LIST] [--deny-ips LIST]
-//!                            [--allow-ports LIST] [--check-policy FILE]
+//!                            [--allow-domains LIST] [--allow-ipss LIST]
+//!                            [--allow-portss LIST] [--check-policy FILE]
 //!
 //! Policy comes from a file (one `KEY VALUE` per line, see `parse_policy`) or
 //! from the inline lists, never both.  Anything wrong with it exits 2 before the
@@ -13,18 +12,26 @@
 //! weaker one that appears to work.
 //!
 //! `--log` appends newline-delimited JSON, one object per connection event,
-//! rendered by agent-sandbox-network-summary.
+//! rendered by agent-sandbox-network-summary. `--detail-log` is a bounded,
+//! ephemeral stream of sanitized denied request heads for the TUI.
+
+mod inject;
+mod l7;
+mod secret;
+mod tls;
 
 use ipnet::IpNet;
+use secret::{SecretBinding, SecretBindings};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tls::SessionCa;
 
 /// Read timeout on proxied sockets.  This is only a liveness tick so a blocked
 /// read can be retried, *not* an idle cap: a stream that goes quiet for longer
@@ -52,6 +59,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_PROBE_HOST: &str = "cloudflare.com:443";
 /// Written by the proxy, read by the sidecar's readiness gate on the host.
 const PROXY_READY: &str = "/sidecar_shared/proxy-ready";
+/// Public session CA for sandbox trust bootstrap, when MITM-capable secret
+/// domains are configured.
+const PROXY_CA_PEM: &str = "/sidecar_shared/ca.pem";
 /// Written only when `wait_for_egress` gives up, and carrying why.
 const EGRESS_DEGRADED: &str = "/sidecar_shared/egress-degraded";
 const BUF_SIZE: usize = 64 * 1024;
@@ -60,450 +70,8 @@ const DNS_CACHE_MAX: usize = 512;
 /// How often the policy file is checked for changes.
 const POLICY_POLL: Duration = Duration::from_secs(1);
 
-// ── Policy ──────────────────────────────────────────────────────────────────
-
-/// A single port, or an inclusive range (`8000-8100`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PortRange {
-    start: u16,
-    end: u16,
-}
-
-impl PortRange {
-    fn contains(&self, port: u16) -> bool {
-        self.start <= port && port <= self.end
-    }
-}
-
-impl std::fmt::Display for PortRange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.start == self.end {
-            write!(f, "{}", self.start)
-        } else {
-            write!(f, "{}-{}", self.start, self.end)
-        }
-    }
-}
-
-/// Applied when a policy is deny-by-default and does not name `allow_ports`
-/// itself: enough for the common case (web + git-over-ssh) without silently
-/// widening a policy the operator did not ask to widen.
-const DEFAULT_ALLOW_PORTS: [PortRange; 3] = [
-    PortRange { start: 80, end: 80 },
-    PortRange {
-        start: 443,
-        end: 443,
-    },
-    PortRange { start: 22, end: 22 },
-];
-
-/// `default_allow` is derived, never supplied: an allow list makes the policy
-/// deny-by-default, deny lists alone leave it allow-by-default.  Constructing
-/// this struct only through `new`/`parse_policy` is what stops a caller (in
-/// particular a reload) from recomputing the lists and forgetting the mode.
-#[derive(Debug)]
-struct ProxyConfig {
-    allow_domains: Vec<String>,
-    deny_domains: Vec<String>,
-    allow_ips: Vec<IpNet>,
-    deny_ips: Vec<IpNet>,
-    default_allow: bool,
-    /// `None` means unrestricted; `Some(_)` (possibly derived) restricts to
-    /// those ranges.  Kept distinct from an empty `Vec` so "not specified" and
-    /// "specified as nothing" cannot be confused.
-    allow_ports: Option<Vec<PortRange>>,
-}
-
-impl ProxyConfig {
-    fn new(
-        allow_domains: Vec<String>,
-        deny_domains: Vec<String>,
-        allow_ips: Vec<IpNet>,
-        deny_ips: Vec<IpNet>,
-        allow_ports_override: Option<Vec<PortRange>>,
-        default_override: Option<bool>,
-    ) -> ProxyConfig {
-        let default_allow = default_override
-            .unwrap_or_else(|| allow_domains.is_empty() && allow_ips.is_empty());
-        // Mirrors default_allow's own derivation: an explicit value always
-        // wins, and otherwise the *mode* decides -- a deny-by-default policy
-        // gets a sane default rather than staying wide open on every port.
-        let allow_ports = match allow_ports_override {
-            Some(v) => Some(v),
-            None if default_allow => None,
-            None => Some(DEFAULT_ALLOW_PORTS.to_vec()),
-        };
-        ProxyConfig {
-            allow_domains,
-            deny_domains,
-            allow_ips,
-            deny_ips,
-            default_allow,
-            allow_ports,
-        }
-    }
-
-    /// One line per rule, for the startup log and for `--check-policy`.
-    fn describe(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for d in &self.allow_domains {
-            out.push(format!("allow_domains {}", d));
-        }
-        for d in &self.deny_domains {
-            out.push(format!("deny_domains {}", d));
-        }
-        for n in &self.allow_ips {
-            out.push(format!("allow_ips {}", n));
-        }
-        for n in &self.deny_ips {
-            out.push(format!("deny_ips {}", n));
-        }
-        if let Some(ranges) = &self.allow_ports {
-            for r in ranges {
-                out.push(format!("allow_ports {}", r));
-            }
-        }
-        out.push(format!(
-            "default {}",
-            if self.default_allow { "allow" } else { "deny" }
-        ));
-        out
-    }
-}
-
-/// Split on commas *and* whitespace.  Only commas are produced by anything that
-/// calls this, but a space-separated list used to arrive here and collapse into
-/// one unparseable token, silently emptying the list -- and an empty allow list
-/// means allow-everything.  Accepting both costs nothing and removes the trap.
-fn split_list(s: &str) -> impl Iterator<Item = &str> {
-    s.split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-}
-
-fn parse_csv(s: &str) -> Vec<String> {
-    split_list(s).map(|s| s.to_ascii_lowercase()).collect()
-}
-
-/// Accept both a CIDR block and a bare address, the latter as a host route.
-///
-/// `IpNet` alone rejects "8.8.8.8" for want of a prefix, while the AGENTS.md
-/// parser accepts it (Python's ip_network treats it as /32).  That disagreement
-/// used to be invisible, because unparseable entries were dropped rather than
-/// reported: a deny_ips entry written as a bare address silently did nothing.
-///
-/// Deliberate limitation: this does not fold an IPv4-mapped V6 CIDR (e.g.
-/// `::ffff:10.0.0.0/104`) down to a V4 range -- doing so would mean remapping
-/// the prefix length across families.  `normalize_host` folds the *request*
-/// side instead, which is enough to match a v4-mapped literal against a plain
-/// V4 policy entry; nothing in this codebase writes the mapped form as a
-/// policy entry itself.
-fn parse_net(s: &str) -> Result<IpNet, String> {
-    if let Ok(net) = s.parse::<IpNet>() {
-        return Ok(net);
-    }
-    match s.parse::<IpAddr>() {
-        Ok(ip) => Ok(IpNet::from(ip)),
-        Err(e) => Err(format!(
-            "{:?} is not an IP address or CIDR block: {}",
-            s, e
-        )),
-    }
-}
-
-/// Unparseable entries are an error, never a silent omission: dropping one turns
-/// a policy the operator wrote into a weaker one nobody asked for.
-fn parse_csv_ips(s: &str) -> Result<Vec<IpNet>, String> {
-    split_list(s).map(parse_net).collect()
-}
-
-/// Accept a single port (`443`) or an inclusive range (`8000-8100`).
-fn parse_port_range(s: &str) -> Result<PortRange, String> {
-    let (start, end) = match s.split_once('-') {
-        Some((a, b)) => (a, b),
-        None => (s, s),
-    };
-    let parse_one = |p: &str| -> Result<u16, String> {
-        p.parse::<u16>()
-            .ok()
-            .filter(|&n| n != 0)
-            .ok_or_else(|| format!("{:?} is not a port in 1-65535", p))
-    };
-    let start = parse_one(start)?;
-    let end = parse_one(end)?;
-    if start > end {
-        return Err(format!("{:?} has start > end", s));
-    }
-    Ok(PortRange { start, end })
-}
-
-/// Unparseable entries are an error, for the same reason as `parse_csv_ips`.
-fn parse_csv_ports(s: &str) -> Result<Vec<PortRange>, String> {
-    split_list(s).map(parse_port_range).collect()
-}
-
-/// Parse the policy file written by the launcher (and edited by
-/// `agent-sandbox-ctl proxy`).
-///
-/// One `KEY VALUE` pair per line, `#` comments and blank lines ignored:
-///
-/// ```text
-/// allow_domains github.com
-/// allow_ips 10.0.0.0/8
-/// default deny
-/// ```
-///
-/// A value containing whitespace is rejected rather than split.  That is the
-/// whole point of the format: the previous wire format packed a list into one
-/// space-separated argument, and every consumer disagreed about how to take it
-/// apart.  Rejecting the shape means the old encoding cannot silently reappear.
-fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
-    let mut allow_domains = Vec::new();
-    let mut deny_domains = Vec::new();
-    let mut allow_ips = Vec::new();
-    let mut deny_ips = Vec::new();
-    let mut allow_ports_override: Option<Vec<PortRange>> = None;
-    let mut default_override = None;
-
-    for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let lineno = i + 1;
-        let (key, value) = line
-            .split_once(char::is_whitespace)
-            .ok_or_else(|| format!("{}: {:?} is not KEY VALUE", lineno, line))?;
-        let value = value.trim();
-        if value.is_empty() {
-            return Err(format!("{}: {} has no value", lineno, key));
-        }
-        if value.split_whitespace().count() > 1 {
-            return Err(format!(
-                "{}: {}: {:?} contains whitespace; write one entry per line",
-                lineno, key, value
-            ));
-        }
-
-        match key {
-            "allow_domains" => allow_domains.push(value.to_ascii_lowercase()),
-            "deny_domains" => deny_domains.push(value.to_ascii_lowercase()),
-            "allow_ips" => allow_ips
-                .push(parse_net(value).map_err(|e| format!("{}: allow_ips: {}", lineno, e))?),
-            "deny_ips" => deny_ips
-                .push(parse_net(value).map_err(|e| format!("{}: deny_ips: {}", lineno, e))?),
-            "allow_ports" => {
-                let r = parse_port_range(value)
-                    .map_err(|e| format!("{}: allow_ports: {}", lineno, e))?;
-                allow_ports_override.get_or_insert_with(Vec::new).push(r);
-            }
-            "default" => {
-                default_override = Some(match value {
-                    "allow" => true,
-                    "deny" => false,
-                    other => {
-                        return Err(format!(
-                            "{}: default: expected 'allow' or 'deny', got {:?}",
-                            lineno, other
-                        ))
-                    }
-                })
-            }
-            other => return Err(format!("{}: unknown key {:?}", lineno, other)),
-        }
-    }
-
-    Ok(ProxyConfig::new(
-        allow_domains,
-        deny_domains,
-        allow_ips,
-        deny_ips,
-        allow_ports_override,
-        default_override,
-    ))
-}
-
-fn load_policy(path: &str) -> Result<ProxyConfig, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read policy {}: {}", path, e))?;
-    parse_policy(&text).map_err(|e| format!("{}:{}", path, e))
-}
-
-/// Fold an IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible (`::a.b.c.d`,
-/// excluding `::` and `::1`) IPv6 literal down to its V4 form, so it matches
-/// the same `deny_ips`/`allow_ips` rules as the plain address would.  Anything
-/// else is returned unchanged.
-///
-/// The compatible form is reconstructed from octets rather than the
-/// deprecated `Ipv6Addr::to_ipv4()`, which also (mis)classifies `::`/`::1` as
-/// address `0.0.0.0`/`0.0.0.1`.
-fn fold_ipv6(ip: std::net::Ipv6Addr) -> IpAddr {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return IpAddr::V4(v4);
-    }
-    let seg = ip.segments();
-    if seg[0..6] == [0, 0, 0, 0, 0, 0] && (seg[6] != 0 || seg[7] > 1) {
-        let o = ip.octets();
-        return IpAddr::V4(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
-    }
-    IpAddr::V6(ip)
-}
-
-/// Normalise a request-line host before any policy match.  `host` is assumed
-/// already ASCII-lowercased by the caller.  `None` means the host cannot mean
-/// anything a policy could sanely list, and is treated as deny -- not a
-/// distinct error path, so no future matcher has to remember to consult it.
-///
-/// Handles two evasions: a trailing-dot FQDN (`github.com.`, which resolvers
-/// accept as identical to `github.com`) and an IPv4-mapped/compatible IPv6
-/// literal (`[::ffff:10.0.0.1]`), both of which used to compare unequal to
-/// the plain form a policy actually lists.
-fn normalize_host(host: &str) -> Option<String> {
-    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        return match inner.parse::<std::net::Ipv6Addr>() {
-            Ok(ip) => Some(format!("[{}]", fold_ipv6(ip))),
-            Err(_) => None,
-        };
-    }
-    if let Ok(IpAddr::V6(ip)) = host.parse::<IpAddr>() {
-        return Some(fold_ipv6(ip).to_string());
-    }
-    if host.parse::<IpAddr>().is_ok() {
-        return Some(host.to_string());
-    }
-
-    // Domain name path.
-    if host.starts_with('.') {
-        return None;
-    }
-    let stripped = host.strip_suffix('.').unwrap_or(host);
-    if stripped.is_empty() || stripped.contains("..") {
-        return None;
-    }
-    // Matches parse_agents.py's DOMAIN_RE charset, including '_': some
-    // internal hostnames legitimately use it, and excluding it here would
-    // silently deny a name a policy already lists.
-    if !stripped
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
-    {
-        return None;
-    }
-    Some(stripped.to_string())
-}
-
-/// Both arguments must already be lowercase.
-fn domain_match(domain: &str, pattern: &str) -> bool {
-    match pattern.strip_prefix("*.") {
-        Some(base) => domain == base || domain.ends_with(&pattern[1..]),
-        None => domain == pattern,
-    }
-}
-
-impl ProxyConfig {
-    /// More specific wins: the longest matching pattern decides.  On an exact
-    /// tie between an allow and a deny rule, allow wins.
-    fn is_allowed_domain(&self, domain: &str) -> bool {
-        let mut best_len: i32 = -1;
-        let mut allowed = self.default_allow;
-
-        for p in &self.allow_domains {
-            if domain_match(domain, p) && p.len() as i32 > best_len {
-                best_len = p.len() as i32;
-                allowed = true;
-            }
-        }
-
-        for p in &self.deny_domains {
-            if domain_match(domain, p) && p.len() as i32 > best_len {
-                best_len = p.len() as i32;
-                allowed = false;
-            }
-        }
-
-        allowed
-    }
-
-    /// More specific wins: the longest matching CIDR prefix decides.
-    fn is_allowed_ip(&self, ip: IpAddr) -> bool {
-        let mut best_prefix: i32 = -1;
-        let mut allowed = self.default_allow;
-
-        for net in &self.allow_ips {
-            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
-                best_prefix = net.prefix_len() as i32;
-                allowed = true;
-            }
-        }
-
-        for net in &self.deny_ips {
-            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
-                best_prefix = net.prefix_len() as i32;
-                allowed = false;
-            }
-        }
-
-        allowed
-    }
-
-    /// Whether an address is explicitly denied.
-    ///
-    /// Deliberately *not* `!is_allowed_ip(ip)`: this runs on the addresses a
-    /// hostname resolved to, after the name itself already passed policy, so
-    /// the deny-by-default fallback must not apply — under an allow list of
-    /// domains no address would ever be listed and every connection would be
-    /// rejected.  Only an explicit `deny_ips` match counts, and a
-    /// more-specific *or equally specific* `allow_ips` rule still overrides
-    /// it — the `>=` below, not `>`, is what makes `allow_ips 10.0.0.0/8`
-    /// actually override a baseline `deny_ips 10.0.0.0/8` at the same prefix,
-    /// matching the tie-break `is_allowed_ip` already uses.
-    fn is_denied_address(&self, ip: IpAddr) -> bool {
-        let mut best_prefix: i32 = -1;
-        let mut denied = false;
-
-        for net in &self.deny_ips {
-            if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
-                best_prefix = net.prefix_len() as i32;
-                denied = true;
-            }
-        }
-
-        for net in &self.allow_ips {
-            if net.contains(&ip) && (net.prefix_len() as i32) >= best_prefix {
-                best_prefix = net.prefix_len() as i32;
-                denied = false;
-            }
-        }
-
-        denied
-    }
-
-    /// `host` is the literal target from the request line, already lowercased.
-    fn is_allowed_target(&self, host: &str) -> bool {
-        let host = match normalize_host(host) {
-            Some(h) => h,
-            None => return false,
-        };
-        match host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
-            Ok(ip) => self.is_allowed_ip(ip),
-            Err(_) => self.is_allowed_domain(&host),
-        }
-    }
-
-    fn is_allowed_port(&self, port: u16) -> bool {
-        self.allow_ports
-            .as_ref()
-            .map_or(true, |ranges| ranges.iter().any(|r| r.contains(port)))
-    }
-
-    /// `host` is the literal target from the request line, already lowercased.
-    ///
-    /// `handle_client` calls `is_allowed_target`/`is_allowed_port` separately
-    /// so it can log which one denied; this combinator is what the tests use.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn is_allowed(&self, host: &str, port: u16) -> bool {
-        self.is_allowed_target(host) && self.is_allowed_port(port)
-    }
-}
+pub mod policy;
+use policy::*;
 
 // ── Name resolution ─────────────────────────────────────────────────────────
 
@@ -564,10 +132,8 @@ impl Resolver {
                         }
                         return Ok(addrs);
                     }
-                    last_err = io::Error::new(
-                        ErrorKind::NotFound,
-                        "resolver returned no addresses",
-                    );
+                    last_err =
+                        io::Error::new(ErrorKind::NotFound, "resolver returned no addresses");
                 }
                 Err(e) => last_err = e,
             }
@@ -582,7 +148,7 @@ impl Resolver {
 // ── Metering ────────────────────────────────────────────────────────────────
 
 /// One JSON line per connection event, consumed by `agent-sandbox-network-summary`
-/// to render the `--proxy` summary and the `agent-sandbox-ctl net` live
+/// to render the `--proxy` summary and the `agent-sandbox ctl net` live
 /// view.  Cheap enough to leave on: a few hundred bytes per connection, versus
 /// the full-payload packet capture it replaces.
 ///
@@ -595,11 +161,50 @@ impl Resolver {
 /// adding anything.
 struct MetricsLog {
     file: Mutex<File>,
+    detail_file: Option<Mutex<File>>,
     /// Process start, in epoch seconds.  Ids embed it so two proxies appending
     /// to the same log cannot mint colliding ids — a correlation id that
     /// silently aliases is worse than none.
     boot: u64,
     next_id: AtomicU64,
+}
+
+const METRICS_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const DETAIL_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const DETAIL_HEAD_MAX_BYTES: usize = 16 * 1024;
+
+fn rotate_if_needed(file: &mut File, incoming: u64, max: u64) -> io::Result<()> {
+    if file.metadata()?.len().saturating_add(incoming) > max {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+    }
+    Ok(())
+}
+
+fn sensitive_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name == "authorization"
+        || name == "proxy-authorization"
+        || name == "cookie"
+        || name == "set-cookie"
+        || name.contains("api-key")
+        || name.contains("apikey")
+        || name.contains("token")
+        || name.contains("secret")
+}
+
+fn sanitize_request_head(head: &str) -> String {
+    head.lines()
+        .map(|line| {
+            if let Some((name, _)) = line.split_once(':') {
+                if sensitive_header(name) {
+                    return format!("{}: <redacted>", name.trim());
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 /// Trim the boilerplate std prepends to resolver errors so the summary stays
@@ -640,13 +245,19 @@ fn now_secs() -> u64 {
 }
 
 impl MetricsLog {
-    fn open(path: &str) -> Option<Arc<MetricsLog>> {
+    fn open(path: &str, detail_path: Option<&str>) -> Option<Arc<MetricsLog>> {
         match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(f) => Some(Arc::new(MetricsLog {
-                file: Mutex::new(f),
-                boot: now_secs(),
-                next_id: AtomicU64::new(1),
-            })),
+            Ok(f) => {
+                let detail_file = detail_path
+                    .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
+                    .map(Mutex::new);
+                Some(Arc::new(MetricsLog {
+                    file: Mutex::new(f),
+                    detail_file,
+                    boot: now_secs(),
+                    next_id: AtomicU64::new(1),
+                }))
+            }
             Err(e) => {
                 eprintln!("proxy: cannot open metrics log {}: {}", path, e);
                 None
@@ -656,21 +267,49 @@ impl MetricsLog {
 
     fn write_line(&self, line: &str) {
         if let Ok(mut f) = self.file.lock() {
+            let _ = rotate_if_needed(&mut f, line.len() as u64, METRICS_LOG_MAX_BYTES);
             let _ = f.write_all(line.as_bytes());
         }
     }
 
+    fn denied_detail(&self, host: &str, port: u16, reason: &str, head: &str) {
+        let Some(file) = &self.detail_file else {
+            return;
+        };
+        let head = sanitize_request_head(&String::from_utf8_lossy(
+            &head.as_bytes()[..head.len().min(DETAIL_HEAD_MAX_BYTES)],
+        ));
+        let line = format!(
+            "{{\"ts\":{},\"host\":\"{}\",\"port\":{},\"reason\":\"{}\",\"request\":\"{}\"}}\n",
+            now_secs(),
+            json_escape(host),
+            port,
+            json_escape(reason),
+            json_escape(&head)
+        );
+        if let Ok(mut file) = file.lock() {
+            let _ = rotate_if_needed(&mut file, line.len() as u64, DETAIL_LOG_MAX_BYTES);
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    fn denied_http_detail(&self, host: &str, port: u16, reason: &str, method: &str, path: &str) {
+        let request = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, host);
+        self.denied_detail(host, port, reason, &request);
+    }
+
     fn next_id(&self) -> String {
-        format!("{}-{}", self.boot, self.next_id.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "{}-{}",
+            self.boot,
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     /// Marks a policy change in the connection log, so `ctl net -f` shows it
     /// interleaved with the connections it affected.
     fn policy_event(&self) {
-        self.write_line(&format!(
-            "{{\"ev\":\"policy\",\"ts\":{}}}\n",
-            now_secs()
-        ));
+        self.write_line(&format!("{{\"ev\":\"policy\",\"ts\":{}}}\n", now_secs()));
     }
 
     /// A connection has been established and is now pumping bytes.
@@ -697,6 +336,9 @@ impl MetricsLog {
         up: u64,
         down: u64,
         ms: u128,
+        method: Option<&str>,
+        path: Option<&str>,
+        status: Option<u16>,
     ) {
         let mut line = String::new();
         if let Some(id) = id {
@@ -715,7 +357,16 @@ impl MetricsLog {
             ms
         ));
         if let Some(e) = err {
-            line.push_str(&format!(",\"err\":\"{}\"", e));
+            line.push_str(&format!(",\"err\":\"{}\"", json_escape(e)));
+        }
+        if let Some(m) = method {
+            line.push_str(&format!(",\"method\":\"{}\"", json_escape(m)));
+        }
+        if let Some(p) = path {
+            line.push_str(&format!(",\"path\":\"{}\"", json_escape(p)));
+        }
+        if let Some(s) = status {
+            line.push_str(&format!(",\"status\":{}", s));
         }
         line.push_str("}\n");
 
@@ -732,6 +383,8 @@ struct Shared {
     /// then evaluates one immutable snapshot for its whole life, so a reload can
     /// never split a decision in half.
     config: RwLock<Arc<ProxyConfig>>,
+    secrets: Arc<SecretBindings>,
+    session_ca: Option<Arc<SessionCa>>,
     resolver: Resolver,
     metrics: Option<Arc<MetricsLog>>,
     /// Instant until which the resolve/connect paths keep retrying.
@@ -744,6 +397,27 @@ impl Shared {
     /// outcome than acting on a config someone else was mid-swap on.
     fn config(&self) -> Arc<ProxyConfig> {
         Arc::clone(&self.config.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Apply the policy ∧ provider gate for one request.
+    ///
+    /// Called per request rather than per connection: a keep-alive connection
+    /// carries many requests, and resolving once at CONNECT time meant a
+    /// token authorized for a single route was injected into every request
+    /// that followed it on the same socket.
+    fn secret_for_request(&self, host: &str, method: &str, path: &str) -> Option<&SecretBinding> {
+        if !self.config().is_secret_route(host, method, path) {
+            return None;
+        }
+        let normalized = normalize_host(host)?;
+        if normalized
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<IpAddr>()
+            .is_ok()
+        {
+            return None;
+        }
+        self.secrets.binding_for_request(&normalized, method, path)
     }
 
     /// Install a new policy.  The DNS cache goes with it: the name check runs
@@ -764,6 +438,18 @@ impl Shared {
         }
     }
 
+    fn denied_detail(&self, host: &str, port: u16, reason: &str, request_head: &str) {
+        if let Some(m) = &self.metrics {
+            m.denied_detail(host, port, reason, request_head);
+        }
+    }
+
+    fn denied_http_detail(&self, host: &str, port: u16, reason: &str, method: &str, path: &str) {
+        if let Some(m) = &self.metrics {
+            m.denied_http_detail(host, port, reason, method, path);
+        }
+    }
+
     fn record(
         &self,
         id: Option<&str>,
@@ -774,9 +460,14 @@ impl Shared {
         up: u64,
         down: u64,
         ms: u128,
+        method: Option<&str>,
+        path: Option<&str>,
+        status: Option<u16>,
     ) {
         if let Some(m) = &self.metrics {
-            m.record(id, host, port, verdict, err, up, down, ms);
+            m.record(
+                id, host, port, verdict, err, up, down, ms, method, path, status,
+            );
         }
     }
 
@@ -787,6 +478,60 @@ impl Shared {
         let id = m.next_id();
         m.open_event(&id, host, port);
         Some(id)
+    }
+
+    fn is_allowed(&self, host: &str, port: u16) -> bool {
+        self.config().is_allowed(host, port)
+    }
+
+    /// Returns `(true, None)` if the request is allowed, or `(false, Some(reason))`
+    /// when it is denied.  The reason is meant for logs only, not for the client.
+    pub fn l7_check(&self, host: &str, method: &str, path: &str) -> (bool, Option<String>) {
+        let cfg = self.config();
+        if cfg.is_l7_allowed(host, method, path) {
+            (true, None)
+        } else {
+            (false, Some(cfg.why_l7_denied(host, method, path)))
+        }
+    }
+}
+
+struct PrefixedStream {
+    inner: TcpStream,
+    prefix: Vec<u8>,
+    pos: usize,
+}
+
+impl PrefixedStream {
+    fn new(inner: TcpStream, prefix: Vec<u8>) -> Self {
+        Self {
+            inner,
+            prefix,
+            pos: 0,
+        }
+    }
+}
+
+impl Read for PrefixedStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let remaining = self.prefix.len() - self.pos;
+            let copy_len = remaining.min(buf.len());
+            buf[..copy_len].copy_from_slice(&self.prefix[self.pos..self.pos + copy_len]);
+            self.pos += copy_len;
+            return Ok(copy_len);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl Write for PrefixedStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -846,12 +591,19 @@ fn read_head(sock: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
     }
 }
 
+fn split_head_and_extra(buf: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        (&buf[..pos + 4], &buf[pos + 4..])
+    } else {
+        (buf, &[])
+    }
+}
+
 /// Connect to the first address that answers, retrying for at least
 /// `RETRY_WINDOW` so a momentarily unreachable network does not become a 502.
 fn connect_any(addrs: &[SocketAddr], retry_until: Instant) -> Result<TcpStream, io::Error> {
     let deadline = (Instant::now() + RETRY_WINDOW).max(retry_until);
-    let mut last_err =
-        io::Error::new(ErrorKind::InvalidInput, "no addresses to connect to");
+    let mut last_err = io::Error::new(ErrorKind::InvalidInput, "no addresses to connect to");
     loop {
         for addr in addrs {
             match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
@@ -889,15 +641,15 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     let method = parts[0];
     let mut url = parts[1];
 
-    let host;
+    let raw_host;
     let port: u16;
 
     if method == "CONNECT" {
         if let Some((h, p)) = url.rsplit_once(':') {
-            host = h.to_ascii_lowercase();
+            raw_host = h.to_ascii_lowercase();
             port = p.parse().unwrap_or(443);
         } else {
-            host = url.to_ascii_lowercase();
+            raw_host = url.to_ascii_lowercase();
             port = 443;
         }
     } else {
@@ -906,46 +658,49 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         }
         let url_no_path = url.split('/').next().unwrap_or("");
         if let Some((h, p)) = url_no_path.rsplit_once(':') {
-            host = h.to_ascii_lowercase();
+            raw_host = h.to_ascii_lowercase();
             port = p.parse().unwrap_or(80);
         } else {
-            host = url_no_path.to_ascii_lowercase();
+            raw_host = url_no_path.to_ascii_lowercase();
             port = 80;
         }
     }
 
-    if host.is_empty() {
+    if raw_host.is_empty() {
         let _ = client_sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
         return;
     }
+
+    let host = match normalize_host(&raw_host) {
+        Some(h) => h,
+        None => {
+            let _ = client_sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            return;
+        }
+    };
 
     // One snapshot for this connection's lifetime.  Taken after the head is
     // parsed so a reload landing mid-handshake cannot make the name check and the
     // resolved-address check disagree.
     let cfg = shared.config();
 
-    if !cfg.is_allowed_target(&host) {
+    if !shared.is_allowed(&host, port) {
+        let reason = cfg.why_denied(&host, port);
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-        eprintln!("proxy: deny {}:{}", host, port);
-        shared.record(None, &host, port, "deny", None, 0, 0, started.elapsed().as_millis());
-        return;
-    }
-
-    if !cfg.is_allowed_port(port) {
-        let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-        eprintln!(
-            "proxy: deny {}:{} (port not in allow_ports; add `allow_ports {}`)",
-            host, port, port
-        );
+        eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+        shared.denied_detail(&host, port, &reason, &req_str);
         shared.record(
             None,
             &host,
             port,
             "deny",
-            Some("port"),
+            Some(&reason),
             0,
             0,
             started.elapsed().as_millis(),
+            Some(method),
+            None,
+            None,
         );
         return;
     }
@@ -965,6 +720,9 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 0,
                 0,
                 started.elapsed().as_millis(),
+                None,
+                None,
+                None,
             );
             return;
         }
@@ -974,9 +732,23 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     // resolves to, so a denied address cannot be reached via an allowed (or
     // merely unlisted) hostname.
     if let Some(bad) = addrs.iter().find(|a| cfg.is_denied_address(a.ip())) {
+        let reason = cfg.why_address_denied(bad.ip());
         let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-        eprintln!("proxy: deny {}:{} (resolves to denied address {})", host, port, bad.ip());
-        shared.record(None, &host, port, "deny", Some("address"), 0, 0, started.elapsed().as_millis());
+        eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+        shared.denied_detail(&host, port, &reason, &req_str);
+        shared.record(
+            None,
+            &host,
+            port,
+            "deny",
+            Some(&reason),
+            0,
+            0,
+            started.elapsed().as_millis(),
+            None,
+            None,
+            None,
+        );
         return;
     }
 
@@ -995,6 +767,9 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 0,
                 0,
                 started.elapsed().as_millis(),
+                None,
+                None,
+                None,
             );
             return;
         }
@@ -1005,6 +780,424 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     let _ = remote_sock.set_nodelay(true);
     let _ = remote_sock.set_read_timeout(Some(IO_TICK));
     let _ = client_sock.set_read_timeout(Some(IO_TICK));
+
+    // Snapshot again, since we might have waited for ask
+    let cfg = shared.config();
+
+    let is_domain_allowed = cfg.is_allowed_target(&host);
+    let has_l7 = cfg.has_l7_rules(&host);
+    let skip_l7 = is_domain_allowed && !has_l7;
+
+    if method != "CONNECT" {
+        if !skip_l7 {
+            // Host-level on purpose: refuse cleartext to a host that carries
+            // any secret route, not only on the routes that would inject.
+            if cfg.is_secret_host(&host) {
+                let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+                eprintln!(
+                    "proxy: deny {}:{} (secret injection requires TLS)",
+                    host, port
+                );
+                shared.denied_detail(&host, port, "cleartext-injection", &req_str);
+                shared.record(
+                    None,
+                    &host,
+                    port,
+                    "deny",
+                    Some("cleartext-injection"),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    Some(method),
+                    None,
+                    None,
+                );
+                return;
+            }
+            let id = shared.open_event(&host, port);
+            let mut client_stream = PrefixedStream::new(client_sock, req_buf[..n].to_vec());
+            match inject::proxy_http1_with_injection(
+                &mut client_stream,
+                &mut remote_sock,
+                &host,
+                port,
+                &shared,
+            ) {
+                Ok(outcome) => {
+                    shared.record(
+                        id.as_deref(),
+                        &host,
+                        port,
+                        "allow",
+                        None,
+                        outcome.up_bytes,
+                        outcome.down_bytes,
+                        started.elapsed().as_millis(),
+                        outcome.method.as_deref(),
+                        outcome.path.as_deref(),
+                        outcome.status,
+                    );
+                }
+                Err(inject::ProxyHttpError::L7Denied {
+                    method,
+                    path,
+                    reason,
+                }) => {
+                    eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+                    shared.denied_http_detail(
+                        &host,
+                        port,
+                        &format!("L7 denied: {}", reason),
+                        &method,
+                        &path,
+                    );
+                    shared.record(
+                        id.as_deref(),
+                        &host,
+                        port,
+                        "deny",
+                        Some(&format!("L7 denied: {}", reason)),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        Some(&method),
+                        Some(&path),
+                        Some(403),
+                    );
+                }
+                Err(inject::ProxyHttpError::Io {
+                    method,
+                    path,
+                    status,
+                    secret_missing,
+                    error,
+                }) => {
+                    eprintln!(
+                        "proxy: injected HTTP proxying failed {}:{}: {}",
+                        host, port, error
+                    );
+                    let mut detail = format!("inject-http: {}", short_err(&error));
+                    if secret_missing {
+                        detail.push_str(" (secret missing: domain configured for secret injection in policy, but --secrets was not enabled)");
+                    }
+                    shared.record(
+                        id.as_deref(),
+                        &host,
+                        port,
+                        "error",
+                        Some(&detail),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        method.as_deref(),
+                        path.as_deref(),
+                        status,
+                    );
+                }
+            }
+            return;
+        }
+    } else if port == 443 {
+        if !skip_l7 && shared.session_ca.is_some() {
+            if client_sock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .is_err()
+            {
+                return;
+            }
+            let session_ca = shared.session_ca.as_ref().unwrap();
+
+            let requested_host = normalize_host(&host).unwrap_or_else(|| host.clone());
+            let leaf = match session_ca.issue_leaf(&requested_host) {
+                Ok(leaf) => leaf,
+                Err(e) => {
+                    eprintln!("proxy: cannot issue leaf cert for {}:{}: {}", host, port, e);
+                    shared.record(
+                        None,
+                        &host,
+                        port,
+                        "error",
+                        Some("leaf-cert"),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        None,
+                        None,
+                        None,
+                    );
+                    return;
+                }
+            };
+
+            let (_, extra) = split_head_and_extra(&req_buf[..n]);
+            let mut client_tls =
+                match tls::terminate(PrefixedStream::new(client_sock, extra.to_vec()), &leaf) {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        eprintln!(
+                            "proxy: TLS acceptor setup failed for {}:{}: {}",
+                            host, port, e
+                        );
+                        shared.record(
+                            None,
+                            &host,
+                            port,
+                            "error",
+                            Some("mitm-accept"),
+                            0,
+                            0,
+                            started.elapsed().as_millis(),
+                            None,
+                            None,
+                            None,
+                        );
+                        return;
+                    }
+                };
+
+            if let Err(e) = client_tls.conn.complete_io(&mut client_tls.sock) {
+                eprintln!(
+                    "proxy: TLS client handshake failed for {}:{}: {}",
+                    host, port, e
+                );
+                shared.record(
+                    None,
+                    &host,
+                    port,
+                    "error",
+                    Some("mitm-client-handshake"),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    None,
+                    None,
+                    None,
+                );
+                return;
+            }
+
+            // After complete_io succeeds, check ALPN
+            let negotiated_alpn = client_tls.conn.alpn_protocol();
+            if let Some(proto) = negotiated_alpn {
+                if proto != b"http/1.1" {
+                    eprintln!(
+                        "proxy: deny {}:{} (MITM requires HTTP/1.1 but client negotiated {:?})",
+                        host,
+                        port,
+                        String::from_utf8_lossy(proto)
+                    );
+                    shared.denied_detail(&host, port, "alpn-unsupported", &req_str);
+                    shared.record(
+                        None,
+                        &host,
+                        port,
+                        "deny",
+                        Some("alpn-unsupported"),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        None,
+                        None,
+                        None,
+                    );
+                    return;
+                }
+            }
+
+            let sni = match client_tls.conn.server_name() {
+                Some(name) => name.to_ascii_lowercase(),
+                None => {
+                    eprintln!("proxy: TLS client sent no SNI for {}:{}", host, port);
+                    shared.denied_detail(&host, port, "sni-missing", &req_str);
+                    shared.record(
+                        None,
+                        &host,
+                        port,
+                        "deny",
+                        Some("sni-missing"),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        None,
+                        None,
+                        None,
+                    );
+                    return;
+                }
+            };
+            let normalized_sni = match normalize_host(&sni) {
+                Some(name) => name,
+                None => {
+                    eprintln!("proxy: invalid SNI {:?} for {}:{}", sni, host, port);
+                    shared.denied_detail(&host, port, "sni-invalid", &req_str);
+                    shared.record(
+                        None,
+                        &host,
+                        port,
+                        "deny",
+                        Some("sni-invalid"),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        None,
+                        None,
+                        None,
+                    );
+                    return;
+                }
+            };
+            if normalized_sni != requested_host {
+                eprintln!(
+                    "proxy: deny {}:{} (SNI {:?} does not match CONNECT authority {:?})",
+                    host, port, normalized_sni, requested_host
+                );
+                shared.denied_detail(&host, port, "sni-mismatch", &req_str);
+                shared.record(
+                    None,
+                    &host,
+                    port,
+                    "deny",
+                    Some("sni-mismatch"),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    None,
+                    None,
+                    None,
+                );
+                return;
+            }
+
+            let mut upstream_tls = match tls::originate(remote_sock, &requested_host) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    eprintln!(
+                        "proxy: cannot initialize upstream TLS for {}:{}: {}",
+                        host, port, e
+                    );
+                    shared.record(
+                        None,
+                        &host,
+                        port,
+                        "error",
+                        Some("mitm-upstream"),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        None,
+                        None,
+                        None,
+                    );
+                    return;
+                }
+            };
+
+            let id = shared.open_event(&host, port);
+            match inject::proxy_http1_with_injection(
+                &mut client_tls,
+                &mut upstream_tls,
+                &requested_host,
+                port,
+                &shared,
+            ) {
+                Ok(outcome) => {
+                    shared.record(
+                        id.as_deref(),
+                        &host,
+                        port,
+                        "allow",
+                        None,
+                        outcome.up_bytes,
+                        outcome.down_bytes,
+                        started.elapsed().as_millis(),
+                        outcome.method.as_deref(),
+                        outcome.path.as_deref(),
+                        outcome.status,
+                    );
+                }
+                Err(inject::ProxyHttpError::L7Denied {
+                    method,
+                    path,
+                    reason,
+                }) => {
+                    eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+                    shared.denied_http_detail(
+                        &host,
+                        port,
+                        &format!("L7 denied: {}", reason),
+                        &method,
+                        &path,
+                    );
+                    shared.record(
+                        id.as_deref(),
+                        &host,
+                        port,
+                        "deny",
+                        Some(&format!("L7 denied: {}", reason)),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        Some(&method),
+                        Some(&path),
+                        Some(403),
+                    );
+                }
+                Err(inject::ProxyHttpError::Io {
+                    method,
+                    path,
+                    status,
+                    secret_missing,
+                    error,
+                }) => {
+                    eprintln!(
+                        "proxy: injected HTTPS proxying failed {}:{}: {}",
+                        host, port, error
+                    );
+                    let mut detail = format!("inject-https: {}", short_err(&error));
+                    if secret_missing {
+                        detail.push_str(" (secret missing: domain configured for secret injection in policy, but --secrets was not enabled)");
+                    }
+                    shared.record(
+                        id.as_deref(),
+                        &host,
+                        port,
+                        "error",
+                        Some(&detail),
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        method.as_deref(),
+                        path.as_deref(),
+                        status,
+                    );
+                }
+            }
+            return;
+        }
+    }
+
+    if method == "CONNECT" && !skip_l7 {
+        let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        eprintln!(
+            "proxy: deny CONNECT {}:{} (L7 rules require TLS interception on port 443)",
+            host, port
+        );
+        shared.denied_detail(&host, port, "connect-l7-unintercepted", &req_str);
+        shared.record(
+            None,
+            &host,
+            port,
+            "deny",
+            Some("connect-l7-unintercepted"),
+            0,
+            0,
+            started.elapsed().as_millis(),
+            None,
+            None,
+            None,
+        );
+        return;
+    }
 
     // Bytes forwarded before the pumps take over, so they still show up in the
     // metered "sent" total.
@@ -1018,14 +1211,12 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             return;
         }
         // Forward any data that arrived alongside the CONNECT head.
-        if let Some(pos) = req_buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
-            let extra = &req_buf[pos + 4..n];
-            if !extra.is_empty() {
-                if remote_sock.write_all(extra).is_err() {
-                    return;
-                }
-                head_up += extra.len() as u64;
+        let (_, extra) = split_head_and_extra(&req_buf[..n]);
+        if !extra.is_empty() {
+            if remote_sock.write_all(extra).is_err() {
+                return;
             }
+            head_up += extra.len() as u64;
         }
     } else {
         if remote_sock.write_all(&req_buf[..n]).is_err() {
@@ -1038,7 +1229,19 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         (Ok(c), Ok(r)) => (c, r),
         _ => {
             eprintln!("proxy: cannot duplicate sockets for {}:{}", host, port);
-            shared.record(None, &host, port, "error", Some("fd"), 0, 0, started.elapsed().as_millis());
+            shared.record(
+                None,
+                &host,
+                port,
+                "error",
+                Some("fd"),
+                0,
+                0,
+                started.elapsed().as_millis(),
+                None,
+                None,
+                None,
+            );
             return;
         }
     };
@@ -1061,6 +1264,9 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         up,
         down,
         started.elapsed().as_millis(),
+        None,
+        None,
+        None,
     );
 }
 
@@ -1173,12 +1379,15 @@ Usage: agent-sandbox-proxy [OPTIONS]
   --policy FILE          read the policy from FILE (see parse_policy)
   --check-policy FILE    validate FILE, print the rules it yields, exit
   --log FILE             append one JSON line per connection event
+  --detail-log FILE      bounded sanitized denied-request details
   --listen ADDR          listen address (default 0.0.0.0:8888)
+  --secret-fd FD         internal: read startup secret bindings from FD
   --allow-domains LIST   comma-separated; mutually exclusive with --policy
-  --deny-domains LIST
-  --allow-ips LIST
-  --deny-ips LIST
-  --allow-ports LIST     ports and ranges, e.g. 443,8000-8100
+  --allow-ipss LIST
+  --allow-portss LIST     ports and ranges, e.g. 443,8000-8100
+
+Deny rules are built-in only: the launcher writes the baseline deny_ip into
+the policy file and there is no flag, and no `ctl` command, that adds another.
 ";
 
 /// Exit codes: 2 for anything wrong with the policy, so the sidecar and the
@@ -1191,11 +1400,11 @@ fn fail(msg: &str) -> ! {
 struct Options {
     policy: String,
     log: String,
+    detail_log: String,
     listen: String,
+    secret_fd: Option<i32>,
     allow_domains: String,
-    deny_domains: String,
     allow_ips: String,
-    deny_ips: String,
     allow_ports: String,
 }
 
@@ -1203,11 +1412,11 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
     let mut o = Options {
         policy: String::new(),
         log: String::new(),
+        detail_log: String::new(),
         listen: "0.0.0.0:8888".to_string(),
+        secret_fd: None,
         allow_domains: String::new(),
-        deny_domains: String::new(),
         allow_ips: String::new(),
-        deny_ips: String::new(),
         allow_ports: String::new(),
     };
     let mut check = None;
@@ -1225,12 +1434,33 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
             "--policy" => o.policy = value(),
             "--check-policy" => check = Some(value()),
             "--log" => o.log = value(),
+            "--detail-log" => o.detail_log = value(),
             "--listen" => o.listen = value(),
+            "--secret-fd" => {
+                let raw = value();
+                let fd = raw
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|n| *n >= 0)
+                    .unwrap_or_else(|| {
+                        fail(&format!(
+                            "--secret-fd: {:?} is not a non-negative integer",
+                            raw
+                        ))
+                    });
+                o.secret_fd = Some(fd);
+            }
             "--allow-domains" => o.allow_domains = value(),
-            "--deny-domains" => o.deny_domains = value(),
             "--allow-ips" => o.allow_ips = value(),
-            "--deny-ips" => o.deny_ips = value(),
             "--allow-ports" => o.allow_ports = value(),
+            "--deny-domains" | "--deny-ips" => {
+                let _ = value();
+                fail("deny rules are built-in only: the launcher writes the baseline deny_ip and nothing else may add one. Narrow an allow rule instead.");
+            }
+            "--proxy-train" => {
+                let _ = value();
+                fail("'--proxy-train' was removed. Run with a policy 'default deny' and watch denied requests via `agent-sandbox ctl tui`.");
+            }
             "-h" | "--help" => {
                 print!("{}", USAGE);
                 std::process::exit(0);
@@ -1246,34 +1476,24 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
 /// exclusive rather than one falling back to the other: a fallback means a failed
 /// load can quietly become an empty policy, which is allow-everything.
 fn initial_config(o: &Options) -> ProxyConfig {
-    let inline = [
-        &o.allow_domains,
-        &o.deny_domains,
-        &o.allow_ips,
-        &o.deny_ips,
-        &o.allow_ports,
-    ]
+    let inline = [&o.allow_domains, &o.allow_ips, &o.allow_ports]
     .iter()
     .any(|s| !s.is_empty());
 
     if !o.policy.is_empty() {
         if inline {
-            fail("--policy and --allow-domains/--deny-domains/--allow-ips/--deny-ips/--allow-ports are mutually exclusive");
+            fail("--policy and --allow-domains/--allow-ips/--allow-ports are mutually exclusive");
         }
         match load_policy(&o.policy) {
             Ok(c) => c,
             Err(e) => fail(&e),
         }
     } else {
-        let allow_ips = match parse_csv_ips(&o.allow_ips) {
+        let allow_ip = match parse_csv_ips(&o.allow_ips) {
             Ok(v) => v,
             Err(e) => fail(&format!("--allow-ips: {}", e)),
         };
-        let deny_ips = match parse_csv_ips(&o.deny_ips) {
-            Ok(v) => v,
-            Err(e) => fail(&format!("--deny-ips: {}", e)),
-        };
-        let allow_ports = if o.allow_ports.is_empty() {
+        let allow_port = if o.allow_ports.is_empty() {
             None
         } else {
             match parse_csv_ports(&o.allow_ports) {
@@ -1281,13 +1501,21 @@ fn initial_config(o: &Options) -> ProxyConfig {
                 Err(e) => fail(&format!("--allow-ports: {}", e)),
             }
         };
+        let allow_host = match parse_csv_domains(&o.allow_domains) {
+            Ok(v) => v,
+            Err(e) => fail(&format!("--allow-domains: {}", e)),
+        };
         ProxyConfig::new(
-            parse_csv(&o.allow_domains),
-            parse_csv(&o.deny_domains),
-            allow_ips,
-            deny_ips,
-            allow_ports,
+            allow_host,
+            Vec::new(),
+            Vec::new(),
+            allow_ip,
+            // Denies are built-in only; the inline lists are a dev path and
+            // carry none.
+            Vec::new(),
+            allow_port,
             None,
+            Vec::new(),
         )
     }
 }
@@ -1321,8 +1549,25 @@ fn main() {
     let metrics = if opts.log.is_empty() {
         None
     } else {
-        MetricsLog::open(&opts.log)
+        MetricsLog::open(
+            &opts.log,
+            (!opts.detail_log.is_empty()).then_some(opts.detail_log.as_str()),
+        )
     };
+
+    let secrets = match SecretBindings::from_fd(opts.secret_fd) {
+        Ok(bindings) => bindings,
+        Err(e) => fail(&format!("--secret-fd: {}", e)),
+    };
+    if !secrets.is_empty() {
+        eprintln!("proxy: loaded {} secret binding(s)", secrets.len());
+    }
+    let session_ca = SessionCa::generate().unwrap_or_else(|e| fail(&format!("session CA: {}", e)));
+    if let Err(e) = session_ca.write_public_cert_pem(PROXY_CA_PEM) {
+        fail(&format!("session CA: {}", e));
+    }
+    eprintln!("proxy: session CA generated at {}", PROXY_CA_PEM);
+    let session_ca = Some(Arc::new(session_ca));
 
     // Bind before probing egress so a port clash fails immediately rather than
     // after the readiness wait.
@@ -1340,6 +1585,8 @@ fn main() {
     // readiness, which is when the agent's first requests land.
     let shared = Arc::new(Shared {
         config: RwLock::new(Arc::new(config)),
+        secrets: Arc::new(secrets),
+        session_ca,
         resolver: Resolver::new(),
         metrics,
         startup_until: Instant::now() + STARTUP_GRACE,
@@ -1388,17 +1635,55 @@ fn main() {
 }
 
 #[cfg(test)]
+pub(crate) fn dummy_shared() -> Arc<Shared> {
+    Arc::new(shared_with("allow_host example.com"))
+}
+
+#[cfg(test)]
+pub(crate) fn shared_with(policy: &str) -> Shared {
+    Shared {
+        config: RwLock::new(Arc::new(parse_policy(policy).expect("initial policy"))),
+        secrets: Arc::new(SecretBindings::default()),
+        session_ca: None,
+        resolver: Resolver::new(),
+        metrics: None,
+        startup_until: Instant::now(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn shared_with_secrets(policy: &str, secrets: &str) -> Shared {
+    Shared {
+        config: RwLock::new(Arc::new(parse_policy(policy).expect("initial policy"))),
+        secrets: Arc::new(SecretBindings::parse(secrets).expect("initial secrets")),
+        session_ca: None,
+        resolver: Resolver::new(),
+        metrics: None,
+        startup_until: Instant::now(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    fn reload_once(path: &str, shared: &Shared) -> bool {
+        super::reload_once(path, shared)
+    }
+
+    /// `deny_d` is gone: there is no domain deny list.  `deny_i` stands in for
+    /// the launcher's built-in baseline, which is the only source of denies.
     fn cfg(allow_d: &str, deny_d: &str, allow_i: &str, deny_i: &str) -> ProxyConfig {
+        assert!(deny_d.is_empty(), "domain denies no longer exist");
         ProxyConfig::new(
-            parse_csv(allow_d),
-            parse_csv(deny_d),
-            parse_csv_ips(allow_i).expect("test allow_ips"),
-            parse_csv_ips(deny_i).expect("test deny_ips"),
+            parse_csv_domains(allow_d).expect("test allow_host"),
+            Vec::new(),
+            Vec::new(),
+            parse_csv_ips(allow_i).expect("test allow_ip"),
+            parse_csv_ips(deny_i).expect("test baseline deny_ip"),
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -1416,24 +1701,30 @@ mod tests {
     }
 
     #[test]
-    fn allow_list_makes_policy_deny_by_default() {
+    fn allow_list_does_not_change_deny_by_default() {
         let c = cfg("github.com", "", "", "");
         assert!(c.is_allowed("github.com", 443));
         assert!(!c.is_allowed("example.com", 443));
     }
 
     #[test]
-    fn deny_list_alone_leaves_policy_allow_by_default() {
-        let c = cfg("", "example.com", "", "");
-        assert!(c.is_allowed("github.com", 443));
+    fn a_baseline_only_policy_is_still_deny_by_default() {
+        // The built-in deny_ip baseline is not an allow list: it narrows, it
+        // never opens.
+        let c = cfg("", "", "", "10.0.0.0/8");
+        assert!(!c.is_allowed("github.com", 443));
         assert!(!c.is_allowed("example.com", 443));
     }
 
     #[test]
     fn more_specific_domain_wins() {
-        let c = cfg("api.github.com", "*.github.com", "", "");
-        assert!(c.is_allowed("api.github.com", 443));
-        assert!(!c.is_allowed("gist.github.com", 443));
+        // Longest pattern decides, so the exact host's port set beats the
+        // wildcard's for that host and only for that host.
+        let c = cfg("*.github.com:443 api.github.com:8443", "", "", "");
+        assert!(c.is_allowed("api.github.com", 8443));
+        assert!(!c.is_allowed("api.github.com", 443));
+        assert!(c.is_allowed("gist.github.com", 443));
+        assert!(!c.is_allowed("gist.github.com", 8443));
     }
 
     #[test]
@@ -1459,8 +1750,9 @@ mod tests {
 
     #[test]
     fn trailing_dot_is_stripped_before_matching() {
-        let c = cfg("", "github.com", "", "");
-        assert!(!c.is_allowed("github.com.", 443));
+        let c = cfg("github.com", "", "", "");
+        assert!(c.is_allowed("github.com.", 443));
+        assert!(!c.is_allowed("evil.com.", 443));
     }
 
     #[test]
@@ -1493,14 +1785,13 @@ mod tests {
 
     #[test]
     fn resolved_address_check_ignores_the_deny_by_default_fallback() {
-        // An allow list of domains and no allow_ips: every resolved address is
-        // unlisted, and must still be reachable.
+        // Even under deny-by-default, is_denied_address only checks explicit blocks
         let c = cfg("github.com", "", "", "");
         assert!(!c.is_denied_address("140.82.121.4".parse().unwrap()));
     }
 
     #[test]
-    fn resolved_address_check_honours_explicit_deny_ips() {
+    fn resolved_address_check_honours_explicit_deny_ip() {
         let c = cfg("internal.example.com", "", "", "169.254.0.0/16");
         assert!(c.is_denied_address("169.254.169.254".parse().unwrap()));
         assert!(!c.is_denied_address("140.82.121.4".parse().unwrap()));
@@ -1515,18 +1806,17 @@ mod tests {
 
     // ── baseline private/loopback deny (F2) ────────────────────────────────
     // These ranges are not compiled into the proxy -- the launcher writes them
-    // into the policy file as ordinary deny_ips entries, so what actually needs
+    // into the policy file as ordinary deny_ip entries, so what actually needs
     // testing here is the *mechanism* the baseline depends on: that any
-    // deny_ips range denies both a literal target and a resolved address, and
-    // that an equally-specific allow_ips overrides it in both paths.
+    // deny_ip range denies both a literal target and a resolved address, and
+    // that an equally-specific allow_ip overrides it in both paths.
 
     #[test]
-    fn each_baseline_range_is_denied_under_default_allow() {
+    fn each_baseline_range_is_denied() {
         let baseline = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,\
                          192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,\
                          0.0.0.0/8,fc00::/7,fe80::/10";
         let c = cfg("", "", "", baseline);
-        assert!(c.default_allow, "deny-only policy must stay allow-by-default");
         for addr in [
             "127.0.0.1",
             "::1",
@@ -1540,8 +1830,16 @@ mod tests {
             "fe80::1",
         ] {
             let ip: IpAddr = addr.parse().unwrap();
-            assert!(!c.is_allowed_ip(ip), "{} should be denied as a literal target", addr);
-            assert!(c.is_denied_address(ip), "{} should be denied as a resolved address", addr);
+            assert!(
+                !c.is_allowed_ip(ip),
+                "{} should be denied as a literal target",
+                addr
+            );
+            assert!(
+                c.is_denied_address(ip),
+                "{} should be denied as a resolved address",
+                addr
+            );
         }
     }
 
@@ -1555,7 +1853,7 @@ mod tests {
     fn equal_prefix_allow_ip_overrides_a_baseline_deny_for_resolved_addresses() {
         // Regression test for the is_denied_address tie-break fix: without it,
         // this is the one case where F2's own documented migration path (an
-        // allow_ips override at the identical prefix) silently did not work.
+        // allow_ip override at the identical prefix) silently did not work.
         let c = cfg("", "", "10.0.0.0/8", "10.0.0.0/8");
         assert!(!c.is_denied_address("10.1.2.3".parse().unwrap()));
     }
@@ -1588,7 +1886,11 @@ mod tests {
         // `retry_until` in the past must not shorten the floor.
         let r = Resolver::new();
         let started = Instant::now();
-        let _ = r.resolve("no-such-host.invalid", 80, Instant::now() - Duration::from_secs(60));
+        let _ = r.resolve(
+            "no-such-host.invalid",
+            80,
+            Instant::now() - Duration::from_secs(60),
+        );
         assert!(
             started.elapsed() >= RETRY_WINDOW,
             "expected retries for at least {:?}, gave up after {:?}",
@@ -1616,11 +1918,38 @@ mod tests {
         assert_eq!(json_escape("a\nb"), "a\\nb");
     }
 
+    #[test]
+    fn denied_details_redact_credentials() {
+        let head = sanitize_request_head(
+            "GET http://example.com/x HTTP/1.1\r\nAuthorization: Bearer secret\r\nX-Trace: ok",
+        );
+        assert!(head.contains("Authorization: <redacted>"));
+        assert!(head.contains("X-Trace: ok"));
+        assert!(!head.contains("Bearer secret"));
+    }
+
+    #[test]
+    fn bounded_log_resets_before_it_grows_past_limit() {
+        let path = std::env::temp_dir().join("agent-sandbox-bounded-log.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"old\n").unwrap();
+        rotate_if_needed(&mut file, 5, 8).unwrap();
+        file.write_all(b"new!!").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new!!");
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Write to a scratch log, return the lines it ended up with.
     fn metrics_lines(name: &str, f: impl FnOnce(&MetricsLog)) -> Vec<String> {
         let path = std::env::temp_dir().join(format!("agent-sandbox-metrics-{}.jsonl", name));
         let _ = std::fs::remove_file(&path);
-        let log = MetricsLog::open(path.to_str().unwrap()).expect("open metrics log");
+        let log = MetricsLog::open(path.to_str().unwrap(), None).expect("open metrics log");
         f(&log);
         let body = std::fs::read_to_string(&path).expect("read metrics log");
         let _ = std::fs::remove_file(&path);
@@ -1633,7 +1962,19 @@ mod tests {
         let lines = metrics_lines("open-close", |log| {
             id = log.next_id();
             log.open_event(&id, "example.com", 443);
-            log.record(Some(&id), "example.com", 443, "allow", None, 10, 20, 5);
+            log.record(
+                Some(&id),
+                "example.com",
+                443,
+                "allow",
+                None,
+                10,
+                20,
+                5,
+                None,
+                None,
+                None,
+            );
         });
         assert_eq!(lines.len(), 2, "expected an open and a close: {:?}", lines);
         assert!(lines[0].contains("\"ev\":\"open\""), "{}", lines[0]);
@@ -1653,13 +1994,59 @@ mod tests {
     #[test]
     fn record_without_an_id_carries_no_event_fields() {
         let lines = metrics_lines("no-id", |log| {
-            log.record(None, "example.com", 443, "deny", None, 0, 0, 1);
+            log.record(
+                None,
+                "example.com",
+                443,
+                "deny",
+                None,
+                0,
+                0,
+                1,
+                None,
+                None,
+                None,
+            );
         });
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("{\"ts\":"), "{}", lines[0]);
         assert!(!lines[0].contains("\"ev\""), "{}", lines[0]);
         assert!(!lines[0].contains("\"id\""), "{}", lines[0]);
         assert!(lines[0].contains("\"verdict\":\"deny\""), "{}", lines[0]);
+    }
+
+    /// A denied request's method, when known, is threaded through so a live
+    /// TUI reading `connections.jsonl` can offer an L7-route rule directly.
+    #[test]
+    fn record_with_a_method_carries_it_through() {
+        let lines = metrics_lines("with-method", |log| {
+            log.record(
+                None,
+                "example.com",
+                443,
+                "deny",
+                Some("domain"),
+                0,
+                0,
+                1,
+                Some("GET"),
+                None,
+                None,
+            );
+        });
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"method\":\"GET\""), "{}", lines[0]);
+    }
+
+    #[test]
+    fn denied_http_detail_records_the_decrypted_request_line() {
+        let path = std::env::temp_dir().join("agent-sandbox-detail-log.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let log = MetricsLog::open(path.to_str().unwrap(), Some(path.to_str().unwrap())).unwrap();
+        log.denied_http_detail("pypi.org", 443, "path denied", "GET", "/simple/");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("GET /simple/ HTTP/1.1"), "{}", body);
+        let _ = std::fs::remove_file(path);
     }
 
     // ── policy parsing ──────────────────────────────────────────────────────
@@ -1688,8 +2075,8 @@ mod tests {
     fn a_bare_address_is_a_host_route() {
         // The AGENTS.md parser accepts these (python ip_network calls it /32) and
         // IpNet on its own does not, so they used to be dropped in silence.
-        let config = parse_policy("deny_ips 8.8.8.8\ndeny_ips 2001:db8::1\n").unwrap();
-        assert_eq!(config.deny_ips.len(), 2);
+        let config = parse_policy("deny_ip 8.8.8.8\ndeny_ip 2001:db8::1\n").unwrap();
+        assert_eq!(config.deny_ip.len(), 2);
         assert!(config.is_denied_address("8.8.8.8".parse().unwrap()));
         assert!(!config.is_denied_address("8.8.4.4".parse().unwrap()));
         assert!(config.is_denied_address("2001:db8::1".parse().unwrap()));
@@ -1700,51 +2087,53 @@ mod tests {
         let config = parse_policy(
             "# comment\n\
              \n\
-             allow_domains github.com\n\
-             allow_domains *.githubusercontent.com\n\
-             deny_domains telemetry.example.com\n\
-             allow_ips 10.0.0.0/8\n\
-             allow_ips 192.168.1.0/24\n\
-             deny_ips 10.1.0.0/24\n",
+             allow_host github.com\n\
+             allow_host *.githubusercontent.com\n\
+             secret_route\tapi.github.com\tGET\t/user\n\
+             allow_signing github.com\n\
+             allow_ip 10.0.0.0/8\n\
+             allow_ip 192.168.1.0/24\n\
+             deny_ip 10.1.0.0/24\n",
         )
         .expect("policy");
-        assert_eq!(config.allow_domains.len(), 2);
-        assert_eq!(config.deny_domains.len(), 1);
-        assert_eq!(config.allow_ips.len(), 2);
-        assert_eq!(config.deny_ips.len(), 1);
-        assert!(!config.default_allow, "an allow list means deny by default");
+        assert_eq!(config.allow_host.len(), 2);
+        assert_eq!(config.secret_routes.len(), 1);
+        assert_eq!(config.allow_signing.len(), 1);
+        assert_eq!(config.allow_ip.len(), 2);
+        assert_eq!(config.deny_ip.len(), 1);
+        assert!(!config.default_allow, "the policy is deny by default");
     }
 
     #[test]
     fn policy_rejects_the_old_space_separated_encoding() {
         // Exactly what the launcher used to pass as one argument.
-        let err = parse_policy("allow_ips 10.0.0.0/8 192.168.1.0/24\n").unwrap_err();
+        let err = parse_policy("allow_ip 10.0.0.0/8 192.168.1.0/24\n").unwrap_err();
         assert!(err.contains("whitespace"), "{}", err);
     }
 
     #[test]
     fn policy_rejects_unknown_keys_and_bad_values() {
         assert!(parse_policy("allow_domians github.com\n").is_err());
-        assert!(parse_policy("allow_ips not-an-ip\n").is_err());
+        assert!(parse_policy("allow_ip not-an-ip\n").is_err());
         assert!(parse_policy("default maybe\n").is_err());
-        assert!(parse_policy("allow_domains\n").is_err());
+        assert!(parse_policy("allow_host\n").is_err());
     }
 
     #[test]
     fn policy_errors_name_the_line() {
-        let err = parse_policy("allow_domains ok.example.com\nallow_ips nope\n").unwrap_err();
+        let err = parse_policy("allow_host ok.example.com\nallow_ip nope\n").unwrap_err();
         assert!(err.starts_with("2:"), "{}", err);
     }
 
     #[test]
     fn explicit_default_overrides_the_derivation() {
         // Deny lists alone would normally leave the policy allow-by-default.
-        let config = parse_policy("deny_domains bad.example.com\ndefault deny\n").unwrap();
+        let config = parse_policy("deny_ip 10.0.0.0/8\ndefault deny\n").unwrap();
         assert!(!config.default_allow);
         assert!(!config.is_allowed("anything.example.com", 443));
 
         // And the other direction: an allow list with an explicit allow default.
-        let config = parse_policy("allow_domains good.example.com\ndefault allow\n").unwrap();
+        let config = parse_policy("allow_host good.example.com\ndefault allow\n").unwrap();
         assert!(config.default_allow);
         assert!(config.is_allowed("anything.example.com", 443));
     }
@@ -1754,8 +2143,11 @@ mod tests {
         // `proxy show` and the startup log render policy with describe(), and
         // the host writes policy files; the two formats must not diverge.
         let original = parse_policy(
-            "allow_domains github.com\ndeny_domains bad.example.com\n\
-             allow_ips 10.0.0.0/8\ndeny_ips 10.1.0.0/24\nallow_ports 8000-8100\n",
+            "allow_host github.com\n\
+             secret_route\tapi.github.com\tGET\t/user\n\
+             allow_signing github.com\n\
+             allow_route\tapi.github.com\t*\t/**\n\
+             allow_ip 10.0.0.0/8\ndeny_ip 10.1.0.0/24\nallow_port 8000-8100\n",
         )
         .unwrap();
         let reparsed = parse_policy(&original.describe().join("\n")).unwrap();
@@ -1763,21 +2155,28 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_policy_allows_everything() {
-        // Documented behaviour, not an accident: --proxy with no rules is a
-        // metering-only proxy.  The launcher says so at startup.
+    fn an_empty_policy_denies_everything() {
         let config = parse_policy("# nothing here\n").unwrap();
-        assert!(config.default_allow);
+        assert!(!config.default_allow);
     }
 
-    // ── allow_ports ─────────────────────────────────────────────────────────
+    // ── allow_port ─────────────────────────────────────────────────────────
 
     #[test]
     fn single_port_and_range_parse() {
-        assert_eq!(parse_port_range("443").unwrap(), PortRange { start: 443, end: 443 });
+        assert_eq!(
+            parse_port_range("443").unwrap(),
+            PortRange {
+                start: 443,
+                end: 443
+            }
+        );
         assert_eq!(
             parse_port_range("8000-8100").unwrap(),
-            PortRange { start: 8000, end: 8100 }
+            PortRange {
+                start: 8000,
+                end: 8100
+            }
         );
         assert!(parse_port_range("0").is_err());
         assert!(parse_port_range("70000").is_err());
@@ -1787,29 +2186,28 @@ mod tests {
 
     #[test]
     fn allow_list_derives_the_default_allow_ports() {
-        let config = parse_policy("allow_domains github.com\n").unwrap();
+        let config = parse_policy("allow_host github.com\n").unwrap();
         assert!(config.is_allowed("github.com", 443));
         assert!(config.is_allowed("github.com", 22));
         assert!(!config.is_allowed("github.com", 8443));
     }
 
     #[test]
-    fn deny_only_policy_is_unrestricted_on_ports() {
-        let config = parse_policy("deny_domains bad.example.com\n").unwrap();
-        assert!(config.is_allowed("github.com", 61234));
+    fn deny_only_policy_is_denied_by_default() {
+        let config = parse_policy("deny_ip 10.0.0.0/8\n").unwrap();
+        assert!(!config.is_allowed("github.com", 61234));
     }
 
     #[test]
     fn explicit_allow_ports_overrides_the_derived_default() {
-        let config =
-            parse_policy("allow_domains github.com\nallow_ports 8443\n").unwrap();
+        let config = parse_policy("allow_host github.com\nallow_port 8443\n").unwrap();
         assert!(!config.is_allowed("github.com", 443));
         assert!(config.is_allowed("github.com", 8443));
     }
 
     #[test]
     fn port_range_is_inclusive() {
-        let config = parse_policy("allow_domains github.com\nallow_ports 8000-8100\n").unwrap();
+        let config = parse_policy("allow_host github.com\nallow_port 8000-8100\n").unwrap();
         assert!(config.is_allowed("github.com", 8000));
         assert!(config.is_allowed("github.com", 8100));
         assert!(!config.is_allowed("github.com", 7999));
@@ -1818,21 +2216,20 @@ mod tests {
 
     #[test]
     fn port_deny_is_distinguishable_from_host_deny() {
-        let config = parse_policy("allow_domains github.com\nallow_ports 443\n").unwrap();
+        let config = parse_policy("allow_host github.com\nallow_port 443\n").unwrap();
         assert!(config.is_allowed_target("github.com"));
         assert!(!config.is_allowed_port(8443));
         assert!(!config.is_allowed("github.com", 8443));
     }
 
-    // ── reload ──────────────────────────────────────────────────────────────
-
-    fn shared_with(policy: &str) -> Shared {
-        Shared {
-            config: RwLock::new(Arc::new(parse_policy(policy).expect("initial policy"))),
-            resolver: Resolver::new(),
-            metrics: None,
-            startup_until: Instant::now(),
-        }
+    #[test]
+    fn domain_specific_port_isolation() {
+        // A target-bound port rule must not leak to other targets: jyu.fi is
+        // restricted to 443, github.com keeps the default ports (80, 443, 22).
+        let config = parse_policy("allow_host jyu.fi:443\nallow_host github.com\n").unwrap();
+        assert!(config.is_allowed("jyu.fi", 443));
+        assert!(!config.is_allowed("jyu.fi", 22));
+        assert!(config.is_allowed("github.com", 443));
     }
 
     fn policy_path(name: &str) -> std::path::PathBuf {
@@ -1840,31 +2237,103 @@ mod tests {
     }
 
     #[test]
-    fn a_reload_carries_the_derived_default() {
-        // The trap this guards: default_allow is derived from the lists, so a
-        // reload that rebuilds the lists but keeps the old mode turns a fresh
-        // allow-list policy into allow-everything.  Deny-only starts
-        // allow-by-default, so the flip has to be observable.
-        let shared = shared_with("deny_domains bad.example.com\n");
+    fn shared_is_allowed_respects_per_target_ports() {
+        // Regression test: `Shared::is_allowed` is the gate `handle_client` actually
+        // calls per-connection, and it used to bypass `ProxyConfig::is_allowed`'s
+        // per-target port matching by checking the host and the (global) port
+        // independently — which let a domain allowed only on one port through on
+        // any default port too.
+        let shared = shared_with("allow_host github.com:22\n");
+        assert!(shared.is_allowed("github.com", 22));
+        assert!(!shared.is_allowed("github.com", 443));
+    }
+
+    #[test]
+    fn a_reload_carries_the_explicit_default() {
+        let shared = shared_with("default allow\n");
         assert!(shared.config().is_allowed("anything.example.com", 443));
 
         let path = policy_path("reload-default");
-        std::fs::write(&path, "allow_ips 10.0.0.0/8\nallow_ips 192.168.1.0/24\n").unwrap();
+        std::fs::write(&path, "allow_ip 10.0.0.0/8\nallow_ip 192.168.1.0/24\n").unwrap();
         assert!(reload_once(path.to_str().unwrap(), &shared));
         let _ = std::fs::remove_file(&path);
 
         assert!(
             !shared.config().is_allowed("anything.example.com", 443),
-            "an allow list must make the reloaded policy deny-by-default"
+            "missing default allow must make the reloaded policy deny-by-default"
         );
     }
 
     #[test]
+    fn secret_injection_requires_both_policy_and_provider() {
+        const POLICY: &str =
+            "allow_host api.example.com\nsecret_route\tapi.example.com\tGET\t/user\n";
+        const PROVIDER: &str = "api.example.com\tGET\t/user\tAuthorization\tBearer provider-token\n";
+
+        let with_both = shared_with_secrets(POLICY, PROVIDER);
+        let binding = with_both
+            .secret_for_request("api.example.com", "GET", "/user")
+            .expect("binding");
+        assert_eq!(binding.header, "Authorization");
+        assert_eq!(binding.value.as_str(), "Bearer provider-token");
+
+        let policy_only = shared_with(POLICY);
+        assert!(policy_only
+            .secret_for_request("api.example.com", "GET", "/user")
+            .is_none());
+
+        let provider_only = shared_with_secrets("allow_host api.example.com\n", PROVIDER);
+        assert!(provider_only
+            .secret_for_request("api.example.com", "GET", "/user")
+            .is_none());
+    }
+
+    #[test]
+    fn secret_injection_is_scoped_to_the_authorized_route() {
+        // The gate that closes the leak: the policy authorizes GET /user only,
+        // so no other route on the same host resolves a binding -- however the
+        // repo's AGENTS.md widened the L7 rules.
+        let shared = shared_with_secrets(
+            "allow_host api.example.com\n\
+             secret_route\tapi.example.com\tGET\t/user\n",
+            "api.example.com\tGET\t/user\tAuthorization\tBearer tok\n",
+        );
+        assert!(shared.secret_for_request("api.example.com", "GET", "/user").is_some());
+        assert!(shared.secret_for_request("api.example.com", "GET", "/zen").is_none());
+        assert!(shared.secret_for_request("api.example.com", "POST", "/user").is_none());
+        assert!(shared.secret_for_request("other.example.com", "GET", "/user").is_none());
+    }
+
+    #[test]
+    fn a_secret_host_is_recognised_whatever_the_route() {
+        // The coarse predicate, which is what refuses cleartext to the host.
+        let cfg = parse_policy("secret_route\tapi.example.com\tGET\t/user\n").expect("policy");
+        assert!(cfg.is_secret_host("api.example.com"));
+        assert!(!cfg.is_secret_host("other.example.com"));
+        assert!(cfg.is_secret_route("api.example.com", "GET", "/user"));
+        assert!(!cfg.is_secret_route("api.example.com", "GET", "/zen"));
+    }
+
+    #[test]
+    fn backed_secret_routes_require_pattern_overlap() {
+        let cfg = parse_policy("secret_route\tapi.example.com\tGET\t/user\n").expect("policy");
+        let unrelated =
+            SecretBindings::parse("other.example.com\tGET\t/user\tAuthorization\tone\n")
+                .expect("secrets");
+        assert!(!has_backed_secret_routes(&cfg, &unrelated));
+
+        let wildcard =
+            SecretBindings::parse("*.example.com\tGET\t/user\tAuthorization\ttwo\n")
+                .expect("secrets");
+        assert!(has_backed_secret_routes(&cfg, &wildcard));
+    }
+
+    #[test]
     fn a_rejected_reload_keeps_the_previous_policy() {
-        let shared = shared_with("allow_domains github.com\n");
+        let shared = shared_with("allow_host github.com\n");
         let path = policy_path("reload-rejected");
 
-        std::fs::write(&path, "allow_ips 10.0.0.0/8 192.168.1.0/24\n").unwrap();
+        std::fs::write(&path, "allow_ip 10.0.0.0/8 192.168.1.0/24\n").unwrap();
         assert!(!reload_once(path.to_str().unwrap(), &shared));
         let _ = std::fs::remove_file(&path);
 
@@ -1876,7 +2345,7 @@ mod tests {
     fn a_vanished_policy_keeps_the_previous_one() {
         // Deleting the file must not read as "no rules": that would be a silent
         // widening to allow-everything.
-        let shared = shared_with("allow_domains github.com\n");
+        let shared = shared_with("allow_host github.com\n");
         assert!(!reload_once(
             policy_path("definitely-absent").to_str().unwrap(),
             &shared
@@ -1886,14 +2355,18 @@ mod tests {
 
     #[test]
     fn a_reload_widens_and_narrows() {
-        let shared = shared_with("allow_domains github.com\n");
+        let shared = shared_with("allow_host github.com\n");
         let path = policy_path("reload-widen");
 
-        std::fs::write(&path, "allow_domains github.com\nallow_domains api.openai.com\n").unwrap();
+        std::fs::write(
+            &path,
+            "allow_host github.com\nallow_host api.openai.com\n",
+        )
+        .unwrap();
         assert!(reload_once(path.to_str().unwrap(), &shared));
         assert!(shared.config().is_allowed("api.openai.com", 443));
 
-        std::fs::write(&path, "allow_domains github.com\n").unwrap();
+        std::fs::write(&path, "allow_host github.com\n").unwrap();
         assert!(reload_once(path.to_str().unwrap(), &shared));
         assert!(!shared.config().is_allowed("api.openai.com", 443));
         let _ = std::fs::remove_file(&path);
