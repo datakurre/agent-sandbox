@@ -1406,6 +1406,7 @@ fn initial_config(o: &Options) -> ProxyConfig {
             allow_domains,
             deny_domains,
             Vec::new(),
+            Vec::new(),
             allow_ips,
             deny_ips,
             allow_ports,
@@ -1567,6 +1568,7 @@ mod tests {
         ProxyConfig::new(
             parse_csv_domains(allow_d).expect("test allow_domains"),
             parse_csv_domains(deny_d).expect("test deny_domains"),
+            Vec::new(),
             Vec::new(),
             parse_csv_ips(allow_i).expect("test allow_ips"),
             parse_csv_ips(deny_i).expect("test deny_ips"),

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use agent_sandbox_proxy::policy::parse_ip_target;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::env;
@@ -99,14 +100,33 @@ fn resolv_nameservers(file: &str) -> Vec<String> {
     ns
 }
 
-fn route_prefix(entry: &str) -> String {
-    if entry.ends_with("/32") && !entry.contains(':') {
-        entry.trim_end_matches("/32").to_string()
-    } else if entry.ends_with("/128") {
-        entry.trim_end_matches("/128").to_string()
-    } else {
-        entry.to_string()
+/// Normalise a policy value to the prefix `ip route` wants, or `None` if it is
+/// not routable (unparseable, or a default route we must not touch).
+///
+/// Parsing rather than string-slicing is the point: since per-target ports
+/// landed, an `allow_ips` value carries a `:port` suffix, and the documented
+/// `allow = ["10.0.0.0/8:80"]` reached `ip` verbatim.  That failed on every
+/// reconcile pass *and* left the baseline blackhole for the range installed,
+/// so the re-allowed range was permitted by the proxy and then dropped on the
+/// floor by the routing table -- the exact failure the exemptions exist to
+/// prevent.  Truncating to the network also matches what the proxy enforces:
+/// `IpNet::contains` masks the address, so `10.1.2.3/8` is the `10.0.0.0/8`
+/// rule there and must be that route here.
+fn route_prefix(entry: &str) -> Option<String> {
+    let net = parse_ip_target(entry).ok()?.target.trunc();
+    if net.prefix_len() == 0 {
+        return None; // a default route is the gateway's, not ours to install
     }
+    let text = net.to_string();
+    // A host route is printed by `ip route show` without its prefix length, so
+    // strip it here or the reconcile never matches.  Only /32 on v4 and /128 on
+    // v6: `2001:db8::/32` is a network, not a host.
+    let bare = if text.contains(':') {
+        text.strip_suffix("/128")
+    } else {
+        text.strip_suffix("/32")
+    };
+    Some(bare.unwrap_or(&text).to_string())
 }
 
 fn want_exemptions(config: &Config) -> Vec<String> {
@@ -116,13 +136,12 @@ fn want_exemptions(config: &Config) -> Vec<String> {
     let mut entries = policy_values(&config.policy_file, "allow_ips");
     entries.extend(resolv_nameservers(&config.resolv_conf));
 
-    for mut entry in entries {
-        if entry == "0.0.0.0/0" || entry == "::/0" {
+    for entry in entries {
+        let Some(prefix) = route_prefix(&entry) else {
             continue;
-        }
-        entry = route_prefix(&entry);
-        if seen.insert(entry.clone()) {
-            result.push(entry);
+        };
+        if seen.insert(prefix.clone()) {
+            result.push(prefix);
         }
     }
     result
@@ -131,13 +150,16 @@ fn want_exemptions(config: &Config) -> Vec<String> {
 fn want_blackholes(config: &Config) -> Vec<String> {
     let exempt = want_exemptions(config);
     let exempt_set: HashSet<String> = exempt.into_iter().collect();
+    let mut seen = HashSet::new();
     let mut result = Vec::new();
 
     let entries = policy_values(&config.policy_file, "deny_ips");
-    for mut entry in entries {
-        entry = route_prefix(&entry);
-        if !exempt_set.contains(&entry) {
-            result.push(entry);
+    for entry in entries {
+        let Some(prefix) = route_prefix(&entry) else {
+            continue;
+        };
+        if !exempt_set.contains(&prefix) && seen.insert(prefix.clone()) {
+            result.push(prefix);
         }
     }
     result
@@ -457,4 +479,85 @@ fn main() -> Result<()> {
 
     let status = proxy_child.0.wait()?;
     std::process::exit(status.code().unwrap_or(0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn config_for(policy: &str, resolv: &str) -> (Config, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy_file = dir.path().join("policy");
+        let resolv_conf = dir.path().join("resolv.conf");
+        write!(fs::File::create(&policy_file).expect("policy"), "{}", policy).expect("write");
+        write!(fs::File::create(&resolv_conf).expect("resolv"), "{}", resolv).expect("write");
+        (
+            Config {
+                dry_run: true,
+                policy_file: policy_file.to_string_lossy().into_owned(),
+                resolv_conf: resolv_conf.to_string_lossy().into_owned(),
+                metrics_log: "/dev/null".to_string(),
+            },
+            dir,
+        )
+    }
+
+    #[test]
+    fn route_prefix_strips_the_port_qualifier() {
+        // The documented `allow = ["10.0.0.0/8:80"]` used to reach `ip` verbatim.
+        assert_eq!(route_prefix("10.0.0.0/8:80").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(route_prefix("10.0.0.0/8").as_deref(), Some("10.0.0.0/8"));
+    }
+
+    #[test]
+    fn route_prefix_strips_only_a_real_host_route() {
+        assert_eq!(route_prefix("1.2.3.4").as_deref(), Some("1.2.3.4"));
+        assert_eq!(route_prefix("1.2.3.4/32").as_deref(), Some("1.2.3.4"));
+        assert_eq!(route_prefix("::1").as_deref(), Some("::1"));
+        // /32 on v6 is a network, not a host: it must keep its prefix length.
+        assert_eq!(route_prefix("2001:db8::/32").as_deref(), Some("2001:db8::/32"));
+    }
+
+    #[test]
+    fn route_prefix_truncates_to_the_network_the_proxy_enforces() {
+        assert_eq!(route_prefix("10.1.2.3/8").as_deref(), Some("10.0.0.0/8"));
+    }
+
+    #[test]
+    fn route_prefix_rejects_defaults_and_junk() {
+        assert_eq!(route_prefix("0.0.0.0/0"), None);
+        assert_eq!(route_prefix("::/0"), None);
+        assert_eq!(route_prefix("not-an-ip"), None);
+    }
+
+    #[test]
+    fn a_port_qualified_allow_exempts_the_range_from_its_blackhole() {
+        // Regression: the exemption carried the ":80", never matched the
+        // baseline deny, and the blackhole stayed installed -- so the range was
+        // allowed by the proxy and unreachable by the route.
+        let (config, _dir) = config_for(
+            "allow_ips 10.0.0.0/8:80\ndeny_ips 10.0.0.0/8\ndeny_ips 192.168.0.0/16\n",
+            "nameserver 192.168.1.1\n",
+        );
+        assert!(want_exemptions(&config).contains(&"10.0.0.0/8".to_string()));
+        assert!(
+            !want_blackholes(&config).contains(&"10.0.0.0/8".to_string()),
+            "an exempted range must not also be blackholed"
+        );
+        // The unrelated baseline range is still blackholed...
+        let blackholes = want_blackholes(&config);
+        assert!(blackholes.contains(&"192.168.0.0/16".to_string()));
+    }
+
+    #[test]
+    fn the_resolver_is_exempt_whatever_the_policy_says() {
+        let (config, _dir) = config_for(
+            "deny_ips 192.168.0.0/16\n",
+            "nameserver 192.168.1.1\nsearch example.com\n",
+        );
+        assert!(want_exemptions(&config).contains(&"192.168.1.1".to_string()));
+        // The /16 is still blackholed; only the resolver's own /32 is exempt.
+        assert!(want_blackholes(&config).contains(&"192.168.0.0/16".to_string()));
+    }
 }

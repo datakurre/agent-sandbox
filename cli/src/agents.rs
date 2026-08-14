@@ -524,9 +524,11 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                         }
                     } else {
                         _proxy_domain("[network].allow", &host_part)?;
-                        // One line per host, not one per port: the same host on
-                        // two ports is two allow entries but one rule to read
-                        // in `ctl proxy show`.
+                        // One line per host:port pair, so `ctl proxy show` and
+                        // `rm allow` operate on the entry as it was written.
+                        // The proxy unions the ports of every line sharing a
+                        // pattern (`union_ports`), so two ports on one host are
+                        // two lines and both are in force.
                         if !policy.allow_domains.contains(&combined) {
                             policy.allow_domains.push(combined);
                         }
@@ -714,6 +716,35 @@ mod export_tests {
         assert!(toml.contains("# deny_domains evil.example.com"), "{toml}");
         assert!(toml.contains("# deny_ips 169.254.169.254/32"), "{toml}");
         assert!(toml.contains("# allow_ports 8000-8100"), "{toml}");
+    }
+
+    /// The link that was missing: `cli` writes the policy file and `proxy`
+    /// reads it, but nothing exercised both halves, so `allow_signing` could
+    /// be emitted by one and rejected as an unknown key by the other -- which
+    /// made the proxy exit 2 on every sandbox whose AGENTS.md declared an SSH
+    /// allow entry.  Any new key must round-trip through here.
+    #[test]
+    fn every_key_the_launcher_writes_is_a_key_the_proxy_parses() {
+        let agents_md = "```agent-sandbox\n\
+             [network]\n\
+             allow = [\"github.com:443\", \"github.com:22\", \"10.0.0.0/8:80\"]\n\
+             \n\
+             [[network.rules]]\n\
+             host = \"api.github.com:443\"\n\
+             method = \"GET\"\n\
+             path = \"/user/repos\"\n\
+             secret = \"GITHUB_TOKEN\"\n\
+             ```\n";
+        let policy = parse_proxy(agents_md).expect("AGENTS.md must parse");
+        let text = format_proxy_policy(&policy, "AGENTS.md");
+        let cfg = parse_policy(&text)
+            .unwrap_or_else(|e| panic!("the proxy rejected the launcher's own policy: {e}\n{text}"));
+
+        assert_eq!(cfg.allow_signing, vec!["github.com".to_string()]);
+        assert!(cfg.secret_domains.contains(&"api.github.com".to_string()));
+        assert!(cfg.is_allowed("github.com", 443), "{text}");
+        assert!(cfg.is_allowed("github.com", 22), "{text}");
+        assert!(cfg.is_allowed("10.1.2.3", 80), "{text}");
     }
 
     #[test]

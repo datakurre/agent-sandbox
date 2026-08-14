@@ -64,6 +64,11 @@ pub struct ProxyConfig {
     pub allow_domains: Vec<TargetRule<String>>,
     pub deny_domains: Vec<TargetRule<String>>,
     pub secret_domains: Vec<String>,
+    /// Hosts the SSH/GPG relay may act for.  Populated by the launcher from
+    /// `allow` entries on port 22; the proxy itself never consults it, but it
+    /// has to *parse* it, because `relay-server` and `agent-sandbox ctl relay`
+    /// read the same file and an unknown key here aborts the whole sidecar.
+    pub allow_signing: Vec<String>,
     pub allow_ips: Vec<TargetRule<IpNet>>,
     pub deny_ips: Vec<TargetRule<IpNet>>,
     pub default_allow: bool,
@@ -76,6 +81,7 @@ impl ProxyConfig {
         allow_domains: Vec<TargetRule<String>>,
         deny_domains: Vec<TargetRule<String>>,
         secret_domains: Vec<String>,
+        allow_signing: Vec<String>,
         allow_ips: Vec<TargetRule<IpNet>>,
         deny_ips: Vec<TargetRule<IpNet>>,
         allow_ports_override: Option<Vec<PortRange>>,
@@ -92,6 +98,7 @@ impl ProxyConfig {
             allow_domains,
             deny_domains,
             secret_domains,
+            allow_signing,
             allow_ips,
             deny_ips,
             default_allow,
@@ -153,6 +160,9 @@ impl ProxyConfig {
         }
         for d in &self.secret_domains {
             out.push(format!("secret_domains {}", d));
+        }
+        for h in &self.allow_signing {
+            out.push(format!("allow_signing {}", h));
         }
         for n in &self.allow_ips {
             out.push(format!("allow_ips {}", n));
@@ -265,6 +275,7 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
     let mut allow_domains = Vec::new();
     let mut deny_domains = Vec::new();
     let mut secret_domains = Vec::new();
+    let mut allow_signing = Vec::new();
     let mut allow_ips = Vec::new();
     let mut deny_ips = Vec::new();
     let mut allow_ports_override: Option<Vec<PortRange>> = None;
@@ -296,6 +307,7 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
             "allow_domains" => allow_domains.push(parse_domain_target(value).map_err(|e| format!("{}: allow_domains: {}", lineno, e))?),
             "deny_domains" => deny_domains.push(parse_domain_target(value).map_err(|e| format!("{}: deny_domains: {}", lineno, e))?),
             "secret_domains" => secret_domains.push(value.to_ascii_lowercase()),
+            "allow_signing" => allow_signing.push(value.to_ascii_lowercase()),
             "allow_ips" => allow_ips
                 .push(parse_ip_target(value).map_err(|e| format!("{}: allow_ips: {}", lineno, e))?),
             "deny_ips" => deny_ips
@@ -332,6 +344,7 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
         allow_domains,
         deny_domains,
         secret_domains,
+        allow_signing,
         allow_ips,
         deny_ips,
         allow_ports_override,
@@ -417,6 +430,31 @@ pub fn has_backed_secret_domains(config: &ProxyConfig, secrets: &SecretBindings)
     })
 }
 
+/// Union the port sets of every rule tied at the winning specificity.
+///
+/// A tie is not a mistake: `allow = ["github.com:443", "github.com:22"]`
+/// compiles to two `allow_domains` lines carrying the *same* pattern with
+/// different port sets, and taking only the first silently dropped the second
+/// port -- which denied SSH on a host the operator had explicitly allowed it
+/// on.  `None` from any tied rule means that rule carries no port constraint
+/// of its own, which widens the union back to the global `allow_ports`.
+fn union_ports<'a>(
+    rules: impl Iterator<Item = Option<&'a Vec<PortRange>>>,
+) -> Option<Vec<PortRange>> {
+    let mut out = Vec::new();
+    for ports in rules {
+        match ports {
+            None => return None,
+            Some(p) => out.extend(p.iter().copied()),
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn is_port_in_target_ports(port: u16, target_ports: Option<&Vec<PortRange>>, global_ports: Option<&[PortRange]>) -> bool {
     match target_ports {
         Some(ports) => ports.iter().any(|r| r.contains(port)),
@@ -425,17 +463,20 @@ fn is_port_in_target_ports(port: u16, target_ports: Option<&Vec<PortRange>>, glo
 }
 
 impl ProxyConfig {
-    pub fn check_domain(&self, domain: &str) -> (bool, Option<&Vec<PortRange>>) {
+    /// Longest-pattern-wins, with the ports of *every* rule tied at that
+    /// length unioned together (see `union_ports`).  Deny needs a strictly
+    /// longer pattern to take the tier, so an equal-length allow wins.
+    pub fn check_domain(&self, domain: &str) -> (bool, Option<Vec<PortRange>>) {
         let mut best_len: i32 = -1;
         let mut allowed = self.default_allow;
-        let mut winner_ports = None;
+        let mut from_deny = false;
 
         for rule in &self.allow_domains {
             let p = &rule.target;
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
                 allowed = true;
-                winner_ports = rule.ports.as_ref();
+                from_deny = false;
             }
         }
 
@@ -444,24 +485,34 @@ impl ProxyConfig {
             if domain_match(domain, p) && p.len() as i32 > best_len {
                 best_len = p.len() as i32;
                 allowed = false;
-                winner_ports = rule.ports.as_ref();
+                from_deny = true;
             }
         }
 
-        (allowed, winner_ports)
+        if best_len < 0 {
+            return (allowed, None);
+        }
+        let tier = if from_deny { &self.deny_domains } else { &self.allow_domains };
+        let ports = union_ports(
+            tier.iter()
+                .filter(|r| r.target.len() as i32 == best_len && domain_match(domain, &r.target))
+                .map(|r| r.ports.as_ref()),
+        );
+        (allowed, ports)
     }
 
-    pub fn check_ip(&self, ip: IpAddr) -> (bool, Option<&Vec<PortRange>>) {
+    /// Longest-prefix-wins, with the same tie handling as `check_domain`.
+    pub fn check_ip(&self, ip: IpAddr) -> (bool, Option<Vec<PortRange>>) {
         let mut best_prefix: i32 = -1;
         let mut allowed = self.default_allow;
-        let mut winner_ports = None;
+        let mut from_deny = false;
 
         for rule in &self.allow_ips {
             let net = &rule.target;
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 allowed = true;
-                winner_ports = rule.ports.as_ref();
+                from_deny = false;
             }
         }
 
@@ -470,11 +521,20 @@ impl ProxyConfig {
             if net.contains(&ip) && (net.prefix_len() as i32) > best_prefix {
                 best_prefix = net.prefix_len() as i32;
                 allowed = false;
-                winner_ports = rule.ports.as_ref();
+                from_deny = true;
             }
         }
 
-        (allowed, winner_ports)
+        if best_prefix < 0 {
+            return (allowed, None);
+        }
+        let tier = if from_deny { &self.deny_ips } else { &self.allow_ips };
+        let ports = union_ports(
+            tier.iter()
+                .filter(|r| r.target.prefix_len() as i32 == best_prefix && r.target.contains(&ip))
+                .map(|r| r.ports.as_ref()),
+        );
+        (allowed, ports)
     }
 
     pub fn is_allowed_domain(&self, domain: &str) -> bool {
@@ -533,11 +593,21 @@ impl ProxyConfig {
         match host_normalized.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
             Ok(ip) => {
                 let (allowed, winner_ports) = self.check_ip(ip);
-                allowed && is_port_in_target_ports(port, winner_ports, self.allow_ports.as_deref())
+                allowed
+                    && is_port_in_target_ports(
+                        port,
+                        winner_ports.as_ref(),
+                        self.allow_ports.as_deref(),
+                    )
             }
             Err(_) => {
                 let (allowed, winner_ports) = self.check_domain(&host_normalized);
-                allowed && is_port_in_target_ports(port, winner_ports, self.allow_ports.as_deref())
+                allowed
+                    && is_port_in_target_ports(
+                        port,
+                        winner_ports.as_ref(),
+                        self.allow_ports.as_deref(),
+                    )
             }
         }
     }
@@ -673,8 +743,8 @@ impl ProxyConfig {
 
         if !allowed {
             why_target
-        } else if !is_port_in_target_ports(port, winner_ports, self.allow_ports.as_deref()) {
-            match winner_ports {
+        } else if !is_port_in_target_ports(port, winner_ports.as_ref(), self.allow_ports.as_deref()) {
+            match &winner_ports {
                 Some(ports) => {
                     let list: Vec<String> = ports.iter().map(|r| r.to_string()).collect();
                     format!("port {} is not in target's allowed ports (configured: {})", port, list.join(", "))
@@ -720,6 +790,23 @@ mod tests {
         assert_eq!(cfg.l7_rules[0].path_pattern, "/api/pypi/pypi");
         assert!(cfg.is_l7_allowed("repo.kopla.jyu.fi", "GET", "/api/pypi/pypi"));
         assert!(!cfg.is_l7_allowed("repo.kopla.jyu.fi", "POST", "/api/pypi/pypi"));
+    }
+
+    #[test]
+    fn parse_policy_reads_allow_signing() {
+        // The launcher writes this for every `allow` entry on port 22.  Until
+        // it was a known key the proxy exited 2 on its own policy file, so a
+        // single `github.com:22` in AGENTS.md stopped the sandbox launching.
+        let cfg = parse_policy("allow_domains github.com:22\nallow_signing GitHub.com\n")
+            .expect("allow_signing must be a known key");
+        assert_eq!(cfg.allow_signing, vec!["github.com".to_string()]);
+    }
+
+    #[test]
+    fn allow_signing_survives_a_describe_round_trip() {
+        let cfg = parse_policy("allow_signing github.com\nallow_signing gitlab.com\n").unwrap();
+        let reparsed = parse_policy(&cfg.describe().join("\n")).expect("describe must re-parse");
+        assert_eq!(reparsed.allow_signing, cfg.allow_signing);
     }
 
     #[test]
@@ -791,6 +878,57 @@ mod tests {
         let reason = cfg.why_target_denied("10.5.1.1");
         assert!(reason.contains("deny_ips"), "{reason}");
         assert!(reason.contains(&ip.to_string()) || reason.contains("10.5.0.0/16"), "{reason}");
+    }
+
+    #[test]
+    fn one_host_on_two_ports_keeps_both() {
+        // `allow = ["github.com:443", "github.com:22"]` compiles to two lines
+        // with the same pattern.  The tie used to go to whichever came first,
+        // so the SSH port the operator asked for was quietly denied.
+        let cfg = parse_policy("allow_domains github.com:443\nallow_domains github.com:22\n")
+            .unwrap();
+        assert!(cfg.is_allowed("github.com", 443));
+        assert!(cfg.is_allowed("github.com", 22));
+        assert!(!cfg.is_allowed("github.com", 8443), "the union must not open other ports");
+    }
+
+    #[test]
+    fn one_cidr_on_two_ports_keeps_both() {
+        let cfg = parse_policy("allow_ips 10.0.0.0/8:80\nallow_ips 10.0.0.0/8:443\n").unwrap();
+        assert!(cfg.is_allowed("10.1.2.3", 80));
+        assert!(cfg.is_allowed("10.1.2.3", 443));
+        assert!(!cfg.is_allowed("10.1.2.3", 22));
+    }
+
+    #[test]
+    fn an_unconstrained_tied_rule_widens_to_the_global_ports() {
+        // `github.com` alone means "the default ports"; a tied `github.com:22`
+        // must not narrow it back down to 22.
+        let cfg = parse_policy("allow_domains github.com\nallow_domains github.com:22\n").unwrap();
+        assert!(cfg.is_allowed("github.com", 80));
+        assert!(cfg.is_allowed("github.com", 443));
+        assert!(cfg.is_allowed("github.com", 22));
+    }
+
+    #[test]
+    fn a_longer_pattern_still_beats_a_tied_pair() {
+        // The union applies within one specificity tier, not across tiers.
+        let cfg = parse_policy(
+            "allow_domains *.github.com:443\nallow_domains *.github.com:22\nallow_domains api.github.com:8443\n",
+        )
+        .unwrap();
+        assert!(cfg.is_allowed("api.github.com", 8443));
+        assert!(!cfg.is_allowed("api.github.com", 22), "the longer pattern wins outright");
+        assert!(cfg.is_allowed("gist.github.com", 22));
+    }
+
+    #[test]
+    fn why_denied_survives_a_tied_pair() {
+        let cfg = parse_policy("allow_domains github.com:443\nallow_domains github.com:22\n")
+            .unwrap();
+        let reason = cfg.why_denied("github.com", 8443);
+        assert!(reason.contains("8443"), "{reason}");
+        assert!(reason.contains("443") && reason.contains("22"), "both ports listed: {reason}");
     }
 
     #[test]
