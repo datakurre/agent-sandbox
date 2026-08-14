@@ -30,7 +30,17 @@ Key layers:
 | `/usr/bin/env`        | Symlink to coreutils `env` for generic shebangs        |
 | `/lib64/ld-linux-*`   | ELF interpreter for prebuilt npm binaries              |
 | `/home/user`          | Home directory (uid/gid mapped at runtime)             |
+| `/home/user/.agents/skills` | Bundled OpenCode skills for Nix and devenv workflows |
 | `/workspace`          | Default working directory                              |
+
+The image bundles `nix`, `nix-flake`, and `devenv` OpenCode skills at
+`/home/user/.agents/skills`. They are image content, not launcher-managed
+mounts. A user-owned skill tree can replace them with
+`--podman-args -v HOST:/home/user/.agents/skills --` or an `AGENTS.md`
+`[mounts]` declaration; Podman overlay semantics determine which files win.
+The image also links the canonical tree from
+`~/.claude/skills`, `~/.codex/skills`, `~/.copilot/skills`, `~/.cursor/skills`,
+and `~/.gemini/skills` for tool-specific discovery.
 
 ### Entrypoint (`agent-sandbox-entrypoint`)
 

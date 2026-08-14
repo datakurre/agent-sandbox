@@ -1,5 +1,21 @@
 # Usage
 
+### Bundled OpenCode skills
+
+The image includes three OpenCode skills at `/home/user/.agents/skills`:
+
+- `nix` for reproducible one-off tools and temporary Nix environments.
+- `nix-flake` for `flake.nix`, `flake.lock`, outputs, development shells, and checks.
+- `devenv` for `devenv.sh`, `devenv.nix`, and declared development environments.
+
+They are bundled into the image rather than mounted by the launcher. To use
+user-owned skills instead, mount a replacement tree with
+`--podman-args -v HOST:/home/user/.agents/skills --` or declare the mount in
+`AGENTS.md` under `[mounts]`. A more specific child mount can replace only one
+bundled skill. The canonical tree is also linked from
+`~/.claude/skills`, `~/.codex/skills`, `~/.copilot/skills`, `~/.cursor/skills`,
+and `~/.gemini/skills` for tools that use those discovery paths.
+
 ### Override the container command
 
 Everything after the `--` sentinel replaces the default command:

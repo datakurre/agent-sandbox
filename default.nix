@@ -268,6 +268,19 @@ let
 
       mkdir -p home/user
       chmod 1777 home/user
+      mkdir -p home/user/.agents/skills
+      mkdir -p home/user/.agents/skills/nix
+      mkdir -p home/user/.agents/skills/nix-flake
+      mkdir -p home/user/.agents/skills/devenv
+      cp ${./skills/nix/SKILL.md} home/user/.agents/skills/nix/SKILL.md
+      cp ${./skills/nix-flake/SKILL.md} home/user/.agents/skills/nix-flake/SKILL.md
+      cp ${./skills/devenv/SKILL.md} home/user/.agents/skills/devenv/SKILL.md
+      # Several agent tools discover skills from their own home directory.
+      # Keep one canonical tree and expose it through compatibility symlinks.
+      for tool in claude codex copilot cursor gemini; do
+        mkdir -p "home/user/.$tool"
+        ln -s /home/user/.agents/skills "home/user/.$tool/skills"
+      done
       mkdir -p workspace
       chmod 1777 workspace
       mkdir -p tmp
