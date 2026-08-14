@@ -362,7 +362,15 @@ let
     '';
   };
 
-
+  ctlLauncher = pkgs.writeShellApplication {
+    name = "agent-sandbox-ctl";
+    runtimeInputs = with pkgs; [
+      agentSandboxRust podman git coreutils jq gnupg util-linux findutils gnugrep gawk secretspec
+    ];
+    text = launcherPreamble + ''
+      exec ${agentSandboxRust}/bin/agent-sandbox ctl "$@"
+    '';
+  };
 
   # `rust` is the whole workspace: buildRustPackage runs `cargo test` in its
   # check phase, so this is what makes `nix flake check` cover the launcher's
@@ -377,6 +385,7 @@ pkgs.symlinkJoin {
   name = "agent-sandbox";
   paths = [
     launcher
+    ctlLauncher
     imageStorePaths
   ];
   passthru = {

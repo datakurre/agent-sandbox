@@ -112,33 +112,55 @@ pub fn require_sidecar(sandbox: &str) -> Result<String> {
 
 pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<String> {
     if let Some(explicit) = explicit {
-        let all_names = sandbox_containers_all()?;
-        let mut valid_matches = Vec::new();
-        for name in &all_names {
-            if name == explicit || name.ends_with(&format!("-{}", explicit)) {
-                valid_matches.push(name.clone());
+        // Try to inspect the explicit container ID or name
+        let mut cmd = Command::new("podman");
+        cmd.arg("inspect")
+           .arg("--format")
+           .arg("{{.Name}} {{index .Config.Labels \"agent-sandbox.role\"}} {{.State.Running}}")
+           .arg(explicit);
+        let output = cmd.output()?;
+        if !output.status.success() {
+            // fallback for backward compatibility with suffix matching
+            let all_names = sandbox_containers_all()?;
+            let mut valid_matches = Vec::new();
+            for name in &all_names {
+                if name == explicit || name.ends_with(&format!("-{}", explicit)) {
+                    valid_matches.push(name.clone());
+                }
             }
-        }
-        if valid_matches.len() == 1 {
-            if want_running && !sandbox_running(&valid_matches[0])? {
-                if explicit == valid_matches[0] {
-                    eprintln!("agent-sandbox ctl: '{}' is not running", explicit);
-                } else {
+            if valid_matches.len() == 1 {
+                if want_running && !sandbox_running(&valid_matches[0])? {
                     eprintln!("agent-sandbox ctl: '{}' is not running", valid_matches[0]);
+                    std::process::exit(1);
+                }
+                return Ok(valid_matches[0].clone());
+            } else if valid_matches.len() > 1 {
+                eprintln!("agent-sandbox ctl: '{}' is ambiguous, matches multiple sandboxes:", explicit);
+                for m in &valid_matches {
+                    eprintln!("  {}\t{}", sandbox_word(m), sandbox_workspace(m).unwrap_or_default());
+                    eprintln!("    full name: {}", m);
                 }
                 std::process::exit(1);
             }
-            return Ok(valid_matches[0].clone());
-        } else if valid_matches.len() > 1 {
-            eprintln!("agent-sandbox ctl: '{}' is ambiguous, matches multiple sandboxes:", explicit);
-            for m in &valid_matches {
-                eprintln!("  {}\t{}", sandbox_word(m), sandbox_workspace(m).unwrap_or_default());
-                eprintln!("    full name: {}", m);
-            }
+            eprintln!("agent-sandbox ctl: no container named or id matching '{}'", explicit);
             std::process::exit(1);
         }
-        eprintln!("agent-sandbox ctl: no container named '{}'", explicit);
-        std::process::exit(1);
+        let stdout = String::from_utf8(output.stdout)?;
+        let parts: Vec<&str> = stdout.trim().split_whitespace().collect();
+        if parts.len() < 3 || parts[1] != "sandbox" {
+            eprintln!("agent-sandbox ctl: container '{}' is not an agent-sandbox", explicit);
+            std::process::exit(1);
+        }
+        let is_running = parts[2] == "true";
+        if want_running && !is_running {
+            eprintln!("agent-sandbox ctl: '{}' is not running", explicit);
+            std::process::exit(1);
+        }
+        let mut name = parts[0];
+        if name.starts_with('/') {
+            name = &name[1..];
+        }
+        return Ok(name.to_string());
     }
 
     let names = if want_running { sandbox_containers()? } else { sandbox_containers_all()? };
@@ -150,9 +172,6 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
         }
         std::process::exit(1);
     }
-    if names.len() == 1 {
-        return Ok(names[0].clone());
-    }
 
     let pwd = env::current_dir()?.to_string_lossy().to_string();
     let mut matches = Vec::new();
@@ -161,13 +180,17 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
             matches.push(name.clone());
         }
     }
+    if matches.is_empty() {
+        eprintln!("agent-sandbox ctl: no sandbox running for current workspace.");
+        std::process::exit(1);
+    }
     if matches.len() == 1 {
         return Ok(matches[0].clone());
     }
 
-    eprintln!("agent-sandbox ctl: several sandboxes are running; pass --sandbox NAME:");
-    for name in &names {
-        eprintln!("  {}\t{}", name, sandbox_workspace(name).unwrap_or_default());
+    eprintln!("agent-sandbox ctl: several sandboxes are running for this workspace; pass --container NAME/ID:");
+    for name in &matches {
+        eprintln!("  {}\t{}", name, pwd);
     }
     std::process::exit(1);
 }

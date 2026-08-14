@@ -270,6 +270,7 @@ fn print_usage(
     want_podman: bool,
     want_selinux: bool,
     want_proxy: bool,
+    want_proxy_log: Option<ProxyLogLevel>,
     want_secrets: bool,
     want_krun: bool,
     want_ports: bool,
@@ -278,6 +279,13 @@ fn print_usage(
 ) {
     let fmt = |b: bool| if b { "[on ]" } else { "[off]" };
     let agent_mounts_all = matches!(want_agent_mounts_mode, AgentMountsMode::All);
+    // Same width as fmt's markers so the column does not jog.
+    let proxy_log_state = match want_proxy_log {
+        None => "[ask]",
+        Some(ProxyLogLevel::Off) => "[off]",
+        Some(ProxyLogLevel::Denied) => "[den]",
+        Some(ProxyLogLevel::All) => "[all]",
+    };
 
     // A raw string, not `\n\` continuations: a backslash-newline in a Rust
     // string literal swallows the *following* line's leading whitespace, which
@@ -314,6 +322,13 @@ Integrations (use --X to enable, --no-X to disable):
   --proxy           {proxy} Routes HTTP(S)/SSH through a proxy, enforcing AGENTS.md's [network]
                          policy if present (blocks direct internet access).
                          Also enables 'agent-sandbox ctl net' for the running sandbox.
+                         Prints a traffic summary per host when the session ends.
+  --proxy-log LEVEL {proxy_log} What to do with the connection log at exit; implies --proxy.
+                         off    discard it
+                         denied keep it if anything was denied or failed
+                         all    keep every session's log
+                         Kept logs land in the current directory.  Without this
+                         flag a session that had denials offers to save one.
   --secrets         {secrets} Resolves secrets with secretspec and injects them into proxied
                          requests. Requires --proxy.
   --krun            {krun} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
@@ -364,6 +379,7 @@ before. It is not a substitute for leaving the three flags off."#,
         podman = fmt(want_podman),
         selinux = fmt(want_selinux),
         proxy = fmt(want_proxy),
+        proxy_log = proxy_log_state,
         secrets = fmt(want_secrets),
         krun = fmt(want_krun),
         ports = fmt(want_ports),
@@ -372,11 +388,37 @@ before. It is not a substitute for leaving the three flags off."#,
     );
 }
 
+/// What to do with the proxy's connection log when the session ends.  The
+/// summary is printed either way; this only decides whether the raw record
+/// survives the teardown that removes the sidecar's shared directory.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ProxyLogLevel {
+    /// Never keep it.
+    Off,
+    /// Keep it only if something was denied or failed.
+    Denied,
+    /// Keep every session's log.
+    All,
+}
+
+/// `None` -- the default -- means "ask": a session that had denials offers to
+/// save the log rather than deciding for the operator.
+fn parse_proxy_log_level(s: &str) -> Option<ProxyLogLevel> {
+    match s {
+        "off" => Some(ProxyLogLevel::Off),
+        "denied" => Some(ProxyLogLevel::Denied),
+        "all" => Some(ProxyLogLevel::All),
+        _ => None,
+    }
+}
+
 struct CleanupGuard {
     sidecar_id: String,
     sidecar_shared: String,
     sidecar_policy: String,
     sidecar_secrets: String,
+    log_level: Option<ProxyLogLevel>,
+    session_word: String,
 }
 
 impl CleanupGuard {
@@ -386,7 +428,112 @@ impl CleanupGuard {
             sidecar_shared: String::new(),
             sidecar_policy: String::new(),
             sidecar_secrets: String::new(),
+            log_level: None,
+            session_word: String::new(),
         }
+    }
+
+    /// Where the connection log lands, if anywhere.  Everything here runs from
+    /// `Drop`, so nothing may panic or exit: the network reclaim and the
+    /// directory removal still have to happen.
+    fn save_log(&self, log: &str, had_failures: bool) {
+        let contents = match fs::read_to_string(log) {
+            Ok(c) if !c.trim().is_empty() => c,
+            _ => return,
+        };
+        let style = net_summary::Style::detect();
+
+        let name = self.log_file_name();
+        let save = match self.log_level {
+            Some(ProxyLogLevel::Off) => return,
+            Some(ProxyLogLevel::All) => true,
+            Some(ProxyLogLevel::Denied) => had_failures,
+            None => {
+                if !had_failures {
+                    return;
+                }
+                // Nothing to ask on a non-interactive run, and the evidence is
+                // about to be deleted -- fall back to the temp copy.
+                if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+                    let fallback = format!(
+                        "{}/agent-sandbox-connections-{}.jsonl",
+                        env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
+                        std::process::id()
+                    );
+                    if fs::write(&fallback, &contents).is_ok() {
+                        Self::announce(Path::new(&fallback), style);
+                    }
+                    return;
+                }
+                Self::prompt(&name)
+            }
+        };
+        if !save {
+            return;
+        }
+
+        let target = env::current_dir()
+            .map(|d| d.join(&name))
+            .unwrap_or_else(|_| PathBuf::from(&name));
+        if fs::write(&target, &contents).is_ok() {
+            Self::announce(&target, style);
+            return;
+        }
+
+        let fallback = PathBuf::from(format!(
+            "{}/{}",
+            env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
+            name
+        ));
+        if fs::write(&fallback, &contents).is_ok() {
+            println!("  (could not write to the current directory)");
+            Self::announce(&fallback, style);
+        } else {
+            eprintln!("  could not save the connection log");
+        }
+    }
+
+    /// Named after the session, so logs from several sandboxes kept in one
+    /// working directory stay distinguishable.
+    fn log_file_name(&self) -> String {
+        let word = if self.session_word.is_empty() {
+            "session"
+        } else {
+            &self.session_word
+        };
+        format!(
+            "agent-sandbox-connections-{}-{}.jsonl",
+            word,
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        )
+    }
+
+    fn prompt(name: &str) -> bool {
+        print!("  Save the connection log to ./{}? [y/N] ", name);
+        if std::io::stdout().flush().is_err() {
+            return false;
+        }
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            return false;
+        }
+        matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+    }
+
+    fn announce(path: &Path, style: net_summary::Style) {
+        let display = path.display().to_string();
+        let absolute = fs::canonicalize(path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| display.clone());
+        println!(
+            "  connection log kept at {}",
+            net_summary::hyperlink(&display, &absolute, style)
+        );
+        println!(
+            "{}",
+            style.dim(&format!("  re-render it with:     agent-sandbox-network-summary {}", display))
+        );
+        println!("");
     }
 }
 
@@ -403,25 +550,23 @@ impl Drop for CleanupGuard {
 
         if !self.sidecar_shared.is_empty() {
             let log = format!("{}/connections.jsonl", self.sidecar_shared);
-            if let Ok(file) = File::open(&log) {
-                let _ = net_summary::process_stream(BufReader::new(file));
-            }
+            let records = match File::open(&log) {
+                Ok(file) => net_summary::read_records(BufReader::new(file)),
+                Err(_) => Vec::new(),
+            };
+
+            // The aggregate report, not the per-record feed: a busy session has
+            // hundreds of connections and what the operator wants at exit is
+            // where the traffic went.
+            let had_failures = records.iter().any(|r| {
+                matches!(r.verdict.as_deref(), Some("deny") | Some("error"))
+            });
+            net_summary::process_summary(records);
+
             // The removal below would take the per-connection timings with it,
             // and those are what distinguish "failed instantly" from "burned
-            // the whole retry window".  Keep the log whenever anything went
-            // wrong.
-            if let Ok(contents) = fs::read_to_string(&log) {
-                if contents.contains("\"verdict\":\"deny\"") || contents.contains("\"verdict\":\"error\"") {
-                    let saved = format!(
-                        "{}/agent-sandbox-connections-{}.jsonl",
-                        env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
-                        std::process::id()
-                    );
-                    if fs::write(&saved, contents).is_ok() {
-                        println!("  connection log kept at {}\n", saved);
-                    }
-                }
-            }
+            // the whole retry window".
+            self.save_log(&log, had_failures);
         }
 
         // podman tears a --rm container down asynchronously after `stop`
@@ -484,6 +629,7 @@ fn run() -> Result<i32> {
     let mut want_mounts = false;
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
     let mut want_proxy = false;
+    let mut want_proxy_log: Option<ProxyLogLevel> = None;
     let mut want_secrets = false;
     let mut want_krun = false;
     let mut want_privileged = false;
@@ -526,22 +672,37 @@ fn run() -> Result<i32> {
     let args: Vec<String> = env::args().skip(1).collect();
 
     // Subcommand routing for ctl
-    if !args.is_empty() {
-        let first_arg = &args[0];
+    let argv0 = env::args().next().unwrap_or_default();
+    let is_ctl_bin = argv0.ends_with("agent-sandbox-ctl");
+
+    if is_ctl_bin || !args.is_empty() {
         let ctl_subcommands = ["load", "list", "status", "proxy", "net", "logs", "log", "attach", "mount", "mounts", "relay", "tui", "purge"];
         let mut run_ctl = false;
         let mut parse_args = vec!["agent-sandbox".to_string()];
 
-        if first_arg == "ctl" {
+        if is_ctl_bin {
             run_ctl = true;
-            if args.len() == 1 {
+            if args.is_empty() {
                 parse_args.push("--help".to_string());
             } else {
-                parse_args.extend(args.iter().skip(1).cloned());
+                parse_args.extend(args.iter().cloned());
             }
-        } else if ctl_subcommands.contains(&first_arg.as_str()) && !agent_cmd_json.contains_key(first_arg) {
-            run_ctl = true;
-            parse_args.extend(args.iter().cloned());
+        } else {
+            for (idx, arg) in args.iter().enumerate() {
+                if arg == "ctl" {
+                    run_ctl = true;
+                    if idx + 1 == args.len() {
+                        parse_args.push("--help".to_string());
+                    } else {
+                        parse_args.extend(args.iter().skip(idx + 1).cloned());
+                    }
+                    break;
+                } else if ctl_subcommands.contains(&arg.as_str()) && !agent_cmd_json.contains_key(arg) {
+                    run_ctl = true;
+                    parse_args.extend(args.iter().skip(idx).cloned());
+                    break;
+                }
+            }
         }
 
         if run_ctl {
@@ -639,6 +800,28 @@ fn run() -> Result<i32> {
                         }
                     }
                     want_agent_mounts_mode = AgentMountsMode::List(list_vec);
+                } else if arg == "--proxy-log" || arg.starts_with("--proxy-log=") {
+                    let value = match arg.strip_prefix("--proxy-log=") {
+                        Some(v) => v.to_string(),
+                        None => {
+                            i += 1;
+                            if i >= args.len() {
+                                fail("agent-sandbox: --proxy-log needs an argument (off, denied, all)");
+                            }
+                            args[i].clone()
+                        }
+                    };
+                    match parse_proxy_log_level(&value) {
+                        Some(level) => want_proxy_log = Some(level),
+                        None => fail(&format!(
+                            "agent-sandbox: --proxy-log: unknown level '{}' (valid: off, denied, all)",
+                            value
+                        )),
+                    }
+                    // Asking what to do with the proxy's log is asking for the
+                    // proxy; --no-proxy after this still wins, as with every
+                    // other flag here.
+                    want_proxy = true;
                 } else if arg == "--krun-memory" {
                     i += 1;
                     if i >= args.len() {
@@ -697,6 +880,7 @@ fn run() -> Result<i32> {
             want_podman,
             want_selinux,
             want_proxy,
+            want_proxy_log,
             want_secrets,
             want_krun,
             want_ports,
@@ -1147,6 +1331,8 @@ fn run() -> Result<i32> {
         cleanup_guard.sidecar_id = sidecar_id.clone();
         cleanup_guard.sidecar_shared = sidecar_shared.clone();
         cleanup_guard.sidecar_policy = sidecar_policy.clone();
+        cleanup_guard.log_level = want_proxy_log;
+        cleanup_guard.session_word = session_word.clone();
 
         // --disable-dns is load-bearing: podman routes a container's whole
         // resolver through aardvark-dns as soon as any of its networks has
@@ -1217,9 +1403,9 @@ fn run() -> Result<i32> {
         fs::write(format!("{}/policy.base", sidecar_policy), &policy_file_content)?;
 
         if !launch::policy_has_allow_rules(&policy_file_content) {
-            eprintln!("agent-sandbox: --proxy is active with no allow rules, so every host is allowed");
-            eprintln!("               on every port. Declare a [network] allow list in AGENTS.md to");
-            eprintln!("               restrict it.");
+            eprintln!("agent-sandbox: --proxy is active with no allow rules.");
+            eprintln!("               Use 'agent-sandbox ctl tui' to allow connections live,");
+            eprintln!("               or declare a [network] allow list in AGENTS.md.");
         }
 
         if want_secrets {
@@ -1267,8 +1453,11 @@ fn run() -> Result<i32> {
             .args(["-e", &format!("SIDECAR_SUBNET={}", sidecar_subnet)])
             .args(&sidecar_extra_env)
             .args(["--label", "agent-sandbox.role=proxy"])
-            .args(["--label", &format!("agent-sandbox.target={}", container_name)])
-            .args(["--label", &format!("agent-sandbox.workspace={}", pwd)])
+            .args(["--label", &format!("agent-sandbox.target={}", container_name)]);
+        if want_workspace {
+            proxy_cmd.args(["--label", &format!("agent-sandbox.workspace={}", pwd)]);
+        }
+        proxy_cmd
             .arg(&image)
             .arg("agent-sandbox-sidecar")
             .stdout(std::process::Stdio::null());
@@ -1419,7 +1608,9 @@ fn run() -> Result<i32> {
     // from a container created before this existed, which would make the ctl
     // columns ambiguous exactly when it matters.
     podman_cmd.args(["--label", "agent-sandbox.role=sandbox"]);
-    podman_cmd.args(["--label", &format!("agent-sandbox.workspace={}", pwd)]);
+    if want_workspace {
+        podman_cmd.args(["--label", &format!("agent-sandbox.workspace={}", pwd)]);
+    }
     podman_cmd.args(["--label", &format!("agent-sandbox.proxy={}", proxy_mode)]);
     podman_cmd.args(["--label", &format!("agent-sandbox.runtime={}", sandbox_runtime)]);
     podman_cmd.args(["--label", &format!("agent-sandbox.command={}", cmd_args.join(" "))]);
@@ -1491,5 +1682,31 @@ mod tests {
         assert_eq!(enforce_selinux_mount_flags("/a:/b:ro,z", false), "/a:/b:ro");
         // Already labeled: not labeled twice.
         assert_eq!(enforce_selinux_mount_flags("/a:/b:rw,Z", true), "/a:/b:rw,Z");
+    }
+
+    #[test]
+    fn proxy_log_levels() {
+        assert_eq!(parse_proxy_log_level("off"), Some(ProxyLogLevel::Off));
+        assert_eq!(parse_proxy_log_level("denied"), Some(ProxyLogLevel::Denied));
+        assert_eq!(parse_proxy_log_level("all"), Some(ProxyLogLevel::All));
+        // Refused rather than silently treated as a default: the level decides
+        // whether the record of a denied session survives.
+        assert_eq!(parse_proxy_log_level("ALL"), None);
+        assert_eq!(parse_proxy_log_level("yes"), None);
+        assert_eq!(parse_proxy_log_level(""), None);
+    }
+
+    /// The saved name has to survive several sandboxes writing into one
+    /// directory, so it carries the session word.
+    #[test]
+    fn saved_log_name_carries_the_session() {
+        let mut guard = CleanupGuard::new();
+        guard.session_word = "teapot".to_string();
+        let name = guard.log_file_name();
+        assert!(name.starts_with("agent-sandbox-connections-teapot-"), "{}", name);
+        assert!(name.ends_with(".jsonl"), "{}", name);
+
+        // A guard that never got a word still produces a usable name.
+        assert!(CleanupGuard::new().log_file_name().starts_with("agent-sandbox-connections-session-"));
     }
 }

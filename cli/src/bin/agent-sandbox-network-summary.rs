@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
-use agent_sandbox_cli::net_summary::{process_stream, process_summary, ProxyRecord};
+use agent_sandbox_cli::net_summary::{process_stream, process_summary, read_records};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -52,17 +52,7 @@ fn main() -> Result<()> {
     if args.stream {
         process_stream(reader)?;
     } else {
-        let mut records = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(record) = serde_json::from_str::<ProxyRecord>(&line) {
-                records.push(record);
-            }
-        }
-        process_summary(records);
+        process_summary(read_records(reader));
     }
 
     Ok(())

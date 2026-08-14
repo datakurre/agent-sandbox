@@ -62,7 +62,7 @@ Every flag in the table below has a corresponding `--no-flag` option (e.g., `--n
 | Container runtime | `--krun` | Runs the sandbox as a KVM microVM with its own kernel, using `podman --runtime krun`. See [Trust model](trust-model.md). |
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
-| Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces `AGENTS.md`'s `[network]` policy if present. See details below. |
+| Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces `AGENTS.md`'s `[network]` policy if present. Prints a per-host traffic summary when the session ends. See details below. |
 | Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into proxied traffic matching `secret_domains`. Requires `--proxy`. |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
@@ -75,6 +75,7 @@ A few flags are one-off pass-throughs rather than persistent toggles, so they ha
 | --- | --- |
 | `-e NAME=VAL`, `--env NAME=VAL` | Injects an environment variable. |
 | `--privileged` | Enables nested podman inside the sandbox (safe — see [Trust model](trust-model.md)). |
+| `--proxy-log off\|denied\|all` | What to do with the proxy's connection log when the session ends; implies `--proxy`. Unset, a session that had denials offers to save one. See [Trust model](trust-model.md). |
 | `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel (including `-v/--volume` and `-p/--publish`). |
 
 There is no `--port` flag: declare ports in `AGENTS.md` and pass `--ports`, or
