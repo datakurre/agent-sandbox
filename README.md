@@ -41,6 +41,12 @@ agent-sandbox --workspace opencode
 
 # Launch opencode with the current directory and a network proxy firewall
 agent-sandbox --workspace --proxy opencode
+
+# Use a reusable host-owned profile instead of this project's AGENTS.md
+agent-sandbox --workspace --proxy-profile development opencode
+
+# Merge a reusable profile with this project's AGENTS.md policy
+agent-sandbox --workspace --proxy --proxy-profile development opencode
 ```
 
 Advanced features like SSH forwarding (`--ssh`), GPG signing (`--gpg`), host Podman socket forwarding (`--podman`), and `devenv` integration are available but opt-in. See the full documentation for details.

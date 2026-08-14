@@ -122,7 +122,11 @@ log of what it did. Changing policy is therefore a host-side operation
 (`agent-sandbox ctl proxy`), which is why the old in-container
 `agent-sandbox-allow` was deleted rather than repaired.
 
-**Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
+**Policy format.** The proxy enforces the merged declarative `[network]` blocks
+from `AGENTS.md` and any explicitly selected host-owned profiles. `--proxy`
+selects the workspace block, `--proxy-profile NAME` selects only that profile,
+and supplying both merges them additively. Profiles are plain TOML files under
+`$XDG_CONFIG_HOME/agent-sandbox/profiles/` (or `~/.config/agent-sandbox/profiles/`).
 `[network].allow_hosts` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
 `[[network.allow_routes]]` configures L7 paths and optional secret injection.
 Those two keys are the whole surface: there is no `deny`, and an unknown key

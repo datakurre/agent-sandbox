@@ -62,7 +62,8 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Container runtime | `--krun` | Runs the sandbox as a KVM microVM with its own kernel, using `podman --runtime krun`. See [Trust model](trust-model.md). |
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
-| Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces `AGENTS.md`'s `[network]` policy if present. Prints a per-host traffic summary when the session ends. See details below. |
+| Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces the workspace `AGENTS.md` `[network]` policy only. Prints a per-host traffic summary when the session ends. See details below. |
+| Network & firewall | `--proxy-profile NAME` | Uses a host-owned reusable profile from `~/.config/agent-sandbox/profiles/NAME.toml` instead of `AGENTS.md`; implies `--proxy` and may be repeated. Combine with `--proxy` to merge both sources. |
 | Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into the proxied requests each `[[network.allow_routes]]` rule authorises — that rule's host, method and path, and no others. Requires `--proxy`. See [Configuration](configuration.md#secrets). |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
@@ -125,7 +126,24 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
    - `d`: Show sanitized details for the selected denial; use `↑`/`↓` to scroll and `Esc` to return
    - `c`: Clear the list of recorded denials
    - `q` or `Esc`: Quit the TUI
-4. **Save Rules**: When you've trained the proxy to your liking, export the complete active policy, including the original `AGENTS.md` rules and live additions, by running `agent-sandbox ctl proxy export > AGENTS.md` (or append it to your existing `[network]` blocks). When the sandbox exits, its summary also prints only the rules added live as copy-pasteable `allow_hosts` and `[[network.allow_routes]]` TOML.
+4. **Save Rules**: When you've trained the proxy to your liking, export the complete active policy, including the original `AGENTS.md` rules and live additions, by running `agent-sandbox ctl proxy export > AGENTS.md` (or append it to your existing `[network]` blocks). For reusable rules, save the `[network]` block as `~/.config/agent-sandbox/profiles/<name>.toml` and launch with `--proxy-profile <name>`. When the sandbox exits, its summary also prints only the rules added live as copy-pasteable `allow_hosts` and `[[network.allow_routes]]` TOML.
+
+The proxy source is selected explicitly:
+
+| Flags | Network policy |
+| --- | --- |
+| `--proxy` | The workspace `AGENTS.md` only |
+| `--proxy-profile development` | The named host-owned profile only; profile selection implies `--proxy` |
+| `--proxy --proxy-profile development` | The profile and `AGENTS.md`, merged additively |
+
+`--proxy-profile` may be repeated. Profiles are never loaded implicitly. Profile files are plain TOML and use the same declarative `[network]` syntax as `AGENTS.md`:
+
+```toml
+[network]
+allow_hosts = ["github.com:443", "registry.npmjs.org:443"]
+```
+
+At session exit, rules added live through the TUI or `agent-sandbox ctl proxy allow` are printed as a TOML block. Add that block to `AGENTS.md` for project-specific persistence, or merge it into a profile for reuse across projects.
 
 The TUI tails the connection log and shows recently-denied hosts live (deduplicated, with a repeat count and the specific reason the policy denied them), so you can add the missing rule without leaving the dashboard. Press `v` to switch to the Connections view, which shows all recent allowed, denied, failed, and currently-open connections live. Press `d` on a row to inspect the latest sanitized request head, including its method, target, path, and non-sensitive headers. The detail stream is ephemeral, capped at 4 MiB, and the TUI retains at most 200 rows in each view with one bounded detail per denied row. Rows won't offer `h` (allow HTTP route) unless a method was recorded for them — allow the domain first with `a`, then retry from inside the sandbox to trigger a real HTTP-route check. There is no `D` (deny) key, and no `ctl proxy deny`: the firewall is deny-by-default, so denying something already-denied is a no-op. Use the Rules view (`r`, with `x` to remove) if you need to narrow a rule you added.
 

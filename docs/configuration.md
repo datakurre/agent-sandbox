@@ -1,6 +1,6 @@
-# AGENTS.md Configuration Guide
+# Network Configuration Guide
 
-The `agent-sandbox` launcher supports declarative configuration defined directly within the project's `AGENTS.md` file. The configuration allows you to expose ports, define volume mounts, and set fine-grained network firewall policies.
+The `agent-sandbox` launcher supports declarative configuration defined directly within the project's `AGENTS.md` file. The configuration allows you to expose ports, define volume mounts, and set fine-grained network firewall policies. Network policies can also be kept as reusable, host-owned profiles.
 
 Configurations must be written in TOML and placed inside a fenced code block tagged with `agent-sandbox`:
 
@@ -119,7 +119,8 @@ path = "/"
 #### Secrets
 
 A rule's `secret` names a secret, never its value. `AGENTS.md` is part of the
-repository and is therefore treated as untrusted: the launcher will only inject
+repository and is therefore treated as untrusted; profile rules are also
+authorized through the same host-side check. The launcher will only inject
 a secret that you have also authorized host-side, in
 `~/.config/agent-sandbox/secrets.toml`.
 
@@ -154,7 +155,7 @@ exact method over `*`).
 With `--secrets`, values are resolved on the host with
 [`secretspec`](https://secretspec.dev) (from the workspace's `secretspec.toml`)
 and handed to the proxy sidecar alone; they never enter the sandbox's
-environment. A rule that `AGENTS.md` requests but the host config does not
+environment. A rule that the selected network sources request but the host config does not
 authorize refuses the launch rather than silently injecting nothing, and prints
 the exact block to paste. The proxy terminates TLS for hosts carrying a rule, so
 the sandbox trusts a per-session CA that exists only for the lifetime of that
@@ -177,3 +178,35 @@ Besides malformed values, these combinations are rejected:
 There is no `deny` key. The firewall is deny-by-default, and the only deny rules
 a policy carries are the built-in private and loopback ranges the launcher adds
 to every session. See [Trust model](trust-model.md).
+
+## Reusable Network Profiles
+
+Profiles are explicit, host-owned network policies stored under:
+
+```text
+$XDG_CONFIG_HOME/agent-sandbox/profiles/<name>.toml
+```
+
+When `XDG_CONFIG_HOME` is unset, the default location is:
+
+```text
+~/.config/agent-sandbox/profiles/<name>.toml
+```
+
+Profile files are plain TOML and contain only a `[network]` table. They use the
+same `allow_hosts` and `[[network.allow_routes]]` syntax as `AGENTS.md`:
+
+```toml
+[network]
+allow_hosts = ["github.com:443", "registry.npmjs.org:443"]
+```
+
+`--proxy-profile NAME` implies `--proxy` and uses the selected profile instead
+of the workspace `AGENTS.md` network block. Supplying both `--proxy` and
+`--proxy-profile` merges the sources additively. The option may be repeated and
+profiles are never loaded implicitly. Invalid or missing profiles refuse the
+launch before the sidecar starts.
+
+Live rules added during a session are not written back automatically. The exit
+summary prints a TOML block that can be added to `AGENTS.md` for project-specific
+access or merged into a profile for reuse.

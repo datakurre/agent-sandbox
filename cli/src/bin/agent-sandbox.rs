@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
-use agent_sandbox_cli::agents::{self, format_proxy_policy, parse_proxy};
+use agent_sandbox_cli::agents::{self, format_proxy_policy, parse_proxy, parse_proxy_profile};
 use agent_sandbox_cli::ctl;
 use agent_sandbox_cli::gpg::{scan_gnupg_home, GpgScanStatus};
 use agent_sandbox_cli::launch;
 use agent_sandbox_cli::net_summary;
-use agent_sandbox_cli::secrets::resolve_secrets_logic;
+use agent_sandbox_cli::secrets::resolve_secrets_logic_with_profiles;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rand::Rng;
@@ -50,9 +50,7 @@ enum CtlCommands {
     Mount(ctl::mount::MountArgs),
     #[command(about = "Show SSH/GPG relay policy and logs")]
     Relay(ctl::relay::RelayArgs),
-    #[command(
-        about = "Interactive dashboard: watch denied requests live and add rules for them"
-    )]
+    #[command(about = "Interactive dashboard: watch denied requests live and add rules for them")]
     Tui(ctl::tui::TuiArgs),
     #[command(about = "Reclaim leftover containers, networks and directories")]
     Purge(ctl::purge::PurgeArgs),
@@ -340,9 +338,11 @@ Integrations (use --X to enable, --no-X to disable):
   --podman          {podman} Forwards the host rootless Podman socket (sibling containers).
   --selinux         {selinux} Applies SELinux shared relabeling (:z) to writable binds.
   --proxy           {proxy} Routes HTTP(S)/SSH through a proxy, enforcing AGENTS.md's [network]
-                         policy if present (blocks direct internet access).
+                          policy if present (blocks direct internet access).
                          Also enables 'agent-sandbox ctl net' for the running sandbox.
-                         Prints a traffic summary per host when the session ends.
+                          Prints a traffic summary per host when the session ends.
+  --proxy-profile NAME     Use a host-owned reusable network profile instead of AGENTS.md.
+                           May be repeated; combine with --proxy to merge both sources.
   --proxy-log LEVEL {proxy_log} What to do with the connection log at exit; implies --proxy.
                          off    discard it
                          denied keep it if anything was denied or failed
@@ -433,6 +433,32 @@ fn parse_proxy_log_level(s: &str) -> Option<ProxyLogLevel> {
     }
 }
 
+fn proxy_profile_path(home: &str, name: &str) -> Result<PathBuf> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "agent-sandbox: invalid proxy profile name '{}'; use letters, numbers, '.', '_' or '-'",
+            name
+        );
+    }
+    let config_home = env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(home).join(".config"));
+    Ok(config_home
+        .join("agent-sandbox")
+        .join("profiles")
+        .join(format!("{}.toml", name)))
+}
+
 struct CleanupGuard {
     sidecar_id: String,
     sidecar_shared: String,
@@ -440,6 +466,8 @@ struct CleanupGuard {
     sidecar_secrets: String,
     log_level: Option<ProxyLogLevel>,
     session_word: String,
+    use_agents_network: bool,
+    proxy_profiles: Vec<String>,
 }
 
 impl CleanupGuard {
@@ -451,6 +479,8 @@ impl CleanupGuard {
             sidecar_secrets: String::new(),
             log_level: None,
             session_word: String::new(),
+            use_agents_network: false,
+            proxy_profiles: Vec::new(),
         }
     }
 
@@ -479,7 +509,22 @@ impl CleanupGuard {
         };
 
         println!("\n  live network rules added during this session:");
-        println!("  Copy this TOML into AGENTS.md if these rules should persist:\n");
+        if self.use_agents_network && !self.proxy_profiles.is_empty() {
+            println!("  Add this TOML to AGENTS.md for this project, or merge it into a reusable profile:\n");
+        } else if self.use_agents_network {
+            println!(
+                "  Add this TOML to AGENTS.md if these rules should persist for this project:\n"
+            );
+        } else if let Some(profile) = self.proxy_profiles.first() {
+            println!(
+                "  Merge this TOML into ~/.config/agent-sandbox/profiles/{}.toml to reuse it:\n",
+                profile
+            );
+        } else {
+            println!(
+                "  Save this TOML as ~/.config/agent-sandbox/profiles/<name>.toml to reuse it:\n"
+            );
+        }
         print!("{}", toml);
         println!();
     }
@@ -698,6 +743,8 @@ fn run() -> Result<i32> {
     let mut want_mounts = false;
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
     let mut want_proxy = false;
+    let mut use_agents_network = false;
+    let mut proxy_profiles: Vec<String> = Vec::new();
     let mut want_proxy_log: Option<ProxyLogLevel> = None;
     let mut want_secrets = false;
     let mut want_krun = false;
@@ -855,8 +902,14 @@ fn run() -> Result<i32> {
             "--no-mounts" => want_mounts = false,
             "--agent-mounts" => want_agent_mounts_mode = AgentMountsMode::All,
             "--no-agent-mounts" => want_agent_mounts_mode = AgentMountsMode::None,
-            "--proxy" => want_proxy = true,
-            "--no-proxy" => want_proxy = false,
+            "--proxy" => {
+                want_proxy = true;
+                use_agents_network = true;
+            }
+            "--no-proxy" => {
+                want_proxy = false;
+                use_agents_network = false;
+            }
             "--secrets" => want_secrets = true,
             "--no-secrets" => want_secrets = false,
             "--krun" => want_krun = true,
@@ -901,6 +954,27 @@ fn run() -> Result<i32> {
                     // Asking what to do with the proxy's log is asking for the
                     // proxy; --no-proxy after this still wins, as with every
                     // other flag here.
+                    want_proxy = true;
+                    // A profile already selected is the requested policy
+                    // source; otherwise --proxy-log has the same source as
+                    // plain --proxy.
+                    if proxy_profiles.is_empty() {
+                        use_agents_network = true;
+                    }
+                } else if arg == "--proxy-profile" || arg.starts_with("--proxy-profile=") {
+                    let value = match arg.strip_prefix("--proxy-profile=") {
+                        Some(v) => v.to_string(),
+                        None => {
+                            i += 1;
+                            if i >= args.len() || args[i].starts_with('-') {
+                                fail("agent-sandbox: --proxy-profile needs a profile name");
+                            }
+                            args[i].clone()
+                        }
+                    };
+                    proxy_profiles.push(value);
+                    // Selecting a profile selects the proxy, while a later
+                    // --no-proxy still wins like the other sequential flags.
                     want_proxy = true;
                 } else if arg == "--krun-memory" {
                     i += 1;
@@ -1465,31 +1539,65 @@ fn run() -> Result<i32> {
     let mut proxy_configured = false;
     let mut secrets_configured = false;
 
-    if agents_md_path.exists() {
+    let mut merged_policy = agents::ProxyPolicy::default();
+    merged_policy.default = vec!["deny".to_string()];
+
+    if use_agents_network && agents_md_path.exists() {
+        let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
+        match parse_proxy(&text) {
+            Ok(policy) => merged_policy.merge(policy),
+            Err(e) => {
+                eprintln!("agent-sandbox: {}", e);
+                return refuse("agent-sandbox: refusing to launch on an invalid [network] block (use --no-proxy to skip).");
+            }
+        }
+    } else if !want_proxy && agents_md_path.exists() {
+        // Preserve the existing diagnostic when a project declares network
+        // rules but the caller did not enable proxy mode.
         if let Ok(text) = fs::read_to_string(&agents_md_path) {
             match parse_proxy(&text) {
                 Ok(policy) => {
-                    policy_file_content =
-                        format_proxy_policy(&policy, &agents_md_path.to_string_lossy());
                     proxy_configured = !policy.allow_host.is_empty()
                         || !policy.allow_ip.is_empty()
                         || !policy.allow_port.is_empty()
                         || !policy.allow_route.is_empty();
                     secrets_configured = !policy.secret_route.is_empty();
                 }
-                Err(e) => {
-                    if want_proxy {
-                        eprintln!("agent-sandbox: {}", e);
-                        return refuse("agent-sandbox: refusing to launch on an invalid [network] block (use --no-proxy to skip).");
-                    } else {
-                        eprintln!(
-                            "agent-sandbox: warning: invalid [network] block in AGENTS.md: {}",
-                            e
-                        );
-                    }
-                }
+                Err(e) => eprintln!(
+                    "agent-sandbox: warning: invalid [network] block in AGENTS.md: {}",
+                    e
+                ),
             }
         }
+    }
+
+    if want_proxy {
+        for profile_name in &proxy_profiles {
+            let profile_path = proxy_profile_path(&home, profile_name)?;
+            let text = fs::read_to_string(&profile_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "agent-sandbox: cannot read proxy profile '{}': {} ({})",
+                    profile_name,
+                    e,
+                    profile_path.display()
+                )
+            })?;
+            let policy = parse_proxy_profile(&text).map_err(|e| {
+                anyhow::anyhow!(
+                    "agent-sandbox: invalid proxy profile '{}': {}",
+                    profile_name,
+                    e
+                )
+            })?;
+            merged_policy.merge(policy);
+        }
+
+        policy_file_content = format_proxy_policy(&merged_policy, "AGENTS.md and proxy profiles");
+        proxy_configured = !merged_policy.allow_host.is_empty()
+            || !merged_policy.allow_ip.is_empty()
+            || !merged_policy.allow_port.is_empty()
+            || !merged_policy.allow_route.is_empty();
+        secrets_configured = !merged_policy.secret_route.is_empty();
     }
 
     if !want_proxy && (proxy_configured || secrets_configured) {
@@ -1540,6 +1648,8 @@ fn run() -> Result<i32> {
         cleanup_guard.sidecar_policy = sidecar_policy.clone();
         cleanup_guard.log_level = want_proxy_log;
         cleanup_guard.session_word = session_word.clone();
+        cleanup_guard.use_agents_network = use_agents_network;
+        cleanup_guard.proxy_profiles = proxy_profiles.clone();
 
         // --disable-dns is load-bearing: podman routes a container's whole
         // resolver through aardvark-dns as soon as any of its networks has
@@ -1627,11 +1737,16 @@ fn run() -> Result<i32> {
             cleanup_guard.sidecar_secrets = sidecar_secrets.clone();
             let config = PathBuf::from(&home).join(".config/agent-sandbox/secrets.toml");
             let manifest = Path::new(&pwd).join("secretspec.toml");
-            let bindings = match resolve_secrets_logic(
+            let profile_paths: Vec<PathBuf> = proxy_profiles
+                .iter()
+                .filter_map(|name| proxy_profile_path(&home, name).ok())
+                .collect();
+            let bindings = match resolve_secrets_logic_with_profiles(
                 Path::new(&format!("{}/policy", sidecar_policy)),
                 &config,
                 &manifest,
                 &agents_md_path,
+                &profile_paths,
             ) {
                 Ok(bindings) => bindings,
                 Err(e) => return refuse(e.to_string().trim_end()),

@@ -2,9 +2,9 @@
 
 use agent_sandbox_proxy::policy::ProxyConfig;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::net::{IpAddr, TcpListener, UdpSocket};
-use serde::Serialize;
 use thiserror::Error;
 use toml::Value;
 
@@ -42,6 +42,31 @@ impl Mapping {
             "{}:{}:{}/{}",
             bind, self.host, self.container, self.protocol
         )
+    }
+}
+
+impl ProxyPolicy {
+    /// Merge another declarative policy, preserving the first occurrence of
+    /// each rule. Profiles and AGENTS.md are intentionally additive: neither
+    /// source can use merging to weaken the deny-by-default policy.
+    pub fn merge(&mut self, other: ProxyPolicy) {
+        fn extend_unique(target: &mut Vec<String>, values: Vec<String>) {
+            for value in values {
+                if !target.contains(&value) {
+                    target.push(value);
+                }
+            }
+        }
+
+        extend_unique(&mut self.allow_host, other.allow_host);
+        extend_unique(&mut self.secret_route, other.secret_route);
+        extend_unique(&mut self.allow_signing, other.allow_signing);
+        extend_unique(&mut self.allow_ip, other.allow_ip);
+        extend_unique(&mut self.allow_port, other.allow_port);
+        extend_unique(&mut self.allow_route, other.allow_route);
+        if self.default.is_empty() {
+            self.default = other.default;
+        }
     }
 }
 
@@ -525,7 +550,8 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 .as_table()
                 .ok_or_else(|| ConfigError::msg("[network] must be a table"))?;
 
-            let allowed_net: HashSet<&str> = ["allow_hosts", "allow_routes"].iter().cloned().collect();
+            let allowed_net: HashSet<&str> =
+                ["allow_hosts", "allow_routes"].iter().cloned().collect();
             let unknown: Vec<_> = net_table
                 .keys()
                 .filter(|k| !allowed_net.contains(k.as_str()))
@@ -546,7 +572,10 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 })?;
                 for (i, rule_val) in rules_arr.iter().enumerate() {
                     let rule = rule_val.as_table().ok_or_else(|| {
-                        ConfigError::msg(format!("[[network.allow_routes]][{}]: must be a table", i))
+                        ConfigError::msg(format!(
+                            "[[network.allow_routes]][{}]: must be a table",
+                            i
+                        ))
                     })?;
 
                     let allowed_rule_keys: HashSet<&str> =
@@ -671,7 +700,10 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                                 policy.allow_ip.push(combined);
                             }
                         } else {
-                            _proxy_domain(&format!("[[network.allow_routes]][{}].host", i), &host_part)?;
+                            _proxy_domain(
+                                &format!("[[network.allow_routes]][{}].host", i),
+                                &host_part,
+                            )?;
                             if !policy.allow_host.contains(&combined) {
                                 policy.allow_host.push(combined);
                             }
@@ -709,6 +741,34 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
     }
 
     Ok(policy)
+}
+
+/// Parse a host-owned profile. Profiles are plain TOML rather than Markdown,
+/// but otherwise use exactly the same declarative network syntax as AGENTS.md.
+pub fn parse_proxy_profile(text: &str) -> Result<ProxyPolicy, ConfigError> {
+    let value: Value = text
+        .parse()
+        .map_err(|e| ConfigError::msg(format!("malformed TOML in proxy profile: {}", e)))?;
+    let table = value
+        .as_table()
+        .ok_or_else(|| ConfigError::msg("proxy profile must contain a TOML table"))?;
+    if let Some(unknown) = table.keys().find(|key| *key != "network") {
+        return Err(ConfigError::msg(format!(
+            "proxy profile: unknown top-level key '{}'; only [network] is supported",
+            unknown
+        )));
+    }
+    let network = table
+        .get("network")
+        .ok_or_else(|| ConfigError::msg("proxy profile must contain a [network] table"))?;
+    if !network.is_table() {
+        return Err(ConfigError::msg("[network] must be a table"));
+    }
+
+    // Reuse the single AGENTS.md validator rather than maintaining a second
+    // parser for the profile format.
+    let wrapped = format!("```toml agent-sandbox\n{}\n```", text);
+    parse_proxy(&wrapped)
 }
 
 pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
@@ -825,9 +885,7 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
                 .secret_routes
                 .iter()
                 .any(|s| {
-                    s.domain == r.domain
-                        && s.method == r.method
-                        && s.path_pattern == r.path_pattern
+                    s.domain == r.domain && s.method == r.method && s.path_pattern == r.path_pattern
                 })
                 .then_some(true),
         })
@@ -836,10 +894,7 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
         (&a.host, &a.method, &a.path, &a.secret).cmp(&(&b.host, &b.method, &b.path, &b.secret))
     });
     allow_routes.dedup_by(|a, b| {
-        a.host == b.host
-            && a.method == b.method
-            && a.path == b.path
-            && a.secret == b.secret
+        a.host == b.host && a.method == b.method && a.path == b.path && a.secret == b.secret
     });
 
     let mut out = toml::to_string_pretty(&NetworkDocument {
@@ -863,7 +918,9 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
         out.push_str(
             "\n# The following have no [network] TOML equivalent (it only supports 'allow_hosts'\n",
         );
-        out.push_str("# and 'allow_routes') and were left out of the block above. Re-apply them after\n");
+        out.push_str(
+            "# and 'allow_routes') and were left out of the block above. Re-apply them after\n",
+        );
         out.push_str("# relaunching with `agent-sandbox ctl proxy allow`:\n");
         for line in advisory {
             out.push_str(&format!("# {}\n", line));
@@ -1001,11 +1058,15 @@ mod export_tests {
              ```\n";
         let policy = parse_proxy(agents_md).expect("AGENTS.md must parse");
         let text = format_proxy_policy(&policy, "AGENTS.md");
-        let cfg = parse_policy(&text)
-            .unwrap_or_else(|e| panic!("the proxy rejected the launcher's own policy: {e}\n{text}"));
+        let cfg = parse_policy(&text).unwrap_or_else(|e| {
+            panic!("the proxy rejected the launcher's own policy: {e}\n{text}")
+        });
 
         assert_eq!(cfg.allow_signing, vec!["github.com".to_string()]);
-        assert!(cfg.secret_routes.iter().any(|r| r.domain == "api.github.com"));
+        assert!(cfg
+            .secret_routes
+            .iter()
+            .any(|r| r.domain == "api.github.com"));
         assert!(cfg.is_allowed("github.com", 443), "{text}");
         assert!(cfg.is_allowed("github.com", 22), "{text}");
         assert!(cfg.is_allowed("10.1.2.3", 80), "{text}");
@@ -1016,5 +1077,30 @@ mod export_tests {
         assert!(is_ip_or_cidr("10.0.0.0/8"));
         assert!(is_ip_or_cidr("169.254.169.254"));
         assert!(!is_ip_or_cidr("example.com"));
+    }
+
+    #[test]
+    fn parses_plain_proxy_profiles_with_network_vocabulary() {
+        let policy = parse_proxy_profile(
+            "[network]\nallow_hosts = [\"github.com:443\"]\n\n[[network.allow_routes]]\nhost = \"api.github.com:443\"\nmethod = \"GET\"\npath = \"/user/repos\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            policy.allow_host,
+            vec!["github.com:443", "api.github.com:443"]
+        );
+        assert_eq!(policy.allow_route, vec!["api.github.com\tGET\t/user/repos"]);
+    }
+
+    #[test]
+    fn merging_profiles_is_additive_and_deduplicates_rules() {
+        let mut first =
+            parse_proxy_profile("[network]\nallow_hosts = [\"github.com:443\"]\n").unwrap();
+        let second = parse_proxy_profile(
+            "[network]\nallow_hosts = [\"github.com:443\", \"pypi.org:443\"]\n",
+        )
+        .unwrap();
+        first.merge(second);
+        assert_eq!(first.allow_host, vec!["github.com:443", "pypi.org:443"]);
     }
 }

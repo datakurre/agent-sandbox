@@ -54,6 +54,8 @@ It is opt-in and should stay that way. The honest reasons to reach for it are ru
 
 The `[network]` block supports `allow_hosts` and `[[network.allow_routes]]` for granular controls.
 - **Default Policy**: The policy is always **deny by default**. To allow all traffic, specify `allow_hosts = ["*"]` or `allow_hosts = ["*:port"]`.
+- **Policy sources**: `--proxy` uses the workspace `AGENTS.md` network policy only. `--proxy-profile NAME` uses the explicit host-owned profile only and implies `--proxy`. Supplying both merges the profile and `AGENTS.md` additively. Profiles may be repeated and are never loaded implicitly.
+- **Profile trust**: Profiles are read from `$XDG_CONFIG_HOME/agent-sandbox/profiles/` or `~/.config/agent-sandbox/profiles/` and are host-controlled configuration. `AGENTS.md` remains project-controlled configuration. Neither source can add a deny directive; the firewall remains deny-by-default.
 - **Wildcards**: Wildcards are supported for domains (e.g., `*.github.com:443`). A strict domain like `github.com:443` matches that exact domain and **does not** match subdomains like `status.github.com:443`. A wildcard matches both the subdomains and the apex, so `*.github.com:443` alone covers `github.com` as well.
 - Domain matching is case-insensitive.
 - **L7 Filtering (`[[network.allow_routes]]`)**: Restricts HTTPS traffic by method and URL path. 
@@ -68,7 +70,7 @@ The `[network]` block supports `allow_hosts` and `[[network.allow_routes]]` for 
 - Non-secret HTTPS remains blind `CONNECT` + byte pump. Only domains subject to L7 filtering or secret injection are decrypted.
 - **Relay Architecture**: When `--proxy` is combined with `--ssh` or `--gpg`, the direct socket mounts are replaced with a relay server running in the sidecar.
 - An invalid `[network]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote. See [Configuration](configuration.md#rules-the-launcher-refuses) for the combinations that are rejected.
-- `--proxy` with no `AGENTS.md` defaults to deny all.
+- `--proxy` with no `AGENTS.md` defaults to deny all. Profile-only launches likewise default to deny all when the selected profiles contain no allow rules.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
 - **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around.
 - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
@@ -221,5 +223,9 @@ reach one of those ranges — and it is an *allow*, not a deny, which is why it 
 available: it is how a corporate git server over a VPN is reached.
 
 Changes take effect for new connections within a second. Connections already established keep running: the proxy checks policy when a connection opens and does not re-check it afterwards, so tightening a rule does not cut a tunnel that is already up — end the session for that. `proxy show` says how many are open when it matters.
+
+Rules added live are session-local. At exit, the launcher prints the new rules as
+a declarative TOML block and explains whether to add them to the project
+`AGENTS.md` or merge them into a reusable profile.
 
 `reset` restores the `[network]` policy from `AGENTS.md` rather than emptying the rules, since an empty policy allows everything. The baseline denials are part of what it restores, so a reset cannot drop them either.

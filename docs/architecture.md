@@ -142,13 +142,14 @@ log of what it did. Changing policy is therefore a host-side operation
 (`agent-sandbox ctl proxy`), which is why the old in-container
 `agent-sandbox-allow` was deleted rather than repaired.
 
-**Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
+**Policy format.** The proxy enforces the merged declarative `[network]` blocks
+from `AGENTS.md` and any explicitly selected host-owned profiles.
 `[network].allow_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
 with a port or port range.  `[[network.allow_routes]]` configures L7 routes and
 optional secret injection.  Those two keys are the whole surface: an unknown key
 under `[network]` refuses the launch rather than being ignored.
 
-The launcher compiles that block into the flat, line-oriented policy file the
+The launcher merges and compiles those blocks into the flat, line-oriented policy file the
 proxy reads (`allow_host`, `allow_ip`, `allow_port`, `allow_route`,
 `secret_route`, `allow_signing`, `deny_ip`, `default`), which is also the
 format `agent-sandbox ctl proxy` edits in place.  `secret_route` records a
