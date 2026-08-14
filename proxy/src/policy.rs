@@ -63,7 +63,12 @@ impl<T: std::fmt::Display> std::fmt::Display for TargetRule<T> {
 pub struct ProxyConfig {
     pub allow_domains: Vec<TargetRule<String>>,
     pub deny_domains: Vec<TargetRule<String>>,
-    pub secret_domains: Vec<String>,
+    /// Routes -- host *and* method *and* path -- that a secret may be injected
+    /// into.  Route-scoped rather than domain-scoped on purpose: AGENTS.md is
+    /// untrusted and controls the other rules on a host, so a domain-wide
+    /// marker let a second, secret-less rule (`method = "*", path = "/**"`)
+    /// collect a token the operator authorized for one endpoint.
+    pub secret_routes: Vec<L7Rule>,
     /// Hosts the SSH/GPG relay may act for.  Populated by the launcher from
     /// `allow` entries on port 22; the proxy itself never consults it, but it
     /// has to *parse* it, because `relay-server` and `agent-sandbox ctl relay`
@@ -80,7 +85,7 @@ impl ProxyConfig {
     pub fn new(
         allow_domains: Vec<TargetRule<String>>,
         deny_domains: Vec<TargetRule<String>>,
-        secret_domains: Vec<String>,
+        secret_routes: Vec<L7Rule>,
         allow_signing: Vec<String>,
         allow_ips: Vec<TargetRule<IpNet>>,
         deny_ips: Vec<TargetRule<IpNet>>,
@@ -97,7 +102,7 @@ impl ProxyConfig {
         ProxyConfig {
             allow_domains,
             deny_domains,
-            secret_domains,
+            secret_routes,
             allow_signing,
             allow_ips,
             deny_ips,
@@ -158,8 +163,8 @@ impl ProxyConfig {
         for d in &self.deny_domains {
             out.push(format!("deny_domains {}", d));
         }
-        for d in &self.secret_domains {
-            out.push(format!("secret_domains {}", d));
+        for r in &self.secret_routes {
+            out.push(format!("secret_l7\t{}\t{}\t{}", r.domain, r.method, r.path_pattern));
         }
         for h in &self.allow_signing {
             out.push(format!("allow_signing {}", h));
@@ -271,10 +276,28 @@ pub fn parse_domain_target(s: &str) -> Result<TargetRule<String>, String> {
     Ok(TargetRule { target: host.to_ascii_lowercase(), ports })
 }
 
+/// `domain<TAB>method<TAB>path`, shared by `allow_l7` and `secret_l7` so the
+/// route a rule allows and the route it may inject into can never be written
+/// in two different dialects.
+fn parse_l7_fields(key: &str, lineno: usize, value: &str) -> Result<L7Rule, String> {
+    let parts: Vec<&str> = value.splitn(3, '\t').collect();
+    if parts.len() != 3 {
+        return Err(format!("{}: {} expects 3 tab-separated fields", lineno, key));
+    }
+    if !parts[2].starts_with('/') {
+        return Err(format!("{}: {}: path {:?} must start with '/'", lineno, key, parts[2]));
+    }
+    Ok(L7Rule {
+        domain: parts[0].to_lowercase(),
+        method: parts[1].to_string(),
+        path_pattern: parts[2].to_string(),
+    })
+}
+
 pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
     let mut allow_domains = Vec::new();
     let mut deny_domains = Vec::new();
-    let mut secret_domains = Vec::new();
+    let mut secret_routes = Vec::new();
     let mut allow_signing = Vec::new();
     let mut allow_ips = Vec::new();
     let mut deny_ips = Vec::new();
@@ -296,17 +319,18 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
             return Err(format!("{}: {} has no value", lineno, key));
         }
 
-        // allow_l7 is intentionally tab-separated (domain<TAB>method<TAB>path),
-        // so it is exempt from the "no whitespace in values" rule that guards
-        // every other key against the old space-separated encoding.
-        if key != "allow_l7" && value.chars().any(char::is_whitespace) {
+        // allow_l7 and secret_l7 are intentionally tab-separated
+        // (domain<TAB>method<TAB>path), so they are exempt from the "no
+        // whitespace in values" rule that guards every other key against the
+        // old space-separated encoding.
+        if !matches!(key, "allow_l7" | "secret_l7") && value.chars().any(char::is_whitespace) {
             return Err(format!("{}: {}: {:?} contains whitespace", lineno, key, value));
         }
 
         match key {
             "allow_domains" => allow_domains.push(parse_domain_target(value).map_err(|e| format!("{}: allow_domains: {}", lineno, e))?),
             "deny_domains" => deny_domains.push(parse_domain_target(value).map_err(|e| format!("{}: deny_domains: {}", lineno, e))?),
-            "secret_domains" => secret_domains.push(value.to_ascii_lowercase()),
+            "secret_l7" => secret_routes.push(parse_l7_fields("secret_l7", lineno, value)?),
             "allow_signing" => allow_signing.push(value.to_ascii_lowercase()),
             "allow_ips" => allow_ips
                 .push(parse_ip_target(value).map_err(|e| format!("{}: allow_ips: {}", lineno, e))?),
@@ -317,17 +341,7 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
                     .map_err(|e| format!("{}: allow_ports: {}", lineno, e))?;
                 allow_ports_override.get_or_insert_with(Vec::new).push(r);
             }
-            "allow_l7" => {
-                let parts: Vec<&str> = value.splitn(3, '\t').collect();
-                if parts.len() != 3 {
-                    return Err(format!("{}: allow_l7 expects 3 tab-separated fields", lineno));
-                }
-                l7_rules.push(L7Rule {
-                    domain: parts[0].to_lowercase(),
-                    method: parts[1].to_string(),
-                    path_pattern: parts[2].to_string(),
-                });
-            }
+            "allow_l7" => l7_rules.push(parse_l7_fields("allow_l7", lineno, value)?),
             "default" => match value {
                 "allow" | "deny" => default_override = Some(value == "allow"),
                 "ask" => return Err(format!(
@@ -343,7 +357,7 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
     Ok(ProxyConfig::new(
         allow_domains,
         deny_domains,
-        secret_domains,
+        secret_routes,
         allow_signing,
         allow_ips,
         deny_ips,
@@ -421,12 +435,14 @@ pub fn patterns_overlap(a: &str, b: &str) -> bool {
     domain_match(&a0, b) || domain_match(&a1, b) || domain_match(&b0, a) || domain_match(&b1, a)
 }
 
-pub fn has_backed_secret_domains(config: &ProxyConfig, secrets: &SecretBindings) -> bool {
-    config.secret_domains.iter().any(|policy_pattern| {
+/// Whether any route the policy marks secret-bearing actually has a provider
+/// binding behind it.
+pub fn has_backed_secret_routes(config: &ProxyConfig, secrets: &SecretBindings) -> bool {
+    config.secret_routes.iter().any(|route| {
         secrets
             .entries()
             .iter()
-            .any(|binding| patterns_overlap(policy_pattern, &binding.domain))
+            .any(|binding| patterns_overlap(&route.domain, &binding.domain))
     })
 }
 
@@ -762,7 +778,13 @@ impl ProxyConfig {
         }
     }
 
-    pub fn is_secret_domain(&self, host: &str) -> bool {
+    /// Whether *any* route on this host can carry a secret.
+    ///
+    /// Deliberately coarse, and used only where the decision has to be made
+    /// before a request is in hand: refusing cleartext to the host, and
+    /// reporting a missing provider.  Injection itself uses
+    /// `is_secret_route`, which is the narrow one.
+    pub fn is_secret_host(&self, host: &str) -> bool {
         let host = match normalize_host(host) {
             Some(h) => h,
             None => return false,
@@ -770,9 +792,29 @@ impl ProxyConfig {
         if host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().is_ok() {
             return false;
         }
-        self.secret_domains
+        self.secret_routes
             .iter()
-            .any(|pattern| domain_match(&host, pattern))
+            .any(|r| domain_match(&host, &r.domain))
+    }
+
+    /// Whether this exact request is one the operator authorized a secret for.
+    ///
+    /// Matches with `glob_match` against the *normalized* path, the same way
+    /// `is_l7_allowed` does, so the policy and the injector can never disagree
+    /// about what a path means.
+    pub fn is_secret_route(&self, host: &str, method: &str, path: &str) -> bool {
+        let host = match normalize_host(host) {
+            Some(h) => h,
+            None => return false,
+        };
+        if host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().is_ok() {
+            return false;
+        }
+        self.secret_routes.iter().any(|r| {
+            domain_match(&host, &r.domain)
+                && (r.method == method || r.method == "*")
+                && crate::l7::glob_match(path, &r.path_pattern)
+        })
     }
 }
 

@@ -390,13 +390,14 @@ impl Shared {
         Arc::clone(&self.config.read().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Apply the policy ∧ provider gate for secret-capable hosts.
-    fn secret_binding_for_host<'a>(
-        &'a self,
-        cfg: &ProxyConfig,
-        host: &str,
-    ) -> Option<&'a SecretBinding> {
-        if !cfg.is_secret_domain(host) {
+    /// Apply the policy ∧ provider gate for one request.
+    ///
+    /// Called per request rather than per connection: a keep-alive connection
+    /// carries many requests, and resolving once at CONNECT time meant a
+    /// token authorized for a single route was injected into every request
+    /// that followed it on the same socket.
+    fn secret_for_request(&self, host: &str, method: &str, path: &str) -> Option<&SecretBinding> {
+        if !self.config().is_secret_route(host, method, path) {
             return None;
         }
         let normalized = normalize_host(host)?;
@@ -407,7 +408,7 @@ impl Shared {
         {
             return None;
         }
-        self.secrets.binding_for_host(&normalized)
+        self.secrets.binding_for_request(&normalized, method, path)
     }
 
     /// Install a new policy.  The DNS cache goes with it: the name check runs
@@ -742,13 +743,14 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     let cfg = shared.config();
 
     let is_domain_allowed = cfg.is_allowed_target(&host);
-    let secret_binding = shared.secret_binding_for_host(&cfg, &host).cloned();
     let has_l7 = cfg.has_l7_rules(&host);
     let skip_l7 = is_domain_allowed && !has_l7;
 
     if method != "CONNECT" {
         if !skip_l7 {
-            if cfg.is_secret_domain(&host) {
+            // Host-level on purpose: refuse cleartext to a host that carries
+            // any secret route, not only on the routes that would inject.
+            if cfg.is_secret_host(&host) {
                 let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
                 eprintln!("proxy: deny {}:{} (secret injection requires TLS)", host, port);
                 shared.denied_detail(&host, port, "cleartext-injection", &req_str);
@@ -773,7 +775,6 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 &mut remote_sock,
                 &host,
                 port,
-                secret_binding.as_ref().map(|b| (b.header.as_str(), b.value.as_str())),
                 &shared,
             ) {
                 Ok(outcome) => {
@@ -1019,7 +1020,6 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 &mut upstream_tls,
                 &requested_host,
                 port,
-                secret_binding.as_ref().map(|b| (b.header.as_str(), b.value.as_str())),
                 &shared,
             ) {
                 Ok(outcome) => {
@@ -1911,7 +1911,8 @@ mod tests {
              allow_domains github.com\n\
              allow_domains *.githubusercontent.com\n\
              deny_domains telemetry.example.com\n\
-             secret_domains api.github.com\n\
+             secret_l7\tapi.github.com\tGET\t/user\n\
+             allow_signing github.com\n\
              allow_ips 10.0.0.0/8\n\
              allow_ips 192.168.1.0/24\n\
              deny_ips 10.1.0.0/24\n",
@@ -1919,7 +1920,8 @@ mod tests {
         .expect("policy");
         assert_eq!(config.allow_domains.len(), 2);
         assert_eq!(config.deny_domains.len(), 1);
-        assert_eq!(config.secret_domains.len(), 1);
+        assert_eq!(config.secret_routes.len(), 1);
+        assert_eq!(config.allow_signing.len(), 1);
         assert_eq!(config.allow_ips.len(), 2);
         assert_eq!(config.deny_ips.len(), 1);
         assert!(!config.default_allow, "the policy is deny by default");
@@ -1965,7 +1967,9 @@ mod tests {
         // the host writes policy files; the two formats must not diverge.
         let original = parse_policy(
             "allow_domains github.com\ndeny_domains bad.example.com\n\
-             secret_domains api.github.com\n\
+             secret_l7\tapi.github.com\tGET\t/user\n\
+             allow_signing github.com\n\
+             allow_l7\tapi.github.com\t*\t/**\n\
              allow_ips 10.0.0.0/8\ndeny_ips 10.1.0.0/24\nallow_ports 8000-8100\n",
         )
         .unwrap();
@@ -2079,44 +2083,67 @@ mod tests {
 
 
     #[test]
-    fn secret_binding_requires_both_policy_and_provider() {
-        let with_both = shared_with_secrets(
-            "allow_domains api.example.com\nsecret_domains api.example.com\n",
-            "api.example.com\tAuthorization\tBearer provider-token\n",
-        );
-        let cfg = with_both.config();
+    fn secret_injection_requires_both_policy_and_provider() {
+        const POLICY: &str =
+            "allow_domains api.example.com\nsecret_l7\tapi.example.com\tGET\t/user\n";
+        const PROVIDER: &str = "api.example.com\tGET\t/user\tAuthorization\tBearer provider-token\n";
+
+        let with_both = shared_with_secrets(POLICY, PROVIDER);
         let binding = with_both
-            .secret_binding_for_host(&cfg, "api.example.com")
+            .secret_for_request("api.example.com", "GET", "/user")
             .expect("binding");
         assert_eq!(binding.header, "Authorization");
         assert_eq!(binding.value.as_str(), "Bearer provider-token");
 
-        let policy_only = shared_with("allow_domains api.example.com\nsecret_domains api.example.com\n");
-        let cfg = policy_only.config();
+        let policy_only = shared_with(POLICY);
         assert!(policy_only
-            .secret_binding_for_host(&cfg, "api.example.com")
+            .secret_for_request("api.example.com", "GET", "/user")
             .is_none());
 
-        let provider_only = shared_with_secrets(
-            "allow_domains api.example.com\n",
-            "api.example.com\tAuthorization\tBearer provider-token\n",
-        );
-        let cfg = provider_only.config();
+        let provider_only = shared_with_secrets("allow_domains api.example.com\n", PROVIDER);
         assert!(provider_only
-            .secret_binding_for_host(&cfg, "api.example.com")
+            .secret_for_request("api.example.com", "GET", "/user")
             .is_none());
     }
 
     #[test]
-    fn backed_secret_domains_require_pattern_overlap() {
-        let cfg = parse_policy("secret_domains api.example.com\n").expect("policy");
+    fn secret_injection_is_scoped_to_the_authorized_route() {
+        // The gate that closes the leak: the policy authorizes GET /user only,
+        // so no other route on the same host resolves a binding -- however the
+        // repo's AGENTS.md widened the L7 rules.
+        let shared = shared_with_secrets(
+            "allow_domains api.example.com\n\
+             secret_l7\tapi.example.com\tGET\t/user\n",
+            "api.example.com\tGET\t/user\tAuthorization\tBearer tok\n",
+        );
+        assert!(shared.secret_for_request("api.example.com", "GET", "/user").is_some());
+        assert!(shared.secret_for_request("api.example.com", "GET", "/zen").is_none());
+        assert!(shared.secret_for_request("api.example.com", "POST", "/user").is_none());
+        assert!(shared.secret_for_request("other.example.com", "GET", "/user").is_none());
+    }
+
+    #[test]
+    fn a_secret_host_is_recognised_whatever_the_route() {
+        // The coarse predicate, which is what refuses cleartext to the host.
+        let cfg = parse_policy("secret_l7\tapi.example.com\tGET\t/user\n").expect("policy");
+        assert!(cfg.is_secret_host("api.example.com"));
+        assert!(!cfg.is_secret_host("other.example.com"));
+        assert!(cfg.is_secret_route("api.example.com", "GET", "/user"));
+        assert!(!cfg.is_secret_route("api.example.com", "GET", "/zen"));
+    }
+
+    #[test]
+    fn backed_secret_routes_require_pattern_overlap() {
+        let cfg = parse_policy("secret_l7\tapi.example.com\tGET\t/user\n").expect("policy");
         let unrelated =
-            SecretBindings::parse("other.example.com\tAuthorization\tone\n").expect("secrets");
-        assert!(!has_backed_secret_domains(&cfg, &unrelated));
+            SecretBindings::parse("other.example.com\tGET\t/user\tAuthorization\tone\n")
+                .expect("secrets");
+        assert!(!has_backed_secret_routes(&cfg, &unrelated));
 
         let wildcard =
-            SecretBindings::parse("*.example.com\tAuthorization\ttwo\n").expect("secrets");
-        assert!(has_backed_secret_domains(&cfg, &wildcard));
+            SecretBindings::parse("*.example.com\tGET\t/user\tAuthorization\ttwo\n")
+                .expect("secrets");
+        assert!(has_backed_secret_routes(&cfg, &wildcard));
     }
 
     #[test]

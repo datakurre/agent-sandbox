@@ -1313,7 +1313,7 @@ fn run() -> Result<i32> {
                         || !policy.allow_ips.is_empty()
                         || !policy.allow_ports.is_empty()
                         || !policy.allow_l7.is_empty();
-                    secrets_configured = !policy.secret_domains.is_empty();
+                    secrets_configured = !policy.secret_l7.is_empty();
                 }
                 Err(e) => {
                     if want_proxy {

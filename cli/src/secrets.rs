@@ -141,28 +141,6 @@ pub fn get_requested_rules(workspace: &Path) -> Vec<SecretRule> {
     requested_rules
 }
 
-pub fn domain_match(domain: &str, pattern: &str) -> bool {
-    if let Some(base) = pattern.strip_prefix("*.") {
-        domain == base || domain.ends_with(&format!(".{}", base))
-    } else {
-        domain == pattern
-    }
-}
-
-pub fn overlap_samples(pattern: &str) -> (String, String) {
-    if let Some(base) = pattern.strip_prefix("*.") {
-        (base.to_string(), format!("sample.{}", base))
-    } else {
-        (pattern.to_string(), pattern.to_string())
-    }
-}
-
-pub fn patterns_overlap(a: &str, b: &str) -> bool {
-    let (a0, a1) = overlap_samples(a);
-    let (b0, b1) = overlap_samples(b);
-    domain_match(&a0, b) || domain_match(&a1, b) || domain_match(&b0, a) || domain_match(&b1, a)
-}
-
 pub fn validate_domain(domain: &str) -> Result<(), ValidationError> {
     let bare = if let Some(base) = domain.strip_prefix("*.") { base } else { domain };
     if bare.is_empty() {
@@ -171,20 +149,25 @@ pub fn validate_domain(domain: &str) -> Result<(), ValidationError> {
     if bare.starts_with('.') || bare.ends_with('.') || bare.contains("..") {
         return Err(ValidationError::MalformedDotPlacement);
     }
+    // ASCII, matching `proxy/src/secret.rs`: a Unicode-alphanumeric domain or
+    // header used to pass here and then be rejected by the sidecar's parser,
+    // which exits the proxy 2 on a config the launcher had just accepted.
     for c in bare.chars() {
-        if !(c.is_alphanumeric() || c == '-' || c == '.' || c == '_') {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_') {
             return Err(ValidationError::ContainsInvalidCharacters);
         }
     }
     let chars: Vec<char> = bare.chars().collect();
-    if !chars.first().unwrap().is_alphanumeric() || !chars.last().unwrap().is_alphanumeric() {
+    if !chars.first().unwrap().is_ascii_alphanumeric()
+        || !chars.last().unwrap().is_ascii_alphanumeric()
+    {
         return Err(ValidationError::InvalidStartEnd);
     }
     Ok(())
 }
 
 pub fn is_header_char(c: char) -> bool {
-    c.is_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
 }
 
 pub fn validate_header(header: &str) -> Result<(), ValidationError> {
@@ -198,24 +181,51 @@ pub fn validate_header(header: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Resolve the bindings the policy's `secret_domains` authorize, returning one
-/// `domain\theader\tvalue` line per binding.  The caller decides where those
-/// go: the launcher writes them straight into the sidecar's `bindings` file
-/// rather than through a pipe, so the values never reach a terminal.
-pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspace: &Path) -> anyhow::Result<Vec<String>> {
-    let mut secret_domains = Vec::new();
-    if let Ok(f) = std::fs::File::open(policy) {
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(f);
-        for line in reader.lines().flatten() {
-            let line = line.trim();
-            if let Some(domain) = line.strip_prefix("secret_domains ") {
-                secret_domains.push(domain.trim().to_lowercase());
-            }
+/// One authorized route, as the policy file records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SecretRoute {
+    domain: String,
+    method: String,
+    path: String,
+}
+
+/// Read the `secret_l7` routes out of a compiled policy file.
+fn policy_secret_routes(policy: &Path) -> Vec<SecretRoute> {
+    let mut routes = Vec::new();
+    let Ok(text) = std::fs::read_to_string(policy) else {
+        return routes;
+    };
+    for line in text.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("secret_l7\t") else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.splitn(3, '\t').collect();
+        if parts.len() == 3 {
+            routes.push(SecretRoute {
+                domain: parts[0].trim().to_lowercase(),
+                method: parts[1].trim().to_string(),
+                path: parts[2].to_string(),
+            });
         }
     }
+    routes
+}
 
-    if secret_domains.is_empty() {
+/// Resolve the bindings the policy's `secret_l7` routes authorize, returning
+/// one `domain\tmethod\tpath\theader\tvalue` line per binding.  The caller
+/// decides where those go: the launcher writes them straight into the
+/// sidecar's `bindings` file rather than through a pipe, so the values never
+/// reach a terminal.
+///
+/// The route travels with the binding on purpose.  The host config authorizes
+/// a secret for one `host`+`method`+`path`; carrying only the domain to the
+/// proxy meant the rest of the authorization was verified and then thrown
+/// away, and any other rule the repo's AGENTS.md allowed on that host
+/// collected the same token.
+pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspace: &Path) -> anyhow::Result<Vec<String>> {
+    let secret_routes = policy_secret_routes(policy);
+
+    if secret_routes.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -263,7 +273,7 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
     };
 
     let mut filtered_bindings = Vec::new();
-    let mut seen_domains: Vec<String> = Vec::new();
+    let mut seen_routes: Vec<SecretRoute> = Vec::new();
 
     let mut missing_rules = Vec::new();
 
@@ -296,15 +306,28 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
             anyhow::bail!("agent-sandbox: Invalid header '{}' in binding: {}", hb.header, e);
         }
 
-        for seen in &seen_domains {
-            if patterns_overlap(&hb_domain, seen) {
-                anyhow::bail!("agent-sandbox: domain '{}' overlaps with existing binding domain '{}'", hb_domain, seen);
-            }
+        let route = SecretRoute {
+            domain: hb_domain.clone(),
+            method: hb.method.to_uppercase(),
+            path: hb.path.clone(),
+        };
+
+        // Only an exact repeat is unresolvable.  Two routes on one host --
+        // which the old domain-overlap check refused outright, aborting any
+        // launch with two secret rules for the same host -- are ordinary now
+        // that injection is scoped to the route.
+        if seen_routes.contains(&route) {
+            anyhow::bail!(
+                "agent-sandbox: duplicate secret binding for {} {} {}",
+                route.domain,
+                route.method,
+                route.path
+            );
         }
 
-        if secret_domains.iter().any(|pd| patterns_overlap(&hb_domain, pd)) {
+        if secret_routes.contains(&route) {
             filtered_bindings.push(hb);
-            seen_domains.push(hb_domain.clone());
+            seen_routes.push(route);
         }
     }
 
@@ -381,8 +404,10 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
         let secret_name = &b.secret;
         let (domain, _port) = parse_host_port(&b.host);
         let domain = domain.to_lowercase();
+        let method = b.method.to_uppercase();
+        let path = &b.path;
         let header = &b.header;
-        let prefix = b.prefix.unwrap_or_default();
+        let prefix = b.prefix.clone().unwrap_or_default();
 
         if let Some(secret_value) = secrets_map.get(secret_name) {
             let val_str = if let Some(s) = secret_value.as_str() {
@@ -390,7 +415,10 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
             } else {
                 secret_value.to_string()
             };
-            lines.push(format!("{}\t{}\t{}{}", domain, header, prefix, val_str));
+            lines.push(format!(
+                "{}\t{}\t{}\t{}\t{}{}",
+                domain, method, path, header, prefix, val_str
+            ));
         } else {
             anyhow::bail!("agent-sandbox: secretspec output missing required secret '{}'\n", secret_name);
         }
@@ -455,6 +483,141 @@ mod tests {
         hb.header = "Authorization".to_string();
         hb.prefix = Some("Basic ".to_string());
         assert!(!rule.matches_host_binding(&hb));
+    }
+
+    fn scratch(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).expect("write");
+        }
+        dir
+    }
+
+    const AGENTS_TWO_RULES: &str = r#"
+```agent-sandbox
+[network]
+allow = ["api.github.com:443"]
+
+[[network.rules]]
+host = "api.github.com:443"
+method = "GET"
+path = "/user/repos"
+secret = "GITHUB_TOKEN"
+header = "Authorization"
+prefix = "Bearer "
+
+[[network.rules]]
+host = "api.github.com:443"
+method = "POST"
+path = "/graphql"
+secret = "GITHUB_TOKEN"
+header = "Authorization"
+prefix = "Bearer "
+```
+"#;
+
+    const SECRETS_TOML_TWO_RULES: &str = r#"
+[[network.rules]]
+host = "api.github.com:443"
+method = "GET"
+path = "/user/repos"
+secret = "GITHUB_TOKEN"
+header = "Authorization"
+prefix = "Bearer "
+
+[[network.rules]]
+host = "api.github.com:443"
+method = "POST"
+path = "/graphql"
+secret = "GITHUB_TOKEN"
+header = "Authorization"
+prefix = "Bearer "
+"#;
+
+    #[test]
+    fn two_secret_rules_on_one_host_are_both_accepted() {
+        // Regression: authorization used to be recorded per domain, and the
+        // second rule tripped a domain-overlap check that aborted the launch --
+        // so a host could carry at most one secret route.  Both are authorized
+        // here, so the resolver must get as far as calling secretspec (which is
+        // not installed in the test environment, hence the error we assert on)
+        // rather than refusing the configuration itself.
+        let dir = scratch(&[
+            (
+                "policy",
+                "allow_domains api.github.com:443\n\
+                 secret_l7\tapi.github.com\tGET\t/user/repos\n\
+                 secret_l7\tapi.github.com\tPOST\t/graphql\n",
+            ),
+            ("secrets.toml", SECRETS_TOML_TWO_RULES),
+            ("AGENTS.md", AGENTS_TWO_RULES),
+            ("secretspec.toml", ""),
+        ]);
+        let err = resolve_secrets_logic(
+            &dir.path().join("policy"),
+            &dir.path().join("secrets.toml"),
+            &dir.path().join("secretspec.toml"),
+            &dir.path().join("AGENTS.md"),
+        )
+        .expect_err("secretspec is absent in tests")
+        .to_string();
+        assert!(!err.contains("overlaps"), "both rules must be authorized: {err}");
+        assert!(err.contains("secretspec"), "{err}");
+    }
+
+    #[test]
+    fn a_rule_the_host_config_does_not_authorize_refuses_the_launch() {
+        // AGENTS.md is untrusted: asking for a secret on a route the operator
+        // never authorized must stop the launch and print the exact block to
+        // paste, not silently inject nothing.
+        let dir = scratch(&[
+            (
+                "policy",
+                "allow_domains api.github.com:443\n\
+                 secret_l7\tapi.github.com\tGET\t/user/repos\n\
+                 secret_l7\tapi.github.com\tPOST\t/graphql\n",
+            ),
+            (
+                "secrets.toml",
+                "[[network.rules]]\n\
+                 host = \"api.github.com:443\"\n\
+                 method = \"GET\"\n\
+                 path = \"/user/repos\"\n\
+                 secret = \"GITHUB_TOKEN\"\n\
+                 header = \"Authorization\"\n\
+                 prefix = \"Bearer \"\n",
+            ),
+            ("AGENTS.md", AGENTS_TWO_RULES),
+            ("secretspec.toml", ""),
+        ]);
+        let err = resolve_secrets_logic(
+            &dir.path().join("policy"),
+            &dir.path().join("secrets.toml"),
+            &dir.path().join("secretspec.toml"),
+            &dir.path().join("AGENTS.md"),
+        )
+        .expect_err("the unauthorized POST rule must refuse the launch")
+        .to_string();
+        assert!(err.contains("not authorized"), "{err}");
+        assert!(err.contains("/graphql"), "the message names the offending route: {err}");
+    }
+
+    #[test]
+    fn a_policy_with_no_secret_routes_resolves_nothing() {
+        let dir = scratch(&[
+            ("policy", "allow_domains api.github.com:443\n"),
+            ("secrets.toml", SECRETS_TOML_TWO_RULES),
+            ("AGENTS.md", AGENTS_TWO_RULES),
+            ("secretspec.toml", ""),
+        ]);
+        let lines = resolve_secrets_logic(
+            &dir.path().join("policy"),
+            &dir.path().join("secrets.toml"),
+            &dir.path().join("secretspec.toml"),
+            &dir.path().join("AGENTS.md"),
+        )
+        .expect("no secret routes is not an error");
+        assert!(lines.is_empty());
     }
 
     #[test]

@@ -415,7 +415,11 @@ pub fn parse_host_port(s: &str) -> (String, Option<String>) {
 pub struct ProxyPolicy {
     pub allow_domains: Vec<String>,
     pub deny_domains: Vec<String>,
-    pub secret_domains: Vec<String>,
+    /// `domain\tmethod\tpath` per rule that names a secret.  Route-scoped, not
+    /// domain-scoped: the proxy injects only into requests matching one of
+    /// these, so a secret-less rule elsewhere on the same host cannot collect
+    /// the token.
+    pub secret_l7: Vec<String>,
     pub allow_signing: Vec<String>,
     pub allow_ips: Vec<String>,
     pub deny_ips: Vec<String>,
@@ -590,8 +594,11 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                         if !secret.is_str() {
                             return Err(ConfigError::msg(format!("[[network.rules]][{}].secret: must be a string", i)));
                         }
-                        if !policy.secret_domains.contains(&host_part) {
-                            policy.secret_domains.push(host_part.clone());
+                        // The route, not just the host: this is what the proxy
+                        // matches a request against before injecting.
+                        let route = format!("{}\t{}\t{}", host_part, method, path);
+                        if !policy.secret_l7.contains(&route) {
+                            policy.secret_l7.push(route);
                         }
                     }
                 }
@@ -607,7 +614,7 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
     
     for val in &policy.allow_domains { lines.push(format!("allow_domains {}", val)); }
     for val in &policy.deny_domains { lines.push(format!("deny_domains {}", val)); }
-    for val in &policy.secret_domains { lines.push(format!("secret_domains {}", val)); }
+    for val in &policy.secret_l7 { lines.push(format!("secret_l7\t{}", val)); }
     for val in &policy.allow_signing { lines.push(format!("allow_signing {}", val)); }
     for val in &policy.allow_ips { lines.push(format!("allow_ips {}", val)); }
     for val in &policy.deny_ips { lines.push(format!("deny_ips {}", val)); }
@@ -648,7 +655,10 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
         out.push_str(&format!("host = {:?}\n", r.domain));
         out.push_str(&format!("method = {:?}\n", r.method));
         out.push_str(&format!("path = {:?}\n", r.path_pattern));
-        if cfg.secret_domains.iter().any(|d| d == &r.domain) {
+        let carries_secret = cfg.secret_routes.iter().any(|s| {
+            s.domain == r.domain && s.method == r.method && s.path_pattern == r.path_pattern
+        });
+        if carries_secret {
             out.push_str("secret = true # placeholder -- fill in the real secret reference; the policy file doesn't retain it\n");
         }
     }
@@ -683,7 +693,7 @@ mod export_tests {
         let cfg = parse_policy(
             "allow_domains github.com\n\
              allow_ips 10.0.0.0/8\n\
-             secret_domains api.github.com\n\
+             secret_l7\tapi.github.com\tGET\t/repos/*\n\
              allow_l7\tapi.github.com\tGET\t/repos/*\n",
         )
         .unwrap();
@@ -695,6 +705,25 @@ mod export_tests {
         assert!(toml.contains("method = \"GET\""), "{toml}");
         assert!(toml.contains("path = \"/repos/*\""), "{toml}");
         assert!(toml.contains("secret = true"), "{toml}");
+    }
+
+    #[test]
+    fn export_marks_only_the_rule_that_actually_carries_a_secret() {
+        // Two rules on one host, one secret-bearing.  The marker used to be
+        // per domain, so both rules came back marked -- which is exactly the
+        // over-broad model this replaces.
+        let cfg = parse_policy(
+            "allow_domains api.github.com\n\
+             secret_l7\tapi.github.com\tGET\t/user/repos\n\
+             allow_l7\tapi.github.com\tGET\t/user/repos\n\
+             allow_l7\tapi.github.com\tGET\t/zen\n",
+        )
+        .unwrap();
+        let toml = format_policy_as_network_toml(&cfg);
+        assert_eq!(toml.matches("secret = true").count(), 1, "{toml}");
+        let (before_zen, after_zen) = toml.split_once("/zen").expect("both rules exported");
+        assert!(before_zen.contains("secret = true"), "{toml}");
+        assert!(!after_zen.contains("secret = true"), "{toml}");
     }
 
     #[test]
@@ -741,7 +770,7 @@ mod export_tests {
             .unwrap_or_else(|e| panic!("the proxy rejected the launcher's own policy: {e}\n{text}"));
 
         assert_eq!(cfg.allow_signing, vec!["github.com".to_string()]);
-        assert!(cfg.secret_domains.contains(&"api.github.com".to_string()));
+        assert!(cfg.secret_routes.iter().any(|r| r.domain == "api.github.com"));
         assert!(cfg.is_allowed("github.com", 443), "{text}");
         assert!(cfg.is_allowed("github.com", 22), "{text}");
         assert!(cfg.is_allowed("10.1.2.3", 80), "{text}");

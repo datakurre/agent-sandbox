@@ -486,36 +486,6 @@ fn copy_to_eof<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<
     }
 }
 
-/// Rewrites every request on a keep-alive connection so `header_name` appears
-/// exactly once with `header_value`.
-pub fn injecting_request_pump<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    header_name: &str,
-    header_value: &str,
-) -> io::Result<u64> {
-    let mut written = 0u64;
-    loop {
-        let Some(head) = read_head(reader)? else {
-            return Ok(written);
-        };
-        let rewritten = rewrite_head(&head, header_name, header_value)?;
-        writer.write_all(&rewritten)?;
-        written += rewritten.len() as u64;
-
-        let head_text = std::str::from_utf8(&head).map_err(|_| {
-            io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
-        })?;
-        if let Some(len) = content_length(head_text)? {
-            written += copy_exact(reader, writer, len)?;
-            continue;
-        }
-        if is_chunked(head_text) {
-            written += copy_chunked_body(reader, writer)?;
-        }
-    }
-}
-
 fn response_has_no_body(request_method: &str, status_code: u16) -> bool {
     request_method.eq_ignore_ascii_case("HEAD")
         || (100..200).contains(&status_code)
@@ -559,9 +529,14 @@ impl std::fmt::Display for ProxyHttpError {
 }
 impl std::error::Error for ProxyHttpError {}
 
-/// Forward HTTP/1.1 request/response exchanges while rewriting each request so
-/// `header_name` appears exactly once, if a secret is provided.
-/// Evaluates L7 policy rules on each request.
+/// Forward HTTP/1.1 request/response exchanges, evaluating L7 policy on each
+/// request and injecting the secret the operator authorized *for that request*
+/// -- host, method and path -- so it appears exactly once.
+///
+/// The per-request resolution is the point.  A keep-alive connection carries
+/// many requests; resolving the binding once when the connection opened meant
+/// a token authorized for `GET /user/repos` was also injected into every other
+/// request the policy happened to allow on that host.
 ///
 /// Returns `HttpExchangeOutcome` on successful parsing (up to EOF), or `ProxyHttpError`.
 pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
@@ -569,10 +544,9 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
     upstream: &mut U,
     expected_host: &str,
     expected_port: u16,
-    secret: Option<(&str, &str)>,
     shared: &std::sync::Arc<crate::Shared>,
 ) -> Result<HttpExchangeOutcome, ProxyHttpError> {
-    let secret_missing = secret.is_none() && shared.config().is_secret_domain(expected_host);
+    let mut secret_missing = false;
     let mut up_bytes = 0u64;
     let mut down_bytes = 0u64;
     let mut last_method: Option<String> = None;
@@ -623,9 +597,21 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
                 return Err(io::Error::new(ErrorKind::PermissionDenied, msg));
             }
 
-            let out_head = match secret {
-                Some((name, value)) => rewrite_head(&request_head, name, value)?,
-                None => request_head.clone(),
+            // Resolved here, against the *normalized* path the L7 check just
+            // used, so `/user/repos/../../zen` cannot carry the token to
+            // `/zen`.
+            let out_head = match shared.secret_for_request(expected_host, &method, &path) {
+                Some(binding) => {
+                    rewrite_head(&request_head, &binding.header, binding.value.as_str())?
+                }
+                None => {
+                    // Authorized route, no provider behind it: worth reporting,
+                    // since the request goes out unauthenticated.
+                    if shared.config().is_secret_route(expected_host, &method, &path) {
+                        secret_missing = true;
+                    }
+                    request_head.clone()
+                }
             };
 
             upstream.write_all(&out_head)?;
@@ -753,21 +739,32 @@ mod tests {
         }
     }
 
+    /// A `Shared` whose policy allows everything on `example.com` and marks
+    /// `route` secret-bearing, with a provider binding behind it.
+    fn shared_injecting(route: &str, header: &str, value: &str) -> std::sync::Arc<crate::Shared> {
+        std::sync::Arc::new(crate::shared_with_secrets(
+            &format!("allow_domains example.com\nsecret_l7\t{route}\n"),
+            &format!("{route}\t{header}\t{value}\n"),
+        ))
+    }
+
     #[test]
     fn rewrites_two_keep_alive_requests() {
-        let input = b"GET /one HTTP/1.1\r\nHost: example.com\r\nAuthorization: old\r\n\r\n\
-                      GET /two HTTP/1.1\r\nHost: example.com\r\nauthorization: old2\r\n\r\n";
-        let mut reader: &[u8] = input;
-        let mut output = Vec::new();
-        let written = injecting_request_pump(
-            &mut reader,
-            &mut output,
-            "Authorization",
-            "Bearer injected-secret",
+        let client_in = b"GET /one HTTP/1.1\r\nHost: example.com\r\nAuthorization: old\r\n\r\n\
+                          GET /two HTTP/1.1\r\nHost: example.com\r\nauthorization: old2\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none\
+                            HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &shared_injecting("example.com\t*\t/**", "Authorization", "Bearer injected-secret"),
         )
-        .expect("pump");
-        assert_eq!(written as usize, output.len());
-        let rendered = String::from_utf8(output).expect("utf8 output");
+        .expect("proxy");
+        let rendered = String::from_utf8(upstream.written).expect("utf8 output");
         assert_eq!(rendered.matches("Authorization: Bearer injected-secret").count(), 2);
         assert!(!rendered.contains("Authorization: old"));
         assert!(!rendered.contains("authorization: old2"));
@@ -775,25 +772,93 @@ mod tests {
 
     #[test]
     fn keeps_request_body_for_content_length() {
-        let input = b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
-        let mut reader: &[u8] = input;
-        let mut output = Vec::new();
-        injecting_request_pump(&mut reader, &mut output, "X-Api-Key", "value").expect("pump");
-        let rendered = String::from_utf8(output).expect("utf8 output");
+        let client_in = b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &shared_injecting("example.com\tPOST\t/submit", "X-Api-Key", "value"),
+        )
+        .expect("proxy");
+        let rendered = String::from_utf8(upstream.written).expect("utf8 output");
         assert!(rendered.ends_with("hello"));
         assert!(rendered.contains("X-Api-Key: value\r\n\r\n"));
     }
 
     #[test]
     fn keeps_chunked_body() {
-        let input = b"POST /chunk HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n\
-                      4\r\ntest\r\n0\r\n\r\n";
-        let mut reader: &[u8] = input;
-        let mut output = Vec::new();
-        injecting_request_pump(&mut reader, &mut output, "X-Test", "yes").expect("pump");
-        let rendered = String::from_utf8(output).expect("utf8 output");
+        let client_in = b"POST /chunk HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n\
+                          4\r\ntest\r\n0\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &shared_injecting("example.com\tPOST\t/chunk", "X-Test", "yes"),
+        )
+        .expect("proxy");
+        let rendered = String::from_utf8(upstream.written).expect("utf8 output");
         assert!(rendered.contains("X-Test: yes\r\n\r\n"));
         assert!(rendered.ends_with("4\r\ntest\r\n0\r\n\r\n"));
+    }
+
+    #[test]
+    fn a_second_request_on_one_connection_outside_the_route_gets_no_secret() {
+        // The leak, end to end.  Both requests are allowed by L7 -- the repo's
+        // AGENTS.md said so -- but only /user/repos is a route the operator
+        // authorized the token for.  Resolving the binding once per connection
+        // put the token on both.
+        let client_in = b"GET /user/repos HTTP/1.1\r\nHost: api.example.com\r\n\r\n\
+                          GET /zen HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none\
+                            HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_domains api.example.com\n\
+             allow_l7\tapi.example.com\t*\t/**\n\
+             secret_l7\tapi.example.com\tGET\t/user/repos\n",
+            "api.example.com\tGET\t/user/repos\tAuthorization\tBearer tok\n",
+        ));
+
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+            .expect("proxy");
+
+        let rendered = String::from_utf8(upstream.written).expect("utf8");
+        let (first, second) = rendered.split_once("GET /zen").expect("both requests forwarded");
+        assert!(first.contains("Authorization: Bearer tok"), "{rendered}");
+        assert!(!second.contains("Bearer tok"), "the token leaked onto /zen: {rendered}");
+    }
+
+    #[test]
+    fn a_dot_segment_path_cannot_carry_the_secret_off_its_route() {
+        // Matching happens on the normalized path, so /user/repos/../../zen is
+        // /zen and gets nothing -- while the request line goes upstream as the
+        // client wrote it.
+        let client_in =
+            b"GET /user/repos/../../zen HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_domains api.example.com\n\
+             allow_l7\tapi.example.com\t*\t/**\n\
+             secret_l7\tapi.example.com\tGET\t/user/**\n",
+            "api.example.com\tGET\t/user/**\tAuthorization\tBearer tok\n",
+        ));
+
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+            .expect("proxy");
+
+        let rendered = String::from_utf8(upstream.written).expect("utf8");
+        assert!(!rendered.contains("Bearer tok"), "{rendered}");
     }
 
     #[test]
@@ -811,8 +876,7 @@ mod tests {
                 &mut upstream,
                 "example.com",
                 80,
-                Some(("Authorization", "Bearer v")),
-                &crate::dummy_shared(),
+                &shared_injecting("example.com\t*\t/**", "Authorization", "Bearer v"),
             )
             .expect("proxy");
 
@@ -840,8 +904,7 @@ mod tests {
             &mut upstream,
             "api.example.com",
             80,
-            Some(("Authorization", "Bearer v")),
-            &crate::dummy_shared(),
+            &shared_injecting("api.example.com\t*\t/**", "Authorization", "Bearer v"),
         )
         .unwrap_err();
 
@@ -865,8 +928,7 @@ mod tests {
             &mut upstream,
             "api.example.com",
             80,
-            Some(("Authorization", "Bearer v")),
-            &crate::dummy_shared(),
+            &shared_injecting("api.example.com\t*\t/**", "Authorization", "Bearer v"),
         )
         .unwrap_err();
 
@@ -921,7 +983,6 @@ mod tests {
             &mut upstream,
             "example.com",
             80,
-            None,
             &crate::dummy_shared(),
         )
         .expect("proxy should succeed");
