@@ -48,12 +48,13 @@ Key layers:
 
 ### Launcher (`agent-sandbox`)
 
-A bash script that wraps `podman run`.  Call flow:
+A Rust binary (`cli/src/bin/agent-sandbox.rs`) that wraps `podman run`; the
+per-integration mount/env fragments live in `cli/src/launch.rs`, where they are
+unit-tested without a podman.  Call flow:
 
 1. Parse flags: consume known flags (`--ssh`, `--no-git`, `--no-workspace`,
-   etc.), pass through `-v` volume mounts (with relative-path expansion),
-   stop at `--` sentinel.
- 2. Build mounts array from toggles (ssh socket, git config, gpg socket,
+   etc.), collect `--podman-args` up to the `--` sentinel, stop at `--`.
+ 2. Build mounts array from toggles (ssh socket, gpg socket,
     devenv dir, podman host socket, CWD workspace) plus the state dirs of
     whichever agents are selected — the positionally-launched one by default,
     or the set chosen via `--agent-mounts`/`--agent-mounts=…` — sourced from
@@ -121,15 +122,22 @@ log of what it did. Changing policy is therefore a host-side operation
 `[network].allow` contains targets to allow (e.g., `github.com:443`, `10.0.0.0/8:80`). The proxy is **deny-by-default**.
 `[[network.rules]]` configures L7 paths and optional secret injection.
 
+An `allow` entry on port 22 also populates `allow_signing`, which is what
+authorizes the SSH/GPG relay: under `--proxy` the host agent sockets go to the
+sidecar, not the sandbox, and the relay refuses everything until that list is
+non-empty.
+
 `agent-sandbox-proxy --check-policy FILE` is the single reference validator:
-`parse_agents.py` writes the file, the proxy reads it, the host-side `proxy`
-command vets its own writes with the same binary, and `checks.firewall-policy`
-tests the whole chain.  There is no second implementation to drift.
+`cli/src/agents.rs` writes the file, the proxy reads it, and the host-side
+`proxy` command vets its own writes with the same parser.  There is no second
+implementation to drift.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
 The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`).
 To authorize secret injection, the operator pastes the exact same `[[network.rules]]` block from `AGENTS.md` into `~/.config/agent-sandbox/secrets.toml`.
-The launcher runs `agent-sandbox-resolve-secrets`, which cross-references this config with the policy's `secret_domains`, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are then written to `/sidecar_secrets/bindings`, which the sidecar reads. The proxy handles actual header injection. When a `secret` field is provided in a `[[network.rules]]` block in `AGENTS.md`, `parse_agents.py` automatically populates the `secret_domains` policy list with their domains, removing the need for manual duplication.
+The launcher calls the resolver in `cli/src/secrets.rs`, which cross-references this config with the policy's `secret_domains`, and then runs `secretspec export` on the host to fetch the values. The filtered bindings are written 0600 into `/sidecar_secrets/bindings`, which only the sidecar mounts. The proxy handles actual header injection. When a `secret` field is provided in a `[[network.rules]]` block in `AGENTS.md`, `parse_proxy` automatically populates the `secret_domains` policy list with their domains, removing the need for manual duplication.
+
+The proxy terminates TLS for hosts carrying an L7 rule, so its per-session CA (`/sidecar_shared/ca.pem`) is bound into the sandbox as a single file and pointed at by `AGENT_SANDBOX_PROXY_CA_FILE`; the entrypoint merges it into the trust bundle.
 
 The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
@@ -196,19 +204,21 @@ New connections see the change within a second; established ones do not.
 
 ## How to add a new integration
 
-1. Add a `want_{name}=1` toggle after the existing toggles (see integration toggles).
-2. Add `--{name}` / `--no-{name}` cases in the argument parsing loop.
-3. Add the mount/env logic after the existing blocks.
+1. Add a `want_{name}` toggle in `cli/src/bin/agent-sandbox.rs`, after the
+   existing toggles.
+2. Add `--{name}` / `--no-{name}` arms in the argument parsing loop.
+3. Put the mount/env logic in `cli/src/launch.rs` as a function returning the
+   `-v`/`-e` fragments, and call it from the launcher next to the other blocks.
 4. If container-side setup is needed in the entrypoint, gate it on an env
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
-5. Update the usage comment.
-6. Test: `nix flake check`
+5. Update `print_usage` and `docs/usage.md`.
+6. Test: `cargo test`, then `nix flake check`.
 
-Note what `nix flake check` cannot cover: podman does not run in a Nix build, so
-nothing that starts a container is tested there.  `checks.ctl-args` drives the
-`ctl` scripts against a stub podman, and `lib/smoke-firewall.sh` is the hand-run
-procedure for the rest (`bash lib/smoke-firewall.sh`, needs a real podman and
-network egress).
+Note what neither can cover: podman does not run in a Nix build, so nothing
+that starts a container is tested there. The cheap end-to-end check is a stub
+`podman` earlier on `PATH` that records its argv, which covers the whole
+flag -> `podman run` mapping; anything past that (proxy egress, relays, krun)
+needs a real podman and network access.
 
 ## How to add a new agent
 

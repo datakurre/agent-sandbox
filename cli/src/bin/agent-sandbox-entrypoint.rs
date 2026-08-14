@@ -209,7 +209,10 @@ fn main() -> Result<()> {
             fs::create_dir_all(parent)?;
         }
         let mut file = fs::OpenOptions::new().create(true).append(true).open(&gitconfig)?;
-        file.write_all(b"[commit]\n\tgpgsign = false\n")?;
+        // Tags as well as commits: the host config that switched signing on
+        // usually switches on both, and either one fails the same way without
+        // a forwarded agent.
+        file.write_all(b"[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n")?;
     }
 
     let base_count: usize = env::var("AGENT_SANDBOX_GIT_CONFIG_COUNT")

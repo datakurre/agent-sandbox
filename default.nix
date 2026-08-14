@@ -11,8 +11,9 @@ let
   # podman namespaces locally loaded images under localhost/.
   imageRef = "localhost/${imageName}:${imageTag}";
 
-  # Shared network for port forwarding.  Only created when a sandbox actually
-  # publishes something; see lib/agent-sandbox-port.sh for why it exists.
+  # Shared network for published ports.  Only created when a sandbox actually
+  # publishes something, so a launch with no ports keeps podman's default
+  # rootless networking untouched.
   networkName = "agent-sandbox";
 
   # Scripts in ./lib keep their own shebang so they can be run and linted in
@@ -52,6 +53,15 @@ let
   proxyScript = pkgs.writeShellScriptBin "agent-sandbox-proxy" ''
     exec ${agentSandboxRust}/bin/agent-sandbox-proxy "$@"
   '';
+
+  # The SSH/GPG relay, in both halves: relay-server runs in the sidecar next to
+  # the forwarded host sockets, relay-ssh/relay-gpg run in the sandbox, which
+  # has no socket of its own under --proxy.  Individually wrapped rather than
+  # putting the whole Rust closure on the image PATH, which would also hand the
+  # agent the launcher and the ctl commands.
+  relayScripts = map (
+    name: pkgs.writeShellScriptBin name ''exec ${agentSandboxRust}/bin/${name} "$@"''
+  ) [ "relay-server" "relay-ssh" "relay-gpg" ];
   unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
   defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
   agentTools = map (a: a.package) agents;
@@ -132,7 +142,8 @@ let
     # No agent-sandbox-allow: policy now lives on a volume the sandbox cannot
     # see, so widening the firewall is a host-side operation
     # (agent-sandbox ctl proxy allow) by design.
-    ++ [ dockerAlias sidecarScript proxyScript ];
+    ++ [ dockerAlias sidecarScript proxyScript ]
+    ++ relayScripts;
 
   tools = baseTools ++ agentTools;
 
@@ -353,7 +364,11 @@ let
 
 
 
+  # `rust` is the whole workspace: buildRustPackage runs `cargo test` in its
+  # check phase, so this is what makes `nix flake check` cover the launcher's
+  # argument handling, the AGENTS.md parsers and the policy format.
   checks = {
+    rust = agentSandboxRust;
     proxy = proxyScript;
   };
 

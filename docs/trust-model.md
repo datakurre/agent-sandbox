@@ -41,7 +41,7 @@ What it does **not** close:
 - **Nothing on the workspace.** With `--workspace` the agent can write to your git repository, and code it plants there runs on your host later, as you, outside every boundary described here. For a careless or prompt-injected coding agent this is the operative risk, and no hypervisor addresses it.
 - **Nothing against a podman, netns or userns misconfiguration**, since the VMM sits inside that same configuration.
 
-Two things it changes that are easy to miss, both measured rather than assumed (`lib/smoke-krun.sh`):
+Two things it changes that are easy to miss, both measured rather than assumed:
 
 - **The agent is `uid 0` inside the guest.** `--userns=keep-id` maps the *VMM process* on the host; it does not reach the guest's own user namespace, so a process that is unprivileged uid 33500 in an ordinary sandbox is root in a `--krun` one. This is not an escalation on the host — files the guest writes still land as your uid, because the VMM performs the write — but "the agent runs unprivileged" stops being true inside the boundary, and anything relying on in-container uid separation should not.
 - **SELinux confinement of the sandbox process is off.** `--krun` runs the sandbox with `--security-opt label=disable`, because the kernel refuses an SELinux domain transition once a process is multi-threaded and libkrun has already spawned the VM's threads by then. With labeling left on, the guest does not boot at all on an enforcing host. `--selinux` still relabels the bind mounts (`:z`). On an SELinux host, `--krun` therefore trades SELinux confinement of the sandbox process for a guest kernel under the agent.

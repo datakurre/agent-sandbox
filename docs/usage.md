@@ -63,10 +63,8 @@ Every flag in the table below has a corresponding `--no-flag` option (e.g., `--n
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
 | Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces `AGENTS.md`'s `[network]` policy if present. See details below. |
-| Network & firewall | `--proxy-train` | Timeout for TUI training mode (default: 300). Also sets default policy to ask. |
 | Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into proxied traffic matching `secret_domains`. Requires `--proxy`. |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
-
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
@@ -75,10 +73,13 @@ A few flags are one-off pass-throughs rather than persistent toggles, so they ha
 
 | Flag | What it does |
 | --- | --- |
-| `--port [HOST:]CONTAINER[/PROTO]` | Publishes a port. |
 | `-e NAME=VAL`, `--env NAME=VAL` | Injects an environment variable. |
 | `--privileged` | Enables nested podman inside the sandbox (safe — see [Trust model](trust-model.md)). |
-| `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel (including `-v/--volume`). |
+| `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel (including `-v/--volume` and `-p/--publish`). |
+
+There is no `--port` flag: declare ports in `AGENTS.md` and pass `--ports`, or
+publish one directly with `--podman-args -p HOST:CONTAINER --`. Either way,
+publishing a port cannot be combined with `--proxy`.
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
@@ -108,16 +109,16 @@ The proxy sidecar is treated as infrastructure: it always runs with SELinux
 labeling disabled for `/sidecar_policy` and `/sidecar_shared` so proxy
 readiness does not depend on host relabeling flags.
 
-### Interactive Proxy Training (Ask Mode)
+### Building a policy interactively
 
-When starting a sandbox on a new codebase or with an unknown set of dependencies, you can run it in "ask mode" to interactively build a proxy policy:
+When starting a sandbox on a new codebase or with an unknown set of dependencies, you can build the proxy policy as you go:
 
-1. **Start the Sandbox**: Run `agent-sandbox --proxy-train 300` (where 300 is the timeout in seconds for pending requests). This launches the sandbox normally but sets the firewall's default policy to "ask".
-2. **Open the TUI**: In a **separate terminal**, run `agent-sandbox ctl tui`. This interactive interface will list all pending network requests that the sandbox is trying to make.
+1. **Start the Sandbox**: Run `agent-sandbox --proxy`. With no `[network]` block yet, requests are recorded and the ones that do not match a rule are denied.
+2. **Open the TUI**: In a **separate terminal**, run `agent-sandbox ctl tui`. This interactive interface lists the requests the sandbox is making, including the denied ones.
 3. **Approve or Deny**: Use the following keybindings to update the policy in real time:
    - `a`: Allow domain
    - `d`: Deny domain
-   - `h`: Allow HTTP route (domain + method) (creates a `[[network.http]]` rule)
+   - `h`: Allow HTTP route (domain + method) (creates a `[[network.rules]]` rule)
    - `A`: Allow IP
    - `D`: Deny IP
    - `q` or `Esc`: Quit the TUI
@@ -129,8 +130,16 @@ The same TUI also works against a normal (`policy = "deny"`) sandbox launched wi
 
 When using Git inside the sandbox, be aware of how the integration flags interact:
 - `--git` injects your effective Git configuration into the container using environment variables instead of mounting `.gitconfig`. Host-side `[include]` directives are evaluated and flattened on the host, while host-specific file paths (like `gpg.*.program`, credential helpers, global gitignore, and custom hooks) are automatically blocklisted so they don't break Git inside the container.
-- `--gpg` is required for `--git` to also include commit signing. Without it, the sandbox explicitly disables signing (e.g., `commit.gpgsign = false`) to prevent signing failures when the host's GnuPG agent is not forwarded.
+- `--gpg` is required for `--git` to also include commit signing. Without it, the sandbox explicitly disables signing (`commit.gpgsign = false`, `tag.gpgsign = false`) to prevent signing failures when the host's GnuPG agent is not forwarded.
 - `--ssh` is required for `git pull` and `git push` to work with SSH remotes. It forwards your host's `SSH_AUTH_SOCK`. Because we avoid excessive host mounts, we do *not* mount your host's `known_hosts` file. Instead, we pre-populate the container's `~/.ssh/known_hosts` with the public keys for GitHub, GitLab, and Bitbucket so first-time connections do not prompt for verification.
+- Combined with `--proxy`, neither socket is mounted into the sandbox at all: a
+  forwarded socket is a capability that does not pass the firewall. The sockets
+  go to the proxy sidecar instead, and the sandbox reaches them through
+  `relay-ssh`/`relay-gpg`, which the relay authorizes against the policy's
+  `allow_signing` list — declare an SSH port to populate it, e.g.
+  `allow = ["github.com:22"]`. With no such entry the relay refuses every
+  request; `agent-sandbox ctl relay` shows the list and the decisions made
+  against it.
 
 ### Examples
 
@@ -159,9 +168,8 @@ agent-sandbox --privileged opencode              # nested podman inside containe
 | `logs [-f] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
 | `tui [WORD] [--sandbox WORD]` | interactive terminal UI: approves ask-mode requests live, and shows recently-denied connections so you can add the missing rule without leaving the dashboard |
 | `proxy show\|allow\|deny\|rm\|reset\|export [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as AGENTS.md TOML |
-
-| `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox |
-| `relay [WORD] [--sandbox WORD]` | show SSH/GPG relay policy and logs |
+| `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
+| `relay [-f] [WORD] [--sandbox WORD]` | show the SSH/GPG relay's `allow_signing` policy and what it has been asked for |
 | `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |
 | `purge [--all] [-n]` | reclaim leftovers; running sandboxes are kept unless `--all` |
 
@@ -179,7 +187,6 @@ $ agent-sandbox ctl status silent
 $ agent-sandbox ctl net --sandbox silent
 $ agent-sandbox ctl logs silent
 $ agent-sandbox ctl proxy show --sandbox silent
-$ agent-sandbox ctl ports ls silent
 $ agent-sandbox ctl mounts ls --sandbox silent
 $ agent-sandbox ctl attach silent -- bash
 ```

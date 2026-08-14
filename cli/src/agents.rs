@@ -515,14 +515,29 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 let (host_part, port_part) = parse_host_port(&item);
                 if host_part != "*" {
                     if is_ip_or_cidr(&host_part) {
-                        policy.allow_ips.push(host_part.clone());
+                        if !policy.allow_ips.contains(&host_part) {
+                            policy.allow_ips.push(host_part.clone());
+                        }
                     } else {
                         _proxy_domain("[network].allow", &host_part)?;
-                        policy.allow_domains.push(host_part.clone());
+                        // One line per host, not one per port: the same host on
+                        // two ports is two allow entries but one rule to read
+                        // in `ctl proxy show`.
+                        if !policy.allow_domains.contains(&host_part) {
+                            policy.allow_domains.push(host_part.clone());
+                        }
                     }
                 }
                 if let Some(port) = port_part {
                     _proxy_port("[network].allow", &port)?;
+                    // An allow entry on the SSH port is also what authorizes
+                    // the relay to reach that host, and -- because gpg has no
+                    // destination of its own -- what enables signing at all.
+                    // The relay refuses everything while allow_signing is
+                    // empty, so this is the only way to turn it on.
+                    if port == "22" && host_part != "*" && !policy.allow_signing.contains(&host_part) {
+                        policy.allow_signing.push(host_part.clone());
+                    }
                     policy.allow_ports.push(port);
                 }
             }
@@ -539,10 +554,14 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     
                     if host_part != "*" {
                         if is_ip_or_cidr(&host_part) {
-                            policy.allow_ips.push(host_part.clone());
+                            if !policy.allow_ips.contains(&host_part) {
+                                policy.allow_ips.push(host_part.clone());
+                            }
                         } else {
                             _proxy_domain(&format!("[[network.rules]][{}].host", i), &host_part)?;
-                            policy.allow_domains.push(host_part.clone());
+                            if !policy.allow_domains.contains(&host_part) {
+                                policy.allow_domains.push(host_part.clone());
+                            }
                         }
                     }
                     

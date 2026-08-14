@@ -57,8 +57,9 @@
         }
       );
 
-      # `nix flake check` runs the parser and gnupg-classifier test suites and
-      # shellchecks every script, without building the container image.
+      # `nix flake check` builds the Rust workspace, which runs `cargo test`
+      # over the launcher, parser and policy suites, without building the
+      # container image.
       checks = lib.genAttrs systems (system: (packageFor system).passthru.checks);
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);

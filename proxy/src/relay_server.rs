@@ -166,7 +166,9 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
                 let _ = write_frame(&mut stream, &Frame::Exit(255));
                 return;
             }
-            ("/usr/bin/gpg", false)
+            // Resolved through PATH: the image is a Nix closure, where the
+            // only thing under /usr/bin is `env`.
+            ("gpg", false)
         },
         CommandType::Ssh => {
             let host = extract_ssh_destination(&req.args);
@@ -209,7 +211,7 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
                     return;
                 }
             }
-            ("/usr/bin/ssh", true)
+            ("ssh", true)
         }
     };
 

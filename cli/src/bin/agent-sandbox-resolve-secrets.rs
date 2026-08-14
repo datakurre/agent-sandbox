@@ -22,13 +22,20 @@ struct Cli {
 
 fn main() {
     let args = Cli::parse();
-    if let Err(e) = resolve_secrets_logic(&args.policy, &args.config, &args.file, &args.workspace) {
-        let err_str = e.to_string();
-        if err_str.ends_with('\n') {
-            eprint!("{}", err_str);
-        } else {
-            eprintln!("{}", err_str);
+    match resolve_secrets_logic(&args.policy, &args.config, &args.file, &args.workspace) {
+        Ok(bindings) => {
+            for line in bindings {
+                println!("{}", line);
+            }
         }
-        std::process::exit(1);
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.ends_with('\n') {
+                eprint!("{}", err_str);
+            } else {
+                eprintln!("{}", err_str);
+            }
+            std::process::exit(1);
+        }
     }
 }

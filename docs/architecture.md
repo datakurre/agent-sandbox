@@ -3,7 +3,7 @@
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
 ("agent-sandbox") together with a launcher binary (`agent-sandbox`) and a
 management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
-`list`, `status`, `net`, `logs`, `tui`, `proxy`, `ports`, `mounts`, `attach`, `relay` and `purge`).
+`list`, `status`, `net`, `logs`, `tui`, `proxy`, `mounts`, `attach`, `relay` and `purge`).
 
 ## What's in the image
 
@@ -57,22 +57,36 @@ Key layers:
 
 ## Launcher (`agent-sandbox`)
 
-A bash script that wraps `podman run`.  Call flow:
+A Rust binary (`cli/src/bin/agent-sandbox.rs`) that wraps `podman run`; the
+per-integration fragments it assembles live in `cli/src/launch.rs`, where they
+are unit-tested without a podman.  Call flow:
 
 1. Parse flags: consume known flags (`--ssh`, `--no-git`, `--no-workspace`,
-   etc.), pass through `-v` volume mounts (with relative-path expansion),
-   stop at `--` sentinel.
- 2. Build mounts array from toggles (ssh socket, git config, gpg socket,
-    devenv dir, podman host socket, CWD workspace) plus the state dirs of
-    whichever agents are selected — the positionally-launched one by default,
-    or the set chosen via `--agent-mounts`/`--agent-mounts=…` — sourced from
-    `agents.nix` (opencode, claude-code, copilot, antigravity).
-3. Build env_args array from toggles (SSH_AUTH_SOCK, git identity,
-   CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
-4. Create ephemeral `/etc/passwd` and `/etc/group` with the host user's uid/gid.
-5. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
+   etc.), collect `--podman-args` up to the `--` sentinel, stop at `--`.
+ 2. Build the mounts array from toggles (ssh socket, gpg socket, devenv dir,
+    podman host socket, CWD workspace) plus the state dirs of whichever agents
+    are selected — the positionally-launched one by default, or the set chosen
+    via `--agent-mounts`/`--agent-mounts=…` — sourced from `agents.nix`
+    (opencode, claude-code, copilot, antigravity).
+3. Build the env array from toggles (SSH_AUTH_SOCK, the flattened git config
+   and identity, CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
+4. Add `[ports]` and `[mounts]` declared in `AGENTS.md` (`cli/src/agents.rs`),
+   under `--ports`/`--mounts`.  An invalid block refuses the launch.
+5. Create ephemeral `/etc/passwd` and `/etc/group` with the host user's uid/gid,
+   and name the container `agent-sandbox-<workspace>-<word>`, where the word is
+   the selector every `ctl` command accepts.
+6. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
    final command (default `opencode`, overridable via `-- …`).
+
+`--git` passes the host's *effective* configuration as `GIT_CONFIG_*`
+environment variables rather than mounting `.gitconfig`: `[include]` directives
+are evaluated on the host, and keys naming a host-only path (`gpg.*.program`,
+credential helpers, `core.excludesFile`, `core.hooksPath`) are dropped, since
+inside the container they would resolve to nothing.  The variables are passed
+indirectly, as `AGENT_SANDBOX_GIT_CONFIG_*`, so the entrypoint can append its
+own entry after them — which is how a signing override wins over the host's
+`commit.gpgsign`.
 
 ## Loader (`agent-sandbox ctl load`)
 
@@ -106,44 +120,58 @@ without aardvark there is nothing to resolve that name.  That also retires a rac
 nothing ever gated on -- the readiness handshake never proved aardvark had
 published the sidecar's record before the sandbox started.
 
-The proxy itself is Rust (`proxy/src/main.rs`, `ipnet` its only dependency): a
-thread-per-connection HTTP forward proxy handling `CONNECT` and absolute-form
-requests.  Policy decisions happen once per connection, before the byte pumps
-start; an established tunnel is never re-evaluated.
+The proxy itself is Rust (`proxy/src/main.rs`): a thread-per-connection HTTP
+forward proxy handling `CONNECT` and absolute-form requests, terminating TLS for
+the hosts that carry an L7 rule.  Policy decisions happen once per connection,
+before the byte pumps start; an established tunnel is never re-evaluated.
 
 Three directories, and which side can see them is the design:
 
 | Path | Mounted into | Contents |
 | --- | --- | --- |
-| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base` |
-| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `connections.jsonl` |
+| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base`, `policy.baseline` |
+| `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `ca.pem`, `connections.jsonl`, `relay.jsonl` |
 | `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
-| (host temp dirs) | — | removed by the launcher's exit trap |
+| (host temp dirs) | — | removed when the launcher exits |
 
-Neither is mounted into the sandbox. That is deliberate and load-bearing: the
+None of them is mounted into the sandbox — `ca.pem` is bound in as a single
+file, not by exposing its directory. That is deliberate and load-bearing: the
 agent must not be able to widen the firewall that contains it, nor rewrite the
 log of what it did. Changing policy is therefore a host-side operation
 (`agent-sandbox ctl proxy`), which is why the old in-container
 `agent-sandbox-allow` was deleted rather than repaired.
 
 **Policy format.** The proxy enforces the `[network]` block from `AGENTS.md`.
-`[network].allow` and `[network].deny` contain domains, wildcard domains, IPs, or CIDR blocks.
-`[network].ports` contains port ranges.
-`[[network.http]]` configures L7 paths and optional secret injection.
+`[network].allow` contains domains, wildcard domains, IPs, or CIDR blocks, each
+with a port or port range.  `[[network.rules]]` configures L7 routes and
+optional secret injection.  Those two keys are the whole surface: an unknown key
+under `[network]` refuses the launch rather than being ignored.
 
-`agent-sandbox-proxy --check-policy FILE` is the single reference validator:
-`parse_agents.py` writes the file, the proxy reads it, the host-side `proxy`
-command vets its own writes with the same binary, and `checks.firewall-policy`
-tests the whole chain.  There is no second implementation to drift.
+The launcher compiles that block into the flat, line-oriented policy file the
+proxy reads (`allow_domains`, `allow_ips`, `allow_ports`, `allow_l7`,
+`secret_domains`, `allow_signing`, `deny_ips`, `default`), which is also the
+format `agent-sandbox ctl proxy` edits in place.  `agent-sandbox-proxy
+--check-policy FILE` validates it: the launcher writes the file, the proxy reads
+it, and the host-side `proxy` command vets its own writes with the same parser,
+so there is no second implementation to drift.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
 The source of authority is a host-controlled TOML file (`~/.config/agent-sandbox/secrets.toml`),
-which defines the exact bindings (domain, header, secret). The launcher runs
-`agent-sandbox-resolve-secrets`, which cross-references this config with the policy's
-`secret_domains` from `AGENTS.md`, and then runs `secretspec export` on the host
-to fetch the values. The filtered bindings are then written to `/sidecar_secrets/bindings`,
-which the sidecar reads. The proxy handles actual header injection. When a `secret` field is provided in a `[[network.http]]` block in `AGENTS.md`, `parse_agents.py` automatically populates the `secret_domains`
-policy list with their domains, removing the need for manual duplication.
+which defines the exact bindings (domain, header, secret). The launcher calls
+the resolver in `cli/src/secrets.rs`, which cross-references that config with the
+policy's `secret_domains` from `AGENTS.md`, and then runs `secretspec export` on
+the host to fetch the values. The filtered bindings are written 0600 into
+`/sidecar_secrets/bindings`, which only the sidecar mounts; the proxy handles the
+actual header injection. A `secret` field on a `[[network.rules]]` entry
+populates `secret_domains` automatically, so there is nothing to duplicate.
+
+**CA trust.** The proxy terminates TLS for any host carrying an L7 rule, using a
+CA it generates per session and writes to `/sidecar_shared/ca.pem`. The launcher
+binds *that file alone* into the sandbox and points
+`AGENT_SANDBOX_PROXY_CA_FILE` at it; the entrypoint merges it with the image's
+bundle into `~/.cache` and exports the result under every variable the usual
+clients read. The directory itself is never mounted into the sandbox — the
+connection log lives there.
 
 The launcher appends a baseline `deny_ips` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.

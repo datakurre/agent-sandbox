@@ -66,6 +66,13 @@ The `[network]` table configures the egress proxy's firewall policy. The sandbox
 
 - **`allow`** (optional): A list of IP addresses, CIDR blocks, or domains along with their port to allow (e.g., `"github.com:443"`, `"10.0.0.0/8:80"`). Wildcard domains (e.g., `"*.github.com:443"`) are supported. To allow all traffic (wildcard allow), you can use `"*"` or `"*:port"`.
 
+An `allow` entry on port `22` does double duty: it is also what authorizes the
+SSH/GPG relay for that host. Under `--proxy` the host agent sockets are held by
+the proxy sidecar rather than mounted into the sandbox, and the relay refuses
+every request until at least one such entry exists — so `"github.com:22"` is
+what makes `git push` and commit signing work in a proxied sandbox. See
+[Usage](usage.md#git-integration-details).
+
 #### L7 HTTP Rules (`[[network.rules]]`)
 
 For finer-grained HTTP proxy control and secret injection, you can specify an array of tables under `[[network.rules]]`.
@@ -101,3 +108,27 @@ host = "registry.npmjs.org:443"
 method = "*"
 path = "/"
 ```
+
+#### Secrets
+
+A rule's `secret` names a secret, never its value. `AGENTS.md` is part of the
+repository and is therefore treated as untrusted: the launcher will only inject
+a secret that you have also authorized host-side, in
+`~/.config/agent-sandbox/secrets.toml`, using the same fields:
+
+```toml
+# ~/.config/agent-sandbox/secrets.toml
+[[network.rules]]
+host = "api.github.com"
+secret = "GITHUB_TOKEN"
+header = "Authorization"
+prefix = "Bearer "
+```
+
+With `--secrets`, values are resolved on the host with
+[`secretspec`](https://secretspec.dev) (from the workspace's `secretspec.toml`)
+and handed to the proxy sidecar alone; they never enter the sandbox's
+environment. A rule that `AGENTS.md` requests but the host config does not
+authorize refuses the launch rather than silently injecting nothing. The proxy
+terminates TLS for hosts carrying a rule, so the sandbox trusts a per-session CA
+that exists only for the lifetime of that sandbox.

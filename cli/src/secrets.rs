@@ -163,7 +163,11 @@ pub fn validate_header(header: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspace: &Path) -> anyhow::Result<()> {
+/// Resolve the bindings the policy's `secret_domains` authorize, returning one
+/// `domain\theader\tvalue` line per binding.  The caller decides where those
+/// go: the launcher writes them straight into the sidecar's `bindings` file
+/// rather than through a pipe, so the values never reach a terminal.
+pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspace: &Path) -> anyhow::Result<Vec<String>> {
     let mut secret_domains = Vec::new();
     if let Ok(f) = std::fs::File::open(policy) {
         use std::io::BufRead;
@@ -177,12 +181,12 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
     }
 
     if secret_domains.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let requested_bindings = get_requested_bindings(workspace);
 
-    let (mut host_config, _toml_val) = match std::fs::read_to_string(config) {
+    let (host_config, _toml_val) = match std::fs::read_to_string(config) {
         Ok(c) => {
             let val: toml::Value = match toml::from_str(&c) {
                 Ok(v) => v,
@@ -286,7 +290,7 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
     }
 
     if filtered_bindings.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut cmd = Command::new("secretspec");
@@ -334,6 +338,7 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
         anyhow::bail!("agent-sandbox: secretspec output was not a JSON object\n");
     };
 
+    let mut lines = Vec::new();
     for b in filtered_bindings {
         let secret_name = &b.secret;
         let (domain, _port) = parse_host_port(&b.host);
@@ -347,11 +352,11 @@ pub fn resolve_secrets_logic(policy: &Path, config: &Path, file: &Path, workspac
             } else {
                 secret_value.to_string()
             };
-            println!("{}\t{}\t{}{}", domain, header, prefix, val_str);
+            lines.push(format!("{}\t{}\t{}{}", domain, header, prefix, val_str));
         } else {
             anyhow::bail!("agent-sandbox: secretspec output missing required secret '{}'\n", secret_name);
         }
     }
 
-    Ok(())
+    Ok(lines)
 }

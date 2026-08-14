@@ -2,19 +2,24 @@
 
 ## How to add a new integration
 
-1. Add a `want_{name}=1` toggle after the existing toggles (see integration toggles).
-2. Add `--{name}` / `--no-{name}` cases in the argument parsing loop.
-3. Add the mount/env logic after the existing blocks.
+1. Add a `want_{name}` toggle in `cli/src/bin/agent-sandbox.rs`, after the
+   existing toggles.
+2. Add `--{name}` / `--no-{name}` arms in the argument parsing loop.
+3. Put the mount/env logic in `cli/src/launch.rs` as a function returning the
+   `-v`/`-e` fragments, and call it from the launcher next to the other blocks.
+   Keeping it there is what makes it testable: the flags are trivially easy to
+   parse and then never read again, which is exactly how the rewrite in
+   `0b4289a` lost every integration at once.
 4. If container-side setup is needed in the entrypoint, gate it on an env
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
-5. Update the usage comment.
-6. Test: `nix flake check`
+5. Update `print_usage` and `docs/usage.md`.
+6. Test: `cargo test` for the fragment, then `nix flake check`.
 
-Note what `nix flake check` cannot cover: podman does not run in a Nix build, so
-nothing that starts a container is tested there.  `checks.ctl-args` drives the
-`ctl` scripts against a stub podman, and `lib/smoke-firewall.sh` is the hand-run
-procedure for the rest (`bash lib/smoke-firewall.sh`, needs a real podman and
-network egress).
+Note what neither can cover: podman does not run in a Nix build, so nothing
+that starts a container is tested there. The cheap end-to-end check is a stub
+`podman` earlier on `PATH` that records its argv — that verifies the whole
+flag → `podman run` mapping without a container runtime. Anything past that
+(proxy egress, relays, krun) needs a real podman and network access.
 
 ## How to add a new agent
 
@@ -36,8 +41,9 @@ and Nix store registration.  No other changes needed.
 
 ## Important implementation constraints
 
-- Nix shell scripts are written with `writeShellScriptBin`; the `''` escaping
-  inheredoc-style strings is Nix's double-single-quote mechanism.
+- The launcher, entrypoint, sidecar and proxy are Rust (`cli/`, `proxy/`); the
+  remaining Nix shell wrappers exist only to put the binaries on `PATH` with the
+  image reference in the environment.
 - The container runs with `--userns=keep-id`, so the uid/gid inside the
   container match the host user.  Passwd/group files are synthesized per-run.
 - Tmpfs mounts on `~/.config`, `~/.cache`, `~/.local` provide writable home
