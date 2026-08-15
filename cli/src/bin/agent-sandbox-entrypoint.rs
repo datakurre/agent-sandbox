@@ -287,7 +287,31 @@ fn main() -> Result<()> {
         );
     }
 
-    // 8. exec "$@"
+    // 8. Host loopback ports
+    // The launcher mounted one socket per mapping and is splicing the far end
+    // to a port on the host's loopback; this puts a TCP listener in front of
+    // each, because the clients that want them -- CDP, a database driver --
+    // speak TCP and not unix sockets.  127.0.0.1 both because NO_PROXY already
+    // exempts it under --proxy and because Chrome's DevTools host check accepts
+    // an IP but not an arbitrary name.
+    //
+    // Spawned, not threaded: this process execs below, which would take any
+    // thread of ours with it.  socat outlives that as a child of PID 1 and dies
+    // with the container.
+    if let Ok(ports) = env::var("AGENT_SANDBOX_HOST_PORTS") {
+        for port in ports.split(',').filter(|p| !p.is_empty()) {
+            let socket = format!("/run/agent-sandbox-host/{}.sock", port);
+            let spawned = Command::new("socat")
+                .arg(format!("TCP-LISTEN:{},bind=127.0.0.1,fork,reuseaddr", port))
+                .arg(format!("UNIX-CONNECT:{}", socket))
+                .spawn();
+            if let Err(e) = spawned {
+                eprintln!("agent-sandbox: could not forward host port {}: {}", port, e);
+            }
+        }
+    }
+
+    // 9. exec "$@"
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
         let err = Command::new(&args[1]).args(&args[2..]).exec();

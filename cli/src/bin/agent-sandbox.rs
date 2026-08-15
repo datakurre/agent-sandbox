@@ -14,10 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, Shutdown, TcpStream};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::thread;
 use tempfile::Builder;
 
 #[derive(Parser, Debug)]
@@ -99,44 +101,98 @@ fn expand_v(spec: &str, current_dir: &Path, home_dir: &str) -> String {
     }
 }
 
-/// The address `--host-loopback` maps to the host's loopback when none is
-/// given.  Link-local, so it collides with nothing routable, and `.3` because
-/// podman has already taken the two below it: `169.254.1.1` is its pasta DNS
-/// forwarder and `169.254.1.2` is `host.containers.internal`.
-const HOST_LOOPBACK_DEFAULT: &str = "169.254.1.3";
+/// Where the sandbox finds the sockets backing `--host-loopback-port`.  A
+/// directory rather than one socket per mount, so the count of mapped ports is
+/// not baked into the podman command line.
+const HOST_PORT_DIR: &str = "/run/agent-sandbox-host";
 
-/// An operator-supplied `--host-loopback=ADDR`, or a refusal.  Rejecting the
-/// two addresses podman already uses is the point of validating at all: pasta
-/// accepts the mapping either way and the collision surfaces much later, as a
-/// sandbox whose DNS or `host.containers.internal` has quietly become the
-/// host's loopback.
-fn validated_host_loopback(addr: &str) -> String {
-    let parsed: IpAddr = match addr.parse() {
-        Ok(a) => a,
-        Err(_) => fail(&format!(
-            "agent-sandbox: --host-loopback: {:?} is not an IP address literal",
-            addr
-        )),
-    };
-    if parsed.is_loopback() || parsed.is_unspecified() {
-        fail(&format!(
-            "agent-sandbox: --host-loopback: {} names the sandbox's own stack, not a\n               route to the host.  Use an address nothing else answers on, such\n               as {}.",
-            parsed, HOST_LOOPBACK_DEFAULT
-        ));
+/// One `--host-loopback-port HOST[:SANDBOX]` mapping.  Both sides are kept
+/// because they differ whenever the sandbox already has something on the host's
+/// port number -- the one case the pasta mapping this replaced got for free, its
+/// address being distinct from the sandbox's own loopback.
+#[derive(Debug, Clone, PartialEq)]
+struct HostPort {
+    host: u16,
+    sandbox: u16,
+}
+
+/// An operator-supplied `--host-loopback-port` value, or a refusal.  Validated
+/// here rather than at connect time because the alternative is an agent inside
+/// meeting a refused connection with no way to tell a typo from a service that
+/// is merely down.
+fn parse_host_loopback_ports(spec: &str) -> Result<Vec<HostPort>, String> {
+    let mut out = Vec::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(format!(
+                "agent-sandbox: --host-loopback-port: {:?} has an empty entry.",
+                spec
+            ));
+        }
+        let (host_str, sandbox_str) = match entry.split_once(':') {
+            Some((h, s)) => (h, s),
+            None => (entry, entry),
+        };
+        let port = |s: &str| -> Result<u16, String> {
+            s.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| {
+                format!(
+                    "agent-sandbox: --host-loopback-port: {:?} is not a port in 1-65535.",
+                    s
+                )
+            })
+        };
+        out.push(HostPort {
+            host: port(host_str)?,
+            sandbox: port(sandbox_str)?,
+        });
     }
-    if addr == "169.254.1.1" || addr == "169.254.1.2" {
-        fail(&format!(
-            "agent-sandbox: --host-loopback: {} is already podman's ({}).\n               Use another address, such as {}.",
-            addr,
-            if addr == "169.254.1.1" {
-                "the pasta DNS forwarder"
-            } else {
-                "host.containers.internal"
-            },
-            HOST_LOOPBACK_DEFAULT
-        ));
-    }
-    parsed.to_string()
+    Ok(out)
+}
+
+/// Serve one `--host-loopback-port` mapping for the life of the session: every
+/// connection arriving on the unix socket the sandbox has mounted is spliced to
+/// the host's loopback.  A socket rather than a route because a route would have
+/// to be a network mode and the sandbox's is already spoken for -- pasta by
+/// default, the proxy's `--internal` network under `--proxy`, a bridge under
+/// `--shared-network`.  A mount is orthogonal to all three, which is the whole
+/// reason this composes where the pasta mapping it replaced could not.
+fn serve_host_port(socket: &Path, host_port: u16) -> std::io::Result<()> {
+    let listener = UnixListener::bind(socket)?;
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let upstream = match TcpStream::connect(("127.0.0.1", host_port)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "agent-sandbox: host port {} is not answering: {}",
+                            host_port, e
+                        );
+                        return;
+                    }
+                };
+                let (Ok(mut from_sandbox), Ok(mut to_host)) =
+                    (stream.try_clone(), upstream.try_clone())
+                else {
+                    return;
+                };
+                // Two halves, two threads: CDP is long-lived and full duplex, so
+                // neither direction may wait on the other.  Each shuts the far
+                // side's write half when its own end closes, or the peer sits on
+                // a socket that will never carry anything again.
+                let outbound = thread::spawn(move || {
+                    let _ = std::io::copy(&mut from_sandbox, &mut to_host);
+                    let _ = to_host.shutdown(Shutdown::Write);
+                });
+                let (mut from_host, mut to_sandbox) = (upstream, stream);
+                let _ = std::io::copy(&mut from_host, &mut to_sandbox);
+                let _ = to_sandbox.shutdown(Shutdown::Write);
+                let _ = outbound.join();
+            });
+        }
+    });
+    Ok(())
 }
 
 /// Whether a `[ports]` bind address is loopback, which is what decides if a
@@ -343,7 +399,7 @@ fn print_usage(
     want_krun: bool,
     want_ports: bool,
     want_shared_network: bool,
-    want_host_loopback: bool,
+    want_host_ports: bool,
     want_mounts: bool,
     want_agent_mounts_mode: &AgentMountsMode,
 ) {
@@ -416,15 +472,20 @@ Ports:
                                            --podman-args -p HOST:CONTAINER --
   --shared-network                   {shared_network} Joins the shared bridge network, so other
                                            containers can reach this one by name.  Replaces
-                                           pasta with a bridge, so --host-loopback and any
-                                           other pasta option no longer apply.
+                                           pasta with a bridge, so any pasta option the
+                                           operator wanted no longer applies.
                                            --no-shared-network turns it back off.
-  --host-loopback[=ADDR]             {host_loopback} Maps ADDR (default {host_loopback_default}) to the
-                                           host's 127.0.0.1, so a service the user runs there
-                                           is reachable without being exposed to anything
-                                           else.  The sandbox gets the address as
-                                           $AGENT_SANDBOX_HOST_LOOPBACK.  Refused with
-                                           --proxy: it is a route around the sidecar.
+  --host-loopback-port PORT          {host_ports} Makes the host's 127.0.0.1:PORT reachable at
+                                           the sandbox's own 127.0.0.1:PORT, so a service the
+                                           user runs there -- a browser's CDP port, say -- can
+                                           be driven from inside.  Repeatable, and takes
+                                           HOST:SANDBOX to move it off a port already in use
+                                           inside.  The sandbox gets the list as
+                                           $AGENT_SANDBOX_HOST_PORTS.  A mounted socket rather
+                                           than a route, so it composes with every network
+                                           mode, --proxy included -- but what it reaches is
+                                           outside the egress policy.
+                                           --no-host-loopback-port drops them all.
 
 Mounts:
   --mounts / --no-mounts             {mounts} Honors [mounts] declarations from AGENTS.md.
@@ -469,8 +530,7 @@ before. It is not a substitute for leaving the three flags off."#,
         krun = fmt(want_krun),
         ports = fmt(want_ports),
         shared_network = fmt(want_shared_network),
-        host_loopback = fmt(want_host_loopback),
-        host_loopback_default = HOST_LOOPBACK_DEFAULT,
+        host_ports = fmt(want_host_ports),
         mounts = fmt(want_mounts),
         agent_mounts = fmt(agent_mounts_all)
     );
@@ -531,6 +591,7 @@ struct CleanupGuard {
     sidecar_shared: String,
     sidecar_policy: String,
     sidecar_secrets: String,
+    host_port_dir: String,
     log_level: Option<ProxyLogLevel>,
     session_word: String,
     use_agents_network: bool,
@@ -544,6 +605,7 @@ impl CleanupGuard {
             sidecar_shared: String::new(),
             sidecar_policy: String::new(),
             sidecar_secrets: String::new(),
+            host_port_dir: String::new(),
             log_level: None,
             session_word: String::new(),
             use_agents_network: false,
@@ -702,6 +764,14 @@ impl CleanupGuard {
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
+        // Before the sidecar's early return: a session can have host-port
+        // sockets without ever having had a proxy, and leaving them behind
+        // would leave a live-looking path to the host's loopback in a runtime
+        // directory that outlives the sandbox.
+        if !self.host_port_dir.is_empty() {
+            let _ = fs::remove_dir_all(&self.host_port_dir);
+        }
+
         if self.sidecar_id.is_empty() {
             return;
         }
@@ -808,7 +878,7 @@ fn run() -> Result<i32> {
     let mut want_ports = false;
     let mut want_ports_any_interface = false;
     let mut want_shared_network = false;
-    let mut want_host_loopback: Option<String> = None;
+    let mut want_host_ports: Vec<HostPort> = Vec::new();
     let mut want_mounts = false;
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
     let mut want_proxy = false;
@@ -969,8 +1039,7 @@ fn run() -> Result<i32> {
             "--ports-any-interface" => want_ports_any_interface = true,
             "--shared-network" => want_shared_network = true,
             "--no-shared-network" => want_shared_network = false,
-            "--host-loopback" => want_host_loopback = Some(HOST_LOOPBACK_DEFAULT.to_string()),
-            "--no-host-loopback" => want_host_loopback = None,
+            "--no-host-loopback-port" => want_host_ports.clear(),
             "--mounts" => want_mounts = true,
             "--no-mounts" => want_mounts = false,
             "--agent-mounts" => want_agent_mounts_mode = AgentMountsMode::All,
@@ -1006,8 +1075,22 @@ fn run() -> Result<i32> {
                         }
                     }
                     want_agent_mounts_mode = AgentMountsMode::List(list_vec);
-                } else if let Some(addr) = arg.strip_prefix("--host-loopback=") {
-                    want_host_loopback = Some(validated_host_loopback(addr));
+                } else if arg == "--host-loopback-port" || arg.starts_with("--host-loopback-port=")
+                {
+                    let value = match arg.strip_prefix("--host-loopback-port=") {
+                        Some(v) => v.to_string(),
+                        None => {
+                            i += 1;
+                            if i >= args.len() {
+                                fail("agent-sandbox: --host-loopback-port needs an argument (PORT, or HOST:SANDBOX)");
+                            }
+                            args[i].clone()
+                        }
+                    };
+                    match parse_host_loopback_ports(&value) {
+                        Ok(ports) => want_host_ports.extend(ports),
+                        Err(e) => fail(&e),
+                    }
                 } else if arg == "--proxy-log" || arg.starts_with("--proxy-log=") {
                     let value = match arg.strip_prefix("--proxy-log=") {
                         Some(v) => v.to_string(),
@@ -1120,7 +1203,7 @@ fn run() -> Result<i32> {
             want_krun,
             want_ports,
             want_shared_network,
-            want_host_loopback.is_some(),
+            !want_host_ports.is_empty(),
             want_mounts,
             &want_agent_mounts_mode,
         );
@@ -1163,44 +1246,35 @@ fn run() -> Result<i32> {
         }
     }
 
-    // Two flags choose the network mode themselves, and each would reach podman
+    // --shared-network chooses the network mode itself, and would reach podman
     // as a second --network beside the operator's.  Podman can only report that
     // contradiction in its own words, long after the launcher had a chance to
-    // say which flag to drop.
-    let launcher_owns_network = if want_shared_network {
-        Some("--shared-network")
-    } else if want_host_loopback.is_some() {
-        Some("--host-loopback")
-    } else {
-        None
-    };
-    if let Some(flag) = launcher_owns_network {
+    // say which flag to drop.  Nothing else here does: --host-loopback-port is a
+    // mounted socket, so it composes with any --network the operator writes.
+    if want_shared_network {
         for arg in &podman_args {
             if arg == "--network"
                 || arg == "--net"
                 || arg.starts_with("--network=")
                 || arg.starts_with("--net=")
             {
-                fail(&format!(
-                    "agent-sandbox: {} cannot be combined with a --network of your own.\n               It is a --network spec itself, and podman takes only one.\n               Drop {}, or write the whole spec by hand.",
-                    flag, flag
-                ));
+                fail(
+                    "agent-sandbox: --shared-network cannot be combined with a --network of your\n               own.  It is a --network spec itself, and podman takes only one.\n               Drop --shared-network, or write the whole spec by hand.",
+                );
             }
         }
     }
 
-    // Both are network modes, and pasta is not a bridge.
-    if want_shared_network && want_host_loopback.is_some() {
-        fail("agent-sandbox: --shared-network cannot be combined with --host-loopback.\n               The shared network is a bridge, where pasta options -- including\n               --map-host-loopback -- do not apply.\n               Drop one of the two.");
-    }
-
-    // A route to the host's loopback is a route the proxy never sees, and what
-    // is listening there is not this launcher's to vouch for -- an unproxied
-    // forward proxy on the host would be an egress path with the policy still
-    // nominally on.  Refused rather than warned about, like every other way of
-    // leaving the sidecar behind.
-    if want_proxy && want_host_loopback.is_some() {
-        fail("agent-sandbox: --proxy cannot be combined with --host-loopback.\n               Mapping the host's loopback into the sandbox is a route around\n               the sidecar, so the egress policy would only be advisory.\n               Drop --host-loopback, or drop --proxy.");
+    // Two mappings landing on one sandbox port would leave whichever socat lost
+    // the bind race silently missing, so the collision is named here instead.
+    let mut seen_sandbox_ports = HashSet::new();
+    for hp in &want_host_ports {
+        if !seen_sandbox_ports.insert(hp.sandbox) {
+            fail(&format!(
+                "agent-sandbox: --host-loopback-port: {} is mapped twice on the sandbox side.\n               Give one of them a different sandbox port, as in HOST:SANDBOX.",
+                hp.sandbox
+            ));
+        }
     }
 
     if want_secrets && !want_proxy {
@@ -1582,14 +1656,12 @@ fn run() -> Result<i32> {
 
     // A shared network is what lets anything else reach this container by name
     // later, and it is opt-in because it is not free: it replaces podman's
-    // rootless default (pasta) with a bridge, and pasta options are the only
-    // route to the host's loopback.  Podman passes --no-map-gw and points
-    // host.containers.internal at the host's *LAN* address, so reaching a
-    // service on the host's 127.0.0.1 takes --host-loopback, which a bridge
-    // cannot honour.  Publishing needs neither -- podman publishes under pasta
-    // just as well -- so the three decisions are kept apart, and the flag
-    // stands on its own: being reachable by name is useful without publishing
-    // anything to the host.
+    // rootless default (pasta) with a bridge, so anything the operator wants
+    // from pasta is given up with it.  Publishing does not need it -- podman
+    // publishes under pasta just as well -- and neither does reaching the host's
+    // loopback, which --host-loopback-port does through a mounted socket rather
+    // than a route.  So the decisions are kept apart, and the flag stands on its
+    // own: being reachable by name is useful without publishing anything.
     let mut network_args: Vec<String> = Vec::new();
     if want_shared_network {
         let network =
@@ -1614,19 +1686,6 @@ fn run() -> Result<i32> {
         }
         network_args.push("--network".to_string());
         network_args.push(network);
-    }
-
-    // The whole of --host-loopback: pasta translates one address to the host's
-    // loopback, so a service the user runs on 127.0.0.1 is reachable without
-    // being exposed to anything else.  The address is also handed to the
-    // sandbox, because an agent cannot otherwise tell a session that has this
-    // route from one that does not -- both look like a refused connection.
-    if let Some(addr) = &want_host_loopback {
-        network_args.push(format!("--network=pasta:--map-host-loopback,{}", addr));
-        eprintln!(
-            "agent-sandbox: {} maps to the host's 127.0.0.1 (AGENT_SANDBOX_HOST_LOOPBACK)",
-            addr
-        );
     }
 
     // Outside the block above: a port is published in either network mode, and
@@ -1770,6 +1829,99 @@ fn run() -> Result<i32> {
     let mut cleanup_guard = CleanupGuard::new();
     let mut proxy_env_vars: Vec<String> = Vec::new();
     let image = env::var("AGENT_SANDBOX_IMAGE").unwrap_or_default();
+
+    // ── Host loopback ports ─────────────────────────────────────────────────
+    // One unix socket per mapping, in a directory mounted into the sandbox,
+    // with the launcher splicing each connection to the host's loopback.  It is
+    // deliberately not a route: a route is a network mode, and the sandbox's is
+    // already spoken for, which is exactly why the pasta mapping this replaced
+    // could not be had together with --proxy.
+    if !want_host_ports.is_empty() {
+        let dir = format!(
+            "{}/agent-sandbox-host-{}",
+            runtime_dir,
+            &uuid::Uuid::new_v4().to_string()[0..8]
+        );
+
+        // A unix socket path has to fit sockaddr_un's 108 bytes, and this one is
+        // built from a runtime directory the launcher does not choose.  Checked
+        // here because the kernel's own answer is "path must be shorter than
+        // SUN_LEN", which names neither the path nor the variable that set it.
+        let longest = want_host_ports
+            .iter()
+            .map(|p| dir.len() + format!("/{}.sock", p.sandbox).len())
+            .max()
+            .unwrap_or(0);
+        if longest >= 108 {
+            fail(&format!(
+                "agent-sandbox: --host-loopback-port: $XDG_RUNTIME_DIR is too long to hold a\n               socket path ({} of the 107 bytes a unix socket allows).\n               Point XDG_RUNTIME_DIR at a shorter directory, such as /run/user/{}.",
+                longest,
+                nix::unistd::getuid().as_raw()
+            ));
+        }
+
+        if let Err(e) = fs::create_dir_all(&dir) {
+            fail(&format!(
+                "agent-sandbox: --host-loopback-port: could not create {}: {}",
+                dir, e
+            ));
+        }
+        // Only this user's, whatever the umask: the sockets in here reach
+        // services on their loopback.
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        cleanup_guard.host_port_dir = dir.clone();
+
+        for hp in &want_host_ports {
+            let socket = PathBuf::from(&dir).join(format!("{}.sock", hp.sandbox));
+            if let Err(e) = serve_host_port(&socket, hp.host) {
+                // refuse() rather than fail(): the guard is armed by now, and
+                // returning is what lets it remove the directory.  Leaving that
+                // behind would leave a live-looking path to the host's loopback
+                // in place of one that failed to open.
+                return refuse(&format!(
+                    "agent-sandbox: --host-loopback-port: could not listen for {}: {}",
+                    hp.sandbox, e
+                ));
+            }
+            eprintln!(
+                "agent-sandbox: 127.0.0.1:{} in the sandbox reaches the host's 127.0.0.1:{}",
+                hp.sandbox, hp.host
+            );
+            // Probed rather than assumed, and a warning rather than a refusal:
+            // the browser flow has the user start Chrome by hand, sometimes
+            // after the sandbox.  Saying so now beats a refused connection an
+            // agent inside cannot tell from a typo.
+            if TcpStream::connect(("127.0.0.1", hp.host)).is_err() {
+                eprintln!(
+                    "               (nothing is listening there yet; it will connect when there is)"
+                );
+            }
+        }
+
+        if want_proxy {
+            eprintln!(
+                "agent-sandbox: warning: a mapped host port is outside the egress policy.  The"
+            );
+            eprintln!(
+                "               proxy does not see what the service on it fetches on its own."
+            );
+        }
+
+        mounts.push("-v".to_string());
+        mounts.push(format!("{}:{}:{}", dir, HOST_PORT_DIR, rw_mount_opts));
+        // Named so an agent can test for the channel rather than discovering
+        // its absence as a refused connection -- and per port, because the
+        // whole point is that only the ports named here are reachable.
+        env_args.push("-e".to_string());
+        env_args.push(format!(
+            "AGENT_SANDBOX_HOST_PORTS={}",
+            want_host_ports
+                .iter()
+                .map(|p| p.sandbox.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
 
     // Checked before the sidecar rather than at `podman run`: the sidecar comes
     // from the same image, and a missing one would surface as "could not start
@@ -2153,13 +2305,6 @@ fn run() -> Result<i32> {
     podman_cmd.args(&network_args);
     podman_cmd.args(&publish_args);
 
-    // Set only when the route exists, so an agent can test for it rather than
-    // discovering its absence as a refused connection.
-    if let Some(addr) = &want_host_loopback {
-        podman_cmd.arg("-e");
-        podman_cmd.arg(format!("AGENT_SANDBOX_HOST_LOOPBACK={}", addr));
-    }
-
     for proxy_env in proxy_env_vars {
         podman_cmd.arg("-e");
         podman_cmd.arg(proxy_env);
@@ -2204,6 +2349,78 @@ fn run() -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_host_loopback_port_maps_to_the_same_number_inside() {
+        assert_eq!(
+            parse_host_loopback_ports("9222").unwrap(),
+            vec![HostPort {
+                host: 9222,
+                sandbox: 9222
+            }]
+        );
+    }
+
+    #[test]
+    fn host_loopback_ports_take_a_sandbox_side_remap_and_a_list() {
+        // HOST:SANDBOX, in that order: the host's port is the one the operator
+        // already knows, and the sandbox side is what moves to avoid a clash.
+        assert_eq!(
+            parse_host_loopback_ports("9222:19222,5432").unwrap(),
+            vec![
+                HostPort {
+                    host: 9222,
+                    sandbox: 19222
+                },
+                HostPort {
+                    host: 5432,
+                    sandbox: 5432
+                }
+            ]
+        );
+    }
+
+    /// Refused rather than silently dropped: an unmapped port is indisting-
+    /// uishable from a service that is down once an agent is inside.
+    #[test]
+    fn host_loopback_ports_refuse_what_is_not_a_port() {
+        for spec in ["0", "70000", "http", "9222:", "", "9222,,5432", "-1"] {
+            assert!(
+                parse_host_loopback_ports(spec).is_err(),
+                "{:?} should not parse",
+                spec
+            );
+        }
+    }
+
+    /// The channel itself, end to end: a listener standing in for the host's
+    /// service, the socket the sandbox would have mounted, and a full-duplex
+    /// exchange over it.  Worth a real socket rather than a mock, since what is
+    /// being claimed is that a mount reaches the host where a route cannot.
+    #[test]
+    fn a_host_port_socket_carries_traffic_both_ways() {
+        use std::io::{Read, Write};
+
+        let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_port = host.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut conn, _) = host.accept().unwrap();
+            let mut buf = [0u8; 5];
+            conn.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping\n");
+            conn.write_all(b"pong\n").unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        serve_host_port(&socket, host_port).unwrap();
+
+        let mut client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        client.write_all(b"ping\n").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "pong\n");
+    }
 
     #[test]
     fn expand_v_roots_relative_paths_in_the_workspace() {

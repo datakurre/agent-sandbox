@@ -148,6 +148,30 @@ Three directories, and which side can see them is the design:
 | `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
 | (host temp dirs) | — | removed by the launcher's `CleanupGuard` on the way out |
 
+### Host loopback ports are a mount, not a relay
+
+`--host-loopback-port` is the one capability that reaches the host without going
+through the sidecar.  The launcher binds a unix socket per mapping in a runtime
+directory, splices each connection to `127.0.0.1:PORT` on the host from its own
+process, and mounts the directory at `/run/agent-sandbox-host`; the entrypoint
+puts a `socat TCP-LISTEN` in front of each socket so ordinary TCP clients inside
+can reach it.
+
+It is a mount rather than a route because a route would have to be a network
+mode, and the sandbox's is always already taken -- pasta by default, the
+`--internal` network under `--proxy`, a bridge under `--shared-network`.  Podman
+takes one network mode, which is why the pasta `--map-host-loopback` mapping this
+replaced could never be had together with `--proxy`.  A bind mount is orthogonal
+to all three.
+
+It is deliberately *not* a sidecar relay, unlike `--ssh` and `--gpg` under
+`--proxy`.  Those are relayed so their egress stays policed; there is no
+equivalent for what a host browser does, since `Page.navigate` to a denied host
+is not an HTTP request the proxy could see or refuse.  Routing it through the
+sidecar would be more machinery for the same hole, and would work only under
+`--proxy`.  So the hole is left visible instead: named ports only, announced at
+launch, and documented in [Trust model](trust-model.md).
+
 None of them is mounted into the sandbox — `ca.pem` is bound in as a single
 file, not by exposing its directory. That is deliberate and load-bearing: the
 agent must not be able to widen the firewall that contains it, nor rewrite the
