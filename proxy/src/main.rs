@@ -1273,10 +1273,15 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             head_up += extra.len() as u64;
         }
     } else {
-        if remote_sock.write_all(&req_buf[..n]).is_err() {
+        // This path splices the client's bytes straight through, so the request
+        // line is the one addressed to *this proxy* unless it is converted:
+        // origin servers are entitled to origin-form, and some insist on it.
+        let (head, extra) = split_head_and_extra(&req_buf[..n]);
+        let head = inject::rewrite_request_target(head).unwrap_or_else(|| head.to_vec());
+        if remote_sock.write_all(&head).is_err() || remote_sock.write_all(extra).is_err() {
             return;
         }
-        head_up += n as u64;
+        head_up += (head.len() + extra.len()) as u64;
     }
 
     let (client_read, remote_write) = match (client_sock.try_clone(), remote_sock.try_clone()) {

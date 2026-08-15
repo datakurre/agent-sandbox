@@ -120,7 +120,9 @@ and owned by the host user, the tmpfs home does not leak between sessions while
 the agent's own state does, a declared port carries traffic and an undeclared
 one does not, `ro` really is read-only, `ctl` finds a running sandbox by the
 labels the launcher wrote, `--host-loopback-port` splices a host service into
-the sandbox, and `ctl purge` reclaims what a killed launcher leaked.
+the sandbox, `agent-sandbox browser` reaches a declared port from a browser
+started before the sandbox existed, and `ctl purge` reclaims what a killed
+launcher leaked.
 
 **Acceptance** asks whether the security promises hold. Deny-by-default egress,
 including the ways around it — a bare IP, a direct DNS query, an unset
@@ -222,8 +224,11 @@ Worth knowing when choosing what to test next:
 - **The `ctl` subcommands** that only format podman output (`list`, `status`,
   `logs`, `net`) have no tests. The stub-podman harness extends to them: give
   the stub a canned `podman ps` reply and assert on what gets printed.
-- **The browser** (`ctl/browser.rs`) has its pure parts covered; launching
-  Chromium under bwrap is untested at any tier.
+- **The browser** (`ctl/browser.rs`) has its pure parts covered, and
+  `90-browser-ports` drives a real instance — its proxy, its policy files and
+  `ctl proxy allow --browser` — with a stub in place of Chromium. Launching
+  Chromium itself under bwrap is still untested at any tier, which is where the
+  managed-policy layer lives.
 
 ## Adding a test
 

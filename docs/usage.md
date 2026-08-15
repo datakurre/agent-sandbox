@@ -185,9 +185,20 @@ It is the same `agent-sandbox-proxy` the sidecar runs, with the same policy
 format, the same `ctl proxy` commands, and the same traffic summary when the
 browser closes. The profile is ephemeral and holds none of your logins.
 
-With no arguments the allow list is **the loopback ports the target sandbox
-publishes, and nothing else** — enough to load the app under test, and no more.
-Widen it up front or while it runs:
+With no arguments the allow list is **the loopback ports of the app under test,
+and nothing else** — the ones `AGENTS.md` declares in its
+[`[ports]` block](configuration.md), plus any the target sandbox already
+publishes. The declaration is what makes the order above work: the browser
+starts before the sandbox exists, so there is nothing to ask podman about yet.
+Each port is allowed as `127.0.0.1:<port>` and as `localhost:<port>`, because
+those are one app to everyone except a proxy.
+
+You do not need `--ports` on the browser and you do not need to repeat the port
+in `[network]`. A declared port the sandbox never publishes is still reachable
+from this browser, so `[ports]` in a repo you do not trust is worth the same
+glance as `[mounts]`.
+
+Widen it beyond the app up front, or while it runs:
 
 ```sh
 agent-sandbox browser --allow example.com:443       # at start
@@ -196,13 +207,16 @@ agent-sandbox browser --network                     # AGENTS.md's [network] bloc
 agent-sandbox ctl proxy allow example.com:443 --browser   # while it runs
 ```
 
+`ctl proxy allow --browser` updates both layers — the proxy within a second,
+and the browser's own managed allow list, which Chromium re-reads.
+
 | Flag | What it does |
 | --- | --- |
 | `--cdp-port PORT` | where CDP listens; walks up from 9222 if taken |
 | `--allow HOST[:PORT]` | allow a domain, IP/CIDR or host:port; repeatable |
 | `--proxy-profile NAME` | merge a host-owned profile, the same files `--proxy-profile` takes |
 | `--network` | also merge `[network]` from `AGENTS.md` in the current directory |
-| `--no-published-ports` | do not seed the allow list from the sandbox's published ports |
+| `--no-published-ports` | do not seed the allow list from ports at all — neither `AGENTS.md`'s `[ports]` nor a running sandbox's published ones |
 | `--extension DIR` | load an unpacked extension; repeatable |
 | `--no-extensions` | load none, including any built into the wrapper |
 | `--keep-profile DIR` | reuse a profile directory instead of an ephemeral one |
