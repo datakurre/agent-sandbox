@@ -78,7 +78,16 @@ let
   # back one flat colour.  Shipping a minimal set turns that trap into a
   # non-event for anything launched from the image.
   imageFonts = with pkgs; [ dejavu_fonts liberation_ttf ];
-  imageFontsConf = pkgs.makeFontsConf { fontDirectories = imageFonts; };
+  # `makeFontsConf` writes a bare file, and the image root is assembled with
+  # `pkgs.buildEnv`, which can only merge directories -- a file among its paths
+  # fails the build.  So the config is wrapped in a directory, and not at
+  # /etc/fonts/fonts.conf: fontconfig ships its own copy of that path and the
+  # two would collide.
+  imageFontsConf = pkgs.runCommand "agent-sandbox-fonts-conf" { } ''
+    install -Dm444 ${pkgs.makeFontsConf { fontDirectories = imageFonts; }} \
+      "$out/share/agent-sandbox/fonts.conf"
+  '';
+  imageFontsConfFile = "${imageFontsConf}/share/agent-sandbox/fonts.conf";
   unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
   defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
   agentTools = map (a: a.package) agents;
@@ -351,7 +360,7 @@ let
         "LOCALE_ARCHIVE=${pkgs.glibcLocales}/lib/locale/locale-archive"
         # See `imageFonts`: without this a headless screenshot is a flat colour
         # and nothing says so.
-        "FONTCONFIG_FILE=${imageFontsConf}"
+        "FONTCONFIG_FILE=${imageFontsConfFile}"
         # Force Go programs to use the C library (glibc) DNS resolver.
         # Go's pure-Go resolver sends raw UDP queries that time out on
         # slirp4netns's DNS forwarder in rootless Podman, causing 5s delays.
