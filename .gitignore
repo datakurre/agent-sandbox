@@ -7,3 +7,6 @@ Cargo.lock
 
 # `mkdocs build` output (see AGENTS.md)
 /site/
+
+# test run output (see docs/testing.md)
+/tests/*/logs/

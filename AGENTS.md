@@ -34,6 +34,7 @@ deliberately keeps no second copy to drift out of date.
 | [`docs/trust-model.md`](docs/trust-model.md) | what each flag exposes, what the firewall does and does not cover |
 | [`docs/architecture.md`](docs/architecture.md) | image, entrypoint, launcher call flow, proxy sidecar, policy format, relay, startup ordering |
 | [`docs/development.md`](docs/development.md) | adding an integration, an agent, or an image tool; implementation constraints |
+| [`docs/testing.md`](docs/testing.md) | the two test tiers, what each covers, how to add to either |
 
 Code is the source of truth over prose in exactly two places, and the docs defer
 to them too:
@@ -43,20 +44,17 @@ to them too:
 
 ## Working on this repo
 
-- Build and test the Rust workspace: `cargo test`, then `nix flake check`.
-- Build the docs the way GitHub Pages does, and treat a warning as a failure:
-
-  ```sh
-  nix-shell -I nixpkgs=channel:nixos-unstable \
-    -p 'python3.withPackages (ps: with ps; [ mkdocs mkdocs-material ])' \
-    --run 'mkdocs build --strict'
-  ```
-
-- Podman does not run in a Nix build, so nothing that starts a container is
-  covered there. The cheap end-to-end check is a stub `podman` earlier on `PATH`
-  that records its argv, which covers the whole flag → `podman run` mapping;
-  anything past that (proxy egress, relays, krun) needs a real podman and
-  network access.
+- **Run `make unittest`.** That is the whole in-container tier: the Rust
+  workspace (including the stub-podman tests that cover the flag →
+  `podman run` mapping) plus the strict docs build. It needs no container
+  runtime, which is the point — podman does not run nested, so this is the
+  only tier an agent working in a sandbox can run.
+- Anything whose answer comes from a real container — proxy egress, the relays,
+  a mount that has to be read-only, krun — lives in `tests/integration/` and
+  runs on the host: `make -C tests/integration`. Do not try to run it from
+  inside a sandbox; ask for the logs instead.
+- [`docs/testing.md`](docs/testing.md) is the page for both tiers: where the
+  boundary is, what each one can establish, and where coverage still thins out.
 - A change to behaviour is not finished until the page that documents it says
   so. `print_usage` in `cli/src/bin/agent-sandbox.rs` and the flag table in
   `docs/usage.md` are two renderings of one fact and must be edited together.

@@ -14,20 +14,16 @@ This page covers how to extend `agent-sandbox`: adding launcher integrations, bu
 4. If container-side setup is needed in the entrypoint, gate it on an env
    var (e.g. `AGENT_SANDBOX_*`) and pass that var from the launcher.
 5. Update `print_usage` and `docs/usage.md`.
-6. Test: `cargo test` for the fragment, then `nix flake check`. For the
-   documentation site, build it the way GitHub Pages does:
+6. Test the fragment, and the flag that reaches it: a `#[cfg(test)]` case in
+   `launch.rs` for what the fragment produces, and a case in
+   `cli/tests/launcher_argv.rs` for the flag actually assembling it into the
+   `podman run` command line. Then `make unittest`, which also builds the docs.
+7. If the integration depends on a real container — a mount that has to be
+   read-only, a port that has to carry traffic, a route the firewall has to
+   refuse — add a case under `tests/integration/` too, and run it on the host.
 
-   ```sh
-   nix-shell -I nixpkgs=channel:nixos-unstable \
-     -p 'python3.withPackages (ps: with ps; [ mkdocs mkdocs-material ])' \
-     --run 'mkdocs build --strict'
-   ```
-
-Note what neither can cover: podman does not run in a Nix build, so nothing
-that starts a container is tested there. The cheap end-to-end check is a stub
-`podman` earlier on `PATH` that records its argv — that verifies the whole
-flag → `podman run` mapping without a container runtime. Anything past that
-(proxy egress, relays, krun) needs a real podman and network access.
+See [Testing](testing.md) for the two tiers, what each one can and cannot
+establish, and how to add to either.
 
 ## How to add a new agent
 

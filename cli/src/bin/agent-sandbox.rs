@@ -1820,6 +1820,22 @@ fn run() -> Result<i32> {
         "{}:/etc/group:ro",
         group_file.path().to_string_lossy()
     ));
+    // The sidecar needs the same two files.  It runs without --userns=keep-id,
+    // so it is uid 0 inside, and the image ships no /etc/passwd of its own --
+    // which leaves the relay's ssh calling getpwuid(0) against an empty passwd
+    // database and failing with "No user exists for uid 0" before it opens a
+    // connection.  The relay runs ssh and gpg here rather than in the sandbox,
+    // so this is the side that has to be able to answer "who am I".
+    sidecar_extra_mounts.push("-v".to_string());
+    sidecar_extra_mounts.push(format!(
+        "{}:/etc/passwd:ro",
+        passwd_file.path().to_string_lossy()
+    ));
+    sidecar_extra_mounts.push("-v".to_string());
+    sidecar_extra_mounts.push(format!(
+        "{}:/etc/group:ro",
+        group_file.path().to_string_lossy()
+    ));
 
     // Include the workspace and a short word in the container name so ctl can
     // identify sandboxes without guessing network/PID relationships.  The word

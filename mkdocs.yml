@@ -52,3 +52,4 @@ nav:
   - Reference:
     - Architecture: architecture.md
     - Development: development.md
+    - Testing: testing.md
