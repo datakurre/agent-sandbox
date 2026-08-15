@@ -51,6 +51,20 @@ a published port is dead, check the bind address first — most dev servers
 default to loopback and need to be told otherwise (`--host 0.0.0.0`,
 `--bind 0.0.0.0`, `HOST=0.0.0.0`, `app.run(host="0.0.0.0")`).
 
+## Reaching a service on the host
+
+The other direction is opt-in per port. `$AGENT_SANDBOX_HOST_PORTS` lists the
+ports the user mapped with `--host-loopback-port`; each is reachable at the
+sandbox's own `127.0.0.1:PORT`. The variable is absent when nothing was mapped,
+which is the normal case — read it rather than probing, so "not mapped" stays
+distinguishable from "not running".
+
+If you need one that is not listed, ask the user to relaunch with
+`agent-sandbox --host-loopback-port PORT`; it cannot be turned on in a running
+session. Note that this works under `--proxy` and that what it reaches is *not*
+covered by the egress policy — so it is not a way around a denied host. For that
+the answer is still `ctl proxy allow`.
+
 ## Where the policy comes from
 
 | Launch flags | Policy |

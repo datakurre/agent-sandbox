@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Drive a headless browser sourced entirely from nixpkgs to screenshot a page for visual/image analysis or to interact with it (navigate, click, fill, wait). Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, or automate clicks/form-fills against a page, and no host browser or Chrome extension is available.
+description: Drive a browser to screenshot a page for visual/image analysis or to interact with it (navigate, click, fill, wait) — either headless from nixpkgs, or the user's own visible Chrome on the host over CDP. Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, automate clicks/form-fills against a page, or work in the user's real browser so they can watch and click along.
 compatibility: opencode
 metadata:
   workflow: headless-browser-automation
@@ -134,89 +134,113 @@ to route around it.
 ## A visible browser: attach to Chrome on the host
 
 Headless-in-container is the default because there's no X server here (see
-above), but a headed browser is still reachable — as a *client*, over CDP, to
-a browser the user launches on the **host**. Ask them to start it with a
-fixed debugging port bound to loopback:
+above), but a headed browser is still reachable — as a *client*, over CDP, to a
+browser the user launches on the **host**. This is what to use when the task
+needs a real browser with the user watching: their own profile and logins, a
+visible window, and the user clicking things themselves between your calls.
+
+### Ask the user for two things, in one message
+
+The sandbox flag below can only be set at launch, so a half-answer costs another
+round trip. Give them both halves at once.
+
+**First, start Chrome on the host** with a debugging port bound to loopback. The
+separate `--user-data-dir` is **required**, not optional — an already-running
+Chrome silently ignores `--remote-debugging-port`:
 
 ```sh
-google-chrome --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1
-# or
-chromium --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1
+google-chrome --user-data-dir=/tmp/cdp-profile \
+              --remote-debugging-port=9222 \
+              --remote-debugging-address=127.0.0.1
+# or chromium, same flags
 ```
 
 Keep `--remote-debugging-address` on `127.0.0.1`, never `0.0.0.0` — CDP has no
-authentication, so reachability is the only thing standing between "the
-sandbox can drive this tab" and "anything on the network can read every
-cookie and run arbitrary JS in it."
+authentication, so reachability is the only thing standing between "the sandbox
+can drive this tab" and "anything on the network can read every cookie and run
+arbitrary JS in it."
 
-By default the sandbox has **no route to the host's loopback at all**, so this
-needs `--host-loopback` at launch. Podman's rootless pasta setup passes
-`--no-map-gw`, which disables the gateway-to-loopback translation, and wires
-`host.containers.internal` with `--map-guest-addr` — that lands on the host's
-*LAN* address, not `127.0.0.1`. Neither one reaches a loopback-bound Chrome.
-The flag asks pasta for the mapping:
+**Second, relaunch the sandbox** with that port named. Tell them to keep whatever
+flags they were already using and add one:
 
 ```sh
-agent-sandbox --host-loopback -- bash
+agent-sandbox --host-loopback-port 9222 -- <their usual command>
 ```
 
-Anything the sandbox then sends to `169.254.1.3` arrives on the host as
-`127.0.0.1 → 127.0.0.1`. Chrome stays bound to loopback, one address reaches
-it, and nothing else on the network can.
-
-**Check `$AGENT_SANDBOX_HOST_LOOPBACK` first.** The launcher sets it to the
-mapped address, and only when the route exists:
+It composes with everything, `--proxy` included:
 
 ```sh
-echo "${AGENT_SANDBOX_HOST_LOOPBACK:?relaunch with: agent-sandbox --host-loopback}"
-curl -s "http://$AGENT_SANDBOX_HOST_LOOPBACK:9222/json/version"
+agent-sandbox --proxy --ports --host-loopback-port 9222 -- claude
 ```
 
-Unset means this session cannot reach the host at all — say so and ask the user
-to relaunch, rather than guessing at ports. Set but refused means Chrome isn't
-listening on the host's `127.0.0.1:9222`: an already-running Chrome ignores
-`--remote-debugging-port`, so the user needs a separate `--user-data-dir` for
-the flag to take effect. Use the variable rather than the literal below; the
-user may have picked another address with `--host-loopback=ADDR`.
+By default the sandbox has **no route to the host's loopback at all**, and
+neither `host.containers.internal` nor the gateway reaches one — podman points
+the first at the host's *LAN* address and passes pasta `--no-map-gw`. The flag is
+the only way in, and it opens exactly the ports named.
 
-Then attach as a CDP client — this is a remote connection, not a local launch,
-so `PLAYWRIGHT_BROWSERS_PATH` and `FONTCONFIG_FILE` aren't needed:
+### Check the channel before dialing
+
+The launcher sets `$AGENT_SANDBOX_HOST_PORTS` to the ports it mapped, and only
+those:
+
+```sh
+case ",$AGENT_SANDBOX_HOST_PORTS," in
+  *,9222,*) ;;
+  *) echo "relaunch with: agent-sandbox --host-loopback-port 9222"; exit 1 ;;
+esac
+curl -s http://127.0.0.1:9222/json/version
+```
+
+Port missing from the list means this session has no channel to it — say so and
+ask for the relaunch, rather than guessing at other ports. Listed but refused
+means Chrome isn't listening on the host's `127.0.0.1:9222`, which is almost
+always the missing `--user-data-dir`.
+
+### Attach
+
+A remote connection, not a local launch, so `PLAYWRIGHT_BROWSERS_PATH` and
+`FONTCONFIG_FILE` aren't needed:
 
 ```python
-import os
 from playwright.sync_api import sync_playwright
 
-host = os.environ["AGENT_SANDBOX_HOST_LOOPBACK"]   # KeyError = no route, relaunch
 p = sync_playwright().start()
-browser = p.chromium.connect_over_cdp(f"http://{host}:9222")
+browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
 page = browser.contexts[0].pages[0]     # the host's already-open tab
 page.goto("https://example.com")
 ```
 
-Dialing the literal address also sidesteps Chrome's DevTools host check, which
-rejects a `Host:` header that is not an IP or `localhost`.
+Dialing `127.0.0.1` also sidesteps Chrome's DevTools host check, which rejects a
+`Host:` header that is not an IP or `localhost`.
+
+If the sandbox already has something on 9222, the user can move the inside
+number: `--host-loopback-port 9222:19222` puts the host's 9222 on the sandbox's
+19222, and `$AGENT_SANDBOX_HOST_PORTS` then lists `19222`.
+
+### Both directions at once
 
 To point that browser at a server running *in* the sandbox, publish a port as
-well — the two compose, since publishing no longer changes the network mode:
+well — the two compose:
 
 ```sh
-agent-sandbox --ports --host-loopback -- bash
+agent-sandbox --proxy --ports --host-loopback-port 9222 -- bash
 ```
 
 The host's Chrome then reaches it over the host's own loopback, e.g.
 `http://127.0.0.1:8000` for a `[ports]` entry publishing 8000. Bind that server
 to `0.0.0.0` inside the sandbox: publishing forwards to the sandbox's interface
-address, so a loopback-bound one is reachable from inside and dead from the
-host.
+address, so a loopback-bound one is reachable from inside and dead from the host.
 
-Two modes have no route to the host and cannot do any of this: `--proxy`
-(deliberately — the sandbox is on an `--internal` network) and
-`--shared-network` (a bridge, where pasta options do not apply). A proxied
-sandbox can still *publish* to the host's loopback, so the user can open your
-server in their own browser; it is only the outbound CDP connection that has
-nowhere to go. The last-resort
-fallback remains `agent-sandbox --no-proxy --podman-args --network=host --
-bash`, which shares the host's entire network stack to obtain the one port.
+### Under `--proxy`, this channel is not policed
+
+The egress policy governs what the *sandbox* connects to. It cannot govern what
+the host's Chrome fetches on its own account, so a `page.goto()` reaches hosts a
+`curl` from here would be denied.
+
+That is not a workaround to reach for. If a host is denied, the fix is still to
+ask the user to run `agent-sandbox ctl proxy allow <host>:443` — the same
+escalation as everywhere else. Don't route ordinary fetching through the host's
+browser to get around a policy.
 
 ## Skip the script: playwright-mcp
 
