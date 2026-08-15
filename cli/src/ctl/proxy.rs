@@ -41,6 +41,11 @@ pub struct TargetArgs {
     pub word: Option<String>,
     #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
     pub container: Option<String>,
+    #[arg(
+        long,
+        help = "Target a running 'agent-sandbox browser' instead of a sandbox"
+    )]
+    pub browser: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -56,6 +61,11 @@ pub struct ExportArgs {
     pub word: Option<String>,
     #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
     pub container: Option<String>,
+    #[arg(
+        long,
+        help = "Target a running 'agent-sandbox browser' instead of a sandbox"
+    )]
+    pub browser: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -74,6 +84,11 @@ pub struct AllowArgs {
     pub word: Option<String>,
     #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
     pub container: Option<String>,
+    #[arg(
+        long,
+        help = "Target a running 'agent-sandbox browser' instead of a sandbox"
+    )]
+    pub browser: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -84,6 +99,11 @@ pub struct CheckArgs {
     pub word: Option<String>,
     #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
     pub container: Option<String>,
+    #[arg(
+        long,
+        help = "Target a running 'agent-sandbox browser' instead of a sandbox"
+    )]
+    pub browser: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -108,6 +128,11 @@ pub struct RmTargetArgs {
     pub word: Option<String>,
     #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
     pub container: Option<String>,
+    #[arg(
+        long,
+        help = "Target a running 'agent-sandbox browser' instead of a sandbox"
+    )]
+    pub browser: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -119,6 +144,11 @@ pub struct RmL7Args {
     pub word: Option<String>,
     #[arg(long, visible_aliases = ["sandbox"], help = "Container ID or name")]
     pub container: Option<String>,
+    #[arg(
+        long,
+        help = "Target a running 'agent-sandbox browser' instead of a sandbox"
+    )]
+    pub browser: bool,
 }
 
 fn sandbox_target(word: &Option<String>, sandbox: &Option<String>) -> Option<String> {
@@ -127,7 +157,20 @@ fn sandbox_target(word: &Option<String>, sandbox: &Option<String>) -> Option<Str
 
 /// Resolves `word`/`--sandbox` to the running sandbox's policy directory on
 /// the host — the same directory `agent-sandbox ctl tui` writes to.
-fn policy_dir(word: &Option<String>, sandbox: &Option<String>) -> Result<(String, String)> {
+///
+/// With `--browser` the target is an `agent-sandbox browser` instead. Its
+/// policy directory is a plain runtime directory rather than a container mount,
+/// but it holds the same `policy`/`policy.base`/`policy.baseline` trio, so
+/// everything downstream — `install_policy`, the delta rendering, the export —
+/// works on it unchanged.
+fn policy_dir(
+    word: &Option<String>,
+    sandbox: &Option<String>,
+    browser: bool,
+) -> Result<(String, String)> {
+    if browser {
+        return browser_policy_dir(sandbox_target(word, sandbox).as_deref());
+    }
     let explicit = sandbox_target(word, sandbox);
     let sandbox_name = resolve_sandbox(explicit.as_deref(), true)?;
     let sidecar = require_sidecar(&sandbox_name)?;
@@ -140,6 +183,35 @@ fn policy_dir(word: &Option<String>, sandbox: &Option<String>) -> Result<(String
         std::process::exit(1);
     }
     Ok((sandbox_name, dir))
+}
+
+/// Find the one running browser's policy directory, or say which ones there
+/// are.
+///
+/// Ambiguity is refused rather than guessed at, the same way `resolve_sandbox`
+/// refuses an ambiguous sandbox name: widening the wrong browser's allow list
+/// would be silent, and the operator would be left wondering why the denial
+/// they were watching did not clear.
+fn browser_policy_dir(explicit: Option<&str>) -> Result<(String, String)> {
+    let mut found = crate::ctl::browser::running_instances();
+    if let Some(want) = explicit {
+        found.retain(|inst| inst.name == want || inst.cdp_port.to_string() == want);
+    }
+    match found.len() {
+        0 => {
+            eprintln!("agent-sandbox ctl proxy: no running 'agent-sandbox browser' found.");
+            eprintln!("               Start one with: agent-sandbox browser");
+            std::process::exit(1);
+        }
+        1 => Ok((found[0].name.clone(), found[0].dir.clone())),
+        _ => {
+            eprintln!("agent-sandbox ctl proxy: several browsers are running; name one:");
+            for inst in &found {
+                eprintln!("               {} (CDP {})", inst.name, inst.cdp_port);
+            }
+            std::process::exit(1);
+        }
+    }
 }
 
 fn parse_lines(lines: &[String]) -> Result<ProxyConfig> {
@@ -206,7 +278,7 @@ pub fn run(args: ProxyArgs) -> Result<()> {
 }
 
 fn show(args: TargetArgs) -> Result<()> {
-    let (sandbox_name, dir) = policy_dir(&args.word, &args.container)?;
+    let (sandbox_name, dir) = policy_dir(&args.word, &args.container, args.browser)?;
     let lines = load_policy_lines(&dir);
     let cfg = parse_lines(&lines)?;
     let base_lines: HashSet<String> = fs::read_to_string(format!("{}/policy.base", dir))
@@ -265,7 +337,7 @@ pub(crate) fn warn_if_no_session_ca(policy_dir: &str, host: &str) {
 }
 
 fn allow(args: AllowArgs) -> Result<()> {
-    let (_, dir) = policy_dir(&args.word, &args.container)?;
+    let (_, dir) = policy_dir(&args.word, &args.container, args.browser)?;
     let mut lines = load_policy_lines(&dir);
     if let Some(method) = args.l7 {
         if is_ip_or_cidr(&args.target) {
@@ -312,7 +384,7 @@ fn remove_matching(lines: &mut Vec<String>, predicate: impl Fn(&str) -> bool) ->
 fn rm(args: RmArgs) -> Result<()> {
     let (dir, lines, removed, summary) = match args.kind {
         RmKind::Allow(a) => {
-            let (_, dir) = policy_dir(&a.word, &a.container)?;
+            let (_, dir) = policy_dir(&a.word, &a.container, a.browser)?;
             let mut lines = load_policy_lines(&dir);
             let key = match target_kind(&a.target) {
                 "ips" => "allow_ip",
@@ -323,7 +395,7 @@ fn rm(args: RmArgs) -> Result<()> {
             (dir, lines, removed, format!("{} {}", key, a.target))
         }
         RmKind::L7(a) => {
-            let (_, dir) = policy_dir(&a.word, &a.container)?;
+            let (_, dir) = policy_dir(&a.word, &a.container, a.browser)?;
             let mut lines = load_policy_lines(&dir);
             let needle = format!("allow_route\t{}\t{}\t{}", a.host, a.method, a.path);
             let removed = remove_matching(&mut lines, |l| l == needle);
@@ -347,7 +419,7 @@ fn rm(args: RmArgs) -> Result<()> {
 }
 
 fn reset(args: TargetArgs) -> Result<()> {
-    let (_, dir) = policy_dir(&args.word, &args.container)?;
+    let (_, dir) = policy_dir(&args.word, &args.container, args.browser)?;
     let base_path = format!("{}/policy.base", dir);
     let base = match fs::read_to_string(&base_path) {
         Ok(text) => text,
@@ -364,7 +436,7 @@ fn reset(args: TargetArgs) -> Result<()> {
 }
 
 fn export(args: ExportArgs) -> Result<()> {
-    let (_, dir) = policy_dir(&args.word, &args.container)?;
+    let (_, dir) = policy_dir(&args.word, &args.container, args.browser)?;
     // The baseline private/loopback deny_ip ranges are enforced
     // unconditionally regardless of AGENTS.md (see `policy.baseline`,
     // written once at launch with exactly that set), so round-tripping them
@@ -390,7 +462,7 @@ fn export(args: ExportArgs) -> Result<()> {
 }
 
 fn check(args: CheckArgs) -> Result<()> {
-    let (sandbox_name, dir) = policy_dir(&args.word, &args.container)?;
+    let (sandbox_name, dir) = policy_dir(&args.word, &args.container, args.browser)?;
     let lines = load_policy_lines(&dir);
     let cfg = parse_lines(&lines)?;
     let (host, port_str) = parse_host_port(&args.target);

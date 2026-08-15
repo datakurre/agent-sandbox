@@ -43,6 +43,8 @@ enum CtlCommands {
     Status(ctl::status::StatusArgs),
     #[command(about = "Manage proxy rules")]
     Proxy(ctl::proxy::ProxyArgs),
+    #[command(about = "Start a throwaway host browser behind a deny-by-default allow list")]
+    Browser(ctl::browser::BrowserArgs),
     #[command(about = "Show network metering for a running sandbox")]
     Net(ctl::net::NetArgs),
     #[command(about = "Show the proxy log for a running sandbox", alias = "log")]
@@ -431,6 +433,8 @@ forwarding SSH, or exposing Git identity.
   agent-sandbox --privileged opencode
                                      pass --privileged to podman run
   agent-sandbox ctl --help           manage sandboxes that are already running
+  agent-sandbox browser              start a throwaway host browser behind a deny-by-default
+                                     allow list, for cooperative testing over CDP
 
 Agents:
   {agent_list}
@@ -485,6 +489,9 @@ Ports:
                                            than a route, so it composes with every network
                                            mode, --proxy included -- but what it reaches is
                                            outside the egress policy.
+                                           'agent-sandbox browser' starts a host browser that
+                                           carries an allow list of its own and prints the
+                                           line to paste here.
                                            --no-host-loopback-port drops them all.
 
 Mounts:
@@ -561,29 +568,7 @@ fn parse_proxy_log_level(s: &str) -> Option<ProxyLogLevel> {
 }
 
 fn proxy_profile_path(home: &str, name: &str) -> Result<PathBuf> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-    {
-        anyhow::bail!(
-            "agent-sandbox: invalid proxy profile name '{}'; use letters, numbers, '.', '_' or '-'",
-            name
-        );
-    }
-    let config_home = env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(home).join(".config"));
-    Ok(config_home
-        .join("agent-sandbox")
-        .join("profiles")
-        .join(format!("{}.toml", name)))
+    launch::proxy_profile_path(home, name).map_err(|e| anyhow::anyhow!(e))
 }
 
 struct CleanupGuard {
@@ -936,7 +921,7 @@ fn run() -> Result<i32> {
     if is_ctl_bin || !args.is_empty() {
         let ctl_subcommands = [
             "load", "list", "status", "proxy", "net", "logs", "log", "attach", "mount", "mounts",
-            "relay", "tui", "purge",
+            "relay", "tui", "purge", "browser",
         ];
         let mut run_ctl = false;
         let mut parse_args = vec!["agent-sandbox".to_string()];
@@ -979,6 +964,7 @@ fn run() -> Result<i32> {
                 CtlCommands::List(a) => ctl::list::run(a)?,
                 CtlCommands::Status(a) => ctl::status::run(a)?,
                 CtlCommands::Proxy(a) => ctl::proxy::run(a)?,
+                CtlCommands::Browser(a) => ctl::browser::run(a)?,
                 CtlCommands::Net(a) => ctl::net::run(a)?,
                 CtlCommands::Logs(a) => ctl::logs::run(a)?,
                 CtlCommands::Attach(a) => ctl::attach::run(a)?,

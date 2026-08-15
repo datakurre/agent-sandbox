@@ -311,15 +311,113 @@ fn main() -> Result<()> {
         }
     }
 
-    // 9. exec "$@"
+    // 9. Browser MCP server
+    // `playwright-mcp` is on the image PATH, so the only thing missing is a
+    // client that knows about it.  Writing the config here rather than baking
+    // it in is not a preference: ~/.config is a tmpfs mount, so anything baked
+    // into the image at that path is gone before the agent starts.
+    //
+    // Off unless asked for.  A default launch must behave exactly as it did
+    // before this step existed -- the config file below is only useful when
+    // something arranged a browser to point it at, and appending an argument to
+    // the agent's own command line is not something to do to every session.
+    let mcp_args = browser_mcp_setup();
+
+    // 10. exec "$@"
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
-        let err = Command::new(&args[1]).args(&args[2..]).exec();
+        let err = Command::new(&args[1]).args(&args[2..]).args(&mcp_args).exec();
         eprintln!("Failed to exec {}: {}", args[1], err);
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+/// Where the generated MCP config lands.  Under `~/.config`, which is a tmpfs:
+/// deliberately *not* one of the agent state paths the launcher bind-mounts
+/// from the host, so this never edits the operator's real agent configuration.
+const MCP_CONFIG: &str = "/home/user/.config/agent-sandbox/mcp.json";
+
+/// Write an MCP config for `playwright-mcp` and return any arguments the agent
+/// needs to pick it up.
+///
+/// Two modes, both explicit:
+///
+/// * `AGENT_SANDBOX_BROWSER_CDP_PORT=N` -- drive the browser `agent-sandbox
+///   browser` started on the host, over the loopback port the launcher mapped.
+///   This is what the line that command prints asks for.
+/// * `AGENT_SANDBOX_BROWSER_MCP=headless` -- launch a headless browser in here
+///   instead, needing no host cooperation at all.
+///
+/// `AGENT_SANDBOX_BROWSER_MCP=off` turns both off.
+fn browser_mcp_setup() -> Vec<String> {
+    let mode = env::var("AGENT_SANDBOX_BROWSER_MCP").unwrap_or_default();
+    if mode == "off" {
+        return Vec::new();
+    }
+    let cdp_port = env::var("AGENT_SANDBOX_BROWSER_CDP_PORT")
+        .ok()
+        .filter(|v| !v.is_empty());
+
+    let server_args: Vec<String> = match (&cdp_port, mode.as_str()) {
+        (Some(port), _) => vec![
+            "--cdp-endpoint".to_string(),
+            // 127.0.0.1 rather than localhost: the entrypoint's socat listener
+            // is on the v4 loopback, and Chrome's DevTools host check accepts
+            // an IP but not an arbitrary name.
+            format!("http://127.0.0.1:{}", port),
+        ],
+        (None, "headless") => vec!["--headless".to_string(), "--isolated".to_string()],
+        (None, _) => return Vec::new(),
+    };
+
+    let Ok(server) = which("mcp-server-playwright").or_else(|_| which("playwright-mcp")) else {
+        eprintln!("agent-sandbox: playwright-mcp is not on PATH; skipping browser MCP setup");
+        return Vec::new();
+    };
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "playwright": {
+                "command": server.to_string_lossy(),
+                "args": server_args,
+            }
+        }
+    });
+    if let Some(parent) = Path::new(MCP_CONFIG).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let rendered = match serde_json::to_string_pretty(&config) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("agent-sandbox: could not render the browser MCP config: {}", e);
+            return Vec::new();
+        }
+    };
+    if let Err(e) = fs::write(MCP_CONFIG, rendered) {
+        eprintln!("agent-sandbox: could not write {}: {}", MCP_CONFIG, e);
+        return Vec::new();
+    }
+
+    // Only Claude Code gets the argument appended, because `--mcp-config` is
+    // additive there and leaves the operator's own servers alone.  Every other
+    // agent is told where the file is and registers it itself -- rewriting five
+    // config formats, each of which is a host-mounted state file, would trade a
+    // one-line hint for a way to corrupt someone's real configuration.
+    let argv0 = env::args().nth(1).unwrap_or_default();
+    let agent = Path::new(&argv0)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if agent == "claude" {
+        return vec!["--mcp-config".to_string(), MCP_CONFIG.to_string()];
+    }
+    eprintln!(
+        "agent-sandbox: browser MCP config written to {} (register it with e.g. `codex mcp add`)",
+        MCP_CONFIG
+    );
+    Vec::new()
 }
 
 fn which(cmd: &str) -> Result<PathBuf, ()> {
