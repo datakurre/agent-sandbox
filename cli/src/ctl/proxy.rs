@@ -230,6 +230,17 @@ fn apply(policy_dir: &str, lines: Vec<String>) -> Result<()> {
         eprintln!("agent-sandbox ctl proxy: {}", e);
         std::process::exit(1);
     }
+    // A browser target has a second layer holding the same permission, and it
+    // is stale the moment the policy changes.  Keyed off the file's existence
+    // rather than a `--browser` branch: a sandbox has no such file, and neither
+    // does a browser started with `--no-policy-overlay`.
+    if let Err(e) = crate::ctl::browser::sync_managed_allowlist(policy_dir, &lines) {
+        eprintln!(
+            "agent-sandbox ctl proxy: the proxy has the new policy, but the browser's \
+             managed allow list could not be updated ({}); the browser may still refuse it",
+            e
+        );
+    }
     println!("  reloading   the proxy applies this within a second");
     Ok(())
 }

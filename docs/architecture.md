@@ -150,6 +150,14 @@ absolute-form requests, terminating TLS for the hosts that carry an L7 rule.
 Policy decisions happen once per connection, before the byte pumps start; an
 established tunnel is never re-evaluated.
 
+A cleartext request arrives in absolute-form -- addressed to the proxy -- and
+leaves in origin-form, as RFC 9112 §3.2.1 requires of a request to an origin
+server. Only the request line's target changes; the path and query are copied
+across verbatim rather than taken from the normalized path the L7 check uses,
+since that normalization exists to keep `/a/../b` off a rule it does not match.
+Most servers accept either form, but not all: `python3 -m http.server` treats
+the absolute target as a path and answers 404 for a file it holds.
+
 Three directories, and which side can see them is the design:
 
 | Path | Mounted into | Contents |
@@ -207,7 +215,10 @@ left out -- the same shape as the host-port directory:
 Reusing the policy file trio rather than inventing a format is what makes
 `agent-sandbox ctl proxy allow --browser` work with no new machinery:
 `install_policy` validates and swaps the file atomically, and the proxy's
-existing watcher picks it up within a second.  `--browser` resolves through
+existing watcher picks it up within a second.  The managed policy is rewritten
+by the same command, in place and by rename, so the two layers never hold
+different permissions -- it was written once at launch, which left every
+runtime widening applied to the proxy and refused by the browser.  `--browser` resolves through
 `meta.json` instead of a sidecar mount, and sweeps directories whose pid is gone
 -- `Drop` does not run on SIGKILL, and a stale directory would otherwise look
 like a second running browser.

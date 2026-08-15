@@ -115,6 +115,64 @@ fn is_chunked(head: &str) -> bool {
     })
 }
 
+/// The request target as an *origin server* must see it.
+///
+/// A client talking to a proxy sends absolute-form -- `GET http://h:8000/a
+/// HTTP/1.1` -- and RFC 9112 §3.2.1 is explicit that the proxy converts it to
+/// origin-form (`GET /a HTTP/1.1`) before forwarding, because absolute-form is
+/// addressed to the proxy, not to the server.  Most servers tolerate being
+/// handed the proxy's copy anyway, which is why this went unnoticed;
+/// `python3 -m http.server` does not, and looks for a file literally named
+/// `http:/h:8000/a`, which is a 404 nobody can explain.
+///
+/// `*` (OPTIONS), origin-form and CONNECT's authority-form are already what the
+/// far end expects and are returned unchanged.
+pub fn origin_form(target: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if target == "*" || target.starts_with('/') {
+        return Cow::Borrowed(target);
+    }
+    let Some(idx) = target.find("://") else {
+        return Cow::Borrowed(target);
+    };
+    let rest = &target[idx + 3..];
+    match rest.find(['/', '?', '#']) {
+        // The common case: the path starts right there, so no copy is needed.
+        Some(i) if rest.as_bytes()[i] == b'/' => Cow::Borrowed(&rest[i..]),
+        // `http://h?q` has no path segment; origin-form still needs one.
+        Some(i) => Cow::Owned(format!("/{}", &rest[i..])),
+        None => Cow::Borrowed("/"),
+    }
+}
+
+/// Rewrite a request head's target to origin-form, or `None` when it already is
+/// one and the bytes can go out untouched.
+///
+/// Only the second token of the first line is replaced; every header, the
+/// method and the version stay byte-identical, and the target's path and query
+/// are copied across verbatim rather than taken from the normalized path the
+/// L7 check uses -- that normalization exists to stop `/a/../b` reaching a rule
+/// it does not match, and forwarding it would change what the origin serves.
+/// A first line that is not exactly three space-separated tokens is left alone:
+/// the request-smuggling checks own that case.
+pub fn rewrite_request_target(head: &[u8]) -> Option<Vec<u8>> {
+    let end = head.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&head[..end]).ok()?;
+    let mut parts = line.split(' ');
+    let (method, target, version) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || method == "CONNECT" {
+        return None;
+    }
+    let origin = origin_form(target);
+    if origin == target {
+        return None;
+    }
+    let mut out = Vec::with_capacity(head.len());
+    out.extend_from_slice(format!("{} {} {}", method, origin, version).as_bytes());
+    out.extend_from_slice(&head[end..]);
+    Some(out)
+}
+
 fn request_method(head: &str) -> io::Result<&str> {
     let request_line = head
         .lines()
@@ -614,6 +672,9 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
                 }
             };
 
+            // Last thing before the wire: what leaves here is addressed to the
+            // origin, not to this proxy.
+            let out_head = rewrite_request_target(&out_head).unwrap_or(out_head);
             upstream.write_all(&out_head)?;
             up_bytes += out_head.len() as u64;
 
@@ -992,5 +1053,65 @@ mod tests {
         let client_rendered = String::from_utf8(client.written).expect("utf8");
         assert!(client_rendered.contains("HTTP/1.1 200 OK"));
         assert!(client_rendered.ends_with("ok"));
+    }
+
+    #[test]
+    fn an_absolute_target_becomes_the_path_the_origin_expects() {
+        assert_eq!(origin_form("http://127.0.0.1:8000/index.html"), "/index.html");
+        assert_eq!(origin_form("http://h/a?b=c"), "/a?b=c");
+        assert_eq!(origin_form("HTTP://Example.com/x"), "/x");
+        assert_eq!(origin_form("http://[::1]:8000/x"), "/x");
+    }
+
+    #[test]
+    fn a_target_with_no_path_still_gets_one() {
+        assert_eq!(origin_form("http://127.0.0.1:8000"), "/");
+        assert_eq!(origin_form("http://h?q=1"), "/?q=1");
+    }
+
+    #[test]
+    fn what_is_already_addressed_to_the_origin_is_left_alone() {
+        assert_eq!(origin_form("/index.html"), "/index.html");
+        assert_eq!(origin_form("*"), "*");
+        // Authority-form, which is CONNECT's and never an origin request.
+        assert_eq!(origin_form("example.com:443"), "example.com:443");
+        assert!(rewrite_request_target(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n").is_none());
+        assert!(rewrite_request_target(b"CONNECT h:443 HTTP/1.1\r\n\r\n").is_none());
+        // Not three tokens: the smuggling checks own this, not the rewriter.
+        assert!(rewrite_request_target(b"GET  http://h/a HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn rewriting_the_target_touches_nothing_else_in_the_head() {
+        let head = b"GET http://127.0.0.1:8000/a?b HTTP/1.1\r\nHost: 127.0.0.1:8000\r\nAccept: */*\r\n\r\n";
+        let out = rewrite_request_target(head).expect("rewritten");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "GET /a?b HTTP/1.1\r\nHost: 127.0.0.1:8000\r\nAccept: */*\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn the_forwarded_request_is_the_one_the_origin_would_have_received() {
+        // The reported failure: a proxied `python3 -m http.server` 404s because
+        // it resolves the absolute target as a path under its document root.
+        let client_in = b"GET http://example.com/index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &shared_injecting("example.com\tPOST\t/nothing", "X-Api-Key", "value"),
+        )
+        .expect("proxy");
+        let rendered = String::from_utf8(upstream.written).expect("utf8 output");
+        assert!(
+            rendered.starts_with("GET /index.html HTTP/1.1\r\n"),
+            "forwarded head was {:?}",
+            rendered
+        );
     }
 }

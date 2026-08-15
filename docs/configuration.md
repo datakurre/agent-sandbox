@@ -42,6 +42,19 @@ dns = { container = 53, protocol = "udp", bind = "0.0.0.0" }
 ```
 ````
 
+#### Who reads this block
+
+The launcher publishes these ports only when it is given `--ports`; without it
+the declaration is inert.
+
+[`agent-sandbox browser`](usage.md#a-cooperative-browser-agent-sandbox-browser)
+reads the same block whether or not `--ports` was passed, and allows each
+loopback-bound entry — as `127.0.0.1:<host>` and as `localhost:<host>` — in the
+browser's own deny-by-default policy, so the app under test loads without
+naming its port a second time under `[network]`. A `host = 0` entry is
+allocated at launch and cannot be allowed ahead of time; give it a fixed host
+port if a browser needs to reach it.
+
 ### 2. `[mounts]`
 
 The `[mounts]` table allows you to bind mount paths from the host into the sandbox container. 

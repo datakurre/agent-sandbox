@@ -88,7 +88,7 @@ pub struct BrowserArgs {
     pub network: bool,
     #[arg(
         long,
-        help = "Do not seed the allow list from the sandbox's published loopback ports"
+        help = "Do not seed the allow list from ports (neither AGENTS.md [ports] nor a running sandbox's published ports)"
     )]
     pub no_published_ports: bool,
     #[arg(
@@ -194,6 +194,39 @@ pub fn published_loopback_ports(ports_json: &str) -> Vec<u16> {
     out.into_iter().collect()
 }
 
+/// Loopback ports an `AGENTS.md` *declares*, whether or not anything has
+/// published them yet.
+///
+/// This is what makes the documented order work.  `--browser` is established at
+/// launch, so the browser starts first and there is no sandbox to inspect at
+/// that moment; seeding from the declaration instead of the observation is the
+/// only way the app under test is reachable without naming its port twice.
+///
+/// Same rule as `published_loopback_ports` about which binds count.  A `host =
+/// 0` entry is resolved by `agents::allocate` at launch and cannot be known
+/// ahead of time, so it is not a port this can seed.
+///
+/// Parsed with wider binds *allowed* and then filtered, rather than refused:
+/// this reads a declaration, it does not gate one.  The launcher is where a
+/// non-loopback bind has to be argued for with `--ports-any-interface`, and a
+/// file it accepts should not make the browser report a broken block and seed
+/// nothing.
+pub fn declared_loopback_ports(text: &str) -> std::result::Result<Vec<u16>, String> {
+    let mappings = crate::agents::parse_ports(text, true, crate::agents::MAX_PORTS)
+        .map_err(|e| e.to_string())?;
+    let mut out = BTreeSet::new();
+    for m in mappings {
+        if m.bind != "127.0.0.1" && m.bind != "::1" {
+            continue;
+        }
+        if m.host == 0 {
+            continue;
+        }
+        out.insert(m.host);
+    }
+    Ok(out.into_iter().collect())
+}
+
 /// Turn everything the operator named into one ordered rule list.
 ///
 /// Order is additive and deliberately boring -- published ports, then profiles
@@ -208,17 +241,19 @@ pub fn build_allow_list(
 
     for port in published {
         rules.push(format!("allow_ip 127.0.0.1/32:{}", port));
+        // `localhost` is a *name* to the proxy: `normalize_host` folds only IP
+        // literals, so the rule above never sees it and `http://localhost:8000`
+        // was denied before DNS while `http://127.0.0.1:8000` worked.  The name
+        // is still bounded -- one that resolves outside `127.0.0.1/32` is caught
+        // by the post-resolution check against the baseline.
+        rules.push(format!("allow_host localhost:{}", port));
     }
 
     // `format_proxy_policy` renders a whole file, header and `default` line
     // included; only the rule lines are wanted here.
     for line in format_proxy_policy(declared, "AGENTS.md and proxy profiles").lines() {
         let line = line.trim_end();
-        if line.starts_with("allow_host ")
-            || line.starts_with("allow_ip ")
-            || line.starts_with("allow_port ")
-            || line.starts_with("allow_route\t")
-        {
+        if is_rule_line(line) {
             rules.push(line.to_string());
         }
     }
@@ -229,6 +264,18 @@ pub fn build_allow_list(
 
     rules.dedup();
     AllowList { rules }
+}
+
+/// The lines of a policy file that grant something, as opposed to its header,
+/// its `default` line and the built-in denies.  One definition, because both
+/// layers are derived from it: the allow list at launch and the `URLAllowlist`
+/// rewritten after every `ctl proxy` edit.
+fn is_rule_line(line: &str) -> bool {
+    let line = line.trim_end();
+    line.starts_with("allow_host ")
+        || line.starts_with("allow_ip ")
+        || line.starts_with("allow_port ")
+        || line.starts_with("allow_route\t")
 }
 
 /// `--allow` takes what `ctl proxy allow` takes, so the two are one thing to
@@ -357,7 +404,56 @@ fn single_port(ports: Option<&str>) -> Option<&str> {
     }
 }
 
-/// The managed policy written into the per-instance policy directory.
+/// The managed policy file, relative to a browser's runtime directory.  Named
+/// once because two commands write it now: this one at launch, and
+/// `ctl proxy` whenever it widens a running browser's policy.
+pub const MANAGED_POLICY_PATH: &str = "policies/managed/agent-sandbox.json";
+
+/// Rewrite a running browser's `URLAllowlist` to match a new policy.
+///
+/// Layer 2 was written once, before Chromium started, and never again -- so
+/// `ctl proxy allow <host> --browser`, which the docs offer as the way to widen
+/// a browser *while it runs*, widened only the proxy and left the browser
+/// refusing the same host with `ERR_BLOCKED_BY_ADMINISTRATOR`.  The two layers
+/// are supposed to describe one permission; this keeps that true after launch.
+///
+/// Only `URLAllowlist` is touched: the proxy port, the blocklist and the
+/// hardening keys are launch facts and no policy edit implies a change to them.
+/// A directory without the file is not an error -- that is every sandbox
+/// target, which is why this is keyed off the file rather than off a flag.
+pub fn sync_managed_allowlist(dir: &str, lines: &[String]) -> Result<()> {
+    let path = format!("{}/{}", dir, MANAGED_POLICY_PATH);
+    if !Path::new(&path).exists() {
+        return Ok(());
+    }
+    let text = fs::read_to_string(&path).with_context(|| format!("cannot read {}", path))?;
+    let mut policy: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("{} is not valid JSON", path))?;
+    let allow = AllowList {
+        rules: lines.iter().filter(|l| is_rule_line(l)).cloned().collect(),
+    };
+    policy["URLAllowlist"] = json!(url_allowlist(&allow));
+
+    // Same temp-file-then-rename as `install_policy`, and inside the same
+    // directory, so Chromium's policy watcher never observes a half-written
+    // file and the rename lands on the bind mount it is watching.
+    let tmp = format!("{}/.agent-sandbox.json.new", dir_of(&path));
+    let rendered = serde_json::to_string_pretty(&policy)? + "\n";
+    if let Err(e) = fs::write(&tmp, rendered) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("cannot write {}", tmp));
+    }
+    fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path))?;
+    Ok(())
+}
+
+fn dir_of(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
 pub fn managed_policy_json(
     allow: &AllowList,
     proxy_port: u16,
@@ -763,18 +859,35 @@ pub fn run(args: BrowserArgs) -> Result<()> {
         }
     };
 
-    let published = match (&sandbox, args.no_published_ports) {
-        (Some(name), false) => {
-            let ports = podman_published_ports(name).unwrap_or_default();
-            if ports.is_empty() {
-                eprintln!(
-                    "browser: {} publishes no loopback ports; the allow list starts empty",
-                    name
-                );
+    // Two sources for the same fact, because neither alone covers the ordinary
+    // case: `AGENTS.md` knows the ports before anything is running, and podman
+    // knows what a sandbox started with other flags actually got.
+    let published: Vec<u16> = if args.no_published_ports {
+        Vec::new()
+    } else {
+        let mut ports = BTreeSet::new();
+        if let Ok(text) = fs::read_to_string("AGENTS.md") {
+            match declared_loopback_ports(&text) {
+                Ok(declared) => ports.extend(declared),
+                // A note, not an error: every other AGENTS.md failure in this
+                // command is one too, and refusing to start a browser over a
+                // block it only reads opportunistically would be its own bug.
+                Err(e) => eprintln!(
+                    "browser: invalid [ports] in AGENTS.md ({}); no ports seeded from it",
+                    e
+                ),
             }
-            ports
         }
-        _ => Vec::new(),
+        if let Some(name) = &sandbox {
+            ports.extend(podman_published_ports(name).unwrap_or_default());
+        }
+        if ports.is_empty() {
+            eprintln!(
+                "browser: no declared or published loopback ports; \
+                 the allow list starts empty"
+            );
+        }
+        ports.into_iter().collect()
     };
 
     // Declared rules: profiles first, then AGENTS.md if asked for.  Same
@@ -869,10 +982,11 @@ pub fn run(args: BrowserArgs) -> Result<()> {
         list
     };
 
-    let managed_dir = format!("{}/policies/managed", runtime_dir);
+    let managed_file = format!("{}/{}", runtime_dir, MANAGED_POLICY_PATH);
+    let managed_dir = dir_of(&managed_file);
     fs::create_dir_all(&managed_dir)?;
     fs::write(
-        format!("{}/agent-sandbox.json", managed_dir),
+        &managed_file,
         serde_json::to_string_pretty(&managed_policy_json(&allow, proxy_port, &extensions))?,
     )?;
 
@@ -1108,8 +1222,122 @@ mod tests {
         let allow = build_allow_list(&[3000, 8000], &ProxyPolicy::default(), &[]);
         assert_eq!(
             allow.rules,
-            vec!["allow_ip 127.0.0.1/32:3000", "allow_ip 127.0.0.1/32:8000"]
+            vec![
+                "allow_ip 127.0.0.1/32:3000",
+                "allow_host localhost:3000",
+                "allow_ip 127.0.0.1/32:8000",
+                "allow_host localhost:8000",
+            ]
         );
+    }
+
+    #[test]
+    fn the_name_for_the_same_port_is_allowed_too() {
+        // `http://localhost:8000` and `http://127.0.0.1:8000` are one app to
+        // everyone except the proxy, which sees a name in the first case and
+        // never reaches the `allow_ip` rule.
+        let text = policy_file(&build_allow_list(&[8000], &ProxyPolicy::default(), &[]));
+        let config = agent_sandbox_proxy::policy::parse_policy(&text).expect("parses");
+        assert!(config.is_allowed("localhost", 8000));
+        assert!(!config.is_allowed("localhost", 8001));
+        assert!(url_allowlist(&build_allow_list(&[8000], &ProxyPolicy::default(), &[]))
+            .contains(&"localhost:8000".to_string()));
+    }
+
+    #[test]
+    fn a_declared_loopback_port_is_seeded_before_anything_publishes_it() {
+        // The documented order starts the browser first, so this -- not podman
+        // -- is what makes the app under test reachable.
+        let text = "```toml agent-sandbox\n[ports]\nweb = 8000\n```\n";
+        assert_eq!(declared_loopback_ports(text).expect("parses"), vec![8000]);
+    }
+
+    #[test]
+    fn a_declaration_the_browser_cannot_act_on_seeds_nothing() {
+        // A wider bind is not evidence the browser was meant to have it, and an
+        // allocated port is not known until the sandbox launches.  Neither is an
+        // error: this file is one the launcher accepts.
+        let wider = "```toml agent-sandbox\n[ports]\nweb = { container = 8000, bind = \"0.0.0.0\" }\n```\n";
+        let allocated = "```toml agent-sandbox\n[ports]\nweb = { container = 8000, host = 0 }\n```\n";
+        assert!(declared_loopback_ports(wider).expect("parses").is_empty());
+        assert!(declared_loopback_ports(allocated).expect("parses").is_empty());
+        assert!(declared_loopback_ports("no blocks here").expect("parses").is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_ports_block_is_reported_rather_than_guessed_at() {
+        let broken = "```toml agent-sandbox\n[ports]\nweb = \"not a port\"\n```\n";
+        assert!(declared_loopback_ports(broken).is_err());
+    }
+
+    #[test]
+    fn a_port_that_is_both_declared_and_published_is_one_rule() {
+        // `run` unions the two sources through a set; this is the rule list that
+        // union has to produce.
+        let mut ports: BTreeSet<u16> = declared_loopback_ports(
+            "```toml agent-sandbox\n[ports]\nweb = 8000\napi = 9000\n```\n",
+        )
+        .expect("parses")
+        .into_iter()
+        .collect();
+        ports.extend(published_loopback_ports(
+            r#"{"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8000"}]}"#,
+        ));
+        let allow = build_allow_list(
+            &ports.into_iter().collect::<Vec<_>>(),
+            &ProxyPolicy::default(),
+            &[],
+        );
+        assert_eq!(
+            allow.rules,
+            vec![
+                "allow_ip 127.0.0.1/32:8000",
+                "allow_host localhost:8000",
+                "allow_ip 127.0.0.1/32:9000",
+                "allow_host localhost:9000",
+            ]
+        );
+    }
+
+    #[test]
+    fn widening_a_running_browser_reaches_the_managed_layer_too() {
+        // Layer 2 was written once at launch, so `ctl proxy allow --browser`
+        // widened the proxy and left the browser refusing the same host.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_string_lossy().to_string();
+        let file = format!("{}/{}", root, MANAGED_POLICY_PATH);
+        fs::create_dir_all(dir_of(&file)).expect("policy dir");
+        let launched = managed_policy_json(&allow_of(&["allow_ip 127.0.0.1/32:8000"]), 41234, &[]);
+        fs::write(&file, serde_json::to_string_pretty(&launched).unwrap()).expect("write");
+
+        sync_managed_allowlist(
+            &root,
+            &[
+                "default deny".to_string(),
+                "allow_ip 127.0.0.1/32:8000".to_string(),
+                "allow_host example.com:443".to_string(),
+                "deny_ip 127.0.0.0/8".to_string(),
+            ],
+        )
+        .expect("sync");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).expect("read")).expect("json");
+        assert_eq!(
+            after["URLAllowlist"],
+            json!(["127.0.0.1:8000", "example.com:443"])
+        );
+        // Everything else is a launch fact and no policy edit implies a change.
+        assert_eq!(after["URLBlocklist"], launched["URLBlocklist"]);
+        assert_eq!(after["ProxySettings"], launched["ProxySettings"]);
+        assert_eq!(after["DefaultSearchProviderEnabled"], json!(false));
+    }
+
+    #[test]
+    fn a_target_without_a_managed_policy_is_not_an_error() {
+        // Every sandbox, and a browser started with --no-policy-overlay.
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(sync_managed_allowlist(&dir.path().to_string_lossy(), &[]).is_ok());
     }
 
     #[test]
@@ -1147,6 +1375,14 @@ mod tests {
 
         // And it must decide the way the banner claims it does.
         assert!(config.is_allowed("127.0.0.1", 3000), "the published port");
+        // The second, post-resolution check: a request that clears `is_allowed`
+        // is refused again once the address is known, and the baseline `/8`
+        // covers loopback.  The `/32` allow has to win there too, or the browser
+        // gets a 403 after the rule that was supposed to let it through.
+        assert!(
+            !config.is_denied_address("127.0.0.1".parse().unwrap()),
+            "the port rule must survive the resolved-address check"
+        );
         assert!(
             !config.is_allowed("127.0.0.1", 5432),
             "another service on the operator's loopback must stay unreachable"
