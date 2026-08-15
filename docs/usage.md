@@ -86,6 +86,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
 | Ports & mounts | `--shared-network` | Joins the shared bridge network so other containers can reach this one by name. See below. |
+| Ports & mounts | `--browser` | Attaches every browser `agent-sandbox browser` is running: maps each of their CDP ports and tells the agent which is which. `--browser=alice,bob` picks some of them. See below. |
 | Ports & mounts | `--host-loopback-port PORT` | Makes the host's `127.0.0.1:PORT` reachable at the sandbox's own `127.0.0.1:PORT`, and exports the list as `$AGENT_SANDBOX_HOST_PORTS`. Repeatable; takes `HOST:SANDBOX`. See below. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
@@ -167,13 +168,18 @@ everything `--proxy` enforces.
 
 ```console
 $ agent-sandbox browser
-browser: CDP on 127.0.0.1:9222, egress deny-by-default
+browser: 'e4c1a80f' -- CDP on 127.0.0.1:9222, egress deny-by-default
 browser: allowed: 127.0.0.1:3000
 browser:   agent-sandbox ctl proxy allow <host>:443 --browser
 browser:
 browser: now run, keeping whatever flags you already use:
-browser:   agent-sandbox --host-loopback-port 9222 -e AGENT_SANDBOX_BROWSER_CDP_PORT=9222 -- claude
+browser:   agent-sandbox --browser -- claude
 ```
+
+`--browser` on the launcher is the other half: it finds the browsers this
+command is running, maps each of their CDP ports, and tells the agent which is
+which, so the tooling below needs no further setup. Start the browsers first —
+the channel is established at launch and cannot be added to a running sandbox.
 
 It is the same `agent-sandbox-proxy` the sidecar runs, with the same policy
 format, the same `ctl proxy` commands, and the same traffic summary when the
@@ -216,15 +222,14 @@ browser: 'alice' -- CDP on 127.0.0.1:9222, egress deny-by-default
 ...
 $ agent-sandbox browser --name bob --keep-profile ~/.cache/browsers/bob
 browser: 'bob' -- CDP on 127.0.0.1:9223, egress deny-by-default
-browser: 2 browsers are running; this line covers all of them:
-browser:   agent-sandbox --host-loopback-port 9222 --host-loopback-port 9223 -e AGENT_SANDBOX_BROWSER_CDP_PORT=alice=9222,bob=9223 -- claude
+browser: 2 browsers running; --browser picks up all of them:
+browser:   agent-sandbox --browser -- claude
 ```
 
-Start them **before** the sandbox and use the last line printed:
-`--host-loopback-port` only takes effect at launch, so a browser started
-afterwards has no channel until the next one. That is why each banner reprints
-the whole command rather than its own fragment — you never have to merge two by
-hand.
+Start them **before** the sandbox: the channel is established at launch, so a
+browser started afterwards is not reachable until the next one. `--browser`
+resolves whatever is running at that moment, so the command does not change as
+you add sessions — `--browser=alice,bob` narrows it if you want only some.
 
 Ports are assigned by walking up from 9222, skipping any a live browser has
 already claimed, so you do not have to allocate them yourself. `--cdp-port`
@@ -299,15 +304,24 @@ the managed-policy route is `ExtensionInstallForcelist`.
 
 ### Browser MCP tools
 
-The `-e AGENT_SANDBOX_BROWSER_CDP_PORT=…` half of the printed line is what wires
-up tooling. With it set, the entrypoint writes an MCP config pointing
-`playwright-mcp` (bundled in the image) at that browser, so an agent gets
-`browser_navigate` / `browser_click` / `browser_take_screenshot` with no setup.
-Claude Code picks the config up automatically; other CLIs are told where it is.
+`--browser` sets `AGENT_SANDBOX_BROWSER_CDP_PORT` for you, and that is what
+wires up tooling: the entrypoint writes an MCP config pointing `playwright-mcp`
+(bundled in the image) at each browser, so an agent gets `browser_navigate` /
+`browser_click` / `browser_take_screenshot` with no setup. Claude Code picks the
+config up automatically; other CLIs are told where the file is.
 
-Set `AGENT_SANDBOX_BROWSER_MCP=headless` instead for a headless browser inside
-the sandbox, needing no host cooperation at all, or `=off` to write nothing. A
-launch that sets neither variable behaves exactly as it did before this existed.
+Set `AGENT_SANDBOX_BROWSER_MCP=headless` instead — with `-e`, and without
+`--browser` — for a headless browser inside the sandbox, needing no host
+cooperation at all, or `=off` to write nothing. A launch that sets neither
+behaves exactly as it did before this existed.
+
+The variable is the underlying interface and `--browser` is a shorthand over it,
+so the long form still works if you want to pin exact ports:
+
+```sh
+agent-sandbox --host-loopback-port 9222 --host-loopback-port 9223 \
+              -e AGENT_SANDBOX_BROWSER_CDP_PORT=alice=9222,bob=9223 -- claude
+```
 
 `--shared-network` is a separate decision. It puts the sandbox on a bridge so
 sibling containers can reach it by name, replacing pasta — so any pasta option

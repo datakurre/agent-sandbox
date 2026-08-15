@@ -65,6 +65,6 @@ agent-sandbox --workspace --proxy --proxy-profile development opencode
 | Run nested containers inside the sandbox | `--privileged` |
 | Add a hardware VM boundary | `--krun` (requires `/dev/kvm`) |
 | Inject API credentials scoped to a route | `--secrets` + `--proxy` |
-| Let the agent drive a visible browser you can watch | run `agent-sandbox browser`, then the line it prints |
+| Let the agent drive a visible browser you can watch | run `agent-sandbox browser`, then relaunch with `--browser` |
 
 See [Usage & Flags](usage.md) for the complete flags reference, [Configuration](configuration.md) for `AGENTS.md` syntax, and [Trust Model](trust-model.md) for the security implications of each flag.

@@ -660,6 +660,24 @@ pub fn running_instances() -> Vec<Instance> {
     out
 }
 
+/// What `--browser` puts in `AGENT_SANDBOX_BROWSER_CDP_PORT` for the browsers
+/// it selected.
+///
+/// One browser keeps the bare port, which is all a single session needs and
+/// what the entrypoint accepted before names existed.  Several are named, so
+/// the entrypoint can define one MCP server per browser and the agent can say
+/// which user it is acting as.
+pub fn cdp_port_env(selected: &[Instance]) -> String {
+    if selected.len() == 1 {
+        return selected[0].cdp_port.to_string();
+    }
+    selected
+        .iter()
+        .map(|i| format!("{}={}", i.name, i.cdp_port))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Signal 0: asks the kernel whether the pid exists without disturbing it.
 fn process_is_alive(pid: u32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
@@ -1002,35 +1020,14 @@ fn wait_for_proxy(runtime_dir: &str) {
     eprintln!("browser: the proxy did not report ready; starting anyway");
 }
 
-/// The relaunch line, covering *every* live browser rather than just this one.
+/// The line to paste, whatever number of browsers is running.
 ///
-/// Simulating two users means two browsers, and the sandbox has to be launched
-/// with both ports -- `--host-loopback-port` cannot be added to a running
-/// session, so a line naming only the browser that happened to print it would
-/// be a line that has to be hand-merged with the last one. `sessions` is
-/// `(name, port)` oldest first.
-pub fn relaunch_line(sessions: &[(String, u16)]) -> String {
-    let ports: String = sessions
-        .iter()
-        .map(|(_, port)| format!("--host-loopback-port {} ", port))
-        .collect();
-    // One browser keeps the bare form, which is all a single session needs and
-    // what the entrypoint has always accepted.  Several are named, so each gets
-    // its own MCP server rather than the agent having to guess which is which.
-    let cdp = if sessions.len() == 1 {
-        sessions[0].1.to_string()
-    } else {
-        sessions
-            .iter()
-            .map(|(name, port)| format!("{}={}", name, port))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    format!(
-        "agent-sandbox {}-e AGENT_SANDBOX_BROWSER_CDP_PORT={} -- claude",
-        ports, cdp
-    )
-}
+/// `--browser` resolves the running browsers itself -- their ports and their
+/// names -- so this stays one flag however many sessions there are, and stays
+/// correct when another starts. It used to spell out a `--host-loopback-port`
+/// per browser plus an `AGENT_SANDBOX_BROWSER_CDP_PORT=` naming them all: an
+/// accurate line that nobody could read and that went stale immediately.
+pub const RELAUNCH_LINE: &str = "agent-sandbox --browser -- claude";
 
 fn print_banner(session: &str, cdp_port: u16, allow: &AllowList, sandbox: Option<&str>) {
     let allowed = url_allowlist(allow);
@@ -1049,24 +1046,19 @@ fn print_banner(session: &str, cdp_port: u16, allow: &AllowList, sandbox: Option
     );
     eprintln!("browser:");
 
-    // Include the browsers that were already running, so the printed line is
-    // the whole command rather than this session's fragment of it.
-    let mut sessions: Vec<(String, u16)> = running_instances()
+    let others = running_instances()
         .into_iter()
         .filter(|i| i.name != session)
-        .map(|i| (i.name, i.cdp_port))
-        .collect();
-    sessions.push((session.to_string(), cdp_port));
-
-    if sessions.len() > 1 {
+        .count();
+    if others > 0 {
         eprintln!(
-            "browser: {} browsers are running; this line covers all of them:",
-            sessions.len()
+            "browser: {} browsers running; --browser picks up all of them:",
+            others + 1
         );
     } else {
         eprintln!("browser: now run, keeping whatever flags you already use:");
     }
-    eprintln!("browser:   {}", relaunch_line(&sessions));
+    eprintln!("browser:   {}", RELAUNCH_LINE);
 
     if sandbox.is_some() {
         eprintln!("browser:");
@@ -1303,24 +1295,25 @@ mod tests {
         assert_eq!(pick_port(9222, |_| false), None);
     }
 
-    #[test]
-    fn one_session_keeps_the_bare_relaunch_line() {
-        assert_eq!(
-            relaunch_line(&[("7f3a1b2c".to_string(), 9222)]),
-            "agent-sandbox --host-loopback-port 9222 \
-             -e AGENT_SANDBOX_BROWSER_CDP_PORT=9222 -- claude"
-        );
+    fn inst(name: &str, port: u16) -> Instance {
+        Instance {
+            dir: format!("/run/x/{name}"),
+            name: name.to_string(),
+            cdp_port: port,
+            pid: 1,
+        }
     }
 
     #[test]
-    fn several_sessions_produce_one_line_covering_all_of_them() {
-        // --host-loopback-port cannot be added to a running sandbox, so a line
-        // naming only the browser that printed it would have to be hand-merged
-        // with the previous one -- exactly the round trip this avoids.
+    fn one_browser_keeps_the_bare_port_the_entrypoint_always_took() {
+        assert_eq!(cdp_port_env(&[inst("7f3a1b2c", 9222)]), "9222");
+    }
+
+    #[test]
+    fn several_browsers_are_named_so_the_agent_can_tell_them_apart() {
         assert_eq!(
-            relaunch_line(&[("alice".to_string(), 9222), ("bob".to_string(), 9223)]),
-            "agent-sandbox --host-loopback-port 9222 --host-loopback-port 9223 \
-             -e AGENT_SANDBOX_BROWSER_CDP_PORT=alice=9222,bob=9223 -- claude"
+            cdp_port_env(&[inst("alice", 9222), inst("bob", 9223)]),
+            "alice=9222,bob=9223"
         );
     }
 

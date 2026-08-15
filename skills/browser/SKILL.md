@@ -165,24 +165,24 @@ needs to paste.
 The sandbox flag can only be set at launch, so this needs a relaunch either
 way. Give them the whole thing in one message:
 
-> Run `agent-sandbox browser` in another terminal. It prints a line starting
-> `agent-sandbox --host-loopback-port …`; run that in place of your usual
-> `agent-sandbox` command, keeping whatever flags you already use.
+> Run `agent-sandbox browser` in another terminal, then relaunch the sandbox
+> with `--browser` added to whatever flags you already use:
+> `agent-sandbox --browser -- claude`.
 
 What they'll see:
 
 ```
 $ agent-sandbox browser
-browser: CDP on 127.0.0.1:9222, egress deny-by-default
+browser: 'e4c1a80f' -- CDP on 127.0.0.1:9222, egress deny-by-default
 browser: allowed: 127.0.0.1:3000
 browser:   agent-sandbox ctl proxy allow <host>:443 --browser
 browser:
 browser: now run, keeping whatever flags you already use:
-browser:   agent-sandbox --host-loopback-port 9222 -e AGENT_SANDBOX_BROWSER_CDP_PORT=9222 -- claude
+browser:   agent-sandbox --browser -- claude
 ```
 
-The `-e AGENT_SANDBOX_BROWSER_CDP_PORT=9222` half is what wires up the MCP
-tools below. `--host-loopback-port` alone is enough for the scripted path.
+`--browser` attaches whatever browsers are running: it maps their CDP ports and
+tells the agent which is which, so the MCP tools below need no further setup.
 
 If they don't have Chromium on their host, `nix run
 github:datakurre/agent-sandbox#browser` runs it with a pinned one.
@@ -257,13 +257,13 @@ browsers rather than one:
 > agent-sandbox browser --name bob   --keep-profile ~/.cache/browsers/bob
 > ```
 
-Each banner reprints the whole relaunch command covering every running browser,
-so the last one is always the complete line — the user never merges two by hand.
-Ports walk up from 9222, so alice is 9222 and bob is 9223.
+Then the same `agent-sandbox --browser -- claude` as always: `--browser` picks
+up every browser that is running, so the command does not grow with the number
+of users. Ports walk up from 9222, so alice is 9222 and bob is 9223.
 
-Ask for both up front. `--host-loopback-port` only applies at launch, so a
-second browser started after the sandbox has no channel until the next relaunch
-— which is the one round trip worth avoiding.
+Ask for both up front. The channel is established at launch, so a second browser
+started after the sandbox is not reachable until the next relaunch — which is
+the one round trip worth avoiding.
 
 Inside, each becomes its own MCP server (`playwright-alice`, `playwright-bob`),
 so say which user you are acting as by choosing the server. From a script, hold
@@ -298,7 +298,7 @@ To point that browser at a server running *in* the sandbox, publish a port —
 that is also what seeds the allow list, so the two fit together:
 
 ```sh
-agent-sandbox --ports --host-loopback-port 9222 -- bash
+agent-sandbox --ports --browser -- bash
 ```
 
 Bind that server to `0.0.0.0` inside the sandbox: publishing forwards to the
