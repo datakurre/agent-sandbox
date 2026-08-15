@@ -351,6 +351,29 @@ const MCP_CONFIG: &str = "/home/user/.config/agent-sandbox/mcp.json";
 ///   instead, needing no host cooperation at all.
 ///
 /// `AGENT_SANDBOX_BROWSER_MCP=off` turns both off.
+/// How to point `playwright-mcp` at a browser, or `None` for "do nothing".
+///
+/// A CDP port wins over the mode: someone who pasted the line `agent-sandbox
+/// browser` printed wants that browser, not a second headless one.
+fn mcp_server_args(cdp_port: Option<&str>, mode: &str) -> Option<Vec<String>> {
+    if mode == "off" {
+        return None;
+    }
+    match (cdp_port, mode) {
+        (Some(port), _) => Some(vec![
+            "--cdp-endpoint".to_string(),
+            // 127.0.0.1 rather than localhost: the entrypoint's socat listener
+            // is on the v4 loopback, and Chrome's DevTools host check accepts
+            // an IP but not an arbitrary name.
+            format!("http://127.0.0.1:{}", port),
+        ]),
+        (None, "headless") => Some(vec!["--headless".to_string(), "--isolated".to_string()]),
+        // Neither asked for: a default launch must behave exactly as it did
+        // before this step existed.
+        (None, _) => None,
+    }
+}
+
 fn browser_mcp_setup() -> Vec<String> {
     let mode = env::var("AGENT_SANDBOX_BROWSER_MCP").unwrap_or_default();
     if mode == "off" {
@@ -360,16 +383,8 @@ fn browser_mcp_setup() -> Vec<String> {
         .ok()
         .filter(|v| !v.is_empty());
 
-    let server_args: Vec<String> = match (&cdp_port, mode.as_str()) {
-        (Some(port), _) => vec![
-            "--cdp-endpoint".to_string(),
-            // 127.0.0.1 rather than localhost: the entrypoint's socat listener
-            // is on the v4 loopback, and Chrome's DevTools host check accepts
-            // an IP but not an arbitrary name.
-            format!("http://127.0.0.1:{}", port),
-        ],
-        (None, "headless") => vec!["--headless".to_string(), "--isolated".to_string()],
-        (None, _) => return Vec::new(),
+    let Some(server_args) = mcp_server_args(cdp_port.as_deref(), &mode) else {
+        return Vec::new();
     };
 
     let Ok(server) = which("mcp-server-playwright").or_else(|_| which("playwright-mcp")) else {
@@ -430,4 +445,55 @@ fn which(cmd: &str) -> Result<PathBuf, ()> {
         }
     }
     Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_default_launch_configures_nothing() {
+        // The whole step is opt-in: a sandbox started without either variable
+        // must behave exactly as it did before this existed, including not
+        // having an argument appended to the agent's own command line.
+        assert_eq!(mcp_server_args(None, ""), None);
+    }
+
+    #[test]
+    fn a_mapped_cdp_port_drives_the_host_browser() {
+        assert_eq!(
+            mcp_server_args(Some("9222"), ""),
+            Some(vec![
+                "--cdp-endpoint".to_string(),
+                "http://127.0.0.1:9222".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn headless_mode_needs_no_host_cooperation() {
+        assert_eq!(
+            mcp_server_args(None, "headless"),
+            Some(vec!["--headless".to_string(), "--isolated".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_cdp_port_wins_over_the_mode() {
+        // Someone who pasted the line `agent-sandbox browser` printed wants
+        // that browser, not a second headless one alongside it.
+        assert_eq!(
+            mcp_server_args(Some("19222"), "headless"),
+            Some(vec![
+                "--cdp-endpoint".to_string(),
+                "http://127.0.0.1:19222".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn off_wins_over_everything() {
+        assert_eq!(mcp_server_args(Some("9222"), "off"), None);
+        assert_eq!(mcp_server_args(None, "off"), None);
+    }
 }

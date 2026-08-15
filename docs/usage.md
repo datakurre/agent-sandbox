@@ -156,6 +156,110 @@ agent-sandbox --host-loopback-port 9222 --host-loopback-port 5432:15432 -- bash
     egress policy no longer bounds what can be fetched. That is deliberate and
     opt-in — but only for the ports you named. See [Trust model](trust-model.md).
 
+## A cooperative browser: `agent-sandbox browser`
+
+The warning above is why this command exists. Handing the agent a CDP port is
+useful — a visible window, a page you can click along with, real rendering — and
+the cost is that the browser on the far end fetches on your account, outside
+everything `--proxy` enforces.
+
+`agent-sandbox browser` starts a browser that carries an allow list of its own:
+
+```console
+$ agent-sandbox browser
+browser: CDP on 127.0.0.1:9222, egress deny-by-default
+browser: allowed: 127.0.0.1:3000
+browser:   agent-sandbox ctl proxy allow <host>:443 --browser
+browser:
+browser: now run, keeping whatever flags you already use:
+browser:   agent-sandbox --host-loopback-port 9222 -e AGENT_SANDBOX_BROWSER_CDP_PORT=9222 -- claude
+```
+
+It is the same `agent-sandbox-proxy` the sidecar runs, with the same policy
+format, the same `ctl proxy` commands, and the same traffic summary when the
+browser closes. The profile is ephemeral and holds none of your logins.
+
+With no arguments the allow list is **the loopback ports the target sandbox
+publishes, and nothing else** — enough to load the app under test, and no more.
+Widen it up front or while it runs:
+
+```sh
+agent-sandbox browser --allow example.com:443       # at start
+agent-sandbox browser --proxy-profile development   # a reusable profile
+agent-sandbox browser --network                     # AGENTS.md's [network] block
+agent-sandbox ctl proxy allow example.com:443 --browser   # while it runs
+```
+
+| Flag | What it does |
+| --- | --- |
+| `--cdp-port PORT` | where CDP listens; walks up from 9222 if taken |
+| `--allow HOST[:PORT]` | allow a domain, IP/CIDR or host:port; repeatable |
+| `--proxy-profile NAME` | merge a host-owned profile, the same files `--proxy-profile` takes |
+| `--network` | also merge `[network]` from `AGENTS.md` in the current directory |
+| `--no-published-ports` | do not seed the allow list from the sandbox's published ports |
+| `--extension DIR` | load an unpacked extension; repeatable |
+| `--no-extensions` | load none, including any built into the wrapper |
+| `--keep-profile DIR` | reuse a profile directory instead of an ephemeral one |
+| `--chromium PATH` | which browser to launch |
+| `--no-policy-overlay` | skip the managed-policy layer (the proxy still applies) |
+
+Several can run at once: each gets its own profile, policy, proxy port and CDP
+port, and cleans up after itself.
+
+Chromium is deliberately **not** part of the default package, so a plain install
+carries no browser closure. `agent-sandbox browser` uses a Chromium on `PATH`;
+if there is none, run it with a pinned one:
+
+```sh
+nix run github:datakurre/agent-sandbox#browser
+```
+
+!!! warning "Two layers, and they are not equals"
+    The proxy is the bound: the browser is launched with `--proxy-server`
+    pointing at it, and it denies by default. A managed Chromium policy
+    (`URLBlocklist`/`URLAllowlist`) is a second, coarser net over the same allow
+    list, and it is best-effort — it needs `bwrap` to bind over Chromium's
+    compile-time policy directory, and the command says so on stderr when it
+    cannot. Without it, a CDP client can create a browser context with a proxy
+    of its own and bypass the first layer. The managed policy binds the agent
+    driving CDP, not you: you own the machine and can edit the same directory.
+    See [Trust model](trust-model.md).
+
+### Extensions
+
+`--extension DIR` loads an unpacked extension, repeatably. To have some loaded
+every time, override the package:
+
+```nix
+(import ./default.nix { inherit pkgs lib; }).override {
+  browserExtensions = [ ./my-extension ];
+}
+```
+
+Nothing is loaded by default: nixpkgs packages no Chrome extensions, so a
+default would mean pinning a release artifact from elsewhere, and the ephemeral
+profile is better off minimal.
+
+Both flags reach Chromium as `--load-extension` plus
+`--disable-extensions-except`, which is also why the wrapper pins `chromium`
+rather than `google-chrome`: branded Chrome removed the first in 137 and the
+second in 139, so an extension list there would quietly do nothing. When the
+managed-policy layer is active it additionally blocks installing anything else
+into the profile. For a Web Store extension rather than an unpacked directory,
+the managed-policy route is `ExtensionInstallForcelist`.
+
+### Browser MCP tools
+
+The `-e AGENT_SANDBOX_BROWSER_CDP_PORT=…` half of the printed line is what wires
+up tooling. With it set, the entrypoint writes an MCP config pointing
+`playwright-mcp` (bundled in the image) at that browser, so an agent gets
+`browser_navigate` / `browser_click` / `browser_take_screenshot` with no setup.
+Claude Code picks the config up automatically; other CLIs are told where it is.
+
+Set `AGENT_SANDBOX_BROWSER_MCP=headless` instead for a headless browser inside
+the sandbox, needing no host cooperation at all, or `=off` to write nothing. A
+launch that sets neither variable behaves exactly as it did before this existed.
+
 `--shared-network` is a separate decision. It puts the sandbox on a bridge so
 sibling containers can reach it by name, replacing pasta — so any pasta option
 you wanted is given up with it. Publishing does not need it, and neither does
@@ -267,10 +371,11 @@ The image includes five OpenCode skills at `/home/user/.agents/skills`:
   `nix develop --command` development shells.
 - `devenv` for `devenv.nix`: declarative environments with language toolchains
   and supporting services, entered with `devenv shell -- <command>`.
-- `browser` for headless browser automation sourced from nixpkgs: screenshotting
-  a page for visual analysis and driving it via Playwright (or the packaged
-  `playwright-mcp` server), including the fontconfig fix a font-less image
-  otherwise needs.
+- `browser` for browser automation, in both shapes: headless inside the sandbox
+  from nixpkgs, and the cooperative host browser `agent-sandbox browser` starts.
+  It covers screenshotting a page for visual analysis, driving it via Playwright
+  or the bundled `playwright-mcp` server, and which of the two browsers a given
+  task wants.
 
 Each skill is a `SKILL.md` with the common path plus reference files with
 advanced patterns. `nix-flake` additionally carries `uv2nix.md` (packaging
@@ -304,6 +409,7 @@ and `~/.gemini/skills` for tools that use those discovery paths.
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
 | `relay [-f] [WORD] [--sandbox WORD]` | show the SSH/GPG relay's `allow_signing` policy and what it has been asked for |
 | `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |
+| `browser [WORD] [--sandbox WORD]` | start a throwaway host browser behind a deny-by-default allow list, for cooperative testing over CDP (see below) |
 | `purge [--all] [-n] [-f]` | reclaim leftovers; running sandboxes are kept unless `--all`, and `-f` skips the confirmation |
 
 New sandboxes are shown by a single session word, such as `silent`. Use that

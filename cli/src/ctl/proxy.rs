@@ -307,10 +307,14 @@ fn show(args: TargetArgs) -> Result<()> {
         } else {
             value.to_string()
         };
-        let source = if base_lines.contains(line) {
-            "AGENTS.md"
-        } else {
+        // A browser's launch rules come from --allow, --proxy-profile and the
+        // sandbox's published ports, so naming AGENTS.md there would be wrong.
+        let source = if !base_lines.contains(line) {
             ""
+        } else if args.browser {
+            "at start"
+        } else {
+            "AGENTS.md"
         };
         println!("  {:<13} {:<34} {}", key, display_value, source);
     }

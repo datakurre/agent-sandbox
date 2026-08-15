@@ -1756,6 +1756,39 @@ mod tests {
         )
     }
 
+    fn args(extra: &[&str]) -> Options {
+        let mut argv = vec!["agent-sandbox-proxy".to_string()];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        parse_args(&argv).0
+    }
+
+    #[test]
+    fn the_shared_dir_defaults_to_the_sidecar_volume() {
+        let o = args(&[]);
+        assert_eq!(o.shared_dir, DEFAULT_SHARED_DIR);
+        assert_eq!(proxy_ready_path(&o.shared_dir), "/sidecar_shared/proxy-ready");
+        assert_eq!(proxy_ca_pem_path(&o.shared_dir), "/sidecar_shared/ca.pem");
+        assert_eq!(
+            egress_degraded_path(&o.shared_dir),
+            "/sidecar_shared/egress-degraded"
+        );
+        assert!(!o.no_egress_probe, "the sidecar still waits for egress");
+    }
+
+    #[test]
+    fn a_host_run_relocates_all_three_state_files() {
+        // `agent-sandbox browser` runs this binary outside the sidecar, where
+        // /sidecar_shared does not exist and writing the CA there is fatal.
+        let o = args(&["--shared-dir", "/run/user/1000/b", "--no-egress-probe"]);
+        assert_eq!(proxy_ready_path(&o.shared_dir), "/run/user/1000/b/proxy-ready");
+        assert_eq!(proxy_ca_pem_path(&o.shared_dir), "/run/user/1000/b/ca.pem");
+        assert_eq!(
+            egress_degraded_path(&o.shared_dir),
+            "/run/user/1000/b/egress-degraded"
+        );
+        assert!(o.no_egress_probe);
+    }
+
     #[test]
     fn exact_domain_does_not_match_subdomains() {
         assert!(domain_match("github.com", "github.com"));

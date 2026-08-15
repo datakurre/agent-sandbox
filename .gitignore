@@ -4,3 +4,6 @@ result
 result-*
 /target/
 Cargo.lock
+
+# `mkdocs build` output (see AGENTS.md)
+/site/

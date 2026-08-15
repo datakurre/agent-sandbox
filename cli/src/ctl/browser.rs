@@ -745,14 +745,16 @@ pub fn run(args: BrowserArgs) -> Result<()> {
 
     // Ports before any files: a clash should fail before there is anything to
     // clean up.
-    let cdp_port =
-        pick_port(args.cdp_port.unwrap_or(DEFAULT_CDP_PORT), port_is_free).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no free port in {} starting at {}",
-                CDP_PORT_SCAN,
-                args.cdp_port.unwrap_or(DEFAULT_CDP_PORT)
-            )
-        })?;
+    //
+    // A port another browser has claimed counts as taken even before its
+    // Chromium has bound it.  Two invocations seconds apart would otherwise
+    // both pick 9222, and the second would lose the race to bind it.  The same
+    // call sweeps the runtime directory of any browser killed hard enough to
+    // skip its own cleanup.
+    let claimed: BTreeSet<u16> = running_instances().iter().map(|i| i.cdp_port).collect();
+    let start = args.cdp_port.unwrap_or(DEFAULT_CDP_PORT);
+    let cdp_port = pick_port(start, |p| !claimed.contains(&p) && port_is_free(p))
+        .ok_or_else(|| anyhow::anyhow!("no free port within {} of {}", CDP_PORT_SCAN, start))?;
     // The proxy port is never advertised, so it can be anything free.
     let proxy_port = TcpListener::bind("127.0.0.1:0")
         .context("cannot reserve a proxy port")?
@@ -1192,5 +1194,17 @@ mod tests {
         assert_eq!(pick_port(9222, |p| p >= 9224), Some(9224));
         assert_eq!(pick_port(9222, |_| true), Some(9222));
         assert_eq!(pick_port(9222, |_| false), None);
+    }
+
+    #[test]
+    fn a_port_another_browser_claimed_is_skipped_even_if_nothing_bound_it_yet() {
+        // The window between picking a port and Chromium binding it is real:
+        // two invocations seconds apart would otherwise both land on 9222.
+        let claimed: BTreeSet<u16> = [9222, 9223].into_iter().collect();
+        assert_eq!(
+            pick_port(9222, |p| !claimed.contains(&p)),
+            Some(9224),
+            "a claimed port is taken whether or not it is bound"
+        );
     }
 }
