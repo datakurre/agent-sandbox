@@ -1,17 +1,17 @@
-# Headless browser — advanced patterns
+# Browser — advanced patterns
 
-Read `SKILL.md` first. This assumes `PLAYWRIGHT_BROWSERS_PATH` and
-`FONTCONFIG_FILE` are already exported as shown there.
+Read `SKILL.md` first. The headless sections assume `PLAYWRIGHT_BROWSERS_PATH`
+is exported as shown there.
 
-## Why fonts are missing, in full
+## Fonts, in full
 
-`agent-sandbox` images are built for CLI/dev tooling, not desktop rendering —
-`/etc/fonts` doesn't exist and no font packages are installed anywhere. That is
-a gap in the base image, not something specific to Chromium: any tool that
-shells out to fontconfig would hit the same wall. `pkgs.makeFontsConf` is
-nixpkgs' own helper for exactly this case (it's what NixOS's headless-browser
-tests use) — it builds a `fonts.conf` pointing at the font packages you give
-it, with no need for a real `/etc/fonts` to exist:
+The image ships `dejavu_fonts` and `liberation_ttf` and sets `FONTCONFIG_FILE`,
+which covers Latin text. It does not ship a full desktop font set: CJK,
+Arabic, Devanagari and emoji all render as boxes or nothing.
+
+`pkgs.makeFontsConf` is nixpkgs' own helper for this (it's what NixOS's
+headless-browser tests use) — it builds a `fonts.conf` pointing at the font
+packages you give it, with no need for a real `/etc/fonts` to exist:
 
 ```sh
 nix build --impure --expr \
@@ -21,12 +21,12 @@ nix build --impure --expr \
 ```
 
 Add `noto-fonts-color-emoji` (or other script-specific font packages) if the
-pages you're rendering need non-Latin scripts or emoji — `dejavu_fonts` and
-`liberation_ttf` alone only cover Latin text well.
+pages you're rendering need non-Latin scripts or emoji.
 
-To debug font resolution directly, add `fontconfig` to a `nix shell` and run
-`fc-list` — with `FONTCONFIG_FILE` unset it prints nothing; with it set, it
-lists every font `makeFontsConf` wired in.
+Note that a `nix shell --command` inherits `FONTCONFIG_FILE` from the
+environment, so the image's value applies unless something overrides it. To
+debug font resolution directly, add `fontconfig` to a `nix shell` and run
+`fc-list` — it lists every font the active config wired in.
 
 ## Filling forms, waiting, multiple tabs
 
@@ -98,9 +98,48 @@ nix build --impure --expr \
   'with (builtins.getFlake "nixpkgs/nixos-25.05").legacyPackages.${builtins.currentSystem}; ...'
 ```
 
+## A browser the user already had open
+
+`agent-sandbox browser` is the path to prefer: it is disposable, it carries an
+allow list, and it prints the relaunch line. But the user may have their own
+Chrome open already — with their logins, their extensions, a session they do
+not want to recreate — and want *that* driven.
+
+That browser is not policed by anything. What it fetches is on their account,
+and `--host-loopback-port` is a channel the sandbox's proxy never sees. Say so
+when suggesting it, and treat it as the exception.
+
+They need two things, in one message:
+
+```sh
+google-chrome --user-data-dir=/tmp/cdp-profile \
+              --remote-debugging-port=9222 \
+              --remote-debugging-address=127.0.0.1
+# or chromium, same flags
+```
+
+```sh
+agent-sandbox --host-loopback-port 9222 -- <their usual command>
+```
+
+The separate `--user-data-dir` is **required**, not optional: Chrome 136+
+refuses `--remote-debugging-port` on the default profile outright, and an
+already-running Chrome silently ignores the flag. Keep
+`--remote-debugging-address` on `127.0.0.1`, never `0.0.0.0` — CDP has no
+authentication, so reachability is the only thing standing between "the sandbox
+can drive this tab" and "anything on the network can read every cookie and run
+arbitrary JS in it."
+
+If the sandbox already has something on 9222, the user can move the inside
+number: `--host-loopback-port 9222:19222` puts the host's 9222 on the sandbox's
+19222, and `$AGENT_SANDBOX_HOST_PORTS` then lists `19222`.
+
+Attach with `connect_over_cdp` exactly as in `SKILL.md`.
+
 ## playwright-mcp flags
 
-From `nix run nixpkgs#playwright-mcp -- --help`:
+`playwright-mcp` is on the image PATH — no `nix run`, and it works under
+`--proxy` without reaching `cache.nixos.org`. From `playwright-mcp --help`:
 
 | Flag | What it does |
 | --- | --- |
@@ -114,27 +153,39 @@ From `nix run nixpkgs#playwright-mcp -- --help`:
 | `--storage-state <path>` | reuse cookies/local storage across runs |
 | `--no-sandbox` | disable Chromium's own sandbox (container default) |
 | `--port <port>` | serve over SSE instead of stdio |
+| `--cdp-endpoint <url>` | drive a browser already running, instead of launching one |
 
-## Registering with other agent CLIs
+`--allowed-origins` / `--blocked-origins` exist too, but its own documentation
+says they are not a security boundary — the proxy is what bounds a host
+browser, and the sandbox's `--proxy` policy is what bounds a headless one.
 
-The same `nix run nixpkgs#playwright-mcp -- --headless --isolated` command
-works as the server command for any MCP-aware CLI; only the registration verb
-differs, e.g. for codex:
+## Registering it yourself
+
+The entrypoint writes an MCP config at `~/.config/agent-sandbox/mcp.json` when
+`AGENT_SANDBOX_BROWSER_CDP_PORT` is set (host browser) or
+`AGENT_SANDBOX_BROWSER_MCP=headless` is set (a headless one in here). Claude
+Code picks it up automatically; other CLIs need one registration, e.g.:
 
 ```sh
-codex mcp add playwright-nix --env DISPLAY=:0 -- nix run nixpkgs#playwright-mcp -- --headless --isolated
+codex mcp add playwright -- playwright-mcp --headless --isolated
 ```
+
+`AGENT_SANDBOX_BROWSER_MCP=off` turns the whole thing off.
 
 ## Debugging checklist
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Screenshot is a flat, uniform color | no fonts | export `FONTCONFIG_FILE` (see `SKILL.md`) |
+| Screenshot is a flat, uniform color | no usable fonts | check `$FONTCONFIG_FILE` and `fc-list`; rebuild it with the scripts the page needs (see above) |
 | `page.goto()` hangs or times out | proxied sandbox denying the host | check `$HTTPS_PROXY`, pass it explicitly, ask for `ctl proxy allow` |
 | "Failed to move to new namespace" / renderer crash | container can't create Chromium's own sandbox | add `--no-sandbox` to `launch(args=[...])` |
 | Renderer crashes under load, blank/partial screenshot | `/dev/shm` too small (often 64 MB in containers) | add `--disable-dev-shm-usage` |
 | `browserType.launch` complains about a missing executable | `PLAYWRIGHT_BROWSERS_PATH` unset or wrong | re-export it, see `SKILL.md` |
-| `$AGENT_SANDBOX_HOST_PORTS` is unset, or missing the port | launched without `--host-loopback-port 9222`, so nothing reaches the host's `127.0.0.1:9222` | ask the user to relaunch with `agent-sandbox --host-loopback-port 9222`, see `SKILL.md` |
-| `connect_over_cdp` refuses/times out with the port listed | the channel exists, so Chrome is not listening on the host's `127.0.0.1:9222` | an already-running Chrome ignores `--remote-debugging-port`; the user needs a separate `--user-data-dir` |
+| `$AGENT_SANDBOX_HOST_PORTS` is unset, or missing the port | launched without `--browser`, so nothing reaches the host's `127.0.0.1:9222` | ask the user to run `agent-sandbox browser`, then relaunch with `--browser`, see `SKILL.md` |
+| `connect_over_cdp` refuses/times out with the port listed | the channel exists, so nothing is listening on the host's `127.0.0.1:9222` | the browser was closed, or a hand-started Chrome had no separate `--user-data-dir` |
+| No `browser_*` MCP tools, but CDP works from a script | relaunched with a bare `--host-loopback-port` instead of `--browser`, so nothing set `AGENT_SANDBOX_BROWSER_CDP_PORT` | use `--browser`, or add the variable with `-e` |
+| Only one browser reachable when two were started | the second was started after the sandbox, so `--browser` never saw it | start every browser before the sandbox; the channel is set at launch |
+| `ctl proxy … --browser` says several browsers are running | more than one session, so the target is ambiguous | name one: `--browser alice` |
+| A page in the host browser fails to load, `curl` from here reaches it | the browser's allow list is separate from the sandbox's | `agent-sandbox ctl proxy allow <host>:443 --browser` |
 | `socat` reports it could not bind, or the port answers the wrong service | something in the sandbox already listens on that number | relaunch with `--host-loopback-port 9222:19222` and dial 19222 inside |
 | `host.containers.internal` refuses even though the host's service is up | that name is podman's `--map-guest-addr`, which resolves to the host's *LAN* address, not its loopback | bind the host service to `0.0.0.0` to use that name, or map it with `--host-loopback-port` for a loopback-bound one |

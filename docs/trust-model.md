@@ -1,7 +1,7 @@
 # Trust model
 
 !!! warning "Flags that pierce the sandbox boundary"
-    `--ssh`, `--gpg`, `--podman`, and `--host-loopback-port` each hand the agent a capability that reaches outside the container. Review the section for each flag below before enabling them.
+    `--ssh`, `--gpg`, `--podman`, and `--host-loopback-port` each hand the agent a capability that reaches outside the container. Review the section for each flag below before enabling them. For the browser case in particular, prefer `agent-sandbox browser` over mapping a CDP port onto a browser of your own.
 
 By design, `agent-sandbox` includes options that pierce the sandbox boundary. Note that these give any agent running inside the container capabilities on the host:
 
@@ -11,6 +11,24 @@ By design, `agent-sandbox` includes options that pierce the sandbox boundary. No
 - `--host-loopback-port PORT` (opt-in): Makes the host's `127.0.0.1:PORT` reachable from inside, so the agent can drive a service you run there. Only the ports you name — but each one is a genuine capability, and what is listening on it decides how large. A database with no password because "it's only local" is now reachable by the agent; a browser's CDP port is the extreme case, because CDP has no authentication and hands the agent a fully-privileged, cookie-bearing browser running as you.
     - **Under `--proxy` it is a channel the sidecar never sees**, and this is the one place where the egress policy stops being a bound. The proxy governs what the *sandbox* connects to; it cannot govern what a program on the host fetches on its own account, so an agent that can say `Page.navigate` can read any page your browser can. Nothing else in the sandbox is loosened — ordinary traffic is still denied by default, and the traffic summary still accounts for it — but a mapped port is deliberately outside that accounting. Map only ports you would be comfortable handing to the agent directly.
     - It is a bind-mounted socket rather than a route, which is why it composes with `--proxy` where the whole-loopback mapping it replaced could not. That is a mechanical fact, not a safety argument: the narrowing to named ports is what makes it defensible.
+    - **`agent-sandbox browser` narrows the browser case specifically**, and is what to reach for instead of starting a browser by hand. What it maps is a browser it started itself: an ephemeral profile carrying none of your logins, behind an allow list of its own that defaults to the loopback ports your sandbox publishes and nothing else. The paragraph above still describes a CDP port *you* opened onto *your* browser; it no longer describes the only way to get one. The bounds and their limits are in the section below.
+
+## A policed host browser: `agent-sandbox browser`
+
+The command exists to make the capability above narrower, not to make the sandbox wider. It is worth being precise about what it does and does not decide.
+
+**What bounds it.** The browser is launched with `--proxy-server` pointing at an `agent-sandbox-proxy` of its own, on a loopback port only that instance knows, denying by default. That proxy is the bound: it is the same binary, the same policy format, and the same `agent-sandbox ctl proxy` commands as the sidecar's, and it writes the same connection log — so what the browser fetched is accounted for, and shown as a traffic summary when it closes.
+
+**A second, weaker layer.** A managed Chromium policy (`URLBlocklist: ["*"]` plus a `URLAllowlist` derived from the same rules, and a pinned `ProxySettings`) is written per instance. It exists for one specific gap: a CDP client can ask for a browser context with a proxy of its own, which the first layer would never see, and `URLBlocklist` is enforced in the browser process regardless of the proxy a context uses. It is best-effort in two ways worth stating plainly:
+
+- It needs `bwrap` to bind over Chromium's policy directory, which is a compile-time constant with no flag or environment override. The command probes for this at start and prints what is lost when it cannot — it does not fail, and it does not pretend.
+- It is coarser than the proxy. Chromium's filter syntax cannot express a CIDR or a port range, so a rule it cannot represent exactly widens to the host. Widening in this layer can only ever let through something the proxy still refuses.
+
+**Who it binds.** The agent driving CDP, not you. `/etc/chromium/policies` is writable by any unprivileged user with `bwrap` — that is precisely the mechanism used to install it — so this is not a control over the person at the keyboard, and is not offered as one.
+
+**What it does not change.** The sandbox's own egress policy is untouched, and the two are separate: a host allowed for the browser is not allowed for a `curl` from inside, and vice versa. A published port is still ingress. The browser's allow list is not a way to widen the sandbox's.
+
+**Two policies, one escalation.** `agent-sandbox ctl proxy allow <host>:443 --browser` widens the browser; the same command without `--browser` widens a sandbox. Both apply within a second without a restart.
 
 ### Running Containers: `--podman` vs `--privileged`
 If you want the agent to be able to run its own containers, `agent-sandbox` supports two distinct models:

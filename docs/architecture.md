@@ -41,7 +41,7 @@ Key layers:
 | `/usr/bin/env`        | Symlink to coreutils `env` for generic shebangs        |
 | `/lib64/ld-linux-*`   | ELF interpreter for prebuilt npm binaries              |
 | `/home/user`          | Home directory (uid/gid mapped at runtime)             |
-| `/home/user/.agents/skills` | Bundled `nix`, `nix-flake` and `devenv` skills   |
+| `/home/user/.agents/skills` | Bundled `agent-sandbox`, `nix`, `nix-flake`, `devenv` and `browser` skills |
 | `/workspace`          | Default working directory                              |
 
 The skills are image content, not a launcher-managed mount, and the image links
@@ -60,7 +60,18 @@ the canonical tree from each tool's own discovery path. See
    built-in `fetch` (undici) stop dialing out directly — this also covers
    the bundled Node-based agent CLIs, which share Node's runtime. An
    operator's own explicit `NODE_USE_ENV_PROXY` setting is left alone.
-5. `exec "$@"`.
+5. Puts a `socat` TCP listener in front of each `--host-loopback-port` socket,
+   because the clients that want them speak TCP and not unix sockets.
+6. When `AGENT_SANDBOX_BROWSER_CDP_PORT` or `AGENT_SANDBOX_BROWSER_MCP=headless`
+   is set, writes an MCP config for the bundled `playwright-mcp` at
+   `~/.config/agent-sandbox/mcp.json` — pointing either at the host browser over
+   that loopback port, or at a headless browser in here. That path is a tmpfs
+   and deliberately not one of the agent state directories the launcher mounts
+   from the host, so this never edits your real agent configuration. Claude Code
+   is passed `--mcp-config`, which is additive; every other agent is told where
+   the file is. Neither variable set means nothing is written and nothing is
+   appended.
+7. `exec "$@"`.
 
 ## Launcher (`agent-sandbox`)
 
@@ -171,6 +182,40 @@ is not an HTTP request the proxy could see or refuse.  Routing it through the
 sidecar would be more machinery for the same hole, and would work only under
 `--proxy`.  So the hole is left visible instead: named ports only, announced at
 launch, and documented in [Trust model](trust-model.md).
+
+### The cooperative browser is a second proxy, not a relay
+
+`agent-sandbox browser` runs the same `agent-sandbox-proxy` binary on the host,
+outside the sidecar entirely.  That is what the proxy's `--shared-dir` and
+`--no-egress-probe` options are for: the three files it writes (`proxy-ready`,
+`ca.pem`, `egress-degraded`) were fixed at `/sidecar_shared`, and the readiness
+probe is a 30s ceiling that only makes sense when a container's network is still
+coming up.
+
+Each invocation owns a mode-0700 directory under `$XDG_RUNTIME_DIR`, named
+`agent-sandbox-browser-<uuid8>` -- the same shape as the host-port directory:
+
+| File | What it is |
+| --- | --- |
+| `policy`, `policy.base`, `policy.baseline` | the same trio as `/sidecar_policy` |
+| `connections.jsonl`, `denied-requests.jsonl` | the proxy's own logs |
+| `policies/managed/agent-sandbox.json` | the Chromium managed policy, bound into place by bwrap |
+| `profile/` | Chromium's `--user-data-dir` |
+| `meta.json` | CDP port, proxy port and pid, so `ctl proxy --browser` can find it |
+
+Reusing the policy file trio rather than inventing a format is what makes
+`agent-sandbox ctl proxy allow --browser` work with no new machinery:
+`install_policy` validates and swaps the file atomically, and the proxy's
+existing watcher picks it up within a second.  `--browser` resolves through
+`meta.json` instead of a sidecar mount, and sweeps directories whose pid is gone
+-- `Drop` does not run on SIGKILL, and a stale directory would otherwise look
+like a second running browser.
+
+It is deliberately *not* the sidecar's proxy.  The sandbox's policy governs what
+the sandbox connects to; the browser is a separate principal on the host, and
+merging the two would mean a rule added for a page the user is looking at also
+widens what the agent can fetch directly.  Two policies, one command to change
+either.
 
 None of them is mounted into the sandbox — `ca.pem` is bound in as a single
 file, not by exposing its directory. That is deliberate and load-bearing: the

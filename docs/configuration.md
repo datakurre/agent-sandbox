@@ -221,6 +221,12 @@ of the workspace `AGENTS.md` network block. Supplying both `--proxy` and
 profiles are never loaded implicitly. Invalid or missing profiles refuse the
 launch before the sidecar starts.
 
+The same profiles are taken by
+[`agent-sandbox browser`](usage.md#a-cooperative-browser-agent-sandbox-browser)
+via its own `--proxy-profile`, so one allow list can serve both a sandbox and
+the browser testing it. They stay separate policies — selecting a profile for
+one does not select it for the other.
+
 Live rules added during a session are not written back automatically. The exit
 summary prints a TOML block that can be added to `AGENTS.md` for project-specific
 access or merged into a profile for reuse.

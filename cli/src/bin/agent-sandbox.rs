@@ -43,6 +43,8 @@ enum CtlCommands {
     Status(ctl::status::StatusArgs),
     #[command(about = "Manage proxy rules")]
     Proxy(ctl::proxy::ProxyArgs),
+    #[command(about = "Start a throwaway host browser behind a deny-by-default allow list")]
+    Browser(ctl::browser::BrowserArgs),
     #[command(about = "Show network metering for a running sandbox")]
     Net(ctl::net::NetArgs),
     #[command(about = "Show the proxy log for a running sandbox", alias = "log")]
@@ -400,6 +402,7 @@ fn print_usage(
     want_ports: bool,
     want_shared_network: bool,
     want_host_ports: bool,
+    want_browser: bool,
     want_mounts: bool,
     want_agent_mounts_mode: &AgentMountsMode,
 ) {
@@ -431,6 +434,8 @@ forwarding SSH, or exposing Git identity.
   agent-sandbox --privileged opencode
                                      pass --privileged to podman run
   agent-sandbox ctl --help           manage sandboxes that are already running
+  agent-sandbox browser              start a throwaway host browser behind a deny-by-default
+                                     allow list, for cooperative testing over CDP
 
 Agents:
   {agent_list}
@@ -475,6 +480,14 @@ Ports:
                                            pasta with a bridge, so any pasta option the
                                            operator wanted no longer applies.
                                            --no-shared-network turns it back off.
+  --browser                          {browser} Attaches every browser 'agent-sandbox browser' is
+                                           running: maps each of their CDP ports and tells the
+                                           agent which is which, so playwright-mcp is wired up
+                                           with no further setup.  --browser=alice,bob picks
+                                           some of them.  Shorthand for the --host-loopback-port
+                                           and -e pair below; --no-browser turns it back off.
+                                           The browsers must already be running -- the channel
+                                           is set at launch and cannot be added later.
   --host-loopback-port PORT          {host_ports} Makes the host's 127.0.0.1:PORT reachable at
                                            the sandbox's own 127.0.0.1:PORT, so a service the
                                            user runs there -- a browser's CDP port, say -- can
@@ -485,6 +498,9 @@ Ports:
                                            than a route, so it composes with every network
                                            mode, --proxy included -- but what it reaches is
                                            outside the egress policy.
+                                           'agent-sandbox browser' starts a host browser that
+                                           carries an allow list of its own and prints the
+                                           line to paste here.
                                            --no-host-loopback-port drops them all.
 
 Mounts:
@@ -531,6 +547,7 @@ before. It is not a substitute for leaving the three flags off."#,
         ports = fmt(want_ports),
         shared_network = fmt(want_shared_network),
         host_ports = fmt(want_host_ports),
+        browser = fmt(want_browser),
         mounts = fmt(want_mounts),
         agent_mounts = fmt(agent_mounts_all)
     );
@@ -561,29 +578,7 @@ fn parse_proxy_log_level(s: &str) -> Option<ProxyLogLevel> {
 }
 
 fn proxy_profile_path(home: &str, name: &str) -> Result<PathBuf> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-    {
-        anyhow::bail!(
-            "agent-sandbox: invalid proxy profile name '{}'; use letters, numbers, '.', '_' or '-'",
-            name
-        );
-    }
-    let config_home = env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(home).join(".config"));
-    Ok(config_home
-        .join("agent-sandbox")
-        .join("profiles")
-        .join(format!("{}.toml", name)))
+    launch::proxy_profile_path(home, name).map_err(|e| anyhow::anyhow!(e))
 }
 
 struct CleanupGuard {
@@ -879,6 +874,9 @@ fn run() -> Result<i32> {
     let mut want_ports_any_interface = false;
     let mut want_shared_network = false;
     let mut want_host_ports: Vec<HostPort> = Vec::new();
+    // `--browser`, and the session names it was narrowed to (empty = all).
+    let mut want_browser = false;
+    let mut want_browser_names: Vec<String> = Vec::new();
     let mut want_mounts = false;
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
     let mut want_proxy = false;
@@ -936,7 +934,7 @@ fn run() -> Result<i32> {
     if is_ctl_bin || !args.is_empty() {
         let ctl_subcommands = [
             "load", "list", "status", "proxy", "net", "logs", "log", "attach", "mount", "mounts",
-            "relay", "tui", "purge",
+            "relay", "tui", "purge", "browser",
         ];
         let mut run_ctl = false;
         let mut parse_args = vec!["agent-sandbox".to_string()];
@@ -979,6 +977,7 @@ fn run() -> Result<i32> {
                 CtlCommands::List(a) => ctl::list::run(a)?,
                 CtlCommands::Status(a) => ctl::status::run(a)?,
                 CtlCommands::Proxy(a) => ctl::proxy::run(a)?,
+                CtlCommands::Browser(a) => ctl::browser::run(a)?,
                 CtlCommands::Net(a) => ctl::net::run(a)?,
                 CtlCommands::Logs(a) => ctl::logs::run(a)?,
                 CtlCommands::Attach(a) => ctl::attach::run(a)?,
@@ -1040,6 +1039,11 @@ fn run() -> Result<i32> {
             "--shared-network" => want_shared_network = true,
             "--no-shared-network" => want_shared_network = false,
             "--no-host-loopback-port" => want_host_ports.clear(),
+            "--browser" => want_browser = true,
+            "--no-browser" => {
+                want_browser = false;
+                want_browser_names.clear();
+            }
             "--mounts" => want_mounts = true,
             "--no-mounts" => want_mounts = false,
             "--agent-mounts" => want_agent_mounts_mode = AgentMountsMode::All,
@@ -1091,6 +1095,10 @@ fn run() -> Result<i32> {
                         Ok(ports) => want_host_ports.extend(ports),
                         Err(e) => fail(&e),
                     }
+                } else if let Some(v) = arg.strip_prefix("--browser=") {
+                    want_browser = true;
+                    want_browser_names
+                        .extend(v.split(',').filter(|s| !s.is_empty()).map(str::to_string));
                 } else if arg == "--proxy-log" || arg.starts_with("--proxy-log=") {
                     let value = match arg.strip_prefix("--proxy-log=") {
                         Some(v) => v.to_string(),
@@ -1204,6 +1212,7 @@ fn run() -> Result<i32> {
             want_ports,
             want_shared_network,
             !want_host_ports.is_empty(),
+            want_browser,
             want_mounts,
             &want_agent_mounts_mode,
         );
@@ -1263,6 +1272,59 @@ fn run() -> Result<i32> {
                 );
             }
         }
+    }
+
+    // `--browser` is the whole browser handshake in one flag: it finds the
+    // browsers `agent-sandbox browser` is running, maps each of their CDP ports,
+    // and tells the entrypoint which is which.  Resolved here, after parsing, so
+    // an explicit --host-loopback-port composes with it and --no-browser can
+    // still cancel it.
+    if want_browser {
+        let running = ctl::browser::running_instances();
+        let selected: Vec<_> = if want_browser_names.is_empty() {
+            running
+        } else {
+            for name in &want_browser_names {
+                if !running.iter().any(|i| &i.name == name) {
+                    fail(&format!(
+                        "agent-sandbox: --browser: no running browser named '{}'.\n               Start one with: agent-sandbox browser --name {}",
+                        name, name
+                    ));
+                }
+            }
+            running
+                .into_iter()
+                .filter(|i| want_browser_names.contains(&i.name))
+                .collect()
+        };
+
+        if selected.is_empty() {
+            fail(
+                "agent-sandbox: --browser: no browser is running.\n               Start one first: agent-sandbox browser\n               (it cannot be attached later -- the channel is set at launch.)",
+            );
+        }
+
+        for inst in &selected {
+            if !want_host_ports.iter().any(|hp| hp.host == inst.cdp_port) {
+                want_host_ports.push(HostPort {
+                    host: inst.cdp_port,
+                    sandbox: inst.cdp_port,
+                });
+            }
+        }
+        env_args.push("-e".to_string());
+        env_args.push(format!(
+            "AGENT_SANDBOX_BROWSER_CDP_PORT={}",
+            ctl::browser::cdp_port_env(&selected)
+        ));
+        eprintln!(
+            "agent-sandbox: --browser: {}",
+            selected
+                .iter()
+                .map(|i| format!("{} on {}", i.name, i.cdp_port))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     // Two mappings landing on one sandbox port would leave whichever socat lost

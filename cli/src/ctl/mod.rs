@@ -1,4 +1,5 @@
 pub mod attach;
+pub mod browser;
 pub mod list;
 pub mod load;
 pub mod logs;

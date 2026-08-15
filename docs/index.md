@@ -8,6 +8,7 @@
 - **Deny-by-default network firewall** — `--proxy` puts the sandbox behind an HTTP proxy that enforces a declarative `[network]` policy from your project's `AGENTS.md`. No rules means no outbound traffic.
 - **Secrets injection** — `--secrets` resolves credentials with `secretspec` and injects them as HTTP headers, scoped to the exact route you authorize. Secrets never enter the sandbox environment.
 - **SSH / GPG forwarding** — `--ssh` and `--gpg` forward host agent sockets; under `--proxy` they travel through a relay that keeps the firewall intact.
+- **Cooperative browser** — `agent-sandbox browser` starts a throwaway Chromium on your host behind an allow list of its own, defaulting to the ports your sandbox publishes and nothing else, so an agent can drive a visible browser over CDP without that being an unpoliced hole.
 - **Management CLI** — `agent-sandbox ctl` manages running sandboxes: inspect traffic, update policies live, attach a shell, and clean up leftovers.
 
 ## Prerequisites
@@ -64,5 +65,6 @@ agent-sandbox --workspace --proxy --proxy-profile development opencode
 | Run nested containers inside the sandbox | `--privileged` |
 | Add a hardware VM boundary | `--krun` (requires `/dev/kvm`) |
 | Inject API credentials scoped to a route | `--secrets` + `--proxy` |
+| Let the agent drive a visible browser you can watch | run `agent-sandbox browser`, then relaunch with `--browser` |
 
 See [Usage & Flags](usage.md) for the complete flags reference, [Configuration](configuration.md) for `AGENTS.md` syntax, and [Trust Model](trust-model.md) for the security implications of each flag.

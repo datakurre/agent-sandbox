@@ -57,13 +57,25 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// resolved, never connected to, so this stays policy-neutral under
 /// `--proxy`.
 const READY_PROBE_HOST: &str = "cloudflare.com:443";
+/// Directory the proxy writes its own state into.  In the sidecar this is the
+/// launcher-owned volume the sandbox cannot see; `agent-sandbox browser` runs
+/// this same binary on the host and points it at a per-instance runtime dir
+/// instead, which is the whole reason the three paths below are derived rather
+/// than constant.
+const DEFAULT_SHARED_DIR: &str = "/sidecar_shared";
 /// Written by the proxy, read by the sidecar's readiness gate on the host.
-const PROXY_READY: &str = "/sidecar_shared/proxy-ready";
+fn proxy_ready_path(shared_dir: &str) -> String {
+    format!("{}/proxy-ready", shared_dir)
+}
 /// Public session CA for sandbox trust bootstrap, when MITM-capable secret
 /// domains are configured.
-const PROXY_CA_PEM: &str = "/sidecar_shared/ca.pem";
+fn proxy_ca_pem_path(shared_dir: &str) -> String {
+    format!("{}/ca.pem", shared_dir)
+}
 /// Written only when `wait_for_egress` gives up, and carrying why.
-const EGRESS_DEGRADED: &str = "/sidecar_shared/egress-degraded";
+fn egress_degraded_path(shared_dir: &str) -> String {
+    format!("{}/egress-degraded", shared_dir)
+}
 const BUF_SIZE: usize = 64 * 1024;
 const HEAD_MAX: usize = 8192;
 const DNS_CACHE_MAX: usize = 512;
@@ -1385,7 +1397,7 @@ fn watch_policy(path: String, shared: Arc<Shared>) {
 /// session looked healthy until the agent's first request came back 502.  The
 /// reason is now also left in `EGRESS_DEGRADED` for the launcher to surface on
 /// the terminal the person is actually looking at.
-fn wait_for_egress() {
+fn wait_for_egress(shared_dir: &str) {
     let started = Instant::now();
     let mut last_err = String::new();
     while started.elapsed() < READY_TIMEOUT {
@@ -1406,7 +1418,7 @@ fn wait_for_egress() {
         started.elapsed(),
         last_err
     );
-    if let Ok(mut f) = File::create(EGRESS_DEGRADED) {
+    if let Ok(mut f) = File::create(egress_degraded_path(shared_dir)) {
         let _ = writeln!(
             f,
             "{} did not resolve within {:?}: {}",
@@ -1423,6 +1435,9 @@ Usage: agent-sandbox-proxy [OPTIONS]
   --log FILE             append one JSON line per connection event
   --detail-log FILE      bounded sanitized denied-request details
   --listen ADDR          listen address (default 0.0.0.0:8888)
+  --shared-dir DIR       where proxy-ready, ca.pem and egress-degraded are
+                         written (default /sidecar_shared)
+  --no-egress-probe      start serving without waiting for egress to resolve
   --secret-fd FD         internal: read startup secret bindings from FD
   --allow-domains LIST   comma-separated; mutually exclusive with --policy
   --allow-ipss LIST
@@ -1444,6 +1459,8 @@ struct Options {
     log: String,
     detail_log: String,
     listen: String,
+    shared_dir: String,
+    no_egress_probe: bool,
     secret_fd: Option<i32>,
     allow_domains: String,
     allow_ips: String,
@@ -1456,6 +1473,8 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
         log: String::new(),
         detail_log: String::new(),
         listen: "0.0.0.0:8888".to_string(),
+        shared_dir: DEFAULT_SHARED_DIR.to_string(),
+        no_egress_probe: false,
         secret_fd: None,
         allow_domains: String::new(),
         allow_ips: String::new(),
@@ -1478,6 +1497,8 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
             "--log" => o.log = value(),
             "--detail-log" => o.detail_log = value(),
             "--listen" => o.listen = value(),
+            "--shared-dir" => o.shared_dir = value(),
+            "--no-egress-probe" => o.no_egress_probe = true,
             "--secret-fd" => {
                 let raw = value();
                 let fd = raw
@@ -1605,10 +1626,11 @@ fn main() {
         eprintln!("proxy: loaded {} secret binding(s)", secrets.len());
     }
     let session_ca = SessionCa::generate().unwrap_or_else(|e| fail(&format!("session CA: {}", e)));
-    if let Err(e) = session_ca.write_public_cert_pem(PROXY_CA_PEM) {
+    let ca_pem = proxy_ca_pem_path(&opts.shared_dir);
+    if let Err(e) = session_ca.write_public_cert_pem(&ca_pem) {
         fail(&format!("session CA: {}", e));
     }
-    eprintln!("proxy: session CA generated at {}", PROXY_CA_PEM);
+    eprintln!("proxy: session CA generated at {}", ca_pem);
     let session_ca = Some(Arc::new(session_ca));
 
     // Bind before probing egress so a port clash fails immediately rather than
@@ -1621,7 +1643,12 @@ fn main() {
         }
     };
 
-    wait_for_egress();
+    // On the host -- `agent-sandbox browser` -- egress readiness is not in
+    // question and the 30s ceiling would only be a stall on the way to a
+    // browser window, so that caller passes --no-egress-probe.
+    if !opts.no_egress_probe {
+        wait_for_egress(&opts.shared_dir);
+    }
 
     // Started after the egress probe so the grace covers the window right after
     // readiness, which is when the agent's first requests land.
@@ -1651,7 +1678,7 @@ fn main() {
     // The sidecar gates its own readiness on this, installs the blackhole routes
     // and only then tells the launcher the sandbox may start -- so the routes are
     // in place before any traffic can exist.
-    if let Ok(mut f) = File::create(PROXY_READY) {
+    if let Ok(mut f) = File::create(proxy_ready_path(&opts.shared_dir)) {
         let _ = f.write_all(b"ready\n");
     }
 
@@ -1727,6 +1754,39 @@ mod tests {
             None,
             Vec::new(),
         )
+    }
+
+    fn args(extra: &[&str]) -> Options {
+        let mut argv = vec!["agent-sandbox-proxy".to_string()];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        parse_args(&argv).0
+    }
+
+    #[test]
+    fn the_shared_dir_defaults_to_the_sidecar_volume() {
+        let o = args(&[]);
+        assert_eq!(o.shared_dir, DEFAULT_SHARED_DIR);
+        assert_eq!(proxy_ready_path(&o.shared_dir), "/sidecar_shared/proxy-ready");
+        assert_eq!(proxy_ca_pem_path(&o.shared_dir), "/sidecar_shared/ca.pem");
+        assert_eq!(
+            egress_degraded_path(&o.shared_dir),
+            "/sidecar_shared/egress-degraded"
+        );
+        assert!(!o.no_egress_probe, "the sidecar still waits for egress");
+    }
+
+    #[test]
+    fn a_host_run_relocates_all_three_state_files() {
+        // `agent-sandbox browser` runs this binary outside the sidecar, where
+        // /sidecar_shared does not exist and writing the CA there is fatal.
+        let o = args(&["--shared-dir", "/run/user/1000/b", "--no-egress-probe"]);
+        assert_eq!(proxy_ready_path(&o.shared_dir), "/run/user/1000/b/proxy-ready");
+        assert_eq!(proxy_ca_pem_path(&o.shared_dir), "/run/user/1000/b/ca.pem");
+        assert_eq!(
+            egress_degraded_path(&o.shared_dir),
+            "/run/user/1000/b/egress-degraded"
+        );
+        assert!(o.no_egress_probe);
     }
 
     #[test]

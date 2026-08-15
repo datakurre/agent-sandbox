@@ -1,22 +1,38 @@
 ---
 name: browser
-description: Drive a browser to screenshot a page for visual/image analysis or to interact with it (navigate, click, fill, wait) — either headless from nixpkgs, or the user's own visible Chrome on the host over CDP. Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, automate clicks/form-fills against a page, or work in the user's real browser so they can watch and click along.
+description: Drive a browser to screenshot a page for visual/image analysis or to interact with it (navigate, click, fill, wait) — either headless inside the sandbox, or a visible browser on the user's host over CDP. Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, automate clicks/form-fills against a page, or work in a real browser the user can watch and click along with.
 compatibility: opencode
 metadata:
   workflow: headless-browser-automation
   audience: developers-and-agents
 ---
 
-# Headless browser, from nixpkgs
+# Two browsers, and which one you want
 
-No host install, same philosophy as the `nix` skill: pull a browser and its
-driver from nixpkgs for the duration of one script or session. Two ingredients
-cover both screenshotting and interactive control — `python3Packages.playwright`
-(the scripting API) and `playwright-driver.browsers` (the actual chromium /
-firefox / webkit binaries). The Python package's driver is symlinked to
-nixpkgs' own `playwright-driver` at build time, so the two are always
-protocol-compatible — never run `playwright install`, it tries to hit a CDN and
-isn't needed.
+| | Headless, in here | Cooperative, on the host |
+| --- | --- | --- |
+| Needs the user to do anything | no | yes, once |
+| The user can watch and click | no | yes |
+| Real fonts, GPU, their logins | no | yes |
+| Egress policy | the sandbox's `--proxy` policy | a separate allow list of its own |
+| Start it with | `nix shell` + Playwright, below | ask the user to run `agent-sandbox browser` |
+
+**Default to headless.** It needs nothing from the user, so it costs no round
+trip. Reach for the host browser only when the task actually needs a visible
+window — the user watching, clicking things themselves between your calls, or a
+page that only behaves in their real browser.
+
+---
+
+# Headless, inside the sandbox
+
+Pull a browser and its driver from nixpkgs for the duration of one script or
+session — same philosophy as the `nix` skill, no host install.
+`python3Packages.playwright` is the scripting API and
+`playwright-driver.browsers` the actual chromium / firefox / webkit binaries.
+The Python package's driver is symlinked to nixpkgs' own `playwright-driver` at
+build time, so the two are always protocol-compatible — never run `playwright
+install`, it tries to hit a CDN and isn't needed.
 
 ## Get the browser, once per session
 
@@ -28,27 +44,31 @@ export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
 
 Everything below inherits this from the environment — no need to repeat it.
 
-## Fix fonts first, or screenshots come back blank
+## Fonts
 
-This image ships no fonts at all (no `/etc/fonts`, no `fc-list`). Headless
-Chromium under these conditions fails **silently**: `page.goto()` succeeds,
-`page.title()` and `page.content()` return correct data, and `page.screenshot()`
-comes back a flat, uniform color — no error, no crash, just a blank image that
-looks like nothing loaded. Confirmed by inspecting the actual pixels: without
-this fix a screenshot of a real page was a single solid color end to end.
+The image ships a minimal font set (DejaVu and Liberation) and exports
+`FONTCONFIG_FILE`, so screenshots taken from anything that inherits the image
+environment render text correctly.
 
-Fix once per session, same way:
+Two cases still need attention:
 
-```sh
-export FONTCONFIG_FILE=$(nix build --impure --expr \
-  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem};
-   makeFontsConf { fontDirectories = [ dejavu_fonts liberation_ttf ]; }' \
-  --no-link --print-out-paths)
-```
+- **A `nix shell` that overrides `FONTCONFIG_FILE`, or a page needing scripts
+  those two fonts don't cover** (CJK, emoji). Build a config with the fonts you
+  need:
 
-Do this before taking any screenshot meant for visual inspection. It is not
-needed if you only read `page.content()` or `aria_snapshot()` (text stays
-correct either way), but skip it and every screenshot is a trap.
+  ```sh
+  export FONTCONFIG_FILE=$(nix build --impure --expr \
+    'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem};
+     makeFontsConf { fontDirectories = [ dejavu_fonts liberation_ttf noto-fonts-color-emoji ]; }' \
+    --no-link --print-out-paths)
+  ```
+
+- **Knowing the failure mode.** With no usable fonts, headless Chromium fails
+  *silently*: `page.goto()` succeeds, `page.title()` and `page.content()` return
+  correct data, and `page.screenshot()` comes back a flat, uniform colour — no
+  error, no crash. If a screenshot is one solid colour, suspect fonts before
+  anything else. `echo $FONTCONFIG_FILE` and `fc-list` say which fonts are
+  actually wired in.
 
 ## Script it: navigate, screenshot, click
 
@@ -131,54 +151,62 @@ A denied host is policy working as configured — ask the user to run
 `agent-sandbox` skill teaches. Don't unset the proxy or add `--no-proxy-server`
 to route around it.
 
-## A visible browser: attach to Chrome on the host
+---
 
-Headless-in-container is the default because there's no X server here (see
-above), but a headed browser is still reachable — as a *client*, over CDP, to a
-browser the user launches on the **host**. This is what to use when the task
-needs a real browser with the user watching: their own profile and logins, a
-visible window, and the user clicking things themselves between your calls.
+# A visible browser: `agent-sandbox browser` on the host
 
-### Ask the user for two things, in one message
+There's no X server in here, so a headed browser has to run on the **host**,
+with this side as a CDP *client*. `agent-sandbox browser` starts one that is
+disposable and carries an allow list of its own, and prints the line the user
+needs to paste.
 
-The sandbox flag below can only be set at launch, so a half-answer costs another
-round trip. Give them both halves at once.
+## Ask the user for one thing
 
-**First, start Chrome on the host** with a debugging port bound to loopback. The
-separate `--user-data-dir` is **required**, not optional — an already-running
-Chrome silently ignores `--remote-debugging-port`:
+The sandbox flag can only be set at launch, so this needs a relaunch either
+way. Give them the whole thing in one message:
 
-```sh
-google-chrome --user-data-dir=/tmp/cdp-profile \
-              --remote-debugging-port=9222 \
-              --remote-debugging-address=127.0.0.1
-# or chromium, same flags
+> Run `agent-sandbox browser` in another terminal, then relaunch the sandbox
+> with `--browser` added to whatever flags you already use:
+> `agent-sandbox --browser -- claude`.
+
+What they'll see:
+
+```
+$ agent-sandbox browser
+browser: 'e4c1a80f' -- CDP on 127.0.0.1:9222, egress deny-by-default
+browser: allowed: 127.0.0.1:3000
+browser:   agent-sandbox ctl proxy allow <host>:443 --browser
+browser:
+browser: now run, keeping whatever flags you already use:
+browser:   agent-sandbox --browser -- claude
 ```
 
-Keep `--remote-debugging-address` on `127.0.0.1`, never `0.0.0.0` — CDP has no
-authentication, so reachability is the only thing standing between "the sandbox
-can drive this tab" and "anything on the network can read every cookie and run
-arbitrary JS in it."
+`--browser` attaches whatever browsers are running: it maps their CDP ports and
+tells the agent which is which, so the MCP tools below need no further setup.
 
-**Second, relaunch the sandbox** with that port named. Tell them to keep whatever
-flags they were already using and add one:
+If they don't have Chromium on their host, `nix run
+github:datakurre/agent-sandbox#browser` runs it with a pinned one.
+
+## What it can reach
+
+With no arguments the browser's allow list is **the loopback ports the running
+sandbox publishes, and nothing else** — so it can load the app under test and
+not the internet. That is the common case for UI work and needs no
+configuration.
+
+Anything wider is opt-in, and the escalation is the same shape as everywhere
+else — ask the user, don't route around it:
 
 ```sh
-agent-sandbox --host-loopback-port 9222 -- <their usual command>
+agent-sandbox ctl proxy allow example.com:443 --browser   # applies within a second, no restart
+agent-sandbox browser --allow example.com:443             # or up front, at start
+agent-sandbox browser --proxy-profile development         # or a reusable profile
 ```
 
-It composes with everything, `--proxy` included:
+A denied host shows up as a failed request in the page, and appears in the
+traffic summary the command prints when the browser closes.
 
-```sh
-agent-sandbox --proxy --ports --host-loopback-port 9222 -- claude
-```
-
-By default the sandbox has **no route to the host's loopback at all**, and
-neither `host.containers.internal` nor the gateway reaches one — podman points
-the first at the host's *LAN* address and passes pasta `--no-map-gw`. The flag is
-the only way in, and it opens exactly the ports named.
-
-### Check the channel before dialing
+## Check the channel before dialing
 
 The launcher sets `$AGENT_SANDBOX_HOST_PORTS` to the ports it mapped, and only
 those:
@@ -186,91 +214,101 @@ those:
 ```sh
 case ",$AGENT_SANDBOX_HOST_PORTS," in
   *,9222,*) ;;
-  *) echo "relaunch with: agent-sandbox --host-loopback-port 9222"; exit 1 ;;
+  *) echo "ask the user to run: agent-sandbox browser"; exit 1 ;;
 esac
 curl -s http://127.0.0.1:9222/json/version
 ```
 
 Port missing from the list means this session has no channel to it — say so and
-ask for the relaunch, rather than guessing at other ports. Listed but refused
-means Chrome isn't listening on the host's `127.0.0.1:9222`, which is almost
-always the missing `--user-data-dir`.
+ask for the relaunch, rather than guessing at other ports.
 
-### Attach
+## Drive it: MCP tools, or a script
 
-A remote connection, not a local launch, so `PLAYWRIGHT_BROWSERS_PATH` and
-`FONTCONFIG_FILE` aren't needed:
+With `AGENT_SANDBOX_BROWSER_CDP_PORT` set, `playwright-mcp` is already
+configured against that browser and you have `browser_navigate`,
+`browser_click`, `browser_snapshot` and `browser_take_screenshot` as native
+tools. Prefer these for interactive, turn-by-turn work.
+
+For a fixed sequence, connect directly. A remote connection, not a local
+launch, so `PLAYWRIGHT_BROWSERS_PATH` and `FONTCONFIG_FILE` aren't needed:
 
 ```python
 from playwright.sync_api import sync_playwright
 
 p = sync_playwright().start()
 browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-page = browser.contexts[0].pages[0]     # the host's already-open tab
-page.goto("https://example.com")
+page = browser.contexts[0].pages[0]     # the browser's already-open tab
+page.goto("http://127.0.0.1:3000")
 ```
 
 Dialing `127.0.0.1` also sidesteps Chrome's DevTools host check, which rejects a
 `Host:` header that is not an IP or `localhost`.
 
-If the sandbox already has something on 9222, the user can move the inside
-number: `--host-loopback-port 9222:19222` puts the host's 9222 on the sandbox's
-19222, and `$AGENT_SANDBOX_HOST_PORTS` then lists `19222`.
+## Two users at once
 
-### Both directions at once
+A separate profile is a separate user, so testing an interaction between two
+people — a shared document, a chat, a buyer and a seller — means asking for two
+browsers rather than one:
 
-To point that browser at a server running *in* the sandbox, publish a port as
-well — the two compose:
+> Run these two, then use the command the **second** one prints:
+>
+> ```sh
+> agent-sandbox browser --name alice --keep-profile ~/.cache/browsers/alice
+> agent-sandbox browser --name bob   --keep-profile ~/.cache/browsers/bob
+> ```
 
-```sh
-agent-sandbox --proxy --ports --host-loopback-port 9222 -- bash
+Then the same `agent-sandbox --browser -- claude` as always: `--browser` picks
+up every browser that is running, so the command does not grow with the number
+of users. Ports walk up from 9222, so alice is 9222 and bob is 9223.
+
+Ask for both up front. The channel is established at launch, so a second browser
+started after the sandbox is not reachable until the next relaunch — which is
+the one round trip worth avoiding.
+
+Inside, each becomes its own MCP server (`playwright-alice`, `playwright-bob`),
+so say which user you are acting as by choosing the server. From a script, hold
+both connections at once:
+
+```python
+alice = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+bob   = p.chromium.connect_over_cdp("http://127.0.0.1:9223")
+a_page, b_page = alice.contexts[0].pages[0], bob.contexts[0].pages[0]
+a_page.fill("#message", "hello"); a_page.click("text=Send")
+b_page.reload()                                    # bob should now see it
 ```
 
-The host's Chrome then reaches it over the host's own loopback, e.g.
-`http://127.0.0.1:8000` for a `[ports]` entry publishing 8000. Bind that server
-to `0.0.0.0` inside the sandbox: publishing forwards to the sandbox's interface
-address, so a loopback-bound one is reachable from inside and dead from the host.
+`--keep-profile` is what makes a login survive: without it every session starts
+signed out, which is right for a disposable browser and wrong for a scenario you
+re-run. Each session also has its own allow list —
+`agent-sandbox ctl proxy allow <host>:443 --browser alice` widens only alice.
 
-### Under `--proxy`, this channel is not policed
+## What this does and does not bound
 
-The egress policy governs what the *sandbox* connects to. It cannot govern what
-the host's Chrome fetches on its own account, so a `page.goto()` reaches hosts a
-`curl` from here would be denied.
+The browser's allow list governs what that browser fetches. It is a **separate**
+policy from the sandbox's — widening one does not widen the other, and a host
+allowed there is not allowed for a `curl` from in here.
 
-That is not a workaround to reach for. If a host is denied, the fix is still to
-ask the user to run `agent-sandbox ctl proxy allow <host>:443` — the same
-escalation as everywhere else. Don't route ordinary fetching through the host's
-browser to get around a policy.
+It is also not absolute. Don't try to get around it: creating a browser context
+with a proxy of its own, or otherwise working around the allow list, is the
+same category of thing as unsetting `HTTPS_PROXY`. If a host is denied, ask.
 
-## Skip the script: playwright-mcp
+## Serving to it
 
-nixpkgs also packages Microsoft's official Playwright MCP server
-(`playwright-mcp`), pre-wired with `PLAYWRIGHT_BROWSERS_PATH` already set. It
-gives an agent native `browser_navigate` / `browser_click` /
-`browser_take_screenshot` / `browser_snapshot` tools instead of hand-written
-scripts — better for many small interactive steps driven turn by turn; a
-script is better for a fixed sequence run once.
+To point that browser at a server running *in* the sandbox, publish a port —
+that is also what seeds the allow list, so the two fit together:
 
 ```sh
-nix run nixpkgs#playwright-mcp -- --headless --isolated
+agent-sandbox --ports --browser -- bash
 ```
 
-Register it (Claude Code):
-
-```sh
-claude mcp add playwright-nix -- nix run nixpkgs#playwright-mcp -- --headless --isolated
-```
-
-`FONTCONFIG_FILE` must already be exported in the shell that runs this command
-— the package's wrapper only force-sets `PLAYWRIGHT_BROWSERS_PATH`, so the
-fonts fix above still applies. It captures console messages and network logs
-too (`--output-mode`/`--output-dir` control where those land), so console
-access doesn't need the scripted path either.
+Bind that server to `0.0.0.0` inside the sandbox: publishing forwards to the
+sandbox's interface address, so a loopback-bound one is reachable from inside
+and dead from the host.
 
 ## More
 
 `reference.md` covers form filling and waiting, multiple tabs, PDF export, the
-raw CDP fallback for when Playwright itself isn't wanted, a version-skew note
-between `python3Packages.playwright` and `playwright-driver` on
-nixpkgs-unstable, the full `playwright-mcp` flag list, and a debugging
-checklist.
+raw CDP fallback, driving a browser the user already had open (rather than one
+`agent-sandbox browser` started), a version-skew note between
+`python3Packages.playwright` and `playwright-driver` on nixpkgs-unstable, the
+`playwright-mcp` flag list, and a debugging checklist.

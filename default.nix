@@ -3,6 +3,15 @@
   lib,
   agents ? import ./agents.nix { inherit pkgs; },
   defaultAgent ? "opencode",
+  # Unpacked Chromium extensions `agent-sandbox browser` loads by default, as
+  # store paths.  Empty on purpose: nixpkgs packages no Chrome extensions, so a
+  # default would mean pinning a release artifact from somewhere else, and the
+  # ephemeral profile is better off minimal.  Override to add your own:
+  #
+  #   (import ./default.nix { inherit pkgs lib; }).override {
+  #     browserExtensions = [ ./my-extension ];
+  #   }
+  browserExtensions ? [ ],
 }:
 
 let
@@ -63,6 +72,13 @@ let
   relayScripts = map (
     name: pkgs.writeShellScriptBin name ''exec ${agentSandboxRust}/bin/${name} "$@"''
   ) [ "relay-server" "relay-ssh" "relay-gpg" ];
+
+  # Headless Chromium renders nothing legible without fonts, and it fails
+  # *silently*: the page loads, the DOM is correct, and every screenshot comes
+  # back one flat colour.  Shipping a minimal set turns that trap into a
+  # non-event for anything launched from the image.
+  imageFonts = with pkgs; [ dejavu_fonts liberation_ttf ];
+  imageFontsConf = pkgs.makeFontsConf { fontDirectories = imageFonts; };
   unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
   defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
   agentTools = map (a: a.package) agents;
@@ -138,7 +154,15 @@ let
       stdenv.cc.cc.lib
       zlib
       glibcLocales
+      # Microsoft's Playwright MCP server, pre-wired to nixpkgs' own browsers.
+      # On the image rather than fetched with `nix run` so it also works under
+      # --proxy, where cache.nixos.org is not reachable unless someone allowed
+      # it.  Serves both browser modes: --cdp-endpoint against a host browser,
+      # and --headless --isolated entirely in here.
+      playwright-mcp
+      fontconfig
     ]
+    ++ imageFonts
     ++ podmanStack
     # No agent-sandbox-allow: policy now lives on a volume the sandbox cannot
     # see, so widening the firewall is a host-side operation
@@ -209,6 +233,9 @@ let
   # closureInfo so they stay in sync.
   containerPaths = tools ++ [
     pkgs.cacert
+    # Referenced only from the image's FONTCONFIG_FILE, so it has to be named
+    # here or it would not be in the closure the image ships.
+    imageFontsConf
     nixConf
     containersConf
     storageConf
@@ -322,6 +349,9 @@ let
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "LANG=en_US.UTF-8"
         "LOCALE_ARCHIVE=${pkgs.glibcLocales}/lib/locale/locale-archive"
+        # See `imageFonts`: without this a headless screenshot is a flat colour
+        # and nothing says so.
+        "FONTCONFIG_FILE=${imageFontsConf}"
         # Force Go programs to use the C library (glibc) DNS resolver.
         # Go's pure-Go resolver sends raw UDP queries that time out on
         # slirp4netns's DNS forwarder in rootless Podman, causing 5s delays.
@@ -384,6 +414,34 @@ let
     '';
   };
 
+  # `agent-sandbox browser` with a browser of its own.
+  #
+  # Deliberately *not* part of the default package: Chromium is a large closure
+  # and most sandboxes never start a browser.  `agent-sandbox browser` still
+  # works from the plain install against a Chromium already on PATH; this is
+  # what makes `nix run .#browser` work on a host with no browser at all, and
+  # what pins the version the managed-policy layer was written against.
+  #
+  # chromium rather than google-chrome, and not only as a licence preference:
+  # branded Chrome dropped --load-extension in 137 and
+  # --disable-extensions-except in 139, which are how extensions reach an
+  # ephemeral profile at all.  bubblewrap is what puts this instance's managed
+  # policy where Chromium looks for it; the command degrades with a warning
+  # when it is unusable, so it is an input rather than a requirement.
+  browserLauncher = pkgs.writeShellApplication {
+    name = "agent-sandbox-browser";
+    runtimeInputs = with pkgs; [
+      agentSandboxRust podman coreutils chromium bubblewrap
+    ];
+    text = launcherPreamble + ''
+      export AGENT_SANDBOX_BROWSER_CHROMIUM="${pkgs.chromium}/bin/chromium"
+      export AGENT_SANDBOX_BROWSER_EXTENSIONS=${
+        lib.escapeShellArg (lib.concatMapStringsSep ":" toString browserExtensions)
+      }
+      exec ${agentSandboxRust}/bin/agent-sandbox ctl browser "$@"
+    '';
+  };
+
   # `rust` is the whole workspace: buildRustPackage runs `cargo test` in its
   # check phase, so this is what makes `nix flake check` cover the launcher's
   # argument handling, the AGENTS.md parsers and the policy format.
@@ -407,6 +465,7 @@ pkgs.symlinkJoin {
       image
       checks
       launcher
+      browserLauncher
       ;
   };
   meta = {

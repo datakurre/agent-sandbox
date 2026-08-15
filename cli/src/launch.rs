@@ -321,6 +321,38 @@ pub fn container_name(workspace_slug: &str, session_word: &str) -> String {
 
 // ── Policy ──────────────────────────────────────────────────────────────────
 
+/// Where a host-owned network profile lives.  Shared by the launcher's
+/// `--proxy-profile` and by `agent-sandbox browser`, which takes the same
+/// profiles so one allow list can serve a sandbox and the browser testing it.
+///
+/// The name is checked rather than joined blindly: it comes from the command
+/// line, and a profile is read from the operator's config directory.
+pub fn proxy_profile_path(home: &str, name: &str) -> Result<std::path::PathBuf, String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "agent-sandbox: invalid proxy profile name '{}'; use letters, numbers, '.', '_' or '-'",
+            name
+        ));
+    }
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(home).join(".config"));
+    Ok(config_home
+        .join("agent-sandbox")
+        .join("profiles")
+        .join(format!("{}.toml", name)))
+}
+
 /// Refused in every mode, so a proxy with no rules cannot be used to reach the
 /// host or its LAN.  Written as ordinary `deny_ip` entries into the same file
 /// the proxy reads and the sidecar mirrors into kernel blackhole routes, so
