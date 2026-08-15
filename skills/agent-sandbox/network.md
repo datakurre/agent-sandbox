@@ -28,6 +28,29 @@ Two consequences worth internalizing:
   that routes SSH through the proxy and sets `NODE_USE_ENV_PROXY=1` for Node.
   Anything else with its own HTTP stack may need `--proxy`-style flags of its own.
 
+The firewall governs *egress*, not the sandbox's own loopback. A server you
+start here stays reachable at `localhost` — `$NO_PROXY` carries
+`localhost,127.0.0.1,::1` so proxy-aware clients dial it directly instead of
+asking the sidecar, which would refuse it as a denied address. If some client
+ignores `$NO_PROXY` and returns a bodiless `403` for a local URL, that is the
+cause; point it at `127.0.0.1` or set its own no-proxy option.
+
+## Reaching a published port from the host
+
+A proxied session can publish ports: `[ports]` entries bound to loopback work
+under `--proxy`, because publishing is ingress and the firewall governs egress.
+(A bind the wider network can reach is refused, as is a raw `-p` through
+`--podman-args` — the launcher cannot check that one's bind address.)
+
+**A server behind a `[ports]` mapping must bind `0.0.0.0`, not `127.0.0.1`.**
+Publishing forwards the host's port to the sandbox's *interface* address, so a
+server bound to loopback is listening where nothing is delivered: `curl
+localhost:PORT` from inside the sandbox works, and the user gets connection
+refused from the host. Nothing in the sandbox reports this, so when a user says
+a published port is dead, check the bind address first — most dev servers
+default to loopback and need to be told otherwise (`--host 0.0.0.0`,
+`--bind 0.0.0.0`, `HOST=0.0.0.0`, `app.run(host="0.0.0.0")`).
+
 ## Where the policy comes from
 
 | Launch flags | Policy |

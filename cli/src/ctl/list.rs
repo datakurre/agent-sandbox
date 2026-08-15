@@ -19,7 +19,7 @@ pub struct ListArgs {
     )]
     pub all: bool,
 
-    #[arg(long, help = "also list the proxy sidecars and port forwarders")]
+    #[arg(long, help = "also list the proxy sidecars")]
     pub roles: bool,
 }
 

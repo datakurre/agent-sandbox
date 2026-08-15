@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -96,6 +97,55 @@ fn expand_v(spec: &str, current_dir: &Path, home_dir: &str) -> String {
     } else {
         format!("{}:{}", src, dest)
     }
+}
+
+/// The address `--host-loopback` maps to the host's loopback when none is
+/// given.  Link-local, so it collides with nothing routable, and `.3` because
+/// podman has already taken the two below it: `169.254.1.1` is its pasta DNS
+/// forwarder and `169.254.1.2` is `host.containers.internal`.
+const HOST_LOOPBACK_DEFAULT: &str = "169.254.1.3";
+
+/// An operator-supplied `--host-loopback=ADDR`, or a refusal.  Rejecting the
+/// two addresses podman already uses is the point of validating at all: pasta
+/// accepts the mapping either way and the collision surfaces much later, as a
+/// sandbox whose DNS or `host.containers.internal` has quietly become the
+/// host's loopback.
+fn validated_host_loopback(addr: &str) -> String {
+    let parsed: IpAddr = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => fail(&format!(
+            "agent-sandbox: --host-loopback: {:?} is not an IP address literal",
+            addr
+        )),
+    };
+    if parsed.is_loopback() || parsed.is_unspecified() {
+        fail(&format!(
+            "agent-sandbox: --host-loopback: {} names the sandbox's own stack, not a\n               route to the host.  Use an address nothing else answers on, such\n               as {}.",
+            parsed, HOST_LOOPBACK_DEFAULT
+        ));
+    }
+    if addr == "169.254.1.1" || addr == "169.254.1.2" {
+        fail(&format!(
+            "agent-sandbox: --host-loopback: {} is already podman's ({}).\n               Use another address, such as {}.",
+            addr,
+            if addr == "169.254.1.1" {
+                "the pasta DNS forwarder"
+            } else {
+                "host.containers.internal"
+            },
+            HOST_LOOPBACK_DEFAULT
+        ));
+    }
+    parsed.to_string()
+}
+
+/// Whether a `[ports]` bind address is loopback, which is what decides if a
+/// published port is compatible with `--proxy`.  `parse_ports` has already
+/// reduced the field to an IP literal (`"localhost"` included), so anything
+/// that fails to parse here is not a bind this launcher wrote -- treated as
+/// non-loopback, because the refusal is the safe answer.
+fn is_loopback_bind(bind: &str) -> bool {
+    bind.parse::<IpAddr>().map(|a| a.is_loopback()).unwrap_or(false)
 }
 
 fn enforce_selinux_mount_flags(mount_opt: &str, want_selinux: bool) -> String {
@@ -292,6 +342,8 @@ fn print_usage(
     want_secrets: bool,
     want_krun: bool,
     want_ports: bool,
+    want_shared_network: bool,
+    want_host_loopback: bool,
     want_mounts: bool,
     want_agent_mounts_mode: &AgentMountsMode,
 ) {
@@ -362,6 +414,17 @@ Ports:
   --ports-any-interface                    Permits port binds outside of loopback interfaces.
                                            An undeclared port is published with
                                            --podman-args -p HOST:CONTAINER --
+  --shared-network                   {shared_network} Joins the shared bridge network, so other
+                                           containers can reach this one by name.  Replaces
+                                           pasta with a bridge, so --host-loopback and any
+                                           other pasta option no longer apply.
+                                           --no-shared-network turns it back off.
+  --host-loopback[=ADDR]             {host_loopback} Maps ADDR (default {host_loopback_default}) to the
+                                           host's 127.0.0.1, so a service the user runs there
+                                           is reachable without being exposed to anything
+                                           else.  The sandbox gets the address as
+                                           $AGENT_SANDBOX_HOST_LOOPBACK.  Refused with
+                                           --proxy: it is a route around the sidecar.
 
 Mounts:
   --mounts / --no-mounts             {mounts} Honors [mounts] declarations from AGENTS.md.
@@ -405,6 +468,9 @@ before. It is not a substitute for leaving the three flags off."#,
         secrets = fmt(want_secrets),
         krun = fmt(want_krun),
         ports = fmt(want_ports),
+        shared_network = fmt(want_shared_network),
+        host_loopback = fmt(want_host_loopback),
+        host_loopback_default = HOST_LOOPBACK_DEFAULT,
         mounts = fmt(want_mounts),
         agent_mounts = fmt(agent_mounts_all)
     );
@@ -741,6 +807,8 @@ fn run() -> Result<i32> {
     let mut want_selinux = false;
     let mut want_ports = false;
     let mut want_ports_any_interface = false;
+    let mut want_shared_network = false;
+    let mut want_host_loopback: Option<String> = None;
     let mut want_mounts = false;
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
     let mut want_proxy = false;
@@ -899,6 +967,10 @@ fn run() -> Result<i32> {
             "--ports" => want_ports = true,
             "--no-ports" => want_ports = false,
             "--ports-any-interface" => want_ports_any_interface = true,
+            "--shared-network" => want_shared_network = true,
+            "--no-shared-network" => want_shared_network = false,
+            "--host-loopback" => want_host_loopback = Some(HOST_LOOPBACK_DEFAULT.to_string()),
+            "--no-host-loopback" => want_host_loopback = None,
             "--mounts" => want_mounts = true,
             "--no-mounts" => want_mounts = false,
             "--agent-mounts" => want_agent_mounts_mode = AgentMountsMode::All,
@@ -934,6 +1006,8 @@ fn run() -> Result<i32> {
                         }
                     }
                     want_agent_mounts_mode = AgentMountsMode::List(list_vec);
+                } else if let Some(addr) = arg.strip_prefix("--host-loopback=") {
+                    want_host_loopback = Some(validated_host_loopback(addr));
                 } else if arg == "--proxy-log" || arg.starts_with("--proxy-log=") {
                     let value = match arg.strip_prefix("--proxy-log=") {
                         Some(v) => v.to_string(),
@@ -1045,6 +1119,8 @@ fn run() -> Result<i32> {
             want_secrets,
             want_krun,
             want_ports,
+            want_shared_network,
+            want_host_loopback.is_some(),
             want_mounts,
             &want_agent_mounts_mode,
         );
@@ -1055,12 +1131,14 @@ fn run() -> Result<i32> {
         podman_args.push("--privileged".to_string());
     }
 
-    // Publishing a port and running a proxy are mutually exclusive, because the
-    // two network topologies contradict each other: a published port puts the
-    // sandbox on a NAT bridge *as well as* the proxy's --internal network,
-    // giving it a route to the internet that does not pass through the proxy at
-    // all.  Checked for podman-args here, and for [ports] once that block has
-    // been parsed.
+    // A published port is ingress and does not by itself defeat an egress
+    // policy -- podman forwards into the proxy's --internal network without
+    // giving the sandbox a route out of it.  What decides is the bind address:
+    // loopback is this machine, anything wider is a channel the proxy never
+    // sees.  A raw -p is refused under --proxy because this launcher never
+    // parses it and so cannot tell the two apart; a declared [ports] entry is
+    // checked on its bind once that block has been parsed.  Host networking is
+    // refused outright -- it is not publishing, it is the host's whole stack.
     if want_proxy {
         let mut idx = 0;
         while idx < podman_args.len() {
@@ -1079,10 +1157,50 @@ fn run() -> Result<i32> {
                 || arg.starts_with("-p=")
                 || arg.starts_with("--publish=")
             {
-                fail("agent-sandbox: --proxy cannot be combined with a published port.\n               A published port puts the sandbox on the shared bridge network,\n               which routes to the internet around the proxy, so the policy\n               would only be advisory.\n               Drop the port, or drop --proxy.");
+                fail("agent-sandbox: --proxy cannot be combined with a raw -p.\n               The launcher does not parse it, so it cannot tell a loopback\n               bind from one the whole network can pull from, and only the\n               first is compatible with an egress policy.\n               Declare the port in AGENTS.md and pass --ports instead.");
             }
             idx += 1;
         }
+    }
+
+    // Two flags choose the network mode themselves, and each would reach podman
+    // as a second --network beside the operator's.  Podman can only report that
+    // contradiction in its own words, long after the launcher had a chance to
+    // say which flag to drop.
+    let launcher_owns_network = if want_shared_network {
+        Some("--shared-network")
+    } else if want_host_loopback.is_some() {
+        Some("--host-loopback")
+    } else {
+        None
+    };
+    if let Some(flag) = launcher_owns_network {
+        for arg in &podman_args {
+            if arg == "--network"
+                || arg == "--net"
+                || arg.starts_with("--network=")
+                || arg.starts_with("--net=")
+            {
+                fail(&format!(
+                    "agent-sandbox: {} cannot be combined with a --network of your own.\n               It is a --network spec itself, and podman takes only one.\n               Drop {}, or write the whole spec by hand.",
+                    flag, flag
+                ));
+            }
+        }
+    }
+
+    // Both are network modes, and pasta is not a bridge.
+    if want_shared_network && want_host_loopback.is_some() {
+        fail("agent-sandbox: --shared-network cannot be combined with --host-loopback.\n               The shared network is a bridge, where pasta options -- including\n               --map-host-loopback -- do not apply.\n               Drop one of the two.");
+    }
+
+    // A route to the host's loopback is a route the proxy never sees, and what
+    // is listening there is not this launcher's to vouch for -- an unproxied
+    // forward proxy on the host would be an egress path with the policy still
+    // nominally on.  Refused rather than warned about, like every other way of
+    // leaving the sidecar behind.
+    if want_proxy && want_host_loopback.is_some() {
+        fail("agent-sandbox: --proxy cannot be combined with --host-loopback.\n               Mapping the host's loopback into the sandbox is a route around\n               the sidecar, so the egress policy would only be advisory.\n               Drop --host-loopback, or drop --proxy.");
     }
 
     if want_secrets && !want_proxy {
@@ -1414,6 +1532,20 @@ fn run() -> Result<i32> {
                 Ok(m) => m,
                 Err(e) => fail(&format!("agent-sandbox: {}", e)),
             };
+            // Under --proxy the bind address decides.  A loopback publish is
+            // ingress from this machine and leaves the egress policy intact:
+            // rootlessport forwards into the --internal network, the sandbox
+            // still has no route out.  A LAN-reachable one is a channel out by
+            // another route -- anything on the network can pull whatever the
+            // agent serves -- and the proxy never sees it, so the policy would
+            // hold for pushed bytes and not for pulled ones.  Refused before
+            // any network is created, so the refusal leaves nothing behind.
+            if want_proxy && !is_loopback_bind(&mapping.bind) {
+                fail(&format!(
+                    "agent-sandbox: --proxy cannot be combined with a port published off loopback ({}).\n               Anything on the network could pull what the agent serves there,\n               which the proxy never sees, so the egress policy would only be\n               advisory.  A loopback bind is fine and needs no flag.\n               Drop --ports-any-interface, or drop --proxy.",
+                    mapping.spec()
+                ));
+            }
             publish_args.push("-p".to_string());
             publish_args.push(mapping.spec());
             published.push(mapping.spec());
@@ -1438,21 +1570,28 @@ fn run() -> Result<i32> {
         }
     }
 
-    // Checked after the [ports] block is parsed, so a declaration that yields
-    // nothing is not treated as a request, and before any network is created,
-    // so the refusal leaves nothing behind.
-    if want_proxy && !published.is_empty() {
-        fail(&format!(
-            "agent-sandbox: --proxy cannot be combined with a published port ({}).\n               A published port puts the sandbox on the shared bridge network,\n               which routes to the internet around the proxy, so the policy\n               would only be advisory.\n               Drop the port, or drop --proxy.",
-            published[0]
-        ));
+    // Refused for the same reason a published port is: joining the shared
+    // bridge *as well as* the proxy's --internal network would hand the sandbox
+    // a route to the internet that never passes the proxy, leaving the policy
+    // advisory.  Checked separately because the flag no longer needs a port.
+    if want_proxy && want_shared_network {
+        fail(
+            "agent-sandbox: --proxy cannot be combined with --shared-network.\n               The shared bridge routes around the proxy's internal network,\n               so the policy would only be advisory.\n               Drop --shared-network, or drop --proxy.",
+        );
     }
 
     // A shared network is what lets anything else reach this container by name
-    // later.  Created lazily, so a launch with no ports at all keeps podman's
-    // default rootless networking untouched.
+    // later, and it is opt-in because it is not free: it replaces podman's
+    // rootless default (pasta) with a bridge, and pasta options are the only
+    // route to the host's loopback.  Podman passes --no-map-gw and points
+    // host.containers.internal at the host's *LAN* address, so reaching a
+    // service on the host's 127.0.0.1 takes --host-loopback, which a bridge
+    // cannot honour.  Publishing needs neither -- podman publishes under pasta
+    // just as well -- so the three decisions are kept apart, and the flag
+    // stands on its own: being reachable by name is useful without publishing
+    // anything to the host.
     let mut network_args: Vec<String> = Vec::new();
-    if !published.is_empty() {
+    if want_shared_network {
         let network =
             env::var("AGENT_SANDBOX_NETWORK").unwrap_or_else(|_| "agent-sandbox".to_string());
         let exists = ProcessCommand::new("podman")
@@ -1475,7 +1614,24 @@ fn run() -> Result<i32> {
         }
         network_args.push("--network".to_string());
         network_args.push(network);
+    }
 
+    // The whole of --host-loopback: pasta translates one address to the host's
+    // loopback, so a service the user runs on 127.0.0.1 is reachable without
+    // being exposed to anything else.  The address is also handed to the
+    // sandbox, because an agent cannot otherwise tell a session that has this
+    // route from one that does not -- both look like a refused connection.
+    if let Some(addr) = &want_host_loopback {
+        network_args.push(format!("--network=pasta:--map-host-loopback,{}", addr));
+        eprintln!(
+            "agent-sandbox: {} maps to the host's 127.0.0.1 (AGENT_SANDBOX_HOST_LOOPBACK)",
+            addr
+        );
+    }
+
+    // Outside the block above: a port is published in either network mode, and
+    // saying so is not the shared network's business.
+    if !published.is_empty() {
         eprintln!("agent-sandbox: publishing {}", published.join(" "));
         eprintln!("               (a server inside must bind 0.0.0.0, not 127.0.0.1)");
     }
@@ -1904,6 +2060,15 @@ fn run() -> Result<i32> {
         proxy_env_vars.push(format!("HTTPS_PROXY=http://{}:8888", sidecar_ip));
         proxy_env_vars.push(format!("http_proxy=http://{}:8888", sidecar_ip));
         proxy_env_vars.push(format!("https_proxy=http://{}:8888", sidecar_ip));
+        // Loopback is exempt because proxying it can only fail: curl and
+        // requests do not special-case it, so a request to a server the agent
+        // just started in its own container would go to the sidecar, resolve to
+        // 127.0.0.1, and be refused by the baseline deny.  This grants nothing
+        // -- the sandbox already owns its netns, and NO_PROXY is a hint to
+        // clients, not a route.  Literal entries only: wildcard and CIDR syntax
+        // disagree across curl, requests, Go and undici.
+        proxy_env_vars.push("NO_PROXY=localhost,127.0.0.1,::1".to_string());
+        proxy_env_vars.push("no_proxy=localhost,127.0.0.1,::1".to_string());
         if want_relay_ssh || want_relay_gpg {
             proxy_env_vars.push(format!("AGENT_SANDBOX_RELAY_ADDRESS={}:8889", sidecar_ip));
         }
@@ -1987,6 +2152,13 @@ fn run() -> Result<i32> {
 
     podman_cmd.args(&network_args);
     podman_cmd.args(&publish_args);
+
+    // Set only when the route exists, so an agent can test for it rather than
+    // discovering its absence as a refused connection.
+    if let Some(addr) = &want_host_loopback {
+        podman_cmd.arg("-e");
+        podman_cmd.arg(format!("AGENT_SANDBOX_HOST_LOOPBACK={}", addr));
+    }
 
     for proxy_env in proxy_env_vars {
         podman_cmd.arg("-e");

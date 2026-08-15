@@ -1,13 +1,14 @@
 # Trust model
 
 !!! warning "Flags that pierce the sandbox boundary"
-    `--ssh`, `--gpg`, and `--podman` each hand the agent a capability that reaches outside the container. Review the section for each flag below before enabling them.
+    `--ssh`, `--gpg`, `--podman`, and `--host-loopback` each hand the agent a capability that reaches outside the container. Review the section for each flag below before enabling them.
 
 By design, `agent-sandbox` includes options that pierce the sandbox boundary. Note that these give any agent running inside the container capabilities on the host:
 
 - `--ssh` (opt-in): The agent can authenticate as you using your forwarded SSH identity (e.g. `git push` to your repos).
 - `--gpg` (opt-in): The agent can sign commits or authenticate with any key held by your host GnuPG agent. Note that `agent-sandbox` protects your private key files by checking for them and gracefully failing the GNUPG directory mount if they are present on disk, but the forwarded GnuPG agent socket is still accessible.
 - `--podman` (opt-in): Forwards the host rootless podman socket. The agent can use this to launch **sibling containers** on the host, which is equivalent to a full sandbox escape (e.g. `podman run -v /:/host ...`).
+- `--host-loopback` (opt-in): Maps one address to the host's `127.0.0.1`, so the agent can reach services you run there — **all of them**, not only the one you had in mind. Narrower than the `--network=host` it replaces, which shares the host's entire network stack, but it is still a route out of the sandbox: anything listening on your loopback, including an unproxied forward proxy or a database with no password because "it's only local", is reachable. Refused with `--proxy`.
 
 ### Running Containers: `--podman` vs `--privileged`
 If you want the agent to be able to run its own containers, `agent-sandbox` supports two distinct models:
@@ -17,7 +18,7 @@ If you want the agent to be able to run its own containers, `agent-sandbox` supp
 
 ## A guest kernel: `--krun`
 
-`--krun` runs the sandbox as a KVM microVM. Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar and the port forwarders stay ordinary containers, so `--proxy` and every `agent-sandbox ctl` subcommand that works by label are unaffected.
+`--krun` runs the sandbox as a KVM microVM. Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar stays an ordinary container, so `--proxy` and every `agent-sandbox ctl` subcommand that works by label are unaffected.
 
 - `agent-sandbox ctl attach` and `agent-sandbox ctl mounts` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `--podman-args -v ... --`.
 - `--podman` is refused under `--krun`; `--privileged` and `--selinux` are accepted with a warning that they are unverified against a guest.
@@ -77,7 +78,7 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
 - An invalid `[network]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote. See [Configuration](configuration.md#rules-the-launcher-refuses) for the combinations that are rejected.
 - `--proxy` with no `AGENTS.md` defaults to deny all. Profile-only launches likewise default to deny all when the selected profiles contain no allow rules.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
-- **Cannot be combined with publishing a port.** A published port puts the sandbox on a NAT bridge alongside the proxy's internal network, giving it egress that does not pass through the proxy at all; the launcher refuses the combination rather than filtering some traffic and letting the rest around.
+- **Composes with a loopback-bound published port; refuses a wider one, and `--shared-network`.** Publishing is ingress: podman forwards the host's port into the proxy's internal network without giving the sandbox a route out of it, so a `[ports]` entry bound to loopback leaves the egress policy intact and is allowed. A bind the rest of the network can reach is refused — anything out there could pull what the agent serves, which the proxy never sees, making the policy advisory for pulled bytes. A raw `-p` through `--podman-args` is refused because the launcher does not parse it and cannot tell the two apart. `--shared-network` is refused outright: the shared bridge is a route around the proxy in its own right.
 - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
 - The traffic summary ranks hosts by volume, collapses the tail beyond 15 hosts, and lists denied and failed connections separately:
 

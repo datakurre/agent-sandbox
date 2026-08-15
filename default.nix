@@ -11,9 +11,10 @@ let
   # podman namespaces locally loaded images under localhost/.
   imageRef = "localhost/${imageName}:${imageTag}";
 
-  # Shared network for published ports.  Only created when a sandbox actually
-  # publishes something, so a launch with no ports keeps podman's default
-  # rootless networking untouched.
+  # Shared network for --shared-network, where sibling containers reach a
+  # sandbox by name.  Only created when that flag asks for it: publishing a port
+  # does not need it, and a bridge would cost the pasta options that are the
+  # only route to the host's loopback.
   networkName = "agent-sandbox";
 
   # Scripts in ./lib keep their own shebang so they can be run and linted in
@@ -125,7 +126,7 @@ let
       nettools
       dnsutils
       openssl
-      # socat backs the port-forward sidecars; the image doubles as their image.
+      # socat backs the entrypoint's generated ssh ProxyCommand under --proxy.
       socat
       git-lfs
       nix

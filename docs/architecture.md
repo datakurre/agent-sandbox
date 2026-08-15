@@ -107,7 +107,11 @@ running `agent-sandbox-sidecar`, and put the sandbox on a `podman network create
 --internal --disable-dns` network with no route off-host.  The sidecar is
 dual-homed on that network and on `bridge`, so it is the sandbox's only path to
 the internet, and the sandbox gets `HTTP_PROXY`/`HTTPS_PROXY` pointing at its
-**address**.
+**address**.  It also gets `NO_PROXY=localhost,127.0.0.1,::1`, because the
+baseline denies `127.0.0.0/8`: without the exemption a client that does not
+special-case loopback -- curl and requests do not -- would send a request aimed
+at a server in this very container to the sidecar and collect a `403`.  The
+exemption grants nothing, since the sandbox already owns its own netns.
 
 **`--disable-dns` is load-bearing.**  Podman routes a container's whole resolver
 through aardvark-dns as soon as *any* of its networks has `dns_enabled` --

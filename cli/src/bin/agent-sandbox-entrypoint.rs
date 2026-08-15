@@ -143,7 +143,13 @@ fn main() -> Result<()> {
                 let proxy_host = parts.next().unwrap_or("");
                 let proxy_port = parts.next().unwrap_or("");
 
-                let config_content = format!("Host *\n  ProxyCommand socat - PROXY:{proxy_host}:%h:%p,proxyport={proxy_port}\n");
+                // ssh takes the first value it sees for a keyword, so the
+                // loopback exemption has to precede the catch-all.  Without it
+                // a local ssh is sent to the sidecar, which refuses 127.0.0.1.
+                let config_content = format!(
+                    "Host localhost 127.0.0.1 ::1\n  ProxyCommand none\n\
+                     Host *\n  ProxyCommand socat - PROXY:{proxy_host}:%h:%p,proxyport={proxy_port}\n"
+                );
                 let mut file = fs::OpenOptions::new()
                     .create(true)
                     .append(true)

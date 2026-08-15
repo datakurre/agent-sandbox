@@ -85,6 +85,8 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into the proxied requests each `[[network.allowed_routes]]` rule authorises — that rule's host, method and path, and no others. Requires `--proxy`. See [Configuration](configuration.md#secrets). |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
+| Ports & mounts | `--shared-network` | Joins the shared bridge network so other containers can reach this one by name. Costs access to the host's loopback — see below. |
+| Ports & mounts | `--host-loopback[=ADDR]` | Maps `ADDR` (default `169.254.1.3`) to the host's `127.0.0.1`, and exports it as `$AGENT_SANDBOX_HOST_LOOPBACK`. Refused with `--proxy`. See below. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
 
@@ -98,8 +100,54 @@ A few flags are one-off pass-throughs rather than persistent toggles, so they ha
 | `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel (including `-v/--volume` and `-p/--publish`). |
 
 There is no `--port` flag: declare ports in `AGENTS.md` and pass `--ports`, or
-publish one directly with `--podman-args -p HOST:CONTAINER --`. Either way,
-publishing a port cannot be combined with `--proxy`.
+publish one directly with `--podman-args -p HOST:CONTAINER --`. Prefer
+`--ports`: it defaults each bind to loopback and refuses a wider one unless
+`--ports-any-interface` is given, while a raw `-p HOST:CONTAINER` binds
+`0.0.0.0` and exposes the port to the LAN.
+
+`--ports` composes with `--proxy` as long as every bind is loopback. Publishing
+is ingress — podman forwards into the proxy's internal network without giving
+the sandbox a route out of it — so the egress policy is untouched. A bind the
+rest of the network can reach is refused under `--proxy`, because anything out
+there could pull whatever the agent chose to serve and the proxy would never see
+it. A raw `-p` is refused under `--proxy` too: the launcher never parses it, so
+it cannot tell the two cases apart.
+
+Whichever you use, the server *inside* the sandbox must bind `0.0.0.0`.
+Publishing forwards to the sandbox's interface address, so a server bound to the
+sandbox's own `127.0.0.1` answers from inside and refuses from the host.
+
+Publishing does not change the network mode, which matters for reaching back to
+the host. Rootless podman leaves the sandbox on pasta, and `--host-loopback`
+asks pasta to translate one address to the host's loopback:
+
+```sh
+agent-sandbox --host-loopback -- bash
+```
+
+Packets the sandbox sends to `169.254.1.3` then arrive on the host as
+`127.0.0.1 → 127.0.0.1`, which is how a sandbox reaches a service the user runs
+on the host without exposing it to anything else — a browser's CDP port, say
+(see the `browser` skill). This is not on by default: podman passes pasta
+`--no-map-gw`, and the `host.containers.internal` entry it does set up points at
+the host's *LAN* address, not its loopback.
+
+The sandbox is told which address it got, as `$AGENT_SANDBOX_HOST_LOOPBACK`, so
+an agent inside can test for the route instead of learning it is missing from a
+refused connection. `--host-loopback=ADDR` picks a different address; anything
+unused will do, but not `169.254.1.1` or `169.254.1.2`, which are podman's own
+DNS forwarder and `host.containers.internal`.
+
+This is a capability, not just a convenience: it exposes everything listening on
+the host's loopback, not only the service you had in mind. It is refused with
+`--proxy`, where it would be a route around the sidecar, and with
+`--shared-network`.
+
+`--shared-network` gives the mapping up. It puts the sandbox on a bridge so
+sibling containers can reach it by name, and pasta options do not apply there —
+the two are mutually exclusive at the podman level. So the shared network is
+opt-in and most sandboxes should leave it off. `AGENT_SANDBOX_NETWORK` names the
+network when the flag is on.
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
@@ -234,7 +282,7 @@ and `~/.gemini/skills` for tools that use those discovery paths.
 | Command | What it does |
 | --- | --- |
 | `load` | build the image and import it into podman |
-| `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows sidecars and forwarders |
+| `list [-a] [--roles]` | running sandboxes and their proxy mode; `--roles` also shows the proxy sidecars |
 | `status [WORD] [--sandbox WORD]` | one screen per sandbox, pointing at the commands below |
 | `net [-f] [WORD] [--sandbox WORD]` | connection summary, or a live feed |
 | `logs [-f] [--tail N] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
@@ -263,7 +311,7 @@ $ agent-sandbox ctl mounts ls --sandbox silent
 $ agent-sandbox ctl attach silent -- bash
 ```
 
-`purge` defaults to leftovers only: exited sandboxes, forwarders and sidecars
-whose sandbox is gone, per-session networks nothing is attached to, and temp
-directories from a launcher that was killed before it could clean up. `-n` shows
-what it would remove.
+`purge` defaults to leftovers only: exited sandboxes, sidecars whose sandbox is
+gone, per-session networks nothing is attached to, and temp directories from a
+launcher that was killed before it could clean up. `-n` shows what it would
+remove.
