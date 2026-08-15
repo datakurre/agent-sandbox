@@ -193,7 +193,8 @@ probe is a 30s ceiling that only makes sense when a container's network is still
 coming up.
 
 Each invocation owns a mode-0700 directory under `$XDG_RUNTIME_DIR`, named
-`agent-sandbox-browser-<uuid8>` -- the same shape as the host-port directory:
+`agent-sandbox-browser-<session>` -- `--name`'s value, or a uuid8 when it was
+left out -- the same shape as the host-port directory:
 
 | File | What it is |
 | --- | --- |
@@ -201,7 +202,7 @@ Each invocation owns a mode-0700 directory under `$XDG_RUNTIME_DIR`, named
 | `connections.jsonl`, `denied-requests.jsonl` | the proxy's own logs |
 | `policies/managed/agent-sandbox.json` | the Chromium managed policy, bound into place by bwrap |
 | `profile/` | Chromium's `--user-data-dir` |
-| `meta.json` | CDP port, proxy port and pid, so `ctl proxy --browser` can find it |
+| `meta.json` | session name, CDP port, proxy port and pid, so `ctl proxy --browser` and the launcher's `--browser` can find it |
 
 Reusing the policy file trio rather than inventing a format is what makes
 `agent-sandbox ctl proxy allow --browser` work with no new machinery:

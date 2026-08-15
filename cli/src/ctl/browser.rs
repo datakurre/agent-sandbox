@@ -601,7 +601,8 @@ fn port_is_free(port: u16) -> bool {
 pub struct Instance {
     /// The runtime directory, which is also the policy directory.
     pub dir: String,
-    /// The uuid suffix, used as the name to disambiguate with.
+    /// The session name -- `--name`, or a uuid8 when it was left out.  What
+    /// `ctl proxy --browser NAME` and `--browser=NAME` match on.
     pub name: String,
     pub cdp_port: u16,
     pub pid: u32,
@@ -661,19 +662,23 @@ pub fn running_instances() -> Vec<Instance> {
 }
 
 /// What `--browser` puts in `AGENT_SANDBOX_BROWSER_CDP_PORT` for the browsers
-/// it selected.
+/// it attached, as `(session name, the port it answers on inside the sandbox)`.
+/// That port is the browser's own CDP port unless `--host-loopback-port`
+/// remapped it; the launcher resolves which, because only the inside number is
+/// dialable from where the agent runs.
 ///
 /// One browser keeps the bare port, which is all a single session needs and
-/// what the entrypoint accepted before names existed.  Several are named, so
-/// the entrypoint can define one MCP server per browser and the agent can say
-/// which user it is acting as.
-pub fn cdp_port_env(selected: &[Instance]) -> String {
-    if selected.len() == 1 {
-        return selected[0].cdp_port.to_string();
+/// what the entrypoint accepted before names existed -- it also keeps that
+/// common case on the plain `playwright` MCP server rather than one named
+/// after a uuid.  Several are named, so the entrypoint can define one server
+/// per browser and the agent can say which user it is acting as.
+pub fn cdp_port_env(attached: &[(String, u16)]) -> String {
+    if let [(_, port)] = attached {
+        return port.to_string();
     }
-    selected
+    attached
         .iter()
-        .map(|i| format!("{}={}", i.name, i.cdp_port))
+        .map(|(name, port)| format!("{}={}", name, port))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1295,26 +1300,28 @@ mod tests {
         assert_eq!(pick_port(9222, |_| false), None);
     }
 
-    fn inst(name: &str, port: u16) -> Instance {
-        Instance {
-            dir: format!("/run/x/{name}"),
-            name: name.to_string(),
-            cdp_port: port,
-            pid: 1,
-        }
+    fn attached(pairs: &[(&str, u16)]) -> Vec<(String, u16)> {
+        pairs.iter().map(|(n, p)| (n.to_string(), *p)).collect()
     }
 
     #[test]
     fn one_browser_keeps_the_bare_port_the_entrypoint_always_took() {
-        assert_eq!(cdp_port_env(&[inst("7f3a1b2c", 9222)]), "9222");
+        assert_eq!(cdp_port_env(&attached(&[("7f3a1b2c", 9222)])), "9222");
     }
 
     #[test]
     fn several_browsers_are_named_so_the_agent_can_tell_them_apart() {
         assert_eq!(
-            cdp_port_env(&[inst("alice", 9222), inst("bob", 9223)]),
+            cdp_port_env(&attached(&[("alice", 9222), ("bob", 9223)])),
             "alice=9222,bob=9223"
         );
+    }
+
+    #[test]
+    fn what_is_advertised_is_the_port_inside_not_the_browser_s_own() {
+        // `--host-loopback-port 9222:19222 --browser`: the operator moved the
+        // inside number, and 9222 reaches nothing from in there.
+        assert_eq!(cdp_port_env(&attached(&[("alice", 19222)])), "19222");
     }
 
     #[test]

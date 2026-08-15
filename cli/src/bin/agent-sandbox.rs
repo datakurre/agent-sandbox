@@ -152,6 +152,37 @@ fn parse_host_loopback_ports(spec: &str) -> Result<Vec<HostPort>, String> {
     Ok(out)
 }
 
+/// Maps every browser `--browser` selected into the sandbox, and reports the
+/// port each one answers on *inside* -- which is what the agent dials, and so
+/// what `AGENT_SANDBOX_BROWSER_CDP_PORT` has to carry.
+///
+/// Usually that is the browser's own CDP port, mapped straight through.  An
+/// explicit `--host-loopback-port 9222:19222` wins over adding a second
+/// mapping: the operator moved the inside number because something in the
+/// sandbox already holds 9222, and advertising the outside one would point the
+/// agent at a port nothing is listening on.
+fn attach_browsers(
+    selected: &[ctl::browser::Instance],
+    host_ports: &mut Vec<HostPort>,
+) -> Vec<(String, u16)> {
+    selected
+        .iter()
+        .map(|inst| {
+            let inside = match host_ports.iter().find(|hp| hp.host == inst.cdp_port) {
+                Some(hp) => hp.sandbox,
+                None => {
+                    host_ports.push(HostPort {
+                        host: inst.cdp_port,
+                        sandbox: inst.cdp_port,
+                    });
+                    inst.cdp_port
+                }
+            };
+            (inst.name.clone(), inside)
+        })
+        .collect()
+}
+
 /// Serve one `--host-loopback-port` mapping for the life of the session: every
 /// connection arriving on the unix socket the sandbox has mounted is spliced to
 /// the host's loopback.  A socket rather than a route because a route would have
@@ -1304,24 +1335,22 @@ fn run() -> Result<i32> {
             );
         }
 
-        for inst in &selected {
-            if !want_host_ports.iter().any(|hp| hp.host == inst.cdp_port) {
-                want_host_ports.push(HostPort {
-                    host: inst.cdp_port,
-                    sandbox: inst.cdp_port,
-                });
-            }
-        }
+        let attached = attach_browsers(&selected, &mut want_host_ports);
         env_args.push("-e".to_string());
         env_args.push(format!(
             "AGENT_SANDBOX_BROWSER_CDP_PORT={}",
-            ctl::browser::cdp_port_env(&selected)
+            ctl::browser::cdp_port_env(&attached)
         ));
         eprintln!(
             "agent-sandbox: --browser: {}",
             selected
                 .iter()
-                .map(|i| format!("{} on {}", i.name, i.cdp_port))
+                .zip(&attached)
+                .map(|(inst, (_, inside))| if *inside == inst.cdp_port {
+                    format!("{} on {}", inst.name, inst.cdp_port)
+                } else {
+                    format!("{} on {} (sandbox {})", inst.name, inst.cdp_port, inside)
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -2439,6 +2468,60 @@ mod tests {
                     sandbox: 5432
                 }
             ]
+        );
+    }
+
+    fn browser(name: &str, cdp_port: u16) -> ctl::browser::Instance {
+        ctl::browser::Instance {
+            dir: format!("/run/user/1000/agent-sandbox-browser-{name}"),
+            name: name.to_string(),
+            cdp_port,
+            pid: 1,
+        }
+    }
+
+    #[test]
+    fn attaching_a_browser_maps_its_cdp_port_straight_through() {
+        let mut ports = Vec::new();
+        assert_eq!(
+            attach_browsers(&[browser("alice", 9222), browser("bob", 9223)], &mut ports),
+            vec![("alice".to_string(), 9222), ("bob".to_string(), 9223)]
+        );
+        assert_eq!(
+            ports,
+            vec![
+                HostPort {
+                    host: 9222,
+                    sandbox: 9222
+                },
+                HostPort {
+                    host: 9223,
+                    sandbox: 9223
+                }
+            ]
+        );
+    }
+
+    /// The pair has to agree: whatever number the mapping puts the browser on
+    /// inside is the number the agent is told to dial.  Advertising the host's
+    /// 9222 while the listener is on 19222 points playwright-mcp at nothing.
+    #[test]
+    fn an_explicit_remap_wins_and_is_what_gets_advertised() {
+        let mut ports = vec![HostPort {
+            host: 9222,
+            sandbox: 19222,
+        }];
+        assert_eq!(
+            attach_browsers(&[browser("alice", 9222)], &mut ports),
+            vec![("alice".to_string(), 19222)]
+        );
+        assert_eq!(
+            ports,
+            vec![HostPort {
+                host: 9222,
+                sandbox: 19222
+            }],
+            "a second mapping for the same host port would be a duplicate"
         );
     }
 

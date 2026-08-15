@@ -170,7 +170,7 @@ everything `--proxy` enforces.
 $ agent-sandbox browser
 browser: 'e4c1a80f' -- CDP on 127.0.0.1:9222, egress deny-by-default
 browser: allowed: 127.0.0.1:3000
-browser:   agent-sandbox ctl proxy allow <host>:443 --browser
+browser:   agent-sandbox ctl proxy allow <host>:443 --browser e4c1a80f
 browser:
 browser: now run, keeping whatever flags you already use:
 browser:   agent-sandbox --browser -- claude
@@ -235,9 +235,13 @@ Ports are assigned by walking up from 9222, skipping any a live browser has
 already claimed, so you do not have to allocate them yourself. `--cdp-port`
 pins one if you want a fixed number.
 
-Inside the sandbox each browser becomes its own MCP server named after the
-session — `playwright-alice`, `playwright-bob` — so an agent can say which user
-it is acting as. From a script, connect to each port directly:
+Inside the sandbox, **two or more** attached browsers each become their own MCP
+server named after the session — `playwright-alice`, `playwright-bob` — so an
+agent can say which user it is acting as. A single attached browser is always
+the plain `playwright`, whatever it is called, so the one-browser case is not
+made to carry a name it has no use for: `--browser=alice` on its own gives
+`playwright`, not `playwright-alice`. From a script, connect to each port
+directly:
 
 ```python
 alice = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
@@ -322,6 +326,12 @@ so the long form still works if you want to pin exact ports:
 agent-sandbox --host-loopback-port 9222 --host-loopback-port 9223 \
               -e AGENT_SANDBOX_BROWSER_CDP_PORT=alice=9222,bob=9223 -- claude
 ```
+
+The two compose rather than fight: a `--host-loopback-port` you wrote yourself
+for a browser's CDP port wins, remap included, and `--browser` advertises the
+number that mapping puts it on **inside**. So
+`--host-loopback-port 9222:19222 --browser` tells the agent 19222, which is
+where the browser actually answers from in there.
 
 `--shared-network` is a separate decision. It puts the sandbox on a bridge so
 sibling containers can reach it by name, replacing pasta — so any pasta option

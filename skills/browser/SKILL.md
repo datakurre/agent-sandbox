@@ -175,7 +175,7 @@ What they'll see:
 $ agent-sandbox browser
 browser: 'e4c1a80f' -- CDP on 127.0.0.1:9222, egress deny-by-default
 browser: allowed: 127.0.0.1:3000
-browser:   agent-sandbox ctl proxy allow <host>:443 --browser
+browser:   agent-sandbox ctl proxy allow <host>:443 --browser e4c1a80f
 browser:
 browser: now run, keeping whatever flags you already use:
 browser:   agent-sandbox --browser -- claude
@@ -265,9 +265,11 @@ Ask for both up front. The channel is established at launch, so a second browser
 started after the sandbox is not reachable until the next relaunch — which is
 the one round trip worth avoiding.
 
-Inside, each becomes its own MCP server (`playwright-alice`, `playwright-bob`),
-so say which user you are acting as by choosing the server. From a script, hold
-both connections at once:
+With two attached, each becomes its own MCP server (`playwright-alice`,
+`playwright-bob`), so say which user you are acting as by choosing the server.
+One attached browser is always the plain `playwright` instead, whatever it is
+named — so don't look for `playwright-alice` until there are actually two. From
+a script, hold both connections at once:
 
 ```python
 alice = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
