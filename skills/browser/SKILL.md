@@ -244,6 +244,44 @@ page.goto("http://127.0.0.1:3000")
 Dialing `127.0.0.1` also sidesteps Chrome's DevTools host check, which rejects a
 `Host:` header that is not an IP or `localhost`.
 
+## Two users at once
+
+A separate profile is a separate user, so testing an interaction between two
+people — a shared document, a chat, a buyer and a seller — means asking for two
+browsers rather than one:
+
+> Run these two, then use the command the **second** one prints:
+>
+> ```sh
+> agent-sandbox browser --name alice --keep-profile ~/.cache/browsers/alice
+> agent-sandbox browser --name bob   --keep-profile ~/.cache/browsers/bob
+> ```
+
+Each banner reprints the whole relaunch command covering every running browser,
+so the last one is always the complete line — the user never merges two by hand.
+Ports walk up from 9222, so alice is 9222 and bob is 9223.
+
+Ask for both up front. `--host-loopback-port` only applies at launch, so a
+second browser started after the sandbox has no channel until the next relaunch
+— which is the one round trip worth avoiding.
+
+Inside, each becomes its own MCP server (`playwright-alice`, `playwright-bob`),
+so say which user you are acting as by choosing the server. From a script, hold
+both connections at once:
+
+```python
+alice = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+bob   = p.chromium.connect_over_cdp("http://127.0.0.1:9223")
+a_page, b_page = alice.contexts[0].pages[0], bob.contexts[0].pages[0]
+a_page.fill("#message", "hello"); a_page.click("text=Send")
+b_page.reload()                                    # bob should now see it
+```
+
+`--keep-profile` is what makes a login survive: without it every session starts
+signed out, which is right for a disposable browser and wrong for a scenario you
+re-run. Each session also has its own allow list —
+`agent-sandbox ctl proxy allow <host>:443 --browser alice` widens only alice.
+
 ## What this does and does not bound
 
 The browser's allow list governs what that browser fetches. It is a **separate**

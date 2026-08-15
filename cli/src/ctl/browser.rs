@@ -119,6 +119,31 @@ pub struct BrowserArgs {
         help = "Chromium binary to launch (default: chromium on PATH)"
     )]
     pub chromium: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Name this session, for simulating several users at once"
+    )]
+    pub name: Option<String>,
+}
+
+/// Session names end up in a directory name, an MCP server name and a `ctl
+/// proxy --browser` argument, so they are checked the same way a proxy profile
+/// name is rather than joined blindly.
+pub fn valid_session_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "invalid session name '{}'; use letters, numbers, '.', '_' or '-'",
+            name
+        );
+    }
+    Ok(())
 }
 
 // ── Allow list ──────────────────────────────────────────────────────────────
@@ -619,7 +644,14 @@ pub fn running_instances() -> Vec<Instance> {
         }
         out.push(Instance {
             dir: path.to_string_lossy().to_string(),
-            name: suffix.to_string(),
+            // The directory carries the name, but meta.json is the record; fall
+            // back to the suffix so a directory written by an older build still
+            // resolves.
+            name: meta
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(suffix)
+                .to_string(),
             cdp_port: meta.get("cdp_port").and_then(|v| v.as_u64()).unwrap_or(0) as u16,
             pid,
         });
@@ -681,6 +713,11 @@ impl Drop for BrowserGuard {
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 pub fn run(args: BrowserArgs) -> Result<()> {
+    // Before anything observable: a name typed wrong should not first produce a
+    // note about podman.
+    if let Some(name) = &args.name {
+        valid_session_name(name)?;
+    }
     let home = std::env::var("HOME").unwrap_or_default();
     // Extensions baked in by the Nix wrapper (`browserExtensions`), as a
     // colon-separated path list.  Command-line `--extension` adds to these;
@@ -751,10 +788,29 @@ pub fn run(args: BrowserArgs) -> Result<()> {
     // both pick 9222, and the second would lose the race to bind it.  The same
     // call sweeps the runtime directory of any browser killed hard enough to
     // skip its own cleanup.
-    let claimed: BTreeSet<u16> = running_instances().iter().map(|i| i.cdp_port).collect();
+    let running = running_instances();
+    let claimed: BTreeSet<u16> = running.iter().map(|i| i.cdp_port).collect();
     let start = args.cdp_port.unwrap_or(DEFAULT_CDP_PORT);
     let cdp_port = pick_port(start, |p| !claimed.contains(&p) && port_is_free(p))
         .ok_or_else(|| anyhow::anyhow!("no free port within {} of {}", CDP_PORT_SCAN, start))?;
+
+    // A name is how one of several concurrent sessions is addressed later, so
+    // a collision with a live one is refused rather than resolved: reusing the
+    // name would make `ctl proxy allow --browser alice` ambiguous, and sharing
+    // the directory would have two proxies writing one policy file.
+    let session = match &args.name {
+        Some(name) => {
+            if let Some(live) = running.iter().find(|i| &i.name == name) {
+                anyhow::bail!(
+                    "a browser named '{}' is already running (CDP {}); pick another name",
+                    name,
+                    live.cdp_port
+                );
+            }
+            name.clone()
+        }
+        None => uuid::Uuid::new_v4().to_string()[0..8].to_string(),
+    };
     // The proxy port is never advertised, so it can be anything free.
     let proxy_port = TcpListener::bind("127.0.0.1:0")
         .context("cannot reserve a proxy port")?
@@ -762,7 +818,7 @@ pub fn run(args: BrowserArgs) -> Result<()> {
         .context("cannot read the reserved proxy port")?
         .port();
 
-    let runtime_dir = make_runtime_dir()?;
+    let runtime_dir = make_runtime_dir(&session)?;
     let profile_dir = match &args.keep_profile {
         Some(dir) => {
             fs::create_dir_all(dir)
@@ -800,6 +856,7 @@ pub fn run(args: BrowserArgs) -> Result<()> {
     fs::write(
         format!("{}/meta.json", runtime_dir),
         serde_json::to_string_pretty(&json!({
+            "name": session,
             "cdp_port": cdp_port,
             "proxy_port": proxy_port,
             "sandbox": sandbox,
@@ -862,7 +919,7 @@ pub fn run(args: BrowserArgs) -> Result<()> {
         }
     };
 
-    print_banner(cdp_port, &allow, sandbox.as_deref());
+    print_banner(&session, cdp_port, &allow, sandbox.as_deref());
 
     let status = browser_cmd
         .status()
@@ -911,17 +968,19 @@ fn podman_published_ports(sandbox: &str) -> Option<Vec<u16>> {
     ))
 }
 
-fn make_runtime_dir() -> Result<String> {
-    let runtime_root = std::env::var("XDG_RUNTIME_DIR")
+fn runtime_root() -> String {
+    std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
-    let dir = format!(
-        "{}/{}{}",
-        runtime_root,
-        RUNTIME_PREFIX,
-        &uuid::Uuid::new_v4().to_string()[0..8]
-    );
+        .unwrap_or_else(|| format!("/run/user/{}", nix::unistd::getuid().as_raw()))
+}
+
+/// The per-invocation directory, named after the session so it is legible in
+/// `ls` and so `ctl proxy --browser alice` has something to match.  Unnamed
+/// sessions fall back to a uuid, which is what several concurrent browsers used
+/// to get in every case.
+fn make_runtime_dir(name: &str) -> Result<String> {
+    let dir = format!("{}/{}{}", runtime_root(), RUNTIME_PREFIX, name);
     fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir))?;
     // Only this user's, whatever the umask: the policy in here decides what a
     // browser holding the operator's session may fetch.
@@ -943,24 +1002,72 @@ fn wait_for_proxy(runtime_dir: &str) {
     eprintln!("browser: the proxy did not report ready; starting anyway");
 }
 
-fn print_banner(cdp_port: u16, allow: &AllowList, sandbox: Option<&str>) {
+/// The relaunch line, covering *every* live browser rather than just this one.
+///
+/// Simulating two users means two browsers, and the sandbox has to be launched
+/// with both ports -- `--host-loopback-port` cannot be added to a running
+/// session, so a line naming only the browser that happened to print it would
+/// be a line that has to be hand-merged with the last one. `sessions` is
+/// `(name, port)` oldest first.
+pub fn relaunch_line(sessions: &[(String, u16)]) -> String {
+    let ports: String = sessions
+        .iter()
+        .map(|(_, port)| format!("--host-loopback-port {} ", port))
+        .collect();
+    // One browser keeps the bare form, which is all a single session needs and
+    // what the entrypoint has always accepted.  Several are named, so each gets
+    // its own MCP server rather than the agent having to guess which is which.
+    let cdp = if sessions.len() == 1 {
+        sessions[0].1.to_string()
+    } else {
+        sessions
+            .iter()
+            .map(|(name, port)| format!("{}={}", name, port))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "agent-sandbox {}-e AGENT_SANDBOX_BROWSER_CDP_PORT={} -- claude",
+        ports, cdp
+    )
+}
+
+fn print_banner(session: &str, cdp_port: u16, allow: &AllowList, sandbox: Option<&str>) {
     let allowed = url_allowlist(allow);
     eprintln!(
-        "browser: CDP on 127.0.0.1:{}, egress deny-by-default",
-        cdp_port
+        "browser: '{}' -- CDP on 127.0.0.1:{}, egress deny-by-default",
+        session, cdp_port
     );
     if allowed.is_empty() {
         eprintln!("browser: nothing is allowed yet -- widen it with:");
     } else {
         eprintln!("browser: allowed: {}", allowed.join(" "));
     }
-    eprintln!("browser:   agent-sandbox ctl proxy allow <host>:443 --browser");
-    eprintln!("browser:");
-    eprintln!("browser: now run, keeping whatever flags you already use:");
     eprintln!(
-        "browser:   agent-sandbox --host-loopback-port {port} -e AGENT_SANDBOX_BROWSER_CDP_PORT={port} -- claude",
-        port = cdp_port
+        "browser:   agent-sandbox ctl proxy allow <host>:443 --browser {}",
+        session
     );
+    eprintln!("browser:");
+
+    // Include the browsers that were already running, so the printed line is
+    // the whole command rather than this session's fragment of it.
+    let mut sessions: Vec<(String, u16)> = running_instances()
+        .into_iter()
+        .filter(|i| i.name != session)
+        .map(|i| (i.name, i.cdp_port))
+        .collect();
+    sessions.push((session.to_string(), cdp_port));
+
+    if sessions.len() > 1 {
+        eprintln!(
+            "browser: {} browsers are running; this line covers all of them:",
+            sessions.len()
+        );
+    } else {
+        eprintln!("browser: now run, keeping whatever flags you already use:");
+    }
+    eprintln!("browser:   {}", relaunch_line(&sessions));
+
     if sandbox.is_some() {
         eprintln!("browser:");
         eprintln!(
@@ -1194,6 +1301,36 @@ mod tests {
         assert_eq!(pick_port(9222, |p| p >= 9224), Some(9224));
         assert_eq!(pick_port(9222, |_| true), Some(9222));
         assert_eq!(pick_port(9222, |_| false), None);
+    }
+
+    #[test]
+    fn one_session_keeps_the_bare_relaunch_line() {
+        assert_eq!(
+            relaunch_line(&[("7f3a1b2c".to_string(), 9222)]),
+            "agent-sandbox --host-loopback-port 9222 \
+             -e AGENT_SANDBOX_BROWSER_CDP_PORT=9222 -- claude"
+        );
+    }
+
+    #[test]
+    fn several_sessions_produce_one_line_covering_all_of_them() {
+        // --host-loopback-port cannot be added to a running sandbox, so a line
+        // naming only the browser that printed it would have to be hand-merged
+        // with the previous one -- exactly the round trip this avoids.
+        assert_eq!(
+            relaunch_line(&[("alice".to_string(), 9222), ("bob".to_string(), 9223)]),
+            "agent-sandbox --host-loopback-port 9222 --host-loopback-port 9223 \
+             -e AGENT_SANDBOX_BROWSER_CDP_PORT=alice=9222,bob=9223 -- claude"
+        );
+    }
+
+    #[test]
+    fn a_session_name_cannot_escape_its_runtime_directory() {
+        assert!(valid_session_name("alice").is_ok());
+        assert!(valid_session_name("user-2.b_c").is_ok());
+        for bad in ["", ".", "..", "a/b", "a b", "a$b"] {
+            assert!(valid_session_name(bad).is_err(), "{bad:?} must be refused");
+        }
     }
 
     #[test]
