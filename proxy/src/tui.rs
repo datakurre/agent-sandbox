@@ -759,7 +759,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             match key.code {
                                 KeyCode::Char('a') => {
-                                    detail = format!("allow_host {}", host);
+                                    detail = format!("allow_host {}:{}", host, port);
                                     policy.push(detail.clone());
                                 }
                                 KeyCode::Char('A') => {
@@ -769,7 +769,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             host
                                         ));
                                     } else {
-                                        detail = format!("allow_ip {}", host);
+                                        detail = format!("allow_ip {}:{}", host, port);
                                         policy.push(detail.clone());
                                     }
                                 }
