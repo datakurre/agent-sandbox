@@ -128,7 +128,7 @@ With `agent-sandbox --proxy --secrets`, resolution happens **on the host**:
 
 1. The launcher reads the `[[network.allowed_routes]]` rules that name a `secret`.
 2. It checks each one against the host-side authorization file,
-   `~/.config/agent-sandbox/secrets.toml`.
+   `~/.config/agent-sandbox/trusted.toml`.
 3. It runs `secretspec export --file <workspace>/secretspec.toml --format json`
    with a reason, honouring any `profile`, `provider` and `scope` set in that file.
 4. The values go to the **proxy sidecar** over a read-only memory mount.
@@ -165,7 +165,7 @@ prefix = "Bearer "
 ```
 ````
 
-**3. `~/.config/agent-sandbox/secrets.toml`** (on the host, never in the repo)
+**3. `~/.config/agent-sandbox/trusted.toml`** (on the host, never in the repo)
 authorizes it — **copied verbatim**, minus the `[network]` wrapper:
 
 ```toml
@@ -188,3 +188,20 @@ block unchanged, not to retype it.
 This asymmetry is the point: `AGENTS.md` is untrusted, so it can name a secret
 but cannot decide where it goes. Note also that secret injection is HTTP/1.1
 only; an h2-only client will fail the TLS handshake against an intercepted host.
+
+## The same file authorizes SSH host keys
+
+`trusted.toml` carries `[[network.known_hosts]]` as well, on the identical
+terms: `AGENTS.md` may name a host on port 22, but not say which key that host
+has. A policy authorizing SSH to a host with no key declared for it refuses the
+launch and prints the block, exactly as an unauthorized secret does:
+
+```toml
+[[network.known_hosts]]
+host = "github.com:22"
+key = "ssh-ed25519 AAAAC3Nza..."
+```
+
+Same rule for you as with secrets: you cannot write that file, and the fix for
+the refusal is to copy the printed block unchanged. See `network.md` for how
+`:22` in `allowed_hosts` pulls the requirement in.

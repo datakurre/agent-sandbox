@@ -18,7 +18,7 @@ impl fmt::Debug for Secret {
 }
 
 /// One authorized injection, scoped to the route the operator named in
-/// `~/.config/agent-sandbox/secrets.toml`.  `method`/`path` are carried all the
+/// `~/.config/agent-sandbox/trusted.toml`.  `method`/`path` are carried all the
 /// way here rather than being checked host-side and discarded: they are what
 /// stops a token authorized for one endpoint riding along on every other
 /// request the repo's AGENTS.md happens to allow.

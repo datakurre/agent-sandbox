@@ -379,6 +379,38 @@ pub(crate) fn warn_if_no_session_ca(policy_dir: &str, host: &str) {
     }
 }
 
+/// Whether `known_hosts` in the policy dir carries a key for `host`.
+///
+/// Shared with the TUI's equivalent check via the same file, which is the only
+/// thing either of them can see: the authorized set is fixed at launch from
+/// trusted.toml, and a live rule cannot add to it.
+pub(crate) fn trusts_host_key(policy_dir: &str, host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    fs::read_to_string(format!("{}/known_hosts", policy_dir))
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .any(|pattern| pattern.to_ascii_lowercase() == host)
+        })
+        .unwrap_or(false)
+}
+
+/// A live `:22` rule authorizes the relay to *reach* a host, but the host keys
+/// are bound in at launch from trusted.toml and a running sandbox cannot be
+/// given more.  So the grant works and the connection then fails verification
+/// -- fail-safe, but baffling unless said out loud.
+pub(crate) fn warn_if_no_trusted_host_key(policy_dir: &str, host: &str) {
+    if trusts_host_key(policy_dir, host) {
+        return;
+    }
+    eprintln!(
+        "  warning     no host key for {} is trusted in this sandbox, so SSH to it will\n\
+         \x20             fail host-key verification. Add a [[network.known_hosts]] entry to\n\
+         \x20             ~/.config/agent-sandbox/trusted.toml and relaunch.",
+        host
+    );
+}
+
 fn allow(args: AllowArgs) -> Result<()> {
     let (_, dir) = policy_dir(&args.word, &args.container, args.browser)?;
     let mut lines = load_policy_lines(&dir);
@@ -420,6 +452,7 @@ fn allow(args: AllowArgs) -> Result<()> {
                 lines.push(line);
                 println!("  allowed     {:<34} {}", host, "ssh (push/pull)");
             }
+            warn_if_no_trusted_host_key(&dir, &host);
         }
     }
     apply(&dir, lines)

@@ -119,6 +119,11 @@ Semantics that decide whether a rule works:
   covering 22 counts, so `"github.com:22,443"` authorizes the relay too. With
   no such entry the relay refuses SSH. Commit signing is separate: it needs no
   `:22` entry, only a session launched with `--gpg`.
+- **`:22` also needs a host key the user authorized.** The launch refuses
+  outright unless `~/.config/agent-sandbox/trusted.toml` carries a
+  `[[network.known_hosts]]` entry for that host. You cannot write that file —
+  it is host-owned, and the refusal prints the exact block. If you propose a
+  `:22` entry, say that the user will need to paste that block too.
 - **Wildcards.** `*.github.com:443` covers subdomains *and* the apex;
   `github.com:443` covers the apex only, never `status.github.com`. Matching is
   case-insensitive.

@@ -12,6 +12,7 @@ require_network
 require_command ssh
 [ -n "${SSH_AUTH_SOCK:-}" ] || skip "no SSH agent on the host (SSH_AUTH_SOCK is unset)"
 ssh-add -l >/dev/null 2>&1 || skip "the host SSH agent holds no keys"
+require_trusted_host_key github.com
 
 ws="$(make_workspace)"
 cleanup() { kill $launcher 2>/dev/null; rm -rf "$ws"; cleanup_sandboxes; }

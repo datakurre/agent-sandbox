@@ -102,6 +102,23 @@ require_env() {
   [ -n "${!name:-}" ] || skip "$name is unset ($why)"
 }
 
+# An `allowed_hosts` entry on port 22 refuses the launch unless the host has
+# authorized a key for that host, and this suite cannot authorize itself: the
+# file is the operator's, and forging it is the one thing these cases must not
+# do.  So skip, with the block to add -- the same shape as the secret cases.
+require_trusted_host_key() {
+  local host="$1"
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}/agent-sandbox/trusted.toml"
+  if ! grep -qs -- "\"$host:22\"\\|\"$host\"" "$config"; then
+    skip "no host key for $host is authorized on this host. Add to
+         $config:
+           [[network.known_hosts]]
+           host = \"$host:22\"
+           key = \"<from: ssh-keyscan $host, verified out of band>\"
+         Launching with a :22 rule and no key is refused by design."
+  fi
+}
+
 # The session word for a running sandbox, from `ctl list`.
 #
 # The listing is two lines of preamble ("Agent-sandbox containers for <pwd>:"

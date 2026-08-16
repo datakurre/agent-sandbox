@@ -151,20 +151,34 @@ path = "/"
 ```
 ````
 
+#### The trusted config
+
+`AGENTS.md` is part of the repository and is therefore treated as untrusted: it
+may *name* a host, but it may not decide what is trusted about that host.
+Anything in that category is authorized in a file only you write,
+`~/.config/agent-sandbox/trusted.toml` (or under `$XDG_CONFIG_HOME`). Profile
+rules go through the same check.
+
+Two things live under that rule, and both work the same way — the launcher
+prints the exact block to paste, and refuses the launch rather than proceeding
+unauthorized:
+
+| Declared in `AGENTS.md` | Authorized in `trusted.toml` |
+| --- | --- |
+| `[[network.allowed_routes]]` with a `secret` | the identical `[[network.allowed_routes]]` block |
+| an `allowed_hosts` entry covering port 22 | a `[[network.known_hosts]]` entry for that host |
+
 #### Secrets
 
-A rule's `secret` names a secret, never its value. `AGENTS.md` is part of the
-repository and is therefore treated as untrusted; profile rules are also
-authorized through the same host-side check. The launcher will only inject
-a secret that you have also authorized host-side, in
-`~/.config/agent-sandbox/secrets.toml`.
+A rule's `secret` names a secret, never its value. The launcher will only
+inject a secret you have also authorized host-side.
 
 **Copy the block verbatim.** Authorization matches on every field — `host`
 (including its port), `method`, `path`, `secret`, `header` and `prefix` — so
 the host-side entry is the `AGENTS.md` rule with nothing changed:
 
 ```toml
-# ~/.config/agent-sandbox/secrets.toml
+# ~/.config/agent-sandbox/trusted.toml
 [[network.allowed_routes]]
 host = "api.github.com:443"
 method = "GET"
@@ -196,6 +210,40 @@ the exact block to paste. The proxy terminates TLS for hosts carrying a rule, so
 the sandbox trusts a per-session CA that exists only for the lifetime of that
 sandbox.
 
+#### SSH host keys
+
+An `allowed_hosts` entry covering port 22 authorizes SSH to that host — it is
+what makes `git push` work in a proxied sandbox. Which host key is trusted for
+it is a separate decision, and a host-side one:
+
+```toml
+# ~/.config/agent-sandbox/trusted.toml
+[[network.known_hosts]]
+host = "github.com:22"
+key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+```
+
+`key` is a `known_hosts` key — the type and the base64, without the leading
+host, which comes from `host`. Repeat the block for a host's other key types.
+A fingerprint is not a key: use one to *verify* what you paste, not in its
+place.
+
+Declare `"github.com:22"` with no matching entry and the launch refuses, naming
+the host and printing the block to add. For the common forges the key is filled
+in for you; for anything else, get it with `ssh-keyscan` **on the host** and
+check the result against a fingerprint you already trust — `ssh-keyscan` asks
+the server who it is, so it cannot tell you the answer is wrong.
+
+The port matters here as it does everywhere else. An entry for
+`"git.example.com:2222"` is what `ssh -p 2222` needs, and it is not
+authorization for a connection to port 22.
+
+Under `--proxy` the authorized set is the whole trusted set: the keys are bound
+into the sandbox and the sidecar at launch, and nothing running can add to them.
+`agent-sandbox ctl proxy allow HOST:22` and the TUI's `a` therefore say so when
+they authorize a host you have no key for — the rule takes effect, and SSH to it
+will fail host-key verification until you add one and relaunch.
+
 #### Rules the launcher refuses
 
 `[network]` is validated before the sandbox starts; an invalid block refuses the
@@ -208,7 +256,10 @@ Besides malformed values, these combinations are rejected:
 - a host allowed outright in `allowed_hosts` that also carries a `[[network.allowed_routes]]`
   entry *without* a secret — the broad allow makes the narrower rule pointless,
   so one of the two is a mistake. The same applies to a wildcard allow (`"*"`,
-  `"*:port"`).
+  `"*:port"`);
+- an `allowed_hosts` entry covering port 22 for a host with no
+  `[[network.known_hosts]]` entry in `trusted.toml` — SSH would be authorized to
+  a host whose identity nothing has vouched for.
 
 There is no `deny` key. The firewall is deny-by-default, and the only deny rules
 a policy carries are the built-in private and loopback ranges the launcher adds

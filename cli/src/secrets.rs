@@ -431,7 +431,7 @@ pub fn resolve_secrets_logic_with_profiles(
             ));
             err_msg.push_str(&format!("               To authorize this secret definition, add the following block to {}:\n\n", config.display()));
             // Keep the suggested TOML block flush-left so it can be copied
-            // directly into secrets.toml without removing prompt indentation.
+            // directly into trusted.toml without removing prompt indentation.
             err_msg.push_str("[[network.allowed_routes]]\n");
             err_msg.push_str(&format!("host = \"{}\"\n", req.host));
             err_msg.push_str(&format!("method = \"{}\"\n", req.method));
@@ -624,7 +624,7 @@ prefix = "Bearer "
 ```
 "#;
 
-    const SECRETS_TOML_TWO_RULES: &str = r#"
+    const TRUSTED_TOML_TWO_RULES: &str = r#"
 [[network.allowed_routes]]
 host = "api.github.com:443"
 method = "GET"
@@ -657,13 +657,13 @@ prefix = "Bearer "
                  secret_route\tapi.github.com\tGET\t/user/repos\n\
                  secret_route\tapi.github.com\tPOST\t/graphql\n",
             ),
-            ("secrets.toml", SECRETS_TOML_TWO_RULES),
+            ("trusted.toml", TRUSTED_TOML_TWO_RULES),
             ("AGENTS.md", AGENTS_TWO_RULES),
             ("secretspec.toml", ""),
         ]);
         let err = resolve_secrets_logic(
             &dir.path().join("policy"),
-            &dir.path().join("secrets.toml"),
+            &dir.path().join("trusted.toml"),
             &dir.path().join("secretspec.toml"),
             &dir.path().join("AGENTS.md"),
         )
@@ -689,7 +689,7 @@ prefix = "Bearer "
                  secret_route\tapi.github.com\tPOST\t/graphql\n",
             ),
             (
-                "secrets.toml",
+                "trusted.toml",
                 "[[network.allowed_routes]]\n\
                  host = \"api.github.com:443\"\n\
                  method = \"GET\"\n\
@@ -703,7 +703,7 @@ prefix = "Bearer "
         ]);
         let err = resolve_secrets_logic(
             &dir.path().join("policy"),
-            &dir.path().join("secrets.toml"),
+            &dir.path().join("trusted.toml"),
             &dir.path().join("secretspec.toml"),
             &dir.path().join("AGENTS.md"),
         )
@@ -726,13 +726,13 @@ prefix = "Bearer "
     fn a_policy_with_no_secret_routes_resolves_nothing() {
         let dir = scratch(&[
             ("policy", "allow_host api.github.com:443\n"),
-            ("secrets.toml", SECRETS_TOML_TWO_RULES),
+            ("trusted.toml", TRUSTED_TOML_TWO_RULES),
             ("AGENTS.md", AGENTS_TWO_RULES),
             ("secretspec.toml", ""),
         ]);
         let lines = resolve_secrets_logic(
             &dir.path().join("policy"),
-            &dir.path().join("secrets.toml"),
+            &dir.path().join("trusted.toml"),
             &dir.path().join("secretspec.toml"),
             &dir.path().join("AGENTS.md"),
         )
