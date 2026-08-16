@@ -20,9 +20,11 @@ pub struct RelayArgs {
     pub container: Option<String>,
 }
 
-/// The relay refuses every request while this list is empty, so it is the
-/// first thing to print: an empty policy explains every denial below it.
-fn allow_signing_rules(policy_dir: &str) -> Vec<String> {
+/// The two axes the relay authorizes independently: which hosts `git push`/
+/// `pull` may reach (`allow_signing` lines), and whether GPG signing is on at
+/// all (`signing_enabled`, set unconditionally by `--gpg`, host-agnostic).
+/// Printed first since they explain every denial below them.
+fn ssh_push_hosts(policy_dir: &str) -> Vec<String> {
     fs::read_to_string(format!("{}/policy", policy_dir))
         .unwrap_or_default()
         .lines()
@@ -32,6 +34,13 @@ fn allow_signing_rules(policy_dir: &str) -> Vec<String> {
         })
         .filter(|r| !r.is_empty())
         .collect()
+}
+
+fn gpg_signing_enabled(policy_dir: &str) -> bool {
+    fs::read_to_string(format!("{}/policy", policy_dir))
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.trim() == "signing_enabled true")
 }
 
 pub fn run(args: RelayArgs) -> Result<()> {
@@ -48,16 +57,25 @@ pub fn run(args: RelayArgs) -> Result<()> {
         std::process::exit(1);
     }
 
-    let rules = allow_signing_rules(&policy_dir);
+    let hosts = ssh_push_hosts(&policy_dir);
+    let gpg_enabled = gpg_signing_enabled(&policy_dir);
     println!("{}", sandbox);
-    if rules.is_empty() {
-        println!("  allow_signing  (none) -- ssh and gpg through the relay are refused");
+    println!(
+        "  gpg signing    {}",
+        if gpg_enabled {
+            "enabled"
+        } else {
+            "disabled -- relaunch with --gpg"
+        }
+    );
+    if hosts.is_empty() {
+        println!("  ssh (push/pull) (none) -- git push/pull through the relay are refused");
         println!(
             "                 Declare an SSH port in AGENTS.md, e.g. allowed_hosts = [\"github.com:22\"]."
         );
     } else {
-        for rule in &rules {
-            println!("  allow_signing  {}", rule);
+        for host in &hosts {
+            println!("  ssh (push/pull) {}", host);
         }
     }
 

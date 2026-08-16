@@ -1577,6 +1577,7 @@ fn initial_config(o: &Options) -> ProxyConfig {
             allow_host,
             Vec::new(),
             Vec::new(),
+            false,
             allow_ip,
             // Denies are built-in only; the inline lists are a dev path and
             // carry none.
@@ -1753,6 +1754,7 @@ mod tests {
             parse_csv_domains(allow_d).expect("test allow_host"),
             Vec::new(),
             Vec::new(),
+            false,
             parse_csv_ips(allow_i).expect("test allow_ip"),
             parse_csv_ips(deny_i).expect("test baseline deny_ip"),
             None,
@@ -2230,6 +2232,7 @@ mod tests {
              allow_host *.githubusercontent.com\n\
              secret_route\tapi.github.com\tGET\t/user\n\
              allow_signing github.com\n\
+             signing_enabled true\n\
              allow_ip 10.0.0.0/8\n\
              allow_ip 192.168.1.0/24\n\
              deny_ip 10.1.0.0/24\n",
@@ -2238,6 +2241,7 @@ mod tests {
         assert_eq!(config.allow_host.len(), 2);
         assert_eq!(config.secret_routes.len(), 1);
         assert_eq!(config.allow_signing.len(), 1);
+        assert!(config.signing_enabled);
         assert_eq!(config.allow_ip.len(), 2);
         assert_eq!(config.deny_ip.len(), 1);
         assert!(!config.default_allow, "the policy is deny by default");
@@ -2285,6 +2289,7 @@ mod tests {
             "allow_host github.com\n\
              secret_route\tapi.github.com\tGET\t/user\n\
              allow_signing github.com\n\
+             signing_enabled true\n\
              allow_route\tapi.github.com\t*\t/**\n\
              allow_ip 10.0.0.0/8\ndeny_ip 10.1.0.0/24\nallow_port 8000-8100\n",
         )

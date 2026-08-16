@@ -207,6 +207,22 @@ impl World {
         self
     }
 
+    /// Stub `gpgconf` on `$PATH` (the same trick `podman` already uses) to
+    /// report a fake agent socket under the test's `$XDG_RUNTIME_DIR`, and
+    /// create that socket file so `--gpg` finds a live agent to forward.
+    pub fn gpg_agent_forwarded(self) -> Self {
+        let socket = self.runtime_dir().join("gnupg/S.gpg-agent");
+        fs::create_dir_all(socket.parent().expect("socket parent")).expect("gpg socket dir");
+        fs::write(&socket, "").expect("stub gpg socket");
+
+        let gpgconf = self.root.join("bin/gpgconf");
+        fs::write(&gpgconf, format!("#!/bin/sh\necho '{}'\n", socket.display()))
+            .expect("write gpgconf stub");
+        make_executable(&gpgconf);
+
+        self
+    }
+
     pub fn run(&self, args: &[&str]) -> Outcome {
         self.run_bin("agent-sandbox", args)
     }

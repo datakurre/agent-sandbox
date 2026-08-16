@@ -91,11 +91,13 @@ The `[network]` table configures the egress proxy's firewall policy. The sandbox
   port explicitly for anything else; a rule that carries one is matched on
   that port alone.
 
-An `allowed_hosts` entry on port `22` does double duty: it is also what authorizes the
-SSH/GPG relay for that host. Under `--proxy` the host agent sockets are held by
-the proxy sidecar rather than mounted into the sandbox, and the relay refuses
-every request until at least one such entry exists — so `"github.com:22"` is
-what makes `git push` and commit signing work in a proxied sandbox. See
+An `allowed_hosts` entry on port `22` is what authorizes the SSH relay for that
+host. Under `--proxy` the host agent sockets are held by the proxy sidecar
+rather than mounted into the sandbox, and the relay refuses every SSH request
+until a matching entry exists — so `"github.com:22"` is what makes `git push`
+work in a proxied sandbox. Commit signing is separate: it needs no network
+declaration at all, since GPG has no destination of its own — `--gpg` alone is
+sufficient, in a proxied sandbox exactly as in an unproxied one. See
 [Usage](usage.md#git-integration-details).
 
 #### L7 HTTP Rules (`[[network.allowed_routes]]`)

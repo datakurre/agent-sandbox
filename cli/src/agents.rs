@@ -61,6 +61,7 @@ impl ProxyPolicy {
         extend_unique(&mut self.allow_host, other.allow_host);
         extend_unique(&mut self.secret_route, other.secret_route);
         extend_unique(&mut self.allow_signing, other.allow_signing);
+        self.signing_enabled = self.signing_enabled || other.signing_enabled;
         extend_unique(&mut self.allow_ip, other.allow_ip);
         extend_unique(&mut self.allow_port, other.allow_port);
         extend_unique(&mut self.allow_route, other.allow_route);
@@ -513,6 +514,10 @@ pub struct ProxyPolicy {
     /// the token.
     pub secret_route: Vec<String>,
     pub allow_signing: Vec<String>,
+    /// Whether the GPG relay should be allowed to sign/authenticate at all,
+    /// independent of any host. Never parsed from AGENTS.md TOML -- set
+    /// directly by the launcher binary whenever `--gpg` wires up the relay.
+    pub signing_enabled: bool,
     pub allow_ip: Vec<String>,
     pub allow_port: Vec<String>,
     pub allow_route: Vec<String>,
@@ -785,6 +790,9 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
     }
     for val in &policy.allow_signing {
         lines.push(format!("allow_signing {}", val));
+    }
+    if policy.signing_enabled {
+        lines.push("signing_enabled true".to_string());
     }
     for val in &policy.allow_ip {
         lines.push(format!("allow_ip {}", val));

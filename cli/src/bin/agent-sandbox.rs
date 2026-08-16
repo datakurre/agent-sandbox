@@ -1873,6 +1873,13 @@ fn run() -> Result<i32> {
             merged_policy.merge(policy);
         }
 
+        // GPG signing is gated on --gpg alone, independent of AGENTS.md: the
+        // relay's GPG check is host-agnostic (gpg has no destination of its
+        // own), so there is nothing for a network policy to usefully name.
+        if want_relay_gpg {
+            merged_policy.signing_enabled = true;
+        }
+
         policy_file_content = format_proxy_policy(&merged_policy, "AGENTS.md and proxy profiles");
         proxy_configured = !merged_policy.allow_host.is_empty()
             || !merged_policy.allow_ip.is_empty()

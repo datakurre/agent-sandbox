@@ -148,6 +148,47 @@ fn the_policy_the_sidecar_is_handed_carries_the_declared_rules_and_a_deny_baseli
     );
 }
 
+/// GPG signing is gated on `--gpg` alone -- host-agnostic, no AGENTS.md
+/// declaration needed -- while SSH push still needs an explicit
+/// `allowed_hosts = ["host:22"]` entry. This is the flag -> policy-line
+/// mapping the split relies on.
+#[test]
+fn signing_enabled_is_written_when_gpg_is_forwarded_with_no_network_declaration() {
+    let world = proxied_world().gpg_agent_forwarded();
+    let out = world.run(&["--workspace", "--proxy", "--gpg", "opencode"]);
+
+    assert!(out.sidecar_call().is_some(), "a sidecar was started");
+    let dir = world.captured("sidecar_policy");
+    let policy = fs::read_to_string(dir.join("policy")).expect("the live policy file");
+
+    assert!(
+        policy.lines().any(|l| l == "signing_enabled true"),
+        "gpg forwarded with no [network] block must still enable signing: {}",
+        policy
+    );
+    assert!(
+        !policy.contains("allow_signing "),
+        "no host was ever declared, so no ssh push host should be authorized: {}",
+        policy
+    );
+}
+
+#[test]
+fn signing_enabled_is_absent_without_gpg() {
+    let world = proxied_world().file("AGENTS.md", ALLOW_EXAMPLE);
+    let out = world.run(&["--workspace", "--proxy", "opencode"]);
+
+    assert!(out.sidecar_call().is_some(), "a sidecar was started");
+    let dir = world.captured("sidecar_policy");
+    let policy = fs::read_to_string(dir.join("policy")).expect("the live policy file");
+
+    assert!(
+        !policy.contains("signing_enabled"),
+        "gpg signing must not be enabled without --gpg: {}",
+        policy
+    );
+}
+
 #[test]
 fn a_session_ca_is_only_trusted_when_the_policy_has_a_rule_that_needs_one() {
     let plain = proxied_world().file("AGENTS.md", ALLOW_EXAMPLE).run(&[

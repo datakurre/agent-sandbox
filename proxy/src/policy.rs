@@ -68,11 +68,17 @@ pub struct ProxyConfig {
     /// marker let a second, secret-less rule (`method = "*", path = "/**"`)
     /// collect a token the operator authorized for one endpoint.
     pub secret_routes: Vec<L7Rule>,
-    /// Hosts the SSH/GPG relay may act for.  Populated by the launcher from
-    /// `allow` entries on port 22; the proxy itself never consults it, but it
-    /// has to *parse* it, because `relay-server` and `agent-sandbox ctl relay`
-    /// read the same file and an unknown key here aborts the whole sidecar.
+    /// Hosts the SSH relay may act for -- i.e. which destinations `git push`/
+    /// `pull` may reach.  Populated by the launcher from `allow` entries on
+    /// port 22; the proxy itself never consults it, but it has to *parse* it,
+    /// because `relay-server` and `agent-sandbox ctl relay` read the same
+    /// file and an unknown key here aborts the whole sidecar.
     pub allow_signing: Vec<String>,
+    /// Whether the GPG relay may sign/authenticate at all.  Host-agnostic --
+    /// gpg has no destination of its own -- and set unconditionally by the
+    /// launcher whenever `--gpg` wires up the relay, independent of
+    /// `AGENTS.md`.
+    pub signing_enabled: bool,
     pub allow_ip: Vec<TargetRule<IpNet>>,
     pub deny_ip: Vec<TargetRule<IpNet>>,
     pub default_allow: bool,
@@ -85,6 +91,7 @@ impl ProxyConfig {
         allow_host: Vec<TargetRule<String>>,
         secret_routes: Vec<L7Rule>,
         allow_signing: Vec<String>,
+        signing_enabled: bool,
         allow_ip: Vec<TargetRule<IpNet>>,
         deny_ip: Vec<TargetRule<IpNet>>,
         allow_port_override: Option<Vec<PortRange>>,
@@ -101,6 +108,7 @@ impl ProxyConfig {
             allow_host,
             secret_routes,
             allow_signing,
+            signing_enabled,
             allow_ip,
             deny_ip,
             default_allow,
@@ -162,6 +170,9 @@ impl ProxyConfig {
         }
         for h in &self.allow_signing {
             out.push(format!("allow_signing {}", h));
+        }
+        if self.signing_enabled {
+            out.push("signing_enabled true".to_string());
         }
         for n in &self.allow_ip {
             out.push(format!("allow_ip {}", n));
@@ -292,6 +303,7 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
     let mut allow_host = Vec::new();
     let mut secret_routes = Vec::new();
     let mut allow_signing = Vec::new();
+    let mut signing_enabled = false;
     let mut allow_ip = Vec::new();
     let mut deny_ip = Vec::new();
     let mut allow_port_override: Option<Vec<PortRange>> = None;
@@ -324,6 +336,10 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
             "allow_host" => allow_host.push(parse_domain_target(value).map_err(|e| format!("{}: allow_host: {}", lineno, e))?),
             "secret_route" => secret_routes.push(parse_l7_fields("secret_route", lineno, value)?),
             "allow_signing" => allow_signing.push(value.to_ascii_lowercase()),
+            "signing_enabled" => match value {
+                "true" | "false" => signing_enabled = value == "true",
+                _ => return Err(format!("{}: signing_enabled: expected 'true' or 'false', got {:?}", lineno, value)),
+            },
             "allow_ip" => allow_ip
                 .push(parse_ip_target(value).map_err(|e| format!("{}: allow_ip: {}", lineno, e))?),
             "deny_ip" => deny_ip
@@ -350,6 +366,7 @@ pub fn parse_policy(text: &str) -> Result<ProxyConfig, String> {
         allow_host,
         secret_routes,
         allow_signing,
+        signing_enabled,
         allow_ip,
         deny_ip,
         allow_port_override,
@@ -826,6 +843,29 @@ mod tests {
         let cfg = parse_policy("allow_signing github.com\nallow_signing gitlab.com\n").unwrap();
         let reparsed = parse_policy(&cfg.describe().join("\n")).expect("describe must re-parse");
         assert_eq!(reparsed.allow_signing, cfg.allow_signing);
+    }
+
+    #[test]
+    fn parse_policy_reads_signing_enabled_independently_of_allow_signing() {
+        // The launcher writes this whenever --gpg wires up the relay, with no
+        // allow_signing host entries at all -- gpg signing must not depend on
+        // any host being named.
+        let cfg = parse_policy("signing_enabled true\n").expect("signing_enabled must be a known key");
+        assert!(cfg.signing_enabled);
+        assert!(cfg.allow_signing.is_empty());
+    }
+
+    #[test]
+    fn parse_policy_rejects_a_non_boolean_signing_enabled() {
+        let err = parse_policy("signing_enabled maybe\n").unwrap_err();
+        assert!(err.contains("expected 'true' or 'false'"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn signing_enabled_survives_a_describe_round_trip() {
+        let cfg = parse_policy("signing_enabled true\n").unwrap();
+        let reparsed = parse_policy(&cfg.describe().join("\n")).expect("describe must re-parse");
+        assert_eq!(reparsed.signing_enabled, cfg.signing_enabled);
     }
 
     #[test]
