@@ -11,7 +11,7 @@ This page describes the internal structure. For security implications of individ
 
 | Category      | Tools                                                |
 | ------------- | ---------------------------------------------------- |
-| AI coding     | opencode, claude-code, github-copilot-cli (copilot), antigravity-cli (agy), codex |
+| AI coding     | opencode, claude-code (claude), github-copilot-cli (copilot), antigravity-cli (agy), codex |
 | Shell / tools | bash, coreutils, ripgrep, fd, jq, curl, wget, …     |
 | Languages     | python3, uv, nodejs, gnumake, gcc libs               |
 | Git / GitHub  | git, gh                                              |
@@ -85,7 +85,7 @@ are unit-tested without a podman.  Call flow:
     podman host socket, CWD workspace) plus the state dirs of whichever agents
     are selected — the positionally-launched one by default, or the set chosen
     via `--agent-mounts`/`--agent-mounts=…` — sourced from `agents.nix`
-    (opencode, claude-code, copilot, antigravity, codex).
+    (opencode, claude, copilot, antigravity, codex).
 3. Build the env array from toggles (SSH_AUTH_SOCK, the flattened git config
    and identity, CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
 4. Add `[ports]` and `[mounts]` declared in `AGENTS.md` (`cli/src/agents.rs`),

@@ -117,14 +117,14 @@ fn each_agent_gets_its_own_command() {
         vec!["opencode", "."]
     );
     assert_eq!(
-        world.run(&["claude-code"]).run_call().command(),
+        world.run(&["claude"]).run_call().command(),
         vec!["claude"]
     );
 }
 
 #[test]
 fn only_the_selected_agents_state_is_mounted() {
-    let out = World::new().run(&["claude-code"]);
+    let out = World::new().run(&["claude"]);
     let run = out.run_call();
 
     assert!(
@@ -142,7 +142,7 @@ fn only_the_selected_agents_state_is_mounted() {
 #[test]
 fn agent_state_files_are_created_on_the_host_so_the_bind_is_a_file_not_a_directory() {
     let world = World::new();
-    let out = world.run(&["claude-code"]);
+    let out = world.run(&["claude"]);
 
     assert!(out.run_call().mount_to("/home/user/.claude.json").is_some());
     assert!(
@@ -542,7 +542,7 @@ fn help_lists_exactly_the_agents_the_catalog_declares() {
 
     assert!(out.stdout.contains("solo"), "{}", out.stdout);
     assert!(
-        !out.stdout.contains("claude-code"),
+        !out.stdout.contains("claude"),
         "the help text must come from the catalog, not a second copy of it"
     );
 }

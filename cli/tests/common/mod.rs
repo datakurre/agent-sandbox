@@ -23,7 +23,7 @@ use std::process::Command;
 /// what these tests assert.
 pub const TEST_AGENT_SPECS: &str = concat!(
     "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\n",
-    "claude-code\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]",
+    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]",
 );
 
 pub const TEST_IMAGE: &str = "localhost/agent-sandbox:test";

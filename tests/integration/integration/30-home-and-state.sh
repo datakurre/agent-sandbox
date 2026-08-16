@@ -26,5 +26,5 @@ assert_contains "$out" "$marker" "the agent's own state in a later session"
 rm -f "$HOME/.config/opencode/probe"
 
 # ...and only for the agent that was selected.
-out="$(sandbox_run claude-code -- bash -c 'ls ~/.config/opencode 2>&1 || true')"
+out="$(sandbox_run claude -- bash -c 'ls ~/.config/opencode 2>&1 || true')"
 assert_not_contains "$out" "probe" "another agent's state directory"
