@@ -61,6 +61,7 @@ impl ProxyPolicy {
         extend_unique(&mut self.allow_host, other.allow_host);
         extend_unique(&mut self.secret_route, other.secret_route);
         extend_unique(&mut self.allow_signing, other.allow_signing);
+        self.signing_enabled = self.signing_enabled || other.signing_enabled;
         extend_unique(&mut self.allow_ip, other.allow_ip);
         extend_unique(&mut self.allow_port, other.allow_port);
         extend_unique(&mut self.allow_route, other.allow_route);
@@ -513,6 +514,10 @@ pub struct ProxyPolicy {
     /// the token.
     pub secret_route: Vec<String>,
     pub allow_signing: Vec<String>,
+    /// Whether the GPG relay should be allowed to sign/authenticate at all,
+    /// independent of any host. Never parsed from AGENTS.md TOML -- set
+    /// directly by the launcher binary whenever `--gpg` wires up the relay.
+    pub signing_enabled: bool,
     pub allow_ip: Vec<String>,
     pub allow_port: Vec<String>,
     pub allow_route: Vec<String>,
@@ -664,10 +669,10 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 if let Some(port) = port_part {
                     _proxy_port("[network].allowed_hosts", &port)?;
                     // An allow entry on the SSH port is also what authorizes
-                    // the relay to reach that host, and -- because gpg has no
-                    // destination of its own -- what enables signing at all.
-                    // The relay refuses everything while allow_signing is
-                    // empty, so this is the only way to turn it on.
+                    // the relay to reach that host, so it is what makes
+                    // `git push`/`pull` work in a proxied session. It says
+                    // nothing about GPG signing, which `signing_enabled`
+                    // gates on its own, host-agnostic.
                     if port == "22"
                         && host_part != "*"
                         && !policy.allow_signing.contains(&host_part)
@@ -785,6 +790,9 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
     }
     for val in &policy.allow_signing {
         lines.push(format!("allow_signing {}", val));
+    }
+    if policy.signing_enabled {
+        lines.push("signing_enabled true".to_string());
     }
     for val in &policy.allow_ip {
         lines.push(format!("allow_ip {}", val));

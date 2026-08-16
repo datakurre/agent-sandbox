@@ -18,7 +18,7 @@ agents="$("$AS" --help | sed -n '/^Agents:/{n;p;}')"
 for agent in $agents; do
   case "$agent" in
     opencode) cmd=opencode ;;
-    claude-code) cmd=claude ;;
+    claude) cmd=claude ;;
     copilot) cmd=copilot ;;
     antigravity) cmd=agy ;;
     codex) cmd=codex ;;

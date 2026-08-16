@@ -11,7 +11,7 @@ This page describes the internal structure. For security implications of individ
 
 | Category      | Tools                                                |
 | ------------- | ---------------------------------------------------- |
-| AI coding     | opencode, claude-code, github-copilot-cli (copilot), antigravity-cli (agy), codex |
+| AI coding     | opencode, claude-code (claude), github-copilot-cli (copilot), antigravity-cli (agy), codex |
 | Shell / tools | bash, coreutils, ripgrep, fd, jq, curl, wget, …     |
 | Languages     | python3, uv, nodejs, gnumake, gcc libs               |
 | Git / GitHub  | git, gh                                              |
@@ -85,7 +85,7 @@ are unit-tested without a podman.  Call flow:
     podman host socket, CWD workspace) plus the state dirs of whichever agents
     are selected — the positionally-launched one by default, or the set chosen
     via `--agent-mounts`/`--agent-mounts=…` — sourced from `agents.nix`
-    (opencode, claude-code, copilot, antigravity, codex).
+    (opencode, claude, copilot, antigravity, codex).
 3. Build the env array from toggles (SSH_AUTH_SOCK, the flattened git config
    and identity, CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
 4. Add `[ports]` and `[mounts]` declared in `AGENTS.md` (`cli/src/agents.rs`),
@@ -249,7 +249,10 @@ the launch rather than being ignored.
 The launcher merges and compiles those blocks into the flat, line-oriented policy file the
 proxy reads (`allow_host`, `allow_ip`, `allow_port`, `allow_route`,
 `secret_route`, `allow_signing`, `deny_ip`, `default`), which is also the
-format `agent-sandbox ctl proxy` edits in place.  `secret_route` records a
+format `agent-sandbox ctl proxy` edits in place. `signing_enabled` is a ninth
+key in that same file, but it is never compiled from `AGENTS.md` -- the
+launcher writes it directly whenever `--gpg` is passed, independent of any
+`[network]` content (see Relay Architecture below).  `secret_route` records a
 *route* -- `domain<TAB>method<TAB>path`, like `allow_route` -- not a domain, and
 `deny_ip` is written only by the launcher: there is no domain deny list, and
 `install_policy` refuses a live edit that changes the deny set.  One host on two
@@ -307,7 +310,7 @@ rather than failing later at certificate validation.
 The launcher appends a baseline `deny_ip` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
 
-**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol. An `allowed_hosts` entry on port 22 is what populates `allow_signing`, and the relay refuses every request while that list is empty — gpg has no destination of its own, so this is also what enables signing at all.
+**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol. The relay authorizes the two independently: `relay-gpg` requests are allowed whenever `signing_enabled` is `true` in the policy file — a flag the launcher writes unconditionally whenever `--gpg` wires up the relay, with no host to name, since gpg has no destination of its own. `relay-ssh` requests are allowed only when the destination host matches an `allow_signing` entry, which an `allowed_hosts` entry on port 22 is what populates — so `git push` still needs an explicit `"host:22"` declaration even though signing does not.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as

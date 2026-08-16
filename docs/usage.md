@@ -230,11 +230,14 @@ When using Git inside the sandbox, be aware of how the integration flags interac
 - Combined with `--proxy`, neither socket is mounted into the sandbox at all: a
   forwarded socket is a capability that does not pass the firewall. The sockets
   go to the proxy sidecar instead, and the sandbox reaches them through
-  `relay-ssh`/`relay-gpg`, which the relay authorizes against the policy's
-  `allow_signing` list — declare an SSH port to populate it, e.g.
-  `allowed_hosts = ["github.com:22"]`. With no such entry the relay refuses every
-  request; `agent-sandbox ctl relay` shows the list and the decisions made
-  against it.
+  `relay-ssh`/`relay-gpg`, which the relay authorizes each independently:
+  `relay-gpg` needs only `--gpg` itself — signing has no destination to name,
+  so no `AGENTS.md` declaration is required, in a proxied sandbox exactly as in
+  an unproxied one. `relay-ssh` still needs an explicit `allowed_hosts` entry
+  on port 22 for the destination, e.g. `allowed_hosts = ["github.com:22"]`,
+  since push/pull genuinely need to name a host; with no such entry `git push`
+  is refused. `agent-sandbox ctl relay` shows both states and the decisions
+  made against them.
 
 ### Bundled OpenCode skills
 
@@ -286,7 +289,7 @@ and `~/.gemini/skills` for tools that use those discovery paths.
 | `tui [WORD] [--sandbox WORD]` | interactive terminal UI: shows denied requests live so you can add the missing rule, a Connections view (`v`) of all recent connections including currently-open ones, plus a Rules view (`r`) to inspect and remove existing rules, without leaving the dashboard |
 | `proxy show\|allow\|rm\|reset\|export\|check [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as a fenced AGENTS.md block (`--plain` for a bare-TOML profile file); `check HOST[:PORT]` dry-runs whether a target would be allowed |
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
-| `relay [-f] [WORD] [--sandbox WORD]` | show the SSH/GPG relay's `allow_signing` policy and what it has been asked for |
+| `relay [-f] [WORD] [--sandbox WORD]` | show whether GPG signing is enabled and which hosts SSH push/pull may reach, plus what the relay has been asked for |
 | `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |
 | `browser [WORD] [--sandbox WORD]` | start a throwaway host browser behind a deny-by-default allow list, for cooperative testing over CDP; `--name` runs several at once (see below) |
 | `purge [--all] [-n] [-f]` | reclaim leftovers; running sandboxes are kept unless `--all`, and `-f` skips the confirmation |

@@ -126,21 +126,40 @@ fn validate_gpg_args(args: &[String]) -> bool {
     has_signing_intent
 }
 
-fn load_allow_signing(policy_path: &str) -> Vec<String> {
-    let mut allowed = Vec::new();
+/// The two authorization axes the relay enforces, read from the same policy
+/// file: `ssh_hosts` gates which destinations `git push`/`pull` may reach,
+/// while `gpg_enabled` gates GPG signing on its own -- host-agnostic, since
+/// gpg has no destination of its own.
+struct SigningPolicy {
+    ssh_hosts: Vec<String>,
+    gpg_enabled: bool,
+}
+
+fn load_signing_policy(policy_path: &str) -> SigningPolicy {
+    let mut ssh_hosts = Vec::new();
+    let mut gpg_enabled = false;
     if let Ok(file) = File::open(policy_path) {
         for line in BufReader::new(file).lines().flatten() {
             let mut parts = line.split_whitespace();
             if let Some(key) = parts.next() {
-                if key == "allow_signing" {
-                    if let Some(val) = parts.next() {
-                        allowed.push(val.to_string());
+                match key {
+                    "allow_signing" => {
+                        if let Some(val) = parts.next() {
+                            ssh_hosts.push(val.to_string());
+                        }
                     }
+                    "signing_enabled" => {
+                        gpg_enabled = parts.next() == Some("true");
+                    }
+                    _ => {}
                 }
             }
         }
     }
-    allowed
+    SigningPolicy {
+        ssh_hosts,
+        gpg_enabled,
+    }
 }
 
 fn handle_client(mut stream: TcpStream, policy_path: &str) {
@@ -152,11 +171,11 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
         }
     };
 
-    let allow_signing_rules = load_allow_signing(policy_path);
+    let signing_policy = load_signing_policy(policy_path);
 
     let (bin, is_ssh) = match req.cmd {
         CommandType::Gpg => {
-            let allowed = !allow_signing_rules.is_empty();
+            let allowed = signing_policy.gpg_enabled;
             let safe_args = validate_gpg_args(&req.args);
 
             log_relay(
@@ -164,7 +183,7 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
                 None,
                 allowed && safe_args,
                 if !allowed {
-                    "no allow_signing rules"
+                    "gpg signing not enabled"
                 } else if !safe_args {
                     "disallowed gpg arguments"
                 } else {
@@ -173,7 +192,7 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
             );
             if !allowed || !safe_args {
                 let msg = if !allowed {
-                    b"agent-sandbox: gpg denied: no allow_signing rules in policy\n".as_slice()
+                    b"agent-sandbox: gpg denied: signing not enabled -- relaunch with --gpg\n".as_slice()
                 } else {
                     b"agent-sandbox: gpg denied: disallowed or dangerous arguments detected\n"
                         .as_slice()
@@ -211,7 +230,7 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
             match host {
                 Some(dest) => {
                     let mut allowed = false;
-                    for rule in &allow_signing_rules {
+                    for rule in &signing_policy.ssh_hosts {
                         if domain_match(&dest, rule) {
                             allowed = true;
                             break;
@@ -499,5 +518,29 @@ mod tests {
         assert!(domain_match("api.github.com", "*.github.com"));
         assert!(domain_match("github.com", "*.github.com"));
         assert!(!domain_match("github.org", "*.github.com"));
+    }
+
+    #[test]
+    fn signing_policy_decouples_gpg_from_ssh_hosts() {
+        // --gpg alone must enable gpg with no ssh destination named at all --
+        // that is the whole point of the split.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy");
+        std::fs::write(&path, "signing_enabled true\n").unwrap();
+
+        let policy = load_signing_policy(path.to_str().unwrap());
+        assert!(policy.gpg_enabled);
+        assert!(policy.ssh_hosts.is_empty());
+    }
+
+    #[test]
+    fn signing_policy_reads_ssh_hosts_independently_of_gpg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy");
+        std::fs::write(&path, "allow_signing github.com\n").unwrap();
+
+        let policy = load_signing_policy(path.to_str().unwrap());
+        assert!(!policy.gpg_enabled);
+        assert_eq!(policy.ssh_hosts, vec!["github.com".to_string()]);
     }
 }

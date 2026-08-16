@@ -23,7 +23,7 @@ use std::process::Command;
 /// what these tests assert.
 pub const TEST_AGENT_SPECS: &str = concat!(
     "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\n",
-    "claude-code\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]",
+    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]",
 );
 
 pub const TEST_IMAGE: &str = "localhost/agent-sandbox:test";
@@ -204,6 +204,22 @@ impl World {
         let dir = self.root.join("replies");
         fs::write(dir.join(format!("{}.out", key)), stdout).expect("reply stdout");
         fs::write(dir.join(format!("{}.code", key)), exit_code.to_string()).expect("reply code");
+        self
+    }
+
+    /// Stub `gpgconf` on `$PATH` (the same trick `podman` already uses) to
+    /// report a fake agent socket under the test's `$XDG_RUNTIME_DIR`, and
+    /// create that socket file so `--gpg` finds a live agent to forward.
+    pub fn gpg_agent_forwarded(self) -> Self {
+        let socket = self.runtime_dir().join("gnupg/S.gpg-agent");
+        fs::create_dir_all(socket.parent().expect("socket parent")).expect("gpg socket dir");
+        fs::write(&socket, "").expect("stub gpg socket");
+
+        let gpgconf = self.root.join("bin/gpgconf");
+        fs::write(&gpgconf, format!("#!/bin/sh\necho '{}'\n", socket.display()))
+            .expect("write gpgconf stub");
+        make_executable(&gpgconf);
+
         self
     }
 

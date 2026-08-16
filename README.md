@@ -2,7 +2,7 @@
 
 [![Docs](https://img.shields.io/badge/docs-GitHub_Pages-blue.svg)](https://datakurre.github.io/agent-sandbox/)
 
-**Sandboxed AI coding environment** built on rootless Podman and Nix. Run AI coding agents in an isolated container — `opencode`, `claude-code`, `copilot`, `codex`, `antigravity`, or any bundled tool — and opt in only to the integrations you need. All integrations are **disabled by default**.
+**Sandboxed AI coding environment** built on rootless Podman and Nix. Run AI coding agents in an isolated container — `opencode`, `claude`, `copilot`, `codex`, `antigravity`, or any bundled tool — and opt in only to the integrations you need. All integrations are **disabled by default**.
 
 ## Full Documentation
 
