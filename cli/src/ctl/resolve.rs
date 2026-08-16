@@ -22,6 +22,31 @@ pub fn sandbox_containers() -> Result<Vec<String>> {
     podman_ps_names(false, "label=agent-sandbox.role=sandbox")
 }
 
+pub fn sandbox_containers_rows(all: bool) -> Result<Vec<(String, String, String)>> {
+    let mut cmd = Command::new("podman");
+    cmd.arg("ps");
+    if all {
+        cmd.arg("-a");
+    }
+    cmd.arg("--filter").arg("label=agent-sandbox.role=sandbox");
+    cmd.arg("--format").arg("{{.Names}}\t{{.Status}}\t{{.RunningFor}}");
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(anyhow!("podman ps failed"));
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let name = parts.next()?.to_string();
+            let status = parts.next().unwrap_or("").to_string();
+            let created = parts.next().unwrap_or("").to_string();
+            Some((name, status, created))
+        })
+        .collect())
+}
+
 pub fn sandbox_containers_all() -> Result<Vec<String>> {
     podman_ps_names(true, "label=agent-sandbox.role=sandbox")
 }
@@ -185,12 +210,8 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
         return Ok(name.to_string());
     }
 
-    let names = if want_running {
-        sandbox_containers()?
-    } else {
-        sandbox_containers_all()?
-    };
-    if names.is_empty() {
+    let rows = sandbox_containers_rows(!want_running)?;
+    if rows.is_empty() {
         if want_running {
             eprintln!("agent-sandbox ctl: no running sandboxes.");
         } else {
@@ -201,9 +222,9 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
 
     let pwd = env::current_dir()?.to_string_lossy().to_string();
     let mut matches = Vec::new();
-    for name in &names {
+    for (name, status, created) in &rows {
         if sandbox_workspace(name).unwrap_or_default() == pwd {
-            matches.push(name.clone());
+            matches.push((name.clone(), status.clone(), created.clone()));
         }
     }
     if matches.is_empty() {
@@ -211,12 +232,13 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
         std::process::exit(1);
     }
     if matches.len() == 1 {
-        return Ok(matches[0].clone());
+        return Ok(matches[0].0.clone());
     }
 
-    eprintln!("agent-sandbox ctl: several sandboxes are running for this workspace; pass --container NAME/ID:");
-    for name in &matches {
-        eprintln!("  {}\t{}", name, pwd);
+    eprintln!("agent-sandbox ctl: several sandboxes are running for this workspace; pass --container NAME:");
+    eprintln!("  NAME\tCREATED\tSTATUS");
+    for (name, status, created) in &matches {
+        eprintln!("  {}\t{}\t{}", sandbox_word(name), created, status);
     }
     std::process::exit(1);
 }

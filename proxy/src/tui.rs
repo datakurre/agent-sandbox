@@ -258,6 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     let sandbox_name = &args[1];
+    let sandbox_short_name = sandbox_name.rsplit('-').next().unwrap_or(sandbox_name);
     let sidecar_policy = &args[2];
     let sidecar_shared = &args[3];
     let connections_log = format!("{}/connections.jsonl", sidecar_shared);
@@ -456,7 +457,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ])
                 .split(size);
 
-            let title = Paragraph::new(format!(" Agent Sandbox TUI — {} ", sandbox_name))
+            let title = Paragraph::new(format!(" Agent Sandbox TUI — {} ", sandbox_short_name))
                 .style(Style::default().add_modifier(Modifier::BOLD).bg(Color::DarkGray).fg(Color::Cyan))
                 .block(Block::default().borders(Borders::ALL));
             f.render_widget(title, chunks[0]);
