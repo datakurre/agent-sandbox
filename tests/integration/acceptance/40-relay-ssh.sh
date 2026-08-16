@@ -49,6 +49,27 @@ out="$(sandbox_run --workspace --proxy --ssh -- \
   bash -c 'ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -T git@github.com 2>&1 || true')"
 assert_contains "$out" "successfully authenticated" "an SSH probe with a caller-supplied known_hosts"
 
+# One entry, two ports: the relay reads 22 out of the list exactly as it would
+# out of a lone ":22" entry, and the proxy still allows 443.
+cat > AGENTS.md <<'EOF'
+```toml agent-sandbox
+[network]
+allowed_hosts = ["github.com:22,443"]
+```
+EOF
+out="$(sandbox_run --workspace --proxy --ssh -- \
+  bash -c 'ssh -T git@github.com 2>&1 || true;
+           echo "https:$(curl --silent --show-error --max-time 20 -o /dev/null -w "%{http_code}" https://github.com/ 2>&1 || echo BLOCKED)"')"
+assert_contains "$out" "successfully authenticated" "an SSH probe with a comma-separated port list"
+assert_contains "$out" "https:2" "an HTTPS fetch with a comma-separated port list"
+
+cat > AGENTS.md <<'EOF'
+```toml agent-sandbox
+[network]
+allowed_hosts = ["github.com:22"]
+```
+EOF
+
 # No socket is mounted into the sandbox: the capability is the relay, not the
 # agent itself.
 out="$(sandbox_run --workspace --proxy --ssh -- bash -c 'echo "${SSH_AUTH_SOCK:-unset}"')"

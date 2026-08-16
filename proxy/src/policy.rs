@@ -1003,6 +1003,25 @@ mod tests {
     }
 
     #[test]
+    fn a_target_carries_a_whole_port_list_on_one_line() {
+        let cfg = parse_policy("allow_host github.com:22,443\n").unwrap();
+        assert!(cfg.is_allowed("github.com", 22));
+        assert!(cfg.is_allowed("github.com", 443));
+        assert!(!cfg.is_allowed("github.com", 8443));
+        // And renders back the way it was written, which is what the exit
+        // summary hands to the user as TOML.
+        assert_eq!(cfg.allow_host[0].to_string(), "github.com:22,443");
+    }
+
+    #[test]
+    fn allow_port_takes_one_range_not_a_list() {
+        // This asymmetry is deliberate and load-bearing: it is why the
+        // launcher splits `*:80,443` into one allow_port line per element.
+        assert!(parse_policy("allow_port 80,443\n").is_err());
+        assert!(parse_policy("allow_port 80\nallow_port 443\n").is_ok());
+    }
+
+    #[test]
     fn why_port_denied_lists_the_configured_ranges() {
         let cfg = parse_policy("allow_host github.com\nallow_port 443\n").unwrap();
         assert!(!cfg.is_allowed_port(8443));

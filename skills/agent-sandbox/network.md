@@ -112,11 +112,13 @@ Semantics that decide whether a rule works:
 
 - **Ports matter.** `"github.com:443"` allows that port only. An entry with no
   port (`"github.com"`) falls back to the built-in defaults 80, 443 and 22 — not
-  every port.
+  every port. A range or comma-separated list is one entry:
+  `"github.com:22,443"`, `"internal:8000-8100,9000"`.
 - **`:22` does double duty.** It also authorizes the SSH relay for that host,
-  which is what makes `git push` work in a proxied session. With no `:22` entry
-  the relay refuses SSH. Commit signing is separate: it needs no `:22` entry,
-  only a session launched with `--gpg`.
+  which is what makes `git push` work in a proxied session. Any element
+  covering 22 counts, so `"github.com:22,443"` authorizes the relay too. With
+  no such entry the relay refuses SSH. Commit signing is separate: it needs no
+  `:22` entry, only a session launched with `--gpg`.
 - **Wildcards.** `*.github.com:443` covers subdomains *and* the apex;
   `github.com:443` covers the apex only, never `status.github.com`. Matching is
   case-insensitive.

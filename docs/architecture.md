@@ -244,9 +244,12 @@ log of what it did. Changing policy is therefore a host-side operation
 **Policy format.** The proxy enforces the merged declarative `[network]` blocks
 from `AGENTS.md` and any explicitly selected host-owned profiles.
 `[network].allowed_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
-with a port or port range; an entry written without one is matched against the
-compiled-in `DEFAULT_ALLOW_PORTS` (80, 443, 22) instead, which is also what
-`allow_port` defaults to when the policy declares none.
+with a port, a port range, or a comma-separated list of both; an entry written
+without one is matched against the compiled-in `DEFAULT_ALLOW_PORTS`
+(80, 443, 22) instead, which is also what `allow_port` defaults to when the
+policy declares none. A host entry carries its whole port list on one line;
+the standalone `allow_port` key takes a single port or range, so a wildcard
+entry like `"*:80,443"` compiles to one `allow_port` line per element.
 `[[network.allowed_routes]]` configures L7 routes and optional secret injection.
 Those two keys are the whole surface: an unknown key under `[network]` refuses
 the launch rather than being ignored.

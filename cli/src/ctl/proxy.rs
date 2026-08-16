@@ -1,6 +1,6 @@
 use super::resolve::*;
 use crate::agents::{format_policy_as_network_toml, is_ip_or_cidr, parse_host_port};
-use agent_sandbox_proxy::policy::{parse_policy, parse_port_range, ProxyConfig};
+use agent_sandbox_proxy::policy::{parse_csv_ports, parse_policy, ProxyConfig};
 use agent_sandbox_proxy::policy_io::{install_policy, load_policy_lines};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -246,13 +246,18 @@ fn apply(policy_dir: &str, lines: Vec<String>) -> Result<()> {
 }
 
 /// What kind of `[network]` entry a bare target string looks like: an
-/// IP/CIDR, a bare port or port range (`8443`, `8000-8100`), or — the
-/// fallback — a domain name.
+/// IP/CIDR, a bare port list or range (`8443`, `8000-8100`, `80,443`), or —
+/// the fallback — a domain name.
+///
+/// The port test has to accept the whole comma-separated syntax, not one
+/// range: a `80,443` that falls through to "domains" installs `allow_host
+/// 80,443`, which the proxy happily reads as a literal domain nothing will
+/// ever match.
 fn target_kind(target: &str) -> &'static str {
     let (host_part, _port_part) = parse_host_port(target);
     if is_ip_or_cidr(&host_part) {
         "ips"
-    } else if parse_port_range(target).is_ok() {
+    } else if parse_csv_ports(target).is_ok_and(|ports| !ports.is_empty()) {
         "ports"
     } else {
         "domains"
@@ -274,6 +279,16 @@ mod tests {
         assert_eq!(target_kind("api.openai.com"), "domains");
         assert_eq!(target_kind("github.com"), "domains");
         assert_eq!(target_kind("github.com:22"), "domains");
+    }
+
+    #[test]
+    fn a_bare_port_list_is_ports_not_a_domain() {
+        // Read as a domain, `80,443` installs an allow_host line the proxy
+        // accepts and nothing ever matches.
+        assert_eq!(target_kind("80,443"), "ports");
+        assert_eq!(target_kind("80,8000-8100"), "ports");
+        assert_eq!(target_kind("github.com:22,443"), "domains");
+        assert_eq!(target_kind("10.0.0.0/8:80,443"), "ips");
     }
 }
 
@@ -487,7 +502,7 @@ fn check(args: CheckArgs) -> Result<()> {
         Some(p) => {
             let Ok(port) = p.parse::<u16>() else {
                 eprintln!(
-                    "agent-sandbox ctl proxy: '{}' is not a plain port (ranges/wildcards aren't a single target to check)",
+                    "agent-sandbox ctl proxy: '{}' names a set of ports, not one target — check a single HOST:PORT at a time",
                     p
                 );
                 std::process::exit(1);
