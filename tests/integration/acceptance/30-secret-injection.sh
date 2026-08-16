@@ -18,7 +18,7 @@ cd "$ws" || exit 1
 # manifest -- authorization says the binding is allowed, it does not supply
 # anything. The `env` provider reads the variable this case already requires,
 # so the manifest can live and die with the temp workspace. Set on the
-# command rather than in the user's secrets.toml, which would change the
+# command rather than in the user's trusted.toml, which would change the
 # provider for every one of their real sessions.
 cat > secretspec.toml <<'EOF'
 [project]
@@ -62,13 +62,13 @@ body="$(sandbox_run --workspace --proxy --secrets -- \
 
 # A secret definition in AGENTS.md is a request, not an instruction: the host
 # has to have authorized that exact binding in ~/.config/agent-sandbox/
-# secrets.toml first. That refusal is the feature working, so skip on it
+# trusted.toml first. That refusal is the feature working, so skip on it
 # rather than failing -- this case cannot authorize itself without writing to
 # the user's real config, which is the one file it must not forge.
 case "$body" in
   *"not authorized"*)
     skip "this secret binding is not authorized on this host. Add to
-         ~/.config/agent-sandbox/secrets.toml:
+         ~/.config/agent-sandbox/trusted.toml:
            [[network.allowed_routes]]
            host = \"httpbingo.org\"
            method = \"GET\"

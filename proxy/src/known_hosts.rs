@@ -1,14 +1,15 @@
-//! Host keys for the git forges, pinned.
+//! Host keys for the git forges, as published by them.
 //!
 //! Public vendor data, kept in the binary rather than fetched or trusted on
 //! first use: an SSH session inside a sandbox is non-interactive, so the
-//! alternative to pinning is not a prompt but either a hard failure or a
-//! silent TOFU accept of whatever answered.
+//! alternative to knowing a key in advance is not a prompt but either a hard
+//! failure or a silent TOFU accept of whatever answered.
 //!
-//! Two places consume it, because there are two places `ssh` can run.  The
-//! sandbox entrypoint seeds `~/.ssh/known_hosts` for a plain session, and
-//! `relay-server` writes its own copy in the sidecar for the `--proxy --ssh`
-//! path, where the real `ssh` runs there instead.
+//! **This is not a trust anchor under `--proxy`.** There, the trusted set is
+//! exactly what the operator authorized in `trusted.toml`, and this const only
+//! supplies the ready-to-paste key in the refusal that asks them to. It is
+//! still the seed for an unproxied session, which has no policy to authorize
+//! against and no egress restriction to protect.
 
 /// `known_hosts` lines for github.com, gitlab.com and bitbucket.org.
 pub const FORGE_KNOWN_HOSTS: &str = "\
@@ -22,3 +23,72 @@ bitbucket.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNT
 bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO\n\
 bitbucket.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDQeJzhupRu0u0cdegZIa8e86EG2qOCsIsD1Xw0xSeiPDlCr7kq97NLmMbpKTX6Esc30NuoqEEHCuc7yWtwp8dI76EEEB1VqY9QJq6vk+aySyboD5QF61I/1WeTwu+deCbgKMGbUijeXhtfbxSxm6JwGrXrhBdofTsbKRUsrN1WoNgUa8uqN1Vx6WAJw1JHPhglEGGHea6QICwJOAr/6mrui/oB7pkaWKHj3z7d1IC4KWLtY47elvjbaTlkN04Kc/5LFEirorGYVbt15kAUlqGM65pk6ZBxtaO3+30LVlORZkxOh+LKL/BvbZ/iRNhItLqNyieoQj/uh/7Iv4uyH/cV/0b4WDSd3DptigWq84lJubb9t/DnZlrJazxyDCulTmKdOR7vs9gMTo+uoIrPSb8ScTtvw65+odKAlBj59dhnVp9zd7QUojOpXlL62Aw56U4oO+FALuevvMjiWeavKhJqlR7i5n9srYcrNV7ttmDw7kf/97P5zauIhxcjX+xHv4M=\n\
 ";
+
+/// The `<type> <base64>` keys published for `host`, or empty when it is not one
+/// of the forges above.
+///
+/// Used to fill in the block the launcher prints when a policy authorizes SSH
+/// to a host the operator has not yet trusted: for the common case that turns
+/// the refusal into one copy-paste instead of a `ssh-keyscan` round trip.
+pub fn pinned_keys_for(host: &str) -> Vec<&'static str> {
+    let host = host.trim().to_ascii_lowercase();
+    FORGE_KNOWN_HOSTS
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(pattern, _)| *pattern == host)
+        .map(|(_, key)| key)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_blob_covers_the_forges_the_docs_name() {
+        for host in ["github.com", "gitlab.com", "bitbucket.org"] {
+            assert!(
+                FORGE_KNOWN_HOSTS.contains(host),
+                "{} is missing from the published keys",
+                host
+            );
+        }
+        // known_hosts is line-oriented; a blob without a trailing newline
+        // corrupts whatever is appended after it.
+        assert!(FORGE_KNOWN_HOSTS.ends_with('\n'));
+        for line in FORGE_KNOWN_HOSTS.lines() {
+            assert_eq!(
+                line.split_whitespace().count(),
+                3,
+                "not a host/type/key triple: {}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn every_forge_has_keys_and_nothing_else_does() {
+        for host in ["github.com", "gitlab.com", "bitbucket.org"] {
+            assert_eq!(
+                pinned_keys_for(host).len(),
+                3,
+                "{host} should have ecdsa, ed25519 and rsa"
+            );
+        }
+        assert!(pinned_keys_for("git.example.com").is_empty());
+        // The apex only -- a subdomain is a different host key.
+        assert!(pinned_keys_for("gist.github.com").is_empty());
+    }
+
+    #[test]
+    fn the_keys_are_returned_without_the_host() {
+        let keys = pinned_keys_for("GitHub.com");
+        assert!(!keys.is_empty());
+        for key in keys {
+            assert!(!key.starts_with("github.com"), "{key}");
+            let mut fields = key.split_whitespace();
+            assert!(fields.next().unwrap().starts_with("ssh-") || fields.clone().count() > 0);
+            assert!(fields.next().is_some(), "no key material in {key:?}");
+        }
+    }
+}

@@ -6,6 +6,7 @@ use agent_sandbox_cli::gpg::{scan_gnupg_home, GpgScanStatus};
 use agent_sandbox_cli::launch;
 use agent_sandbox_cli::net_summary;
 use agent_sandbox_cli::secrets::resolve_secrets_logic_with_profiles;
+use agent_sandbox_cli::trusted;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rand::Rng;
@@ -1888,6 +1889,34 @@ fn run() -> Result<i32> {
         secrets_configured = !merged_policy.secret_route.is_empty();
     }
 
+    // ── Host-key authorization ──────────────────────────────────────────────
+    // Before the cleanup guard is armed and before any container exists: this
+    // check reads no written file and shells out to nothing, so it can fail
+    // outright rather than building a network only to tear it down.  The
+    // secrets check further down cannot -- it reads the compiled policy back
+    // and calls secretspec -- which is why the two run at different points.
+    let trusted_config = trusted::config_path(&home);
+    if let Some(message) = trusted::legacy_path_refusal(&home) {
+        fail(&message);
+    }
+    let trusted_known_hosts = match trusted::load_known_hosts(&trusted_config) {
+        Ok(hosts) => hosts,
+        Err(e) => fail(&e.to_string()),
+    };
+    if want_proxy {
+        // `allow_signing` is the policy's own record of "SSH to this host is
+        // authorized", and it exists only for an allowed_hosts entry covering
+        // port 22.  Keying off it rather than off the TOML means a port range
+        // and a comma-separated list are caught on the same terms as a lone
+        // `:22`, and an allowed_routes host on :22 is not -- it never reaches
+        // the relay either.
+        let unauthorized =
+            trusted::unauthorized_signing_hosts(&merged_policy.allow_signing, &trusted_known_hosts);
+        if !unauthorized.is_empty() {
+            fail(&trusted::refusal(&unauthorized, &trusted_config));
+        }
+    }
+
     if !want_proxy && (proxy_configured || secrets_configured) {
         eprintln!("agent-sandbox: warning: [network] rules or secrets are configured in AGENTS.md, but proxy is not active.");
         eprintln!("               Launch with --proxy to enforce them.");
@@ -2107,6 +2136,19 @@ fn run() -> Result<i32> {
             &policy_file_content,
         )?;
 
+        // The authorized host keys travel beside the policy, in the same
+        // ro-mounted directory, because they are the same kind of thing: a
+        // host-side decision the sandbox may read and may not write.  Every
+        // declared entry is written, not only the ones that satisfied a
+        // requirement -- an entry on another port is exactly what an
+        // `ssh -p 2222` through the proxy needs.
+        if !trusted_known_hosts.is_empty() {
+            fs::write(
+                format!("{}/known_hosts", sidecar_policy),
+                trusted::render_known_hosts(&trusted_known_hosts),
+            )?;
+        }
+
         if !launch::policy_has_allow_rules(&policy_file_content) {
             eprintln!("agent-sandbox: --proxy is active with no allow rules.");
             eprintln!("               Use 'agent-sandbox ctl tui' to allow connections live,");
@@ -2116,7 +2158,7 @@ fn run() -> Result<i32> {
         if want_secrets {
             fs::create_dir_all(&sidecar_secrets)?;
             cleanup_guard.sidecar_secrets = sidecar_secrets.clone();
-            let config = PathBuf::from(&home).join(".config/agent-sandbox/secrets.toml");
+            let config = trusted::config_path(&home);
             let manifest = Path::new(&pwd).join("secretspec.toml");
             let profile_paths: Vec<PathBuf> = proxy_profiles
                 .iter()
@@ -2308,6 +2350,22 @@ fn run() -> Result<i32> {
         // name would grant trust for no purpose.  The cost is that an L7 rule
         // added mid-session has no CA to go with it -- `ctl proxy allow --l7`
         // and the TUI's `h` say so rather than failing silently.
+        // The sandbox's own ssh still leaves through the CONNECT proxy (the
+        // entrypoint writes a ProxyCommand for it), so it needs the same
+        // authorized keys the relay uses.  Bound as a single file, like the CA
+        // below and for the same reason: the directory it lives in is the
+        // policy, and the agent must not be able to rewrite that.
+        let known_hosts_file = format!("{}/known_hosts", sidecar_policy);
+        if Path::new(&known_hosts_file).exists() {
+            mounts.push("-v".to_string());
+            mounts.push(format!(
+                "{}:/run/agent-sandbox-known-hosts:ro",
+                known_hosts_file
+            ));
+            env_args.push("-e".to_string());
+            env_args.push("AGENT_SANDBOX_KNOWN_HOSTS=/run/agent-sandbox-known-hosts".to_string());
+        }
+
         let ca_pem = format!("{}/ca.pem", sidecar_shared);
         if launch::policy_has_l7_rules(&policy_file_content) && Path::new(&ca_pem).exists() {
             mounts.push("-v".to_string());

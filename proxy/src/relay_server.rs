@@ -1,7 +1,6 @@
 #[path = "relay_protocol.rs"]
 mod relay_protocol;
 
-use agent_sandbox_proxy::known_hosts::FORGE_KNOWN_HOSTS;
 use relay_protocol::{read_frame, write_frame, CommandType, Frame, RelayHeader};
 use std::env;
 use std::fs::File;
@@ -11,44 +10,18 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 
-/// Where the relay keeps its pinned `known_hosts`.  Sidecar-local on purpose:
-/// `/sidecar_shared` is a host bind mount, and a trust anchor that is compiled
-/// into the binary precisely so it cannot be tampered with has no business
-/// living somewhere a host-side process can rewrite it.
-const KNOWN_HOSTS_PATH: &str = "/run/agent-sandbox/known_hosts";
-const KNOWN_HOSTS_FALLBACK: &str = "/tmp/agent-sandbox-known_hosts";
-
-/// Writes the pinned forge host keys and returns the path `ssh` should read.
+/// The authorized host keys, written by the launcher beside the policy.
 ///
-/// Called once from `main` before the listener binds -- `handle_client` runs
-/// one thread per connection and would otherwise race on the same path.
+/// Read rather than written here, and read from the ro-mounted policy
+/// directory rather than assembled in the sidecar, because the set is an
+/// operator decision: it is exactly what `trusted.toml` authorized.  Nothing
+/// in this process may add to it.
 ///
-/// The sandbox seeds `~/.ssh/known_hosts` for itself, but that file is on the
-/// wrong side of the boundary here: under `--proxy --ssh` the agent socket is
-/// mounted into this sidecar, so *this* is where the real `ssh` runs.  Nor is
-/// `$HOME` an option -- the sidecar runs as uid 0 against a passwd whose root
-/// entry is `/root`, and OpenSSH expands `~` from `getpwuid`, not the
-/// environment, so a file written to the image's `HOME=/home/user` would
-/// never be read.  Hence an explicit path and an explicit `-o`.
-///
-/// Fails open on a write error: no worse than the behaviour this replaced.
-fn install_known_hosts() -> Option<String> {
-    for path in [KNOWN_HOSTS_PATH, KNOWN_HOSTS_FALLBACK] {
-        if let Some(dir) = Path::new(path).parent() {
-            if std::fs::create_dir_all(dir).is_err() {
-                continue;
-            }
-        }
-        if std::fs::write(path, FORGE_KNOWN_HOSTS).is_ok() {
-            return Some(path.to_string());
-        }
-    }
-    eprintln!(
-        "relay-server: could not write {}; ssh will fall back to its own host-key handling",
-        KNOWN_HOSTS_PATH
-    );
-    None
-}
+/// It has to be an explicit `-o` rather than a file in `$HOME`.  The sidecar
+/// runs as uid 0 against a passwd whose root entry is `/root`, and OpenSSH
+/// expands `~` from `getpwuid`, not the environment -- so a file written to
+/// the image's `HOME=/home/user` would never be read.
+const DEFAULT_KNOWN_HOSTS: &str = "/sidecar_policy/known_hosts";
 
 /// Whether the caller already set `keyword` themselves.
 ///
@@ -526,6 +499,7 @@ fn main() {
     let mut args = env::args().skip(1);
     let mut listen_addr = "0.0.0.0:8889".to_string();
     let mut policy_path = "/sidecar_policy/policy".to_string();
+    let mut known_hosts_path = DEFAULT_KNOWN_HOSTS.to_string();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -539,13 +513,22 @@ fn main() {
                     policy_path = val;
                 }
             }
+            "--known-hosts" => {
+                if let Some(val) = args.next() {
+                    known_hosts_path = val;
+                }
+            }
             _ => {}
         }
     }
 
-    // Before the bind, so the file is in place for the first connection and
-    // no two handler threads can race to write it.
-    let known_hosts = install_known_hosts();
+    // Absent when trusted.toml authorized no keys.  Nothing is injected then,
+    // and ssh fails closed on its own -- which is right, because a policy that
+    // authorized an SSH host without a key for it would have been refused
+    // before this sidecar was started.
+    let known_hosts = Path::new(&known_hosts_path)
+        .exists()
+        .then_some(known_hosts_path);
 
     let listener = TcpListener::bind(&listen_addr).unwrap_or_else(|e| {
         eprintln!("relay-server: failed to bind {}: {}", listen_addr, e);
@@ -724,28 +707,6 @@ mod tests {
             extract_ssh_destination(&full)
         );
         assert_eq!(extract_ssh_destination(&full), Some("github.com".into()));
-    }
-
-    #[test]
-    fn the_pinned_blob_covers_the_forges_the_docs_promise() {
-        for host in ["github.com", "gitlab.com", "bitbucket.org"] {
-            assert!(
-                FORGE_KNOWN_HOSTS.contains(host),
-                "{} is missing from the pinned known_hosts",
-                host
-            );
-        }
-        // known_hosts is line-oriented; a blob without a trailing newline
-        // corrupts whatever is appended after it.
-        assert!(FORGE_KNOWN_HOSTS.ends_with('\n'));
-        for line in FORGE_KNOWN_HOSTS.lines() {
-            assert_eq!(
-                line.split_whitespace().count(),
-                3,
-                "not a host/type/key triple: {}",
-                line
-            );
-        }
     }
 
     #[test]

@@ -250,6 +250,23 @@ fn ip_available(kind: DeniedKind, host: &str) -> bool {
     }
 }
 
+/// Whether the sandbox trusts a host key for `host`.
+///
+/// The authorized set is written beside the policy at launch, from the
+/// operator's `trusted.toml`, and nothing running can add to it — so this is
+/// read-only advice, not a gate. A grant for an untrusted host is still
+/// correct; it just cannot connect until the operator authorizes a key.
+fn trusts_host_key(policy_dir: &str, host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    fs::read_to_string(format!("{}/known_hosts", policy_dir))
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .any(|pattern| pattern.to_ascii_lowercase() == host)
+        })
+        .unwrap_or(false)
+}
+
 /// The policy lines that would let a denied row through, in the order they
 /// should be written.
 ///
@@ -934,6 +951,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let kind = row.kind;
 
                             let mut guard_msg: Option<String> = None;
+                            let mut untrusted_key_host: Option<String> = None;
                             let mut detail = String::new();
                             let mut policy = load_policy_lines(sidecar_policy);
 
@@ -955,6 +973,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if !policy.contains(&line) {
                                             policy.push(line);
                                         }
+                                    }
+                                    // The grant still goes through -- it is
+                                    // correct and it is what was asked for --
+                                    // but a host with no authorized key will
+                                    // fail verification rather than connect,
+                                    // and nothing running can add one.
+                                    if kind == DeniedKind::Ssh
+                                        && !trusts_host_key(sidecar_policy, &host)
+                                    {
+                                        untrusted_key_host = Some(host.clone());
                                     }
                                 }
                                 KeyCode::Char('A') => {
@@ -1015,9 +1043,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     port,
                                     &mut selected_idx,
                                 );
-                                status_msg = format!("Added: {}", detail);
-                                status_kind = StatusKind::Success;
-                                status_until = Some(Instant::now() + Duration::from_secs(3));
+                                match untrusted_key_host {
+                                    Some(host) => {
+                                        status_msg = format!(
+                                            "Added, but no host key for {} is trusted here — SSH will fail verification. Add [[network.known_hosts]] to trusted.toml and relaunch.",
+                                            host
+                                        );
+                                        status_kind = StatusKind::Info;
+                                        status_until =
+                                            Some(Instant::now() + Duration::from_secs(6));
+                                    }
+                                    None => {
+                                        status_msg = format!("Added: {}", detail);
+                                        status_kind = StatusKind::Success;
+                                        status_until =
+                                            Some(Instant::now() + Duration::from_secs(3));
+                                    }
+                                }
                             }
                         }
                     }

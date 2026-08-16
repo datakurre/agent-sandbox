@@ -140,7 +140,7 @@ value.
 
 `30-secret-injection` needs one thing more, and deliberately does not arrange it
 for itself. A `secret` in an `AGENTS.md` route is a *request* that the host must
-authorize in `~/.config/agent-sandbox/secrets.toml` before anything is injected
+authorize in `~/.config/agent-sandbox/trusted.toml` before anything is injected
 — an untrusted project file cannot spend your credentials on its own. The case
 skips on that refusal and prints the block to add. Authorizing it from inside
 the test would forge the very approval the feature exists to require, so that
@@ -161,7 +161,7 @@ allowed; the *value* is resolved on the host by `secretspec` from the
 workspace's `secretspec.toml`, so the case writes a throwaway manifest into its
 temp workspace and selects the `env` provider through `SECRETSPEC_PROVIDER` —
 which reads the `AGENT_SANDBOX_TEST_SECRET` it already requires. The provider is
-set on the command rather than in `secrets.toml`, where it would change how
+set on the command rather than in `trusted.toml`, where it would change how
 every real session resolves its secrets.
 
 ## What the first host run found

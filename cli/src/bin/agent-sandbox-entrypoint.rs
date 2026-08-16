@@ -94,13 +94,18 @@ fn main() -> Result<()> {
     // the one that used to gate this -- a forwarded agent at /agent.sock --
     // is absent on both of the others.  Under --proxy the socket goes to the
     // sidecar instead, and under --proxy without --ssh the sandbox's own ssh
-    // still goes out through the CONNECT proxy configured below.  The blob is
-    // public vendor data, so seeding it costs nothing and the
-    // already-present check below keeps a repeat run a no-op.
+    // still goes out through the CONNECT proxy configured below.
+    //
+    // Under --proxy the launcher binds in the keys the operator authorized in
+    // trusted.toml, and those are the whole trusted set -- the built-in forge
+    // keys are not consulted, because a policy that named a host the operator
+    // did not authorize would have been refused before the container started.
+    // Without --proxy there is no policy to authorize against and no egress
+    // restriction either, so the built-in keys stand in; they are public
+    // vendor data, and the already-present check keeps a repeat run a no-op.
     //
     // This is the sandbox's copy.  Under --proxy --ssh the real ssh runs in
-    // the sidecar and reads a separate copy that relay-server writes; see
-    // proxy/src/known_hosts.rs.
+    // the sidecar and reads the same file from /sidecar_policy.
     {
         let ssh_dir = home_path.join(".ssh");
         fs::create_dir_all(&ssh_dir)?;
@@ -120,21 +125,30 @@ fn main() -> Result<()> {
             }
         }
 
-        let mut needs_append = false;
-        if let Ok(content) = fs::read_to_string(&known_hosts) {
-            if !content.contains("github.com") {
-                needs_append = true;
+        let seed = match env::var("AGENT_SANDBOX_KNOWN_HOSTS") {
+            Ok(path) if !path.is_empty() => {
+                fs::read_to_string(&path).unwrap_or_else(|_| String::new())
             }
-        } else {
-            needs_append = true;
-        }
+            _ => FORGE_KNOWN_HOSTS.to_string(),
+        };
 
-        if needs_append {
+        // Line-wise rather than "does it mention github.com": the authorized
+        // set is whatever the operator wrote, and may name none of the forges.
+        let existing = fs::read_to_string(&known_hosts).unwrap_or_default();
+        let missing: Vec<&str> = seed
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter(|line| !existing.lines().any(|have| have.trim() == line.trim()))
+            .collect();
+
+        if !missing.is_empty() {
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&known_hosts)?;
-            file.write_all(FORGE_KNOWN_HOSTS.as_bytes())?;
+            for line in missing {
+                writeln!(file, "{}", line)?;
+            }
         }
     }
 

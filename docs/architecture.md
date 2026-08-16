@@ -51,12 +51,13 @@ the canonical tree from each tool's own discovery path. See
 ## Entrypoint (`agent-sandbox-entrypoint`)
 
 1. Loads the Nix store registration on first start (unless `AGENT_SANDBOX_HOST_NIX=1`, in which case the host's `/nix` mount is used, or `AGENT_SANDBOX_SKIP_NIX_INIT=1`, which sidecar launches set because they do not need Nix bootstrap).
-2. Seeds `~/.ssh/known_hosts` with pinned host keys for the common git forges,
-   unconditionally, so a non-interactive `ssh` neither prompts nor fails. This
-   is the sandbox's copy, and it is the one `ssh` uses when the sandbox runs
-   `ssh` itself; under `--proxy --ssh` the real `ssh` runs in the sidecar
-   instead and reads the copy `relay-server` writes there (see *Relay
-   Architecture* below).
+2. Seeds `~/.ssh/known_hosts`, unconditionally, so a non-interactive `ssh`
+   neither prompts nor fails. Under `--proxy` the source is the file the
+   launcher bound in from `trusted.toml` (`AGENT_SANDBOX_KNOWN_HOSTS`);
+   otherwise it is the published keys for the common git forges. This is the
+   sandbox's copy, and it is the one `ssh` uses when the sandbox runs `ssh`
+   itself; under `--proxy --ssh` the real `ssh` runs in the sidecar instead and
+   reads the same file from `/sidecar_policy` (see *Relay Architecture* below).
 3. When `AGENT_SANDBOX_GPG_AGENT=1`, symlinks the forwarded host gpg-agent
    socket into `~/.gnupg/S.gpg-agent`.
 4. When `HTTP_PROXY` is set, compensates for tools that don't honor it on
@@ -167,7 +168,7 @@ Three directories, and which side can see them is the design:
 
 | Path | Mounted into | Contents |
 | --- | --- | --- |
-| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base`, `policy.baseline` |
+| `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base`, `policy.baseline`, `known_hosts` |
 | `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `ca.pem`, `connections.jsonl`, `denied-requests.jsonl`, `relay.jsonl` |
 | `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
 | (host temp dirs) | — | removed by the launcher's `CleanupGuard` on the way out |
@@ -283,7 +284,7 @@ would fail the first line of every trimmed log.
 
 **Secret Injection.** `--secrets` triggers secret injection via `secretspec`.
 The source of authority is a host-controlled TOML file
-(`~/.config/agent-sandbox/secrets.toml`), which defines the exact bindings --
+(`~/.config/agent-sandbox/trusted.toml`), which defines the exact bindings --
 host and port, method, path, secret, header, prefix. The launcher calls the
 resolver in `cli/src/secrets.rs`, which cross-references that config with the
 policy's `secret_route` routes from `AGENTS.md`, and then runs `secretspec export`
@@ -299,6 +300,19 @@ collected the same token.  `inject::proxy_http1_with_injection` now resolves the
 binding *per request*, after the L7 check and against the same normalized path,
 so a keep-alive connection carrying several requests is several decisions and
 `/user/repos/../../zen` cannot carry the token to `/zen`.
+
+**Host-key trust.** The same host-controlled file carries
+`[[network.known_hosts]]`, and the same shape of check applies: `cli/src/trusted.rs`
+compares the compiled policy's `allow_signing` entries against it, and a host
+authorized for SSH with no key declared for it refuses the launch before any
+container exists -- earlier than the secrets check, which has to wait on a
+written policy file and a `secretspec` call.  The authorized keys are rendered
+to `known_hosts` syntax beside the policy and mounted read-only into the sidecar
+(where `relay-server` points `ssh` at them) and, one file at a time, into the
+sandbox (where the entrypoint seeds `~/.ssh/known_hosts` from them).  The
+built-in forge keys in `proxy/src/known_hosts.rs` are not a trust anchor under
+`--proxy`; they only fill in the refusal's suggested block, and they still seed
+an unproxied session, which has no policy to authorize against.
 
 **CA trust.** The proxy terminates TLS for any host carrying an L7 rule, using a
 CA it generates per session and writes to `/sidecar_shared/ca.pem`. The launcher
@@ -321,19 +335,19 @@ CGNAT, ULA) to every policy it writes, under `--proxy`.
 **Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol. The relay authorizes the two independently: `relay-gpg` requests are allowed whenever `signing_enabled` is `true` in the policy file — a flag the launcher writes unconditionally whenever `--gpg` wires up the relay, with no host to name, since gpg has no destination of its own. `relay-ssh` requests are allowed only when the destination host matches an `allow_signing` entry, which an `allowed_hosts` entry on port 22 is what populates — so `git push` still needs an explicit `"host:22"` declaration even though signing does not.
 
 Because the relay runs the real `ssh` in the sidecar, host-key verification has
-to be solved there too. `relay-server` writes the pinned forge keys to
-`/run/agent-sandbox/known_hosts` at startup and prepends
+to be solved there too. `relay-server` reads `/sidecar_policy/known_hosts` —
+the keys the operator authorized, written there by the launcher — and prepends
 `-o UserKnownHostsFile=… -o GlobalKnownHostsFile=/dev/null` to the ssh it
 spawns. Both halves are necessary: the sandbox's own `known_hosts` is on the
 far side of the boundary, and an implicit `~/.ssh/known_hosts` would not be
 found either, since the sidecar runs as uid 0 and OpenSSH expands `~` from
-`getpwuid` — `/root` — rather than from the image's `HOME=/home/user`. The
-injection is skipped entirely when the caller already passed a
-`UserKnownHostsFile` of their own, so a self-hosted forge outside the pinned
-set stays reachable. Options are prepended rather than appended because ssh
-keeps the first value it sees for a keyword and stops reading options at the
-destination; the policy check and the dangerous-option scan both run over the
-caller's argv alone, so neither is affected.
+`getpwuid` — `/root` — rather than from the image's `HOME=/home/user`. Options
+are prepended rather than appended because ssh keeps the first value it sees
+for a keyword and stops reading options at the destination; the policy check
+and the dangerous-option scan both run over the caller's argv alone, so neither
+is affected. The injection is skipped entirely when the caller already passed a
+`UserKnownHostsFile` of their own — see [Trust model](trust-model.md) for what
+that does and does not bound.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as

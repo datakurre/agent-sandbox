@@ -13,6 +13,9 @@ use std::thread;
 use std::time::Duration;
 
 const POLICY_FILE: &str = "/sidecar_policy/policy";
+/// The host keys trusted.toml authorized, written by the launcher beside the
+/// policy.  Absent when it authorized none.
+const KNOWN_HOSTS_FILE: &str = "/sidecar_policy/known_hosts";
 const SECRET_BINDINGS_FILE: &str = "/sidecar_secrets/bindings";
 const METRICS_LOG: &str = "/sidecar_shared/connections.jsonl";
 const DETAIL_LOG: &str = "/sidecar_shared/denied-requests.jsonl";
@@ -446,6 +449,8 @@ fn main() -> Result<()> {
                 &format!("{}:8889", sidecar_listen),
                 "--policy",
                 &config.policy_file,
+                "--known-hosts",
+                KNOWN_HOSTS_FILE,
             ])
             .spawn()
             .ok();
