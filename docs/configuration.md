@@ -47,7 +47,7 @@ dns = { container = 53, protocol = "udp", bind = "0.0.0.0" }
 The launcher publishes these ports only when it is given `--ports`; without it
 the declaration is inert.
 
-[`agent-sandbox browser`](usage.md#a-cooperative-browser-agent-sandbox-browser)
+[`agent-sandbox browser`](browser.md)
 reads the same block whether or not `--ports` was passed, and allows each
 loopback-bound entry — as `127.0.0.1:<host>` and as `localhost:<host>` — in the
 browser's own deny-by-default policy, so the app under test loads without
@@ -235,7 +235,7 @@ profiles are never loaded implicitly. Invalid or missing profiles refuse the
 launch before the sidecar starts.
 
 The same profiles are taken by
-[`agent-sandbox browser`](usage.md#a-cooperative-browser-agent-sandbox-browser)
+[`agent-sandbox browser`](browser.md)
 via its own `--proxy-profile`, so one allow list can serve both a sandbox and
 the browser testing it. They stay separate policies — selecting a profile for
 one does not select it for the other.

@@ -50,6 +50,16 @@ agent-sandbox --workspace --proxy-profile development opencode
 
 # Merge a reusable profile with AGENTS.md (additive)
 agent-sandbox --workspace --proxy --proxy-profile development opencode
+
+# Reattach to a running sandbox
+agent-sandbox ctl attach
+
+# Publish a port declared in AGENTS.md's [ports] block, and mount [mounts]
+agent-sandbox --workspace --ports --mounts opencode
+
+# Drive a visible, allow-listed browser from inside the sandbox
+agent-sandbox browser &
+agent-sandbox --workspace --browser -- claude
 ```
 
-Advanced features like SSH forwarding (`--ssh`), GPG signing (`--gpg`), host Podman socket forwarding (`--podman`), and `devenv` integration are available but opt-in. See the full documentation for details.
+Every agent also gets built-in skills (`agent-sandbox`, `nix`, `nix-flake`, `devenv`, `browser`) baked into the image, so it already knows how the sandbox works. Advanced features like SSH forwarding (`--ssh`), GPG signing (`--gpg`), host Podman socket forwarding (`--podman`), and `devenv` integration are available but opt-in. See the full documentation for details.

@@ -73,3 +73,16 @@ to them too:
     outer four-backtick fence; `docs/configuration.md` shows the pattern.
 - Prefer linking between pages over repeating a paragraph. This file exists to
   point at them.
+
+
+## Agent sandbox for this project
+
+```toml agent-sandbox
+[network]
+allowed_hosts = [
+    "channels.nixos.org:443",
+    "github.com:443",
+    "index.crates.io:443",
+    "releases.nixos.org:443",
+]
+```

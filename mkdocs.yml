@@ -53,3 +53,4 @@ nav:
     - Architecture: architecture.md
     - Development: development.md
     - Testing: testing.md
+    - Cooperative Browser: browser.md

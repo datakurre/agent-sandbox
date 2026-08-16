@@ -481,58 +481,22 @@ Integrations (use --X to enable, --no-X to disable):
   --nix             {nix} Mounts the host /nix/store for native Nix execution.
   --podman          {podman} Forwards the host rootless Podman socket (sibling containers).
   --selinux         {selinux} Applies SELinux shared relabeling (:z) to writable binds.
-  --proxy           {proxy} Routes HTTP(S)/SSH through a proxy, enforcing AGENTS.md's [network]
-                          policy if present (blocks direct internet access).
-                         Also enables 'agent-sandbox ctl net' for the running sandbox.
-                          Prints a traffic summary per host when the session ends.
+  --proxy           {proxy} Deny-by-default network firewall enforcing AGENTS.md's [network] policy.
   --proxy-profile NAME     Use a host-owned reusable network profile instead of AGENTS.md.
-                           May be repeated; combine with --proxy to merge both sources.
-  --proxy-log LEVEL {proxy_log} What to do with the connection log at exit; implies --proxy.
-                         off    discard it
-                         denied keep it if anything was denied or failed
-                         all    keep every session's log
-                         Kept logs land in the current directory.  Without this
-                         flag a session that had denials offers to save one.
-  --secrets         {secrets} Resolves secrets with secretspec and injects them into the
-                         proxied requests each [[network.allowed_routes]] rule authorizes.
-                         Requires --proxy.
+  --proxy-log LEVEL {proxy_log} What to do with the connection log at exit (off/denied/all); implies --proxy.
+  --secrets         {secrets} Injects secretspec-resolved credentials into proxied requests. Requires --proxy.
   --krun            {krun} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
-                         Adds a guest-kernel boundary inside the existing container boundary.
-                         'agent-sandbox ctl attach' and 'ctl mounts' do not work against a
-                         krun sandbox.
 
 Ports:
   --ports / --no-ports               {ports} Honors [ports] declarations from AGENTS.md.
   --ports-any-interface                    Permits port binds outside of loopback interfaces.
-                                           An undeclared port is published with
-                                           --podman-args -p HOST:CONTAINER --
-  --shared-network                   {shared_network} Joins the shared bridge network, so other
-                                           containers can reach this one by name.  Replaces
-                                           pasta with a bridge, so any pasta option the
-                                           operator wanted no longer applies.
-                                           --no-shared-network turns it back off.
-  --browser                          {browser} Attaches every browser 'agent-sandbox browser' is
-                                           running: maps each of their CDP ports and tells the
-                                           agent which is which, so playwright-mcp is wired up
-                                           with no further setup.  --browser=alice,bob picks
-                                           some of them.  Shorthand for the --host-loopback-port
-                                           and -e pair below; --no-browser turns it back off.
-                                           The browsers must already be running -- the channel
-                                           is set at launch and cannot be added later.
-  --host-loopback-port PORT          {host_ports} Makes the host's 127.0.0.1:PORT reachable at
-                                           the sandbox's own 127.0.0.1:PORT, so a service the
-                                           user runs there -- a browser's CDP port, say -- can
-                                           be driven from inside.  Repeatable, and takes
-                                           HOST:SANDBOX to move it off a port already in use
-                                           inside.  The sandbox gets the list as
-                                           $AGENT_SANDBOX_HOST_PORTS.  A mounted socket rather
-                                           than a route, so it composes with every network
-                                           mode, --proxy included -- but what it reaches is
-                                           outside the egress policy.
-                                           'agent-sandbox browser' starts a host browser that
-                                           carries an allow list of its own and prints the
-                                           line to paste here.
-                                           --no-host-loopback-port drops them all.
+  --shared-network                   {shared_network} Joins the shared bridge network so sibling
+                                           containers can reach this one by name.
+  --browser                          {browser} Attaches every running 'agent-sandbox browser'
+                                           session, wiring up playwright-mcp automatically.
+  --host-loopback-port PORT          {host_ports} Makes a host 127.0.0.1:PORT reachable at the
+                                           sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP
+                                           port). Repeatable; takes HOST:SANDBOX to remap.
 
 Mounts:
   --mounts / --no-mounts             {mounts} Honors [mounts] declarations from AGENTS.md.
@@ -550,17 +514,11 @@ Podman / Environment:
   -e, --env NAME=VAL        pass environment variable to podman
   --podman-args             treat all following args (until --) as podman args
 
---podman, --ssh and --gpg each hand the agent a capability that reaches
-outside the sandbox. --podman forwards the host podman socket, allowing the
-agent to create sibling containers on the host (a full sandbox escape).
-To safely let the agent run containers, use --privileged instead to enable
-securely nested containers inside the sandbox. See the trust model at
-https://datakurre.github.io/agent-sandbox/trust-model/ for details.
-
---krun closes none of those three. It adds a guest kernel under the agent, so
-code the agent runs faces a hypervisor before it faces the host kernel, but the
-VM runs inside the same container namespaces and the same proxy topology as
-before. It is not a substitute for leaving the three flags off."#,
+--podman, --ssh, --gpg and --krun each interact with the sandbox boundary
+differently -- --podman in particular is a full sandbox escape; prefer
+--privileged for nested containers. See the trust model:
+https://datakurre.github.io/agent-sandbox/trust-model/
+Full flag reference and examples: https://datakurre.github.io/agent-sandbox/usage/"#,
         agent_list = agent_list,
         workspace = fmt(want_workspace),
         ssh = fmt(want_ssh),
