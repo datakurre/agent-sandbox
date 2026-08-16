@@ -669,10 +669,10 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 if let Some(port) = port_part {
                     _proxy_port("[network].allowed_hosts", &port)?;
                     // An allow entry on the SSH port is also what authorizes
-                    // the relay to reach that host, and -- because gpg has no
-                    // destination of its own -- what enables signing at all.
-                    // The relay refuses everything while allow_signing is
-                    // empty, so this is the only way to turn it on.
+                    // the relay to reach that host, so it is what makes
+                    // `git push`/`pull` work in a proxied session. It says
+                    // nothing about GPG signing, which `signing_enabled`
+                    // gates on its own, host-agnostic.
                     if port == "22"
                         && host_part != "*"
                         && !policy.allow_signing.contains(&host_part)

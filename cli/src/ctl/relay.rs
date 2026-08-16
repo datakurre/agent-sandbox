@@ -23,24 +23,37 @@ pub struct RelayArgs {
 /// The two axes the relay authorizes independently: which hosts `git push`/
 /// `pull` may reach (`allow_signing` lines), and whether GPG signing is on at
 /// all (`signing_enabled`, set unconditionally by `--gpg`, host-agnostic).
-/// Printed first since they explain every denial below them.
-fn ssh_push_hosts(policy_dir: &str) -> Vec<String> {
-    fs::read_to_string(format!("{}/policy", policy_dir))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            line.strip_prefix("allow_signing ")
-                .map(|r| r.trim().to_string())
-        })
-        .filter(|r| !r.is_empty())
-        .collect()
+/// Printed first since they explain every denial below them. Mirrors
+/// `relay_server::load_signing_policy`, which reads the same file.
+struct SigningPolicy {
+    ssh_hosts: Vec<String>,
+    gpg_enabled: bool,
 }
 
-fn gpg_signing_enabled(policy_dir: &str) -> bool {
-    fs::read_to_string(format!("{}/policy", policy_dir))
-        .unwrap_or_default()
-        .lines()
-        .any(|line| line.trim() == "signing_enabled true")
+fn load_signing_policy(policy_dir: &str) -> SigningPolicy {
+    let mut ssh_hosts = Vec::new();
+    let mut gpg_enabled = false;
+    let text = fs::read_to_string(format!("{}/policy", policy_dir)).unwrap_or_default();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        if let Some(key) = parts.next() {
+            match key {
+                "allow_signing" => {
+                    if let Some(val) = parts.next() {
+                        ssh_hosts.push(val.to_string());
+                    }
+                }
+                "signing_enabled" => {
+                    gpg_enabled = parts.next() == Some("true");
+                }
+                _ => {}
+            }
+        }
+    }
+    SigningPolicy {
+        ssh_hosts,
+        gpg_enabled,
+    }
 }
 
 pub fn run(args: RelayArgs) -> Result<()> {
@@ -57,12 +70,12 @@ pub fn run(args: RelayArgs) -> Result<()> {
         std::process::exit(1);
     }
 
-    let hosts = ssh_push_hosts(&policy_dir);
-    let gpg_enabled = gpg_signing_enabled(&policy_dir);
+    let policy = load_signing_policy(&policy_dir);
+    let hosts = &policy.ssh_hosts;
     println!("{}", sandbox);
     println!(
         "  gpg signing    {}",
-        if gpg_enabled {
+        if policy.gpg_enabled {
             "enabled"
         } else {
             "disabled -- relaunch with --gpg"
@@ -74,7 +87,7 @@ pub fn run(args: RelayArgs) -> Result<()> {
             "                 Declare an SSH port in AGENTS.md, e.g. allowed_hosts = [\"github.com:22\"]."
         );
     } else {
-        for host in &hosts {
+        for host in hosts {
             println!("  ssh (push/pull) {}", host);
         }
     }

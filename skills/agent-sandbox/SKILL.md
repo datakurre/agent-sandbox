@@ -83,7 +83,7 @@ user for the flag that would provide it.
 | `Could not resolve host` in a proxied session | internal network has no DNS; only proxy-aware clients work | make the tool honour `$HTTP_PROXY`, or add a rule |
 | Certificate error after a rule was added mid-session | an L7 route added live has no session CA behind it | add the rule to `AGENTS.md`, then relaunch |
 | `agent-sandbox: ssh to X denied by allow_signing policy` | relay not authorized for that host | add `"X:22"` to `allowed_hosts`, relaunch |
-| `agent-sandbox: gpg denied: no allow_signing rules in policy` | same, for commit signing | as above |
+| `agent-sandbox: gpg denied: signing not enabled` | `--gpg` was not passed; unrelated to `allowed_hosts` | relaunch with `--gpg` |
 | `git push` prompts for a password | no `--ssh`, so no agent forwarding | relaunch with `--ssh` |
 | Commit signing fails or is disabled | no `--gpg` (the launcher then sets `commit.gpgsign=false`) | relaunch with `--gpg` |
 | `Permission denied` writing outside `/workspace` | read-only or tmpfs path | keep the file in the workspace or `$TMPDIR` |

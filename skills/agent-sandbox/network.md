@@ -29,8 +29,9 @@ the proxy decides per connection against a deny-by-default policy.
 
 That is also why a forwarded SSH or GPG socket is *not* mounted into a proxied
 sandbox — a socket is a capability that would bypass the firewall entirely. The
-agent sockets stay with the sidecar, and `relay-ssh`/`relay-gpg` reach them only
-for hosts the policy authorizes for signing.
+agent sockets stay with the sidecar. `relay-ssh` reaches the SSH socket only for
+hosts the policy authorizes; `relay-gpg` needs no host at all — gpg has no
+destination of its own, so signing is gated by `--gpg` alone.
 
 Two consequences worth internalizing:
 
@@ -112,9 +113,10 @@ Semantics that decide whether a rule works:
 - **Ports matter.** `"github.com:443"` allows that port only. An entry with no
   port (`"github.com"`) falls back to the built-in defaults 80, 443 and 22 — not
   every port.
-- **`:22` does double duty.** It also authorizes the SSH/GPG relay for that host,
-  which is what makes `git push` and commit signing work in a proxied session.
-  With no `:22` entry the relay refuses everything.
+- **`:22` does double duty.** It also authorizes the SSH relay for that host,
+  which is what makes `git push` work in a proxied session. With no `:22` entry
+  the relay refuses SSH. Commit signing is separate: it needs no `:22` entry,
+  only a session launched with `--gpg`.
 - **Wildcards.** `*.github.com:443` covers subdomains *and* the apex;
   `github.com:443` covers the apex only, never `status.github.com`. Matching is
   case-insensitive.
