@@ -180,7 +180,7 @@ codex mcp add playwright -- playwright-mcp --headless --isolated
 | `page.goto()` hangs or times out | proxied sandbox denying the host | check `$HTTPS_PROXY`, pass it explicitly, ask for `ctl proxy allow` |
 | "Failed to move to new namespace" / renderer crash | container can't create Chromium's own sandbox | add `--no-sandbox` to `launch(args=[...])` |
 | Renderer crashes under load, blank/partial screenshot | `/dev/shm` too small (often 64 MB in containers) | add `--disable-dev-shm-usage` |
-| `browserType.launch` complains about a missing executable | `PLAYWRIGHT_BROWSERS_PATH` unset or wrong | re-export it, see `SKILL.md` |
+| `browserType.launch` complains about a missing executable | `PLAYWRIGHT_BROWSERS_PATH` unset — likely `export`ed in a separate tool call that didn't carry into this one | re-derive it in the *same* command as the failing one, see `SKILL.md` |
 | `$AGENT_SANDBOX_HOST_PORTS` is unset, or missing the port | launched without `--browser`, so nothing reaches the host's `127.0.0.1:9222` | ask the user to run `agent-sandbox browser`, then relaunch with `--browser`, see `SKILL.md` |
 | `connect_over_cdp` refuses/times out with the port listed | the channel exists, so nothing is listening on the host's `127.0.0.1:9222` | the browser was closed, or a hand-started Chrome had no separate `--user-data-dir` |
 | No `browser_*` MCP tools, but CDP works from a script | relaunched with a bare `--host-loopback-port` instead of `--browser`, so nothing set `AGENT_SANDBOX_BROWSER_CDP_PORT` | use `--browser`, or add the variable with `-e` |

@@ -6,6 +6,20 @@ you find one, how to use the tool without leaking anything, and how
 
 Upstream: <https://secretspec.dev> / <https://github.com/cachix/secretspec>.
 
+## Before you start
+
+- **Never run `secretspec get` or `secretspec export`** to "see" a value, and
+  never pipe either into a file, log, or message. Use `secretspec run` to
+  inject a secret into a command instead.
+- **Always pass `--reason "..."`** — an agent-driven call without one fails
+  outright (`require_reason` defaults to `"agents"`).
+- **`keyring://` cannot work inside the sandbox** (no session bus/display) —
+  that's expected, not a bug to fix. A file-based provider or `--secrets`
+  is the way forward here.
+- **The three files below must match exactly**, port included — a mismatch
+  refuses the launch, and the fix is to paste the printed block, not retype
+  it.
+
 ## What the file tells you
 
 [secretspec](https://secretspec.dev) separates **declaration** from **storage**.

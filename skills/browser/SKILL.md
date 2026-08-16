@@ -7,6 +7,23 @@ metadata:
   audience: developers-and-agents
 ---
 
+## Before you start
+
+- **Default to headless** unless the task needs a window the user can watch or
+  click in themselves.
+- **Never run `playwright install`** — the nixpkgs driver is already paired
+  with the Python package; that command tries to hit a CDN and isn't needed.
+- **`export`ed variables may not survive your next tool call.** Many agent
+  harnesses run each shell command fresh, with no memory of a previous
+  `export`. Keep `PLAYWRIGHT_BROWSERS_PATH` / `FONTCONFIG_FILE` in the *same*
+  command as whatever uses them (`&&`-chained, or one script) rather than
+  trusting "set it once" — see below.
+- **Bind a server behind a published port to `0.0.0.0`**, not `127.0.0.1` —
+  publishing forwards to the sandbox's interface address, not its loopback.
+- A denied host is the sandbox's egress policy working as intended — ask the
+  user for `ctl proxy allow`, don't unset the proxy or add a browser-level
+  proxy of your own to route around it.
+
 # Two browsers, and which one you want
 
 | | Headless, in here | Cooperative, on the host |
@@ -34,7 +51,7 @@ The Python package's driver is symlinked to nixpkgs' own `playwright-driver` at
 build time, so the two are always protocol-compatible — never run `playwright
 install`, it tries to hit a CDN and isn't needed.
 
-## Get the browser, once per session
+## Get the browser
 
 ```sh
 export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
@@ -42,7 +59,21 @@ export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
   --no-link --print-out-paths)
 ```
 
-Everything below inherits this from the environment — no need to repeat it.
+The build resolves to a cached, content-addressed store path, so re-running
+this line costs nothing after the first time. **Don't rely on the `export`
+surviving into a later tool call** — if your next command is a separate shell
+invocation, this variable is gone. Put the `export` and the command that needs
+it in one invocation:
+
+```sh
+export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
+  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; playwright-driver.browsers' \
+  --no-link --print-out-paths) && \
+nix shell --impure --expr '...' --command python3 script.py
+```
+
+or write it into the script/session you're about to run rather than a
+throwaway shell line.
 
 ## Fonts
 
@@ -63,6 +94,9 @@ Two cases still need attention:
     --no-link --print-out-paths)
   ```
 
+  Same caveat as `PLAYWRIGHT_BROWSERS_PATH` above: chain this into the same
+  command as the script that needs it, don't `export` it as a standalone step.
+
 - **Knowing the failure mode.** With no usable fonts, headless Chromium fails
   *silently*: `page.goto()` succeeds, `page.title()` and `page.content()` return
   correct data, and `page.screenshot()` comes back a flat, uniform colour — no
@@ -72,7 +106,13 @@ Two cases still need attention:
 
 ## Script it: navigate, screenshot, click
 
+This still needs `$PLAYWRIGHT_BROWSERS_PATH` in its environment — the
+Playwright driver reads it at launch. Set it in the same command:
+
 ```sh
+export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
+  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; playwright-driver.browsers' \
+  --no-link --print-out-paths) && \
 nix shell --impure --expr \
   'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem};
    [ (python3.withPackages (ps: [ ps.playwright ])) fontconfig dejavu_fonts liberation_ttf ]' \

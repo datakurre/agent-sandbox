@@ -134,14 +134,15 @@ them all (it cannot build foreign systems without a remote builder).
 
 ## More
 
-- `reference.md` — per-language packaging skeletons with the fixed-output hash
-  workflow, `apps` vs `packages`, multiple devShells, overlays and
-  `follows`/`--override-input`, writing `checks`, templates, `nix repl`
-  debugging, and direnv.
-- `uv2nix.md` — Python projects with a `uv.lock`: the workspace/overlay/pythonSet
-  pipeline, venv vs application outputs, editable development shells, build-system
-  overrides, tests as checks, PEP 723 scripts, and sharing the boilerplate as a
-  flake `lib` output.
-- `images.md` — OCI container images from a flake package with
-  `dockerTools.streamLayeredImage`: non-root user, `tini` entry point, labels,
+- Read `reference.md` before packaging a new language target, adding a second
+  devShell, wiring up an overlay or `follows`/`--override-input`, writing a
+  `checks` entry, or debugging evaluation with `nix repl` — per-language
+  skeletons, the fixed-output hash workflow, `apps` vs `packages`, and
+  templates all live there.
+- **If the project has a `uv.lock`, stop and read `uv2nix.md`** — the
+  workspace/overlay/pythonSet pipeline, venv vs application outputs, editable
+  development shells, build-system overrides, tests as checks, PEP 723
+  scripts, and sharing the boilerplate as a flake `lib` output.
+- Read `images.md` before turning a flake package into an OCI image —
+  `dockerTools.streamLayeredImage`, non-root user, `tini` entry point, labels,
   layer count, and verifying an image without a container runtime.

@@ -9,6 +9,19 @@ metadata:
 
 # You may be in a sandbox
 
+## Before you start
+
+- **Don't unset or override `HTTP_PROXY`**, add host network access, or reach
+  for `--podman`/`--privileged` to get around a denial.
+- **Don't tunnel a blocked destination through an allowed one.**
+- **`agent-sandbox ctl …` runs on the host**, in another terminal — never in
+  here, no matter how the failure looks.
+- **A bodiless `403 Forbidden` from the proxy is policy working as
+  configured, not a bug.** Don't retry it in a loop; it won't change until the
+  policy does.
+- **Editing `AGENTS.md` takes effect only on the next relaunch** — it grants
+  nothing in the current session.
+
 `agent-sandbox` runs coding agents in a rootless Podman container where **every**
 host capability — the workspace, network, SSH, GPG, Podman — is opt-in and was
 chosen by the user at launch. If you are reading this file, you are probably
@@ -132,8 +145,10 @@ is a better outcome than a task completed by widening the boundary.
 
 ## More
 
-- `network.md` — the proxy in detail: policy syntax and semantics, what the
-  launcher refuses, the `ctl`/TUI loop the user drives, and which changes apply
-  live versus needing a relaunch.
-- `secretspec.md` — reading a `secretspec.toml`, running secretspec safely, and
-  how `--secrets` injects credentials the sandbox never sees.
+- Read `network.md` before proposing any `AGENTS.md` `[network]` change, or
+  diagnosing anything proxy-related in more depth — policy syntax and
+  semantics, what the launcher refuses, the `ctl`/TUI loop the user drives,
+  and which changes apply live versus needing a relaunch.
+- Read `secretspec.md` before touching a `secretspec.toml` or a secret-bound
+  route — reading the manifest, running secretspec safely, and how
+  `--secrets` injects credentials the sandbox never sees.

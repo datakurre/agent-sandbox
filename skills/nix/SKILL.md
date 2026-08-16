@@ -82,6 +82,8 @@ minutes on first run — anchor the regex and expect the wait, or use
 
 ## More
 
-`reference.md` covers ad-hoc language environments with packages (Python,
-Node), one-off derivations and overrides via `--expr`, `nix-shell` shebang
-scripts, store inspection and debugging, and offline or cache-constrained use.
+Read `reference.md` before writing a one-off derivation, a language
+environment with extra packages (Python, Node, …), a `nix-shell` shebang
+script, an override of a package's build inputs, or when debugging a store
+path or an offline/cache-constrained failure — these need patterns not shown
+here.

@@ -142,6 +142,8 @@ the `devenv.lock` diff when you do.
 
 ## More
 
-`reference.md` covers language-specific setups, process readiness probes and
-dependency ordering, service configuration, splitting config with `imports`,
-one-off `-O` overrides, containers, CI use, and devenv inside a flake.
+Read `reference.md` when the task needs any of: a specific language toolchain
+setup, a process readiness probe or service dependency ordering, service
+configuration beyond `enable = true`, splitting config with `imports`, a
+one-off `-O` override, a container output, CI caching, or devenv driven from
+inside a flake.

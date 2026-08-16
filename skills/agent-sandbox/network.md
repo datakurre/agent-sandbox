@@ -4,6 +4,18 @@ Read `SKILL.md` first. Everything here applies to a **proxied session** — one
 where `$HTTP_PROXY` is set. Without it there is no firewall and none of this is
 relevant.
 
+## Before you start
+
+- **There is no `deny` key and no `ctl proxy deny`.** The firewall is
+  deny-by-default already; denying something already denied is a no-op.
+- **Ports matter.** `"github.com:443"` is not the same as `"github.com"` —
+  the latter falls back to just 80/443/22.
+- **Most changes are live** (`ctl proxy allow/rm/reset`, `ctl mounts`); an L7
+  route needing TLS interception, `[ports]`, `--secrets`, and any launch flag
+  need a **relaunch** — see the table near the bottom before promising either.
+- **Don't propose `"*"` or a bare `"*:443"`** to work around one missing
+  host — ask for the narrowest rule that unblocks the task.
+
 ## Topology
 
 ```
