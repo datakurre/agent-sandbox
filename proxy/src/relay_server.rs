@@ -1,13 +1,106 @@
 #[path = "relay_protocol.rs"]
 mod relay_protocol;
 
+use agent_sandbox_proxy::known_hosts::FORGE_KNOWN_HOSTS;
 use relay_protocol::{read_frame, write_frame, CommandType, Frame, RelayHeader};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
+
+/// Where the relay keeps its pinned `known_hosts`.  Sidecar-local on purpose:
+/// `/sidecar_shared` is a host bind mount, and a trust anchor that is compiled
+/// into the binary precisely so it cannot be tampered with has no business
+/// living somewhere a host-side process can rewrite it.
+const KNOWN_HOSTS_PATH: &str = "/run/agent-sandbox/known_hosts";
+const KNOWN_HOSTS_FALLBACK: &str = "/tmp/agent-sandbox-known_hosts";
+
+/// Writes the pinned forge host keys and returns the path `ssh` should read.
+///
+/// Called once from `main` before the listener binds -- `handle_client` runs
+/// one thread per connection and would otherwise race on the same path.
+///
+/// The sandbox seeds `~/.ssh/known_hosts` for itself, but that file is on the
+/// wrong side of the boundary here: under `--proxy --ssh` the agent socket is
+/// mounted into this sidecar, so *this* is where the real `ssh` runs.  Nor is
+/// `$HOME` an option -- the sidecar runs as uid 0 against a passwd whose root
+/// entry is `/root`, and OpenSSH expands `~` from `getpwuid`, not the
+/// environment, so a file written to the image's `HOME=/home/user` would
+/// never be read.  Hence an explicit path and an explicit `-o`.
+///
+/// Fails open on a write error: no worse than the behaviour this replaced.
+fn install_known_hosts() -> Option<String> {
+    for path in [KNOWN_HOSTS_PATH, KNOWN_HOSTS_FALLBACK] {
+        if let Some(dir) = Path::new(path).parent() {
+            if std::fs::create_dir_all(dir).is_err() {
+                continue;
+            }
+        }
+        if std::fs::write(path, FORGE_KNOWN_HOSTS).is_ok() {
+            return Some(path.to_string());
+        }
+    }
+    eprintln!(
+        "relay-server: could not write {}; ssh will fall back to its own host-key handling",
+        KNOWN_HOSTS_PATH
+    );
+    None
+}
+
+/// Whether the caller already set `keyword` themselves.
+///
+/// ssh hands the `-o` string to the same parser that reads ssh_config, so all
+/// three spellings are legal: `-o Key=Val`, `-oKey=Val`, and `-o "Key Val"`.
+/// The match is anchored at the option *name*, so a value that merely contains
+/// the keyword -- `-o ProxyJump=userknownhostsfile.example.com` -- does not
+/// count.
+fn has_ssh_option(args: &[String], keyword: &str) -> bool {
+    let mut expect_value = false;
+    for arg in args {
+        let opt = if expect_value {
+            expect_value = false;
+            arg.as_str()
+        } else if arg == "-o" {
+            expect_value = true;
+            continue;
+        } else if arg.starts_with("-o") && arg.len() > 2 {
+            &arg[2..]
+        } else {
+            continue;
+        };
+        let name = opt
+            .split(|c: char| c == '=' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if name.eq_ignore_ascii_case(keyword) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The options that point `ssh` at the pinned file, ready to be *prepended*:
+/// ssh takes the first value it sees for a keyword, and options have to come
+/// before the destination.
+///
+/// Skipped whole when the caller named a known-hosts file of their own -- the
+/// escape hatch for a self-hosted forge, and the reason `GlobalKnownHostsFile`
+/// is not forced separately: pinning our file on top of theirs would narrow
+/// them further than they asked.
+fn known_hosts_args(args: &[String], path: &str) -> Vec<String> {
+    if has_ssh_option(args, "UserKnownHostsFile") {
+        return Vec::new();
+    }
+    vec![
+        "-o".to_string(),
+        format!("UserKnownHostsFile={}", path),
+        "-o".to_string(),
+        "GlobalKnownHostsFile=/dev/null".to_string(),
+    ]
+}
 
 fn domain_match(domain: &str, pattern: &str) -> bool {
     let domain = domain.to_ascii_lowercase();
@@ -162,7 +255,7 @@ fn load_signing_policy(policy_path: &str) -> SigningPolicy {
     }
 }
 
-fn handle_client(mut stream: TcpStream, policy_path: &str) {
+fn handle_client(mut stream: TcpStream, policy_path: &str, known_hosts: Option<&str>) {
     let req = match RelayHeader::read_from(&mut stream) {
         Ok(r) => r,
         Err(e) => {
@@ -285,6 +378,15 @@ fn handle_client(mut stream: TcpStream, policy_path: &str) {
     };
 
     let mut cmd = Command::new(bin);
+    // Prepended, never appended: ssh keeps the first value it sees for a
+    // keyword and stops reading options at the destination.  Both the
+    // destination extraction and the dangerous-option scan above ran over
+    // `req.args` alone, so neither sees these.
+    if is_ssh {
+        if let Some(path) = known_hosts {
+            cmd.args(known_hosts_args(&req.args, path));
+        }
+    }
     cmd.args(&req.args);
 
     // Only pass through a strict whitelist of safe environment variables from the sandbox
@@ -416,6 +518,10 @@ fn main() {
         }
     }
 
+    // Before the bind, so the file is in place for the first connection and
+    // no two handler threads can race to write it.
+    let known_hosts = install_known_hosts();
+
     let listener = TcpListener::bind(&listen_addr).unwrap_or_else(|e| {
         eprintln!("relay-server: failed to bind {}: {}", listen_addr, e);
         std::process::exit(1);
@@ -425,8 +531,9 @@ fn main() {
         match stream {
             Ok(s) => {
                 let pp = policy_path.clone();
+                let kh = known_hosts.clone();
                 thread::spawn(move || {
-                    handle_client(s, &pp);
+                    handle_client(s, &pp, kh.as_deref());
                 });
             }
             Err(e) => {
@@ -505,6 +612,115 @@ mod tests {
             "user/repo.git".into(),
         ];
         assert_eq!(extract_ssh_destination(&args), Some("github.com".into()));
+    }
+
+    // ── known_hosts injection ───────────────────────────────────────────────
+
+    #[test]
+    fn has_ssh_option_reads_all_three_spellings() {
+        let sep = vec!["-o".into(), "UserKnownHostsFile=/x".into()];
+        let combined = vec!["-oUserKnownHostsFile=/x".into()];
+        let spaced = vec!["-o".into(), "UserKnownHostsFile /x".into()];
+        for args in [&sep, &combined, &spaced] {
+            assert!(
+                has_ssh_option(args, "UserKnownHostsFile"),
+                "missed {:?}",
+                args
+            );
+        }
+    }
+
+    #[test]
+    fn has_ssh_option_ignores_case_of_the_keyword() {
+        let args = vec!["-ouserknownhostsfile=/x".into()];
+        assert!(has_ssh_option(&args, "UserKnownHostsFile"));
+    }
+
+    #[test]
+    fn has_ssh_option_matches_the_name_not_the_value() {
+        // The keyword appearing inside somebody else's value is not a match:
+        // matching it would silently drop our pinning.
+        let args = vec![
+            "-o".into(),
+            "ProxyJump=userknownhostsfile.example.com".into(),
+            "github.com".into(),
+        ];
+        assert!(!has_ssh_option(&args, "UserKnownHostsFile"));
+    }
+
+    #[test]
+    fn has_ssh_option_is_not_fooled_by_a_flag_that_starts_with_o() {
+        let args = vec!["-obscure".into()];
+        assert!(!has_ssh_option(&args, "UserKnownHostsFile"));
+    }
+
+    #[test]
+    fn known_hosts_args_pins_by_default() {
+        let args = vec!["git@github.com".into()];
+        assert_eq!(
+            known_hosts_args(&args, "/run/kh"),
+            vec![
+                "-o".to_string(),
+                "UserKnownHostsFile=/run/kh".to_string(),
+                "-o".to_string(),
+                "GlobalKnownHostsFile=/dev/null".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn known_hosts_args_defers_to_a_caller_who_named_their_own_file() {
+        let args = vec![
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=no".into(),
+            "git@selfhosted.example".into(),
+        ];
+        assert!(known_hosts_args(&args, "/run/kh").is_empty());
+    }
+
+    #[test]
+    fn known_hosts_args_do_not_move_the_destination() {
+        // The injected options are prepended to argv, but every check the
+        // relay makes runs over the caller's args alone -- so the destination
+        // the policy was checked against is the destination ssh will use.
+        let args = vec![
+            "-o".into(),
+            "SendEnv=GIT_PROTOCOL".into(),
+            "git@github.com".into(),
+            "git-upload-pack".into(),
+            "user/repo.git".into(),
+        ];
+        let mut full = known_hosts_args(&args, "/run/kh");
+        full.extend(args.iter().cloned());
+        assert_eq!(
+            extract_ssh_destination(&args),
+            extract_ssh_destination(&full)
+        );
+        assert_eq!(extract_ssh_destination(&full), Some("github.com".into()));
+    }
+
+    #[test]
+    fn the_pinned_blob_covers_the_forges_the_docs_promise() {
+        for host in ["github.com", "gitlab.com", "bitbucket.org"] {
+            assert!(
+                FORGE_KNOWN_HOSTS.contains(host),
+                "{} is missing from the pinned known_hosts",
+                host
+            );
+        }
+        // known_hosts is line-oriented; a blob without a trailing newline
+        // corrupts whatever is appended after it.
+        assert!(FORGE_KNOWN_HOSTS.ends_with('\n'));
+        for line in FORGE_KNOWN_HOSTS.lines() {
+            assert_eq!(
+                line.split_whitespace().count(),
+                3,
+                "not a host/type/key triple: {}",
+                line
+            );
+        }
     }
 
     #[test]

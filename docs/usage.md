@@ -226,7 +226,7 @@ When using Git inside the sandbox, be aware of how the integration flags interac
 
 - `--git` injects your effective Git configuration into the container using environment variables instead of mounting `.gitconfig`. Host-side `[include]` directives are evaluated and flattened on the host, while host-specific file paths (like `gpg.*.program`, credential helpers, global gitignore, and custom hooks) are automatically blocklisted so they don't break Git inside the container.
 - `--gpg` is required for `--git` to also include commit signing. Without it, the sandbox explicitly disables signing (`commit.gpgsign = false`, `tag.gpgsign = false`) to prevent signing failures when the host's GnuPG agent is not forwarded.
-- `--ssh` is required for `git pull` and `git push` to work with SSH remotes. It forwards your host's `SSH_AUTH_SOCK`. Because we avoid excessive host mounts, we do *not* mount your host's `known_hosts` file. Instead, we pre-populate the container's `~/.ssh/known_hosts` with the public keys for GitHub, GitLab, and Bitbucket so first-time connections do not prompt for verification.
+- `--ssh` is required for `git pull` and `git push` to work with SSH remotes. It forwards your host's `SSH_AUTH_SOCK`. Because we avoid excessive host mounts, we do *not* mount your host's `known_hosts` file. Instead, we pin the public keys for GitHub, GitLab, and Bitbucket so first-time connections neither prompt nor fail. An SSH session in a sandbox is non-interactive, so the alternative to pinning is not a prompt but either a hard failure or a silent trust-on-first-use accept of whatever answered.
 - Combined with `--proxy`, neither socket is mounted into the sandbox at all: a
   forwarded socket is a capability that does not pass the firewall. The sockets
   go to the proxy sidecar instead, and the sandbox reaches them through
@@ -238,6 +238,14 @@ When using Git inside the sandbox, be aware of how the integration flags interac
   since push/pull genuinely need to name a host; with no such entry `git push`
   is refused. `agent-sandbox ctl relay` shows both states and the decisions
   made against them.
+- Host keys are pinned on whichever side actually runs `ssh`. Unproxied, that
+  is the sandbox's own `~/.ssh/known_hosts`. Under `--proxy --ssh` it is the
+  sidecar, so `relay-server` writes its own copy there and passes
+  `-o UserKnownHostsFile=…`: the sandbox's file would be on the wrong side of
+  the boundary, and the sidecar runs as `root`, whose home is `/root` rather
+  than the image's `HOME`. Naming your own file
+  (`ssh -o UserKnownHostsFile=…`) turns the injection off, which is the escape
+  hatch for a forge outside the pinned set.
 
 ### Bundled OpenCode skills
 
