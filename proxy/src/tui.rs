@@ -1,6 +1,6 @@
 use agent_sandbox_proxy::policy_io::{install_policy, load_policy_lines};
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -17,6 +17,10 @@ use std::{
     env, fs,
     io::{self, BufRead, Seek, SeekFrom},
     net::IpAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -259,6 +263,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connections_log = format!("{}/connections.jsonl", sidecar_shared);
     let details_log = format!("{}/denied-requests.jsonl", sidecar_shared);
 
+    let sigint_flag = Arc::new(AtomicBool::new(false));
+    {
+        let flag = sigint_flag.clone();
+        ctrlc::set_handler(move || {
+            flag.store(true, Ordering::SeqCst);
+        })?;
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -279,6 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut status_msg = String::new();
     let mut status_kind = StatusKind::Info;
     let mut status_until: Option<Instant> = None;
+    let mut ctrlc_armed_until: Option<Instant> = None;
 
     let mut conn_file = None;
     let mut conn_pos = 0;
@@ -293,6 +306,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 status_msg.clear();
                 status_until = None;
             }
+        }
+
+        if sigint_flag.load(Ordering::SeqCst) {
+            break;
         }
 
         if conn_file.is_none() {
@@ -654,6 +671,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(until) = ctrlc_armed_until {
+                            if Instant::now() < until {
+                                break;
+                            }
+                        }
+                        status_msg = "Press Ctrl+C again to quit".to_string();
+                        status_kind = StatusKind::Info;
+                        status_until = Some(Instant::now() + Duration::from_secs(2));
+                        ctrlc_armed_until = Some(Instant::now() + Duration::from_secs(2));
+                    }
                     KeyCode::Char('q') => break,
                     KeyCode::Esc if show_detail => {
                         show_detail = false;

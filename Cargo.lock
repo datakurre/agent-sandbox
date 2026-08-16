@@ -30,6 +30,7 @@ name = "agent-sandbox-proxy"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "ctrlc",
  "ipnet",
  "ratatui",
  "rcgen",

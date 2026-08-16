@@ -396,6 +396,7 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
    - `d`: Show sanitized details for the selected row, in the denied-requests view or the Connections view; use `↑`/`↓` to scroll and `Esc` to return
    - `c`: Clear the list of recorded denials
    - `q` or `Esc`: Quit the TUI
+   - `Ctrl+C`: Quit the TUI — press twice within 2 seconds to confirm (a single press only shows a warning); also handles an external SIGINT sent to the process
 4. **Save Rules**: When you've trained the proxy to your liking, export the complete active policy — the original `AGENTS.md` rules plus the live additions — with `agent-sandbox ctl proxy export`. It prints a fenced ```` ```toml agent-sandbox ```` block, which is the form the launcher reads, so append it to the project's `AGENTS.md` (`agent-sandbox ctl proxy export >> AGENTS.md`) and delete the `[network]` block it supersedes. Redirect with a single `>` only into a scratch file: it would truncate `AGENTS.md`, prose and all. For reusable rules, `agent-sandbox ctl proxy export --plain` prints the same policy without the Markdown fence — that is what a `~/.config/agent-sandbox/profiles/<name>.toml` file wants, launched with `--proxy-profile <name>`. When the sandbox exits, its summary also prints only the rules added live as copy-pasteable `allowed_hosts` and `[[network.allowed_routes]]` TOML.
 
 The proxy source is selected explicitly:
