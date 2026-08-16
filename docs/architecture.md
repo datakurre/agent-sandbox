@@ -51,7 +51,12 @@ the canonical tree from each tool's own discovery path. See
 ## Entrypoint (`agent-sandbox-entrypoint`)
 
 1. Loads the Nix store registration on first start (unless `AGENT_SANDBOX_HOST_NIX=1`, in which case the host's `/nix` mount is used, or `AGENT_SANDBOX_SKIP_NIX_INIT=1`, which sidecar launches set because they do not need Nix bootstrap).
-2. Sets up `known_hosts` for common git forges to avoid first-time connection prompts.
+2. Seeds `~/.ssh/known_hosts` with pinned host keys for the common git forges,
+   unconditionally, so a non-interactive `ssh` neither prompts nor fails. This
+   is the sandbox's copy, and it is the one `ssh` uses when the sandbox runs
+   `ssh` itself; under `--proxy --ssh` the real `ssh` runs in the sidecar
+   instead and reads the copy `relay-server` writes there (see *Relay
+   Architecture* below).
 3. When `AGENT_SANDBOX_GPG_AGENT=1`, symlinks the forwarded host gpg-agent
    socket into `~/.gnupg/S.gpg-agent`.
 4. When `HTTP_PROXY` is set, compensates for tools that don't honor it on
@@ -239,9 +244,12 @@ log of what it did. Changing policy is therefore a host-side operation
 **Policy format.** The proxy enforces the merged declarative `[network]` blocks
 from `AGENTS.md` and any explicitly selected host-owned profiles.
 `[network].allowed_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
-with a port or port range; an entry written without one is matched against the
-compiled-in `DEFAULT_ALLOW_PORTS` (80, 443, 22) instead, which is also what
-`allow_port` defaults to when the policy declares none.
+with a port, a port range, or a comma-separated list of both; an entry written
+without one is matched against the compiled-in `DEFAULT_ALLOW_PORTS`
+(80, 443, 22) instead, which is also what `allow_port` defaults to when the
+policy declares none. A host entry carries its whole port list on one line;
+the standalone `allow_port` key takes a single port or range, so a wildcard
+entry like `"*:80,443"` compiles to one `allow_port` line per element.
 `[[network.allowed_routes]]` configures L7 routes and optional secret injection.
 Those two keys are the whole surface: an unknown key under `[network]` refuses
 the launch rather than being ignored.
@@ -311,6 +319,21 @@ The launcher appends a baseline `deny_ip` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
 
 **Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol. The relay authorizes the two independently: `relay-gpg` requests are allowed whenever `signing_enabled` is `true` in the policy file — a flag the launcher writes unconditionally whenever `--gpg` wires up the relay, with no host to name, since gpg has no destination of its own. `relay-ssh` requests are allowed only when the destination host matches an `allow_signing` entry, which an `allowed_hosts` entry on port 22 is what populates — so `git push` still needs an explicit `"host:22"` declaration even though signing does not.
+
+Because the relay runs the real `ssh` in the sidecar, host-key verification has
+to be solved there too. `relay-server` writes the pinned forge keys to
+`/run/agent-sandbox/known_hosts` at startup and prepends
+`-o UserKnownHostsFile=… -o GlobalKnownHostsFile=/dev/null` to the ssh it
+spawns. Both halves are necessary: the sandbox's own `known_hosts` is on the
+far side of the boundary, and an implicit `~/.ssh/known_hosts` would not be
+found either, since the sidecar runs as uid 0 and OpenSSH expands `~` from
+`getpwuid` — `/root` — rather than from the image's `HOME=/home/user`. The
+injection is skipped entirely when the caller already passed a
+`UserKnownHostsFile` of their own, so a self-hosted forge outside the pinned
+set stays reachable. Options are prepended rather than appended because ssh
+keeps the first value it sees for a keyword and stops reading options at the
+destination; the policy check and the dangerous-option scan both run over the
+caller's argv alone, so neither is affected.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as

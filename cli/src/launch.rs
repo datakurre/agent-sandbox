@@ -28,8 +28,10 @@ fn env(name: &str, value: &str) -> Vec<String> {
 
 // ── SSH ─────────────────────────────────────────────────────────────────────
 
-/// The agent socket is bound at a fixed path: the entrypoint keys its
-/// `known_hosts` seeding off `/agent.sock` existing.
+/// The agent socket is bound at a fixed path so `SSH_AUTH_SOCK` can name it
+/// without the launcher and the entrypoint having to agree on anything else.
+/// This is the un-proxied route; under `--proxy` the socket goes to the
+/// sidecar and `relay-ssh` stands in for it instead.
 pub fn ssh_direct(sock: &str, rw: &str) -> (Vec<String>, Vec<String>) {
     (
         bind(sock, "/agent.sock", rw),

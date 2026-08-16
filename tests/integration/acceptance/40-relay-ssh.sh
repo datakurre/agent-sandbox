@@ -27,13 +27,48 @@ EOF
 # GitHub answers an authenticated SSH probe with a greeting and exit 1, so the
 # greeting is the signal, not the status.
 #
+# No StrictHostKeyChecking flag here, deliberately: the probe has to work the
+# way `git clone` invokes ssh, with nothing added. relay-server pins the forge
+# host keys in the sidecar, because that is where the real ssh runs -- the
+# sandbox's own known_hosts is on the wrong side of the boundary, and root's
+# home there is /root rather than the image's HOME.
+#
 # This is also the case that catches the sidecar losing its /etc/passwd: the
 # relay runs ssh there rather than in the sandbox, and the sidecar runs without
 # --userns=keep-id over an image that ships no passwd file, so ssh fails at
 # getpwuid with "No user exists for uid 0" long before any policy is consulted.
 out="$(sandbox_run --workspace --proxy --ssh -- \
-  bash -c 'ssh -o StrictHostKeyChecking=no -T git@github.com 2>&1 || true')"
+  bash -c 'ssh -T git@github.com 2>&1 || true')"
 assert_contains "$out" "successfully authenticated" "an SSH probe to an allowed host"
+assert_not_contains "$out" "Host key verification failed" "the relay's pinned known_hosts"
+
+# The pinning is a default, not a cage: a caller who names their own
+# known-hosts file gets it, which is the escape hatch for a self-hosted forge
+# whose key is not in the pinned set.
+out="$(sandbox_run --workspace --proxy --ssh -- \
+  bash -c 'ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -T git@github.com 2>&1 || true')"
+assert_contains "$out" "successfully authenticated" "an SSH probe with a caller-supplied known_hosts"
+
+# One entry, two ports: the relay reads 22 out of the list exactly as it would
+# out of a lone ":22" entry, and the proxy still allows 443.
+cat > AGENTS.md <<'EOF'
+```toml agent-sandbox
+[network]
+allowed_hosts = ["github.com:22,443"]
+```
+EOF
+out="$(sandbox_run --workspace --proxy --ssh -- \
+  bash -c 'ssh -T git@github.com 2>&1 || true;
+           echo "https:$(curl --silent --show-error --max-time 20 -o /dev/null -w "%{http_code}" https://github.com/ 2>&1 || echo BLOCKED)"')"
+assert_contains "$out" "successfully authenticated" "an SSH probe with a comma-separated port list"
+assert_contains "$out" "https:2" "an HTTPS fetch with a comma-separated port list"
+
+cat > AGENTS.md <<'EOF'
+```toml agent-sandbox
+[network]
+allowed_hosts = ["github.com:22"]
+```
+EOF
 
 # No socket is mounted into the sandbox: the capability is the relay, not the
 # agent itself.

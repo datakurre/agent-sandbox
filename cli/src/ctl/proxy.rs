@@ -1,6 +1,6 @@
 use super::resolve::*;
 use crate::agents::{format_policy_as_network_toml, is_ip_or_cidr, parse_host_port};
-use agent_sandbox_proxy::policy::{parse_policy, parse_port_range, ProxyConfig};
+use agent_sandbox_proxy::policy::{parse_csv_ports, parse_policy, ProxyConfig};
 use agent_sandbox_proxy::policy_io::{install_policy, load_policy_lines};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -246,13 +246,18 @@ fn apply(policy_dir: &str, lines: Vec<String>) -> Result<()> {
 }
 
 /// What kind of `[network]` entry a bare target string looks like: an
-/// IP/CIDR, a bare port or port range (`8443`, `8000-8100`), or — the
-/// fallback — a domain name.
+/// IP/CIDR, a bare port list or range (`8443`, `8000-8100`, `80,443`), or —
+/// the fallback — a domain name.
+///
+/// The port test has to accept the whole comma-separated syntax, not one
+/// range: a `80,443` that falls through to "domains" installs `allow_host
+/// 80,443`, which the proxy happily reads as a literal domain nothing will
+/// ever match.
 fn target_kind(target: &str) -> &'static str {
     let (host_part, _port_part) = parse_host_port(target);
     if is_ip_or_cidr(&host_part) {
         "ips"
-    } else if parse_port_range(target).is_ok() {
+    } else if parse_csv_ports(target).is_ok_and(|ports| !ports.is_empty()) {
         "ports"
     } else {
         "domains"
@@ -261,7 +266,7 @@ fn target_kind(target: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::target_kind;
+    use super::{signing_host, target_kind};
 
     #[test]
     fn target_kind_infers_ip_port_or_domain() {
@@ -274,6 +279,29 @@ mod tests {
         assert_eq!(target_kind("api.openai.com"), "domains");
         assert_eq!(target_kind("github.com"), "domains");
         assert_eq!(target_kind("github.com:22"), "domains");
+    }
+
+    #[test]
+    fn only_a_domain_covering_22_authorizes_the_relay() {
+        assert_eq!(signing_host("github.com:22"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:22,443"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:20-30"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:443"), None);
+        // A portless entry gets the default ports at the proxy, but nothing
+        // here says 22 -- and guessing would grant key use nobody asked for.
+        assert_eq!(signing_host("github.com"), None);
+        assert_eq!(signing_host("10.0.0.1:22"), None);
+        assert_eq!(signing_host("*:22"), None);
+    }
+
+    #[test]
+    fn a_bare_port_list_is_ports_not_a_domain() {
+        // Read as a domain, `80,443` installs an allow_host line the proxy
+        // accepts and nothing ever matches.
+        assert_eq!(target_kind("80,443"), "ports");
+        assert_eq!(target_kind("80,8000-8100"), "ports");
+        assert_eq!(target_kind("github.com:22,443"), "domains");
+        assert_eq!(target_kind("10.0.0.0/8:80,443"), "ips");
     }
 }
 
@@ -381,8 +409,38 @@ fn allow(args: AllowArgs) -> Result<()> {
         };
         lines.push(format!("{} {}", key, args.target));
         println!("  allowed     {:<34} {}", args.target, kind);
+
+        // The same double duty an AGENTS.md entry does: a host allowed on the
+        // SSH port is also what authorizes the relay to reach it. Without this
+        // the live rule opens the port and `git push` is still refused, which
+        // reads as the rule not having taken effect.
+        if let Some(host) = signing_host(&args.target) {
+            let line = format!("allow_signing {}", host);
+            if !lines.contains(&line) {
+                lines.push(line);
+                println!("  allowed     {:<34} {}", host, "ssh (push/pull)");
+            }
+        }
     }
     apply(&dir, lines)
+}
+
+/// The host an allow target authorizes the SSH relay for, if any: a domain
+/// whose port spec covers 22.
+///
+/// Not IPs — `allow_signing` is matched against the destination as written on
+/// the ssh command line, which is a name.
+fn signing_host(target: &str) -> Option<String> {
+    let (host, ports) = parse_host_port(target);
+    if host == "*" || is_ip_or_cidr(&host) {
+        return None;
+    }
+    let ports = ports?;
+    parse_csv_ports(&ports)
+        .ok()?
+        .iter()
+        .any(|r| r.contains(22))
+        .then_some(host)
 }
 
 /// Drops the first line matching `predicate`; reports whether anything was
@@ -407,6 +465,19 @@ fn rm(args: RmArgs) -> Result<()> {
                 _ => "allow_host",
             };
             let removed = remove_matching(&mut lines, |l| l == format!("{} {}", key, a.target));
+            // Whatever `allow` added, `rm allow` takes back -- but only when
+            // no other rule still covers 22 for that host, or removing one of
+            // two entries would silently revoke the relay.
+            if let Some(host) = signing_host(&a.target) {
+                let still_allowed = lines.iter().any(|l| {
+                    l.strip_prefix("allow_host ")
+                        .and_then(signing_host)
+                        .is_some_and(|h| h == host)
+                });
+                if !still_allowed {
+                    remove_matching(&mut lines, |l| l == format!("allow_signing {}", host));
+                }
+            }
             (dir, lines, removed, format!("{} {}", key, a.target))
         }
         RmKind::L7(a) => {
@@ -487,7 +558,7 @@ fn check(args: CheckArgs) -> Result<()> {
         Some(p) => {
             let Ok(port) = p.parse::<u16>() else {
                 eprintln!(
-                    "agent-sandbox ctl proxy: '{}' is not a plain port (ranges/wildcards aren't a single target to check)",
+                    "agent-sandbox ctl proxy: '{}' names a set of ports, not one target — check a single HOST:PORT at a time",
                     p
                 );
                 std::process::exit(1);

@@ -91,7 +91,13 @@ The `[network]` table configures the egress proxy's firewall policy. The sandbox
   port explicitly for anything else; a rule that carries one is matched on
   that port alone.
 
-An `allowed_hosts` entry on port `22` is what authorizes the SSH relay for that
+  The port may also be a range or a comma-separated list of ports and ranges:
+  `"github.com:22,443"` and `"internal.example.com:8000-8100,9000"` are both
+  one entry. Writing them as separate entries works identically — the proxy
+  unions the ports of every rule sharing a pattern — so the list is a
+  convenience, not a different semantics.
+
+An `allowed_hosts` entry covering port `22` is what authorizes the SSH relay for that
 host. Under `--proxy` the host agent sockets are held by the proxy sidecar
 rather than mounted into the sandbox, and the relay refuses every SSH request
 until a matching entry exists — so `"github.com:22"` is what makes `git push`

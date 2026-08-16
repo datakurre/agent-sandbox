@@ -439,31 +439,41 @@ fn _proxy_ip(field: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Validates a port spec: a port, a range, or a comma-separated list of both.
+///
+/// Delegated to the proxy's own parser rather than reimplemented, so what the
+/// launcher accepts and what the proxy accepts cannot drift apart -- the
+/// asymmetry this closes had the exit summary printing `host:22,443` back as
+/// TOML that the launcher then refused on relaunch.
 fn _proxy_port(field: &str, value: &str) -> Result<(), ConfigError> {
-    let parts: Vec<&str> = value.split('-').collect();
-    let parse_err = || {
-        ConfigError::msg(format!(
-            "{}: {:?} is not a port or port range",
-            field, value
-        ))
-    };
-    let (start, end) = if parts.len() == 1 {
-        let p: u32 = parts[0].parse().map_err(|_| parse_err())?;
-        (p, p)
-    } else if parts.len() == 2 {
-        let p1: u32 = parts[0].parse().map_err(|_| parse_err())?;
-        let p2: u32 = parts[1].parse().map_err(|_| parse_err())?;
-        (p1, p2)
-    } else {
-        return Err(parse_err());
-    };
-    if start < 1 || start > 65535 || end < 1 || end > 65535 || start > end {
+    // `split_list` drops empty elements, so an empty spec parses as "no ports"
+    // rather than failing. Caught here, because `"github.com:"` would otherwise
+    // compile to a line the proxy reads back as a literal domain.
+    if value.trim().is_empty() || value.split(',').any(|p| p.trim().is_empty()) {
         return Err(ConfigError::msg(format!(
-            "{}: {:?} is out of range or start > end",
+            "{}: {:?} has an empty port. Write a port, a range, or a comma-separated list of them.",
             field, value
         )));
     }
+    agent_sandbox_proxy::policy::parse_csv_ports(value).map_err(|_| {
+        ConfigError::msg(format!(
+            "{}: {:?} is not a port, port range, or comma-separated list of them",
+            field, value
+        ))
+    })?;
     Ok(())
+}
+
+/// Whether a port spec covers 22 -- including via a range, which is what
+/// `is_allowed(host, 22)` will do at the proxy.
+///
+/// An `allowed_hosts` entry on the SSH port does double duty: it is also what
+/// authorizes the relay to reach that host, so this is what decides whether
+/// `git push`/`pull` work in a proxied session.
+fn ports_include_ssh(spec: &str) -> bool {
+    agent_sandbox_proxy::policy::parse_csv_ports(spec)
+        .map(|ranges| ranges.iter().any(|r| r.contains(22)))
+        .unwrap_or(false)
 }
 
 fn _proxy_list<F>(
@@ -489,11 +499,26 @@ where
     Ok(out)
 }
 
+/// Splits `host:ports` on the last colon, where `ports` may be a port, a
+/// range, or a comma-separated list of both.
+///
+/// The right-hand side is recognised on the same terms as the proxy's
+/// `policy::parse_target_with_ports`, deliberately: what the splitter accepts
+/// and what the policy file accepts have to be the same set. `*` is recognised
+/// here and rejected by `_proxy_port`, which is what produces the good error
+/// message instead of "not a valid domain name".
 pub fn parse_host_port(s: &str) -> (String, Option<String>) {
     if let Some(pos) = s.rfind(':') {
         let left = &s[..pos];
         let right = &s[pos + 1..];
-        if right.chars().all(|c| c.is_ascii_digit()) || right == "*" || right.contains('-') {
+        let looks_like_ports = !right.is_empty()
+            && right
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ',' || c == '-');
+        // An unbracketed IPv6 address is all colons and hex; splitting it here
+        // would hand `_proxy_domain` a fragment and blame the domain.
+        let is_unbracketed_ipv6 = left.contains(':') && !left.starts_with('[');
+        if (looks_like_ports || right == "*") && !is_unbracketed_ipv6 {
             let host = if left.starts_with('[') && left.ends_with(']') {
                 &left[1..left.len() - 1]
             } else {
@@ -656,11 +681,13 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                         }
                     } else {
                         _proxy_domain("[network].allowed_hosts", &host_part)?;
-                        // One line per host:port pair, so `ctl proxy show` and
-                        // `rm allow` operate on the entry as it was written.
-                        // The proxy unions the ports of every line sharing a
-                        // pattern (`union_ports`), so two ports on one host are
-                        // two lines and both are in force.
+                        // One line per entry, so `ctl proxy show` and
+                        // `rm allow` operate on the entry as it was written --
+                        // including a comma-separated port list, which the
+                        // proxy parses on one line. The proxy also unions the
+                        // ports of every line sharing a pattern
+                        // (`union_ports`), so two entries on one host are two
+                        // lines and both are in force.
                         if !policy.allow_host.contains(&combined) {
                             policy.allow_host.push(combined);
                         }
@@ -668,19 +695,27 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 }
                 if let Some(port) = port_part {
                     _proxy_port("[network].allowed_hosts", &port)?;
-                    // An allow entry on the SSH port is also what authorizes
-                    // the relay to reach that host, so it is what makes
-                    // `git push`/`pull` work in a proxied session. It says
-                    // nothing about GPG signing, which `signing_enabled`
+                    // An allow entry covering the SSH port is also what
+                    // authorizes the relay to reach that host, so it is what
+                    // makes `git push`/`pull` work in a proxied session. It
+                    // says nothing about GPG signing, which `signing_enabled`
                     // gates on its own, host-agnostic.
-                    if port == "22"
+                    if ports_include_ssh(&port)
                         && host_part != "*"
                         && !policy.allow_signing.contains(&host_part)
                     {
                         policy.allow_signing.push(host_part.clone());
                     }
                     if host_part == "*" {
-                        policy.allow_port.push(port);
+                        // One line per element: the proxy's `allow_port` arm
+                        // takes a single port or range, unlike the port field
+                        // of a host target.
+                        for element in port.split(',') {
+                            let element = element.to_string();
+                            if !policy.allow_port.contains(&element) {
+                                policy.allow_port.push(element);
+                            }
+                        }
                     }
                 }
             }
@@ -717,8 +752,14 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
 
                     if let Some(port) = port_part {
                         _proxy_port(&format!("[[network.allowed_routes]][{}].host", i), &port)?;
-                        if host_part == "*" && !policy.allow_port.contains(&port) {
-                            policy.allow_port.push(port.clone());
+                        if host_part == "*" {
+                            // One line per element, as in allowed_hosts above.
+                            for element in port.split(',') {
+                                let element = element.to_string();
+                                if !policy.allow_port.contains(&element) {
+                                    policy.allow_port.push(element);
+                                }
+                            }
                         }
                     }
 
@@ -1078,6 +1119,87 @@ mod export_tests {
         assert!(cfg.is_allowed("github.com", 443), "{text}");
         assert!(cfg.is_allowed("github.com", 22), "{text}");
         assert!(cfg.is_allowed("10.1.2.3", 80), "{text}");
+    }
+
+    #[test]
+    fn csv_ports_compile_to_one_line_and_still_authorize_the_relay() {
+        let agents_md = "```agent-sandbox\n\
+             [network]\n\
+             allowed_hosts = [\"github.com:22,443\"]\n\
+             ```\n";
+        let policy = parse_proxy(agents_md).expect("AGENTS.md must parse");
+        assert_eq!(policy.allow_host, vec!["github.com:22,443".to_string()]);
+        assert_eq!(policy.allow_signing, vec!["github.com".to_string()]);
+
+        let text = format_proxy_policy(&policy, "AGENTS.md");
+        let cfg = parse_policy(&text).unwrap_or_else(|e| {
+            panic!("the proxy rejected the launcher's own policy: {e}\n{text}")
+        });
+        assert!(cfg.is_allowed("github.com", 22), "{text}");
+        assert!(cfg.is_allowed("github.com", 443), "{text}");
+        assert!(!cfg.is_allowed("github.com", 8443), "{text}");
+    }
+
+    #[test]
+    fn a_range_covering_22_authorizes_the_relay_too() {
+        let agents_md = "```agent-sandbox\n\
+             [network]\n\
+             allowed_hosts = [\"git.example.com:20-30\"]\n\
+             ```\n";
+        let policy = parse_proxy(agents_md).expect("AGENTS.md must parse");
+        assert_eq!(policy.allow_signing, vec!["git.example.com".to_string()]);
+    }
+
+    #[test]
+    fn a_wildcard_with_csv_ports_becomes_one_allow_port_line_each() {
+        // The proxy's allow_port arm takes a single port or range, so a list
+        // has to be split before it is written.
+        let agents_md = "```agent-sandbox\n\
+             [network]\n\
+             allowed_hosts = [\"*:80,443\"]\n\
+             ```\n";
+        let policy = parse_proxy(agents_md).expect("AGENTS.md must parse");
+        assert_eq!(policy.allow_port, vec!["80".to_string(), "443".to_string()]);
+
+        let text = format_proxy_policy(&policy, "AGENTS.md");
+        assert!(text.contains("allow_port 80\n"), "{text}");
+        assert!(text.contains("allow_port 443\n"), "{text}");
+        parse_policy(&text)
+            .unwrap_or_else(|e| panic!("the proxy rejected a split allow_port: {e}\n{text}"));
+    }
+
+    #[test]
+    fn the_exit_summary_round_trips_csv_ports() {
+        // `ctl proxy allow github.com:22,443` writes one line, and the exit
+        // summary renders every live rule back as [network] TOML. That TOML
+        // has to be something AGENTS.md accepts, or the advice it prints is
+        // advice that does not work.
+        let cfg = parse_policy("allow_host github.com:22,443\ndefault deny\n").expect("policy");
+        let toml = format_policy_as_network_toml(&cfg);
+        assert!(toml.contains("github.com:22,443"), "{toml}");
+
+        let fenced = format!("```toml agent-sandbox\n{}```\n", toml);
+        let policy = parse_proxy(&fenced).unwrap_or_else(|e| {
+            panic!("AGENTS.md rejected the exit summary's own TOML: {e}\n{toml}")
+        });
+        assert_eq!(policy.allow_signing, vec!["github.com".to_string()]);
+    }
+
+    #[test]
+    fn a_port_spec_has_to_name_at_least_one_port() {
+        // `split_list` drops empty elements, so without an explicit check
+        // "github.com:" compiles to a line the proxy reads as a literal domain.
+        for bad in ["github.com:", "github.com:22,", "github.com:,443"] {
+            let agents_md = format!(
+                "```agent-sandbox\n[network]\nallowed_hosts = [\"{}\"]\n```\n",
+                bad
+            );
+            assert!(
+                parse_proxy(&agents_md).is_err(),
+                "'{}' should not compile",
+                bad
+            );
+        }
     }
 
     #[test]

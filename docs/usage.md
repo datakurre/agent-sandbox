@@ -179,7 +179,7 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
 1. **Start the Sandbox**: Run `agent-sandbox --proxy`. With no `[network]` block yet, requests are recorded and the ones that do not match a rule are denied.
 2. **Open the TUI**: In a **separate terminal**, run `agent-sandbox ctl tui`. This interactive interface lists the requests the sandbox is making, including the denied ones.
 3. **Approve**: Use the following keybindings to update the policy in real time:
-   - `a`: Allow domain
+   - `a`: Allow domain — or, on an SSH row, authorize the relay for that host
    - `h`: Allow HTTP route (domain + method) (creates a `[[network.allowed_routes]]` rule)
    - `A`: Allow IP
    - `v`: Switch between the live Connections view and denied requests
@@ -220,13 +220,42 @@ path = "/noop"
 
 Retry the request, inspect the resulting L7 denial, then replace `/noop` with the required path or path pattern. The placeholder path itself remains denied; remove the temporary rule when training is complete.
 
+#### Relay denials in the TUI
+
+The relay is a second gate, and it refuses requests the proxy never sees: under
+`--proxy --ssh` the real `ssh` runs in the sidecar, authorized by
+`allow_signing` rather than by a host/port rule. Those decisions appear in the
+same denied-requests list, with `SSH` in the Method column and port `22` — the
+port an `allowed_hosts` entry has to name, whatever port `ssh` itself dialled.
+`a` on such a row writes both lines the grant needs:
+
+```
+allow_signing github.com
+allow_host github.com:22
+```
+
+`relay-server` re-reads the policy on every call, so a retry works without
+relaunching, and the exit summary renders the pair back as
+`allowed_hosts = ["github.com:22"]` — one entry, from which a relaunch
+re-derives `allow_signing`. `h` and `A` are refused on these rows: nothing
+about a relay decision is HTTP, and it authorizes a host rather than an
+address.
+
+A refused **`gpg`** call is shown too, but read-only. Signing has no
+destination for a policy to name, so it is enabled by launching with `--gpg`
+and by nothing else; `a` says so rather than writing a rule that would not
+help. `agent-sandbox ctl relay` remains the full record, including SSH calls
+whose destination could not be read out of the command line — those have no
+host to write a rule for, so the TUI leaves them out rather than offering a
+fix it cannot deliver.
+
 ### Git Integration Details
 
 When using Git inside the sandbox, be aware of how the integration flags interact:
 
 - `--git` injects your effective Git configuration into the container using environment variables instead of mounting `.gitconfig`. Host-side `[include]` directives are evaluated and flattened on the host, while host-specific file paths (like `gpg.*.program`, credential helpers, global gitignore, and custom hooks) are automatically blocklisted so they don't break Git inside the container.
 - `--gpg` is required for `--git` to also include commit signing. Without it, the sandbox explicitly disables signing (`commit.gpgsign = false`, `tag.gpgsign = false`) to prevent signing failures when the host's GnuPG agent is not forwarded.
-- `--ssh` is required for `git pull` and `git push` to work with SSH remotes. It forwards your host's `SSH_AUTH_SOCK`. Because we avoid excessive host mounts, we do *not* mount your host's `known_hosts` file. Instead, we pre-populate the container's `~/.ssh/known_hosts` with the public keys for GitHub, GitLab, and Bitbucket so first-time connections do not prompt for verification.
+- `--ssh` is required for `git pull` and `git push` to work with SSH remotes. It forwards your host's `SSH_AUTH_SOCK`. Because we avoid excessive host mounts, we do *not* mount your host's `known_hosts` file. Instead, we pin the public keys for GitHub, GitLab, and Bitbucket so first-time connections neither prompt nor fail. An SSH session in a sandbox is non-interactive, so the alternative to pinning is not a prompt but either a hard failure or a silent trust-on-first-use accept of whatever answered.
 - Combined with `--proxy`, neither socket is mounted into the sandbox at all: a
   forwarded socket is a capability that does not pass the firewall. The sockets
   go to the proxy sidecar instead, and the sandbox reaches them through
@@ -238,6 +267,14 @@ When using Git inside the sandbox, be aware of how the integration flags interac
   since push/pull genuinely need to name a host; with no such entry `git push`
   is refused. `agent-sandbox ctl relay` shows both states and the decisions
   made against them.
+- Host keys are pinned on whichever side actually runs `ssh`. Unproxied, that
+  is the sandbox's own `~/.ssh/known_hosts`. Under `--proxy --ssh` it is the
+  sidecar, so `relay-server` writes its own copy there and passes
+  `-o UserKnownHostsFile=…`: the sandbox's file would be on the wrong side of
+  the boundary, and the sidecar runs as `root`, whose home is `/root` rather
+  than the image's `HOME`. Naming your own file
+  (`ssh -o UserKnownHostsFile=…`) turns the injection off, which is the escape
+  hatch for a forge outside the pinned set.
 
 ### Bundled OpenCode skills
 
