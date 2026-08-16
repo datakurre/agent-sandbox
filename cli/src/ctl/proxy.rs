@@ -266,7 +266,7 @@ fn target_kind(target: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::target_kind;
+    use super::{signing_host, target_kind};
 
     #[test]
     fn target_kind_infers_ip_port_or_domain() {
@@ -279,6 +279,19 @@ mod tests {
         assert_eq!(target_kind("api.openai.com"), "domains");
         assert_eq!(target_kind("github.com"), "domains");
         assert_eq!(target_kind("github.com:22"), "domains");
+    }
+
+    #[test]
+    fn only_a_domain_covering_22_authorizes_the_relay() {
+        assert_eq!(signing_host("github.com:22"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:22,443"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:20-30"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:443"), None);
+        // A portless entry gets the default ports at the proxy, but nothing
+        // here says 22 -- and guessing would grant key use nobody asked for.
+        assert_eq!(signing_host("github.com"), None);
+        assert_eq!(signing_host("10.0.0.1:22"), None);
+        assert_eq!(signing_host("*:22"), None);
     }
 
     #[test]
@@ -396,8 +409,38 @@ fn allow(args: AllowArgs) -> Result<()> {
         };
         lines.push(format!("{} {}", key, args.target));
         println!("  allowed     {:<34} {}", args.target, kind);
+
+        // The same double duty an AGENTS.md entry does: a host allowed on the
+        // SSH port is also what authorizes the relay to reach it. Without this
+        // the live rule opens the port and `git push` is still refused, which
+        // reads as the rule not having taken effect.
+        if let Some(host) = signing_host(&args.target) {
+            let line = format!("allow_signing {}", host);
+            if !lines.contains(&line) {
+                lines.push(line);
+                println!("  allowed     {:<34} {}", host, "ssh (push/pull)");
+            }
+        }
     }
     apply(&dir, lines)
+}
+
+/// The host an allow target authorizes the SSH relay for, if any: a domain
+/// whose port spec covers 22.
+///
+/// Not IPs — `allow_signing` is matched against the destination as written on
+/// the ssh command line, which is a name.
+fn signing_host(target: &str) -> Option<String> {
+    let (host, ports) = parse_host_port(target);
+    if host == "*" || is_ip_or_cidr(&host) {
+        return None;
+    }
+    let ports = ports?;
+    parse_csv_ports(&ports)
+        .ok()?
+        .iter()
+        .any(|r| r.contains(22))
+        .then_some(host)
 }
 
 /// Drops the first line matching `predicate`; reports whether anything was
@@ -422,6 +465,19 @@ fn rm(args: RmArgs) -> Result<()> {
                 _ => "allow_host",
             };
             let removed = remove_matching(&mut lines, |l| l == format!("{} {}", key, a.target));
+            // Whatever `allow` added, `rm allow` takes back -- but only when
+            // no other rule still covers 22 for that host, or removing one of
+            // two entries would silently revoke the relay.
+            if let Some(host) = signing_host(&a.target) {
+                let still_allowed = lines.iter().any(|l| {
+                    l.strip_prefix("allow_host ")
+                        .and_then(signing_host)
+                        .is_some_and(|h| h == host)
+                });
+                if !still_allowed {
+                    remove_matching(&mut lines, |l| l == format!("allow_signing {}", host));
+                }
+            }
             (dir, lines, removed, format!("{} {}", key, a.target))
         }
         RmKind::L7(a) => {

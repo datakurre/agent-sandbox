@@ -82,7 +82,8 @@ user for the flag that would provide it.
 | `403 Forbidden` from the proxy, empty body | host not in the policy | `agent-sandbox ctl proxy allow <host>:443` |
 | `Could not resolve host` in a proxied session | internal network has no DNS; only proxy-aware clients work | make the tool honour `$HTTP_PROXY`, or add a rule |
 | Certificate error after a rule was added mid-session | an L7 route added live has no session CA behind it | add the rule to `AGENTS.md`, then relaunch |
-| `agent-sandbox: ssh to X denied by allow_signing policy` | relay not authorized for that host | add `"X:22"` to `allowed_hosts`, relaunch |
+| `agent-sandbox: ssh to X denied by allow_signing policy` | relay not authorized for that host | `agent-sandbox ctl proxy allow X:22` (live), or add `"X:22"` to `allowed_hosts` to persist it |
+| `Host key verification failed` on an allowed SSH host | the forge is outside the pinned key set | supply the key: `ssh -o UserKnownHostsFile=<file>`, which also turns the pinning off |
 | `agent-sandbox: gpg denied: signing not enabled` | `--gpg` was not passed; unrelated to `allowed_hosts` | relaunch with `--gpg` |
 | `git push` prompts for a password | no `--ssh`, so no agent forwarding | relaunch with `--ssh` |
 | Commit signing fails or is disabled | no `--gpg` (the launcher then sets `commit.gpgsign=false`) | relaunch with `--gpg` |

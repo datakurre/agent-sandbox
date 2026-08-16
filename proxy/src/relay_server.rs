@@ -116,22 +116,47 @@ fn domain_match(domain: &str, pattern: &str) -> bool {
     }
 }
 
+const RELAY_LOG: &str = "/sidecar_shared/relay.jsonl";
+/// Smaller than the proxy's own logs: one line per relay call, and a
+/// commit-signing loop can make a lot of them.  Bounded at all because the TUI
+/// rescans the file from the top when it starts.
+const RELAY_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn log_relay(cmd: &str, dest: Option<&str>, allowed: bool, reason: &str) {
-    let line = match dest {
-        Some(d) => format!(
-            "{{\"cmd\":\"{}\",\"dest\":\"{}\",\"allowed\":{},\"reason\":\"{}\"}}\n",
-            cmd, d, allowed, reason
-        ),
-        None => format!(
-            "{{\"cmd\":\"{}\",\"allowed\":{},\"reason\":\"{}\"}}\n",
-            cmd, allowed, reason
-        ),
-    };
+    // `ts` is what lets a reader age a record -- the TUI shows relay denials
+    // beside the proxy's, and "17s ago" needs a clock.  Note there is no port
+    // here on purpose: the relay authorizes by host, and its ssh egress never
+    // goes through the proxy, so any port in this record would be a guess.
+    let mut record = serde_json::json!({
+        "cmd": cmd,
+        "allowed": allowed,
+        "reason": reason,
+        "ts": now_secs(),
+    });
+    if let Some(d) = dest {
+        record["dest"] = serde_json::Value::String(d.to_string());
+    }
+    let line = format!("{}\n", record);
+
+    // read as well as append: rotation seeks and truncates.
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/sidecar_shared/relay.jsonl")
+        .read(true)
+        .open(RELAY_LOG)
     {
+        let _ = agent_sandbox_proxy::logfile::rotate_if_needed(
+            &mut file,
+            line.len() as u64,
+            RELAY_LOG_MAX_BYTES,
+        );
         let _ = file.write_all(line.as_bytes());
     }
 }

@@ -108,6 +108,44 @@ struct DetailEvent {
     request: String,
 }
 
+/// A line from `relay.jsonl`, written by `relay-server` in the sidecar.
+///
+/// A separate stream from `connections.jsonl` because it records a separate
+/// decision: the relay authorizes *use of the forwarded agent*, and its `ssh`
+/// runs in the sidecar without passing through the proxy at all. `dest` is
+/// absent for gpg, which has no destination, and for an ssh call whose
+/// destination could not be read out of argv. `ts` is `Option` because the
+/// host-side TUI and the sidecar image can be different builds.
+#[derive(Deserialize, Debug, Clone)]
+struct RelayEvent {
+    cmd: String,
+    dest: Option<String>,
+    allowed: bool,
+    reason: Option<String>,
+    ts: Option<u64>,
+}
+
+/// The port an `allowed_hosts` entry has to name for the launcher to derive
+/// `allow_signing` from it — whatever port ssh itself ends up using.
+const SSH_POLICY_PORT: u16 = 22;
+
+/// The key a GPG denial is filed under. Not a host: gpg has no destination,
+/// and port 0 cannot collide with a real denial.
+const GPG_ROW_HOST: &str = "gpg";
+const GPG_ROW_PORT: u16 = 0;
+
+/// Which decision refused a row, and therefore what would let it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeniedKind {
+    /// The proxy refused a connection: a host/port rule fixes it.
+    Egress,
+    /// The relay refused to run `ssh` to a destination: `allow_signing` does.
+    Ssh,
+    /// The relay refused to run `gpg`. Nothing in the policy fixes this —
+    /// signing is enabled by launching with `--gpg`.
+    Gpg,
+}
+
 /// A denied host/port, deduplicated across repeats so a retrying agent
 /// doesn't spam the list with one row per attempt.
 #[derive(Debug, Clone)]
@@ -119,6 +157,7 @@ struct DeniedEntry {
     detail: Option<String>,
     count: u32,
     last_seen: u64,
+    kind: DeniedKind,
 }
 
 impl DeniedEntry {
@@ -139,20 +178,96 @@ const MAX_DENIED_ROWS: usize = 200;
 const MAX_CONNECTION_ROWS: usize = 200;
 const MAX_DETAIL_BYTES_PER_ROW: usize = 16 * 1024;
 
+/// Fold a relay decision into the same denied set the proxy's denials go into.
+///
+/// One map and one key, because for `(host, 22)` the two denials have the same
+/// remedy and the relay's grant is a strict superset of the proxy's: it adds
+/// `allow_signing` on top of the host rule, and `allow_signing` is inert when
+/// no relay is running. Two collections would mean two rows for one problem
+/// and two keypresses to fix it.
+fn ingest_relay_event(denied: &mut HashMap<(String, u16), DeniedEntry>, event: RelayEvent) {
+    if event.allowed {
+        return;
+    }
+    let (host, port, kind, method) = match event.cmd.as_str() {
+        "ssh" => match event.dest {
+            Some(dest) => (dest, SSH_POLICY_PORT, DeniedKind::Ssh, "SSH"),
+            // "could not determine destination": there is no host to write a
+            // rule for, so a row offering to allow one would be a lie.
+            // `ctl relay` still shows it.
+            None => return,
+        },
+        "gpg" => (
+            GPG_ROW_HOST.to_string(),
+            GPG_ROW_PORT,
+            DeniedKind::Gpg,
+            "GPG",
+        ),
+        _ => return,
+    };
+
+    let ts = event.ts.unwrap_or_else(now_secs);
+    let entry = denied
+        .entry((host.clone(), port))
+        .or_insert_with(|| DeniedEntry {
+            host,
+            port,
+            reason: None,
+            method: Some(method.to_string()),
+            detail: None,
+            count: 0,
+            last_seen: ts,
+            kind,
+        });
+    entry.count += 1;
+    entry.last_seen = ts;
+    entry.kind = kind;
+    entry.method = Some(method.to_string());
+    if let Some(reason) = event.reason.filter(|r| !r.is_empty()) {
+        entry.reason = Some(reason);
+    }
+}
+
 /// Whether `h` (allow HTTP route) makes sense for this row: only once a real
 /// HTTP method is known. A domain/IP-level deny before any L7 check ran
 /// carries `"CONNECT"` or no method at all, and a rule built from either can
-/// never match a real request.
-fn h_available(method: Option<&str>) -> bool {
-    matches!(method, Some(m) if m != "CONNECT")
+/// never match a real request. A relay denial never has one — nothing about
+/// it is HTTP.
+fn h_available(kind: DeniedKind, method: Option<&str>) -> bool {
+    kind == DeniedKind::Egress && matches!(method, Some(m) if m != "CONNECT")
 }
 
 /// Whether `A` (allow IP) makes sense for this row's host: it must actually
-/// parse as an IP or CIDR. Most rows carry a domain name instead.
-fn ip_available(host: &str) -> bool {
+/// parse as an IP or CIDR. Most rows carry a domain name instead, and a relay
+/// row is authorized by host regardless of what it resolves to.
+fn ip_available(kind: DeniedKind, host: &str) -> bool {
+    if kind != DeniedKind::Egress {
+        return false;
+    }
     match host.split_once('/') {
         Some((ip, mask)) => ip.parse::<IpAddr>().is_ok() && mask.parse::<u8>().is_ok(),
         None => host.parse::<IpAddr>().is_ok(),
+    }
+}
+
+/// The policy lines that would let a denied row through, in the order they
+/// should be written.
+///
+/// Lifted out of the key handler so the mapping from "what was refused" to
+/// "what authorizes it" is testable on its own. An SSH row needs both: the
+/// `allow_signing` entry is what the relay consults, and the `:22` host rule
+/// is what makes the exit summary render `allowed_hosts = ["host:22"]`, from
+/// which a relaunch re-derives `allow_signing`. Write only one and the grant
+/// does not survive the session.
+fn grant_lines(row: &DeniedEntry) -> Vec<String> {
+    match row.kind {
+        DeniedKind::Egress => vec![format!("allow_host {}:{}", row.host, row.port)],
+        DeniedKind::Ssh => vec![
+            format!("allow_signing {}", row.host),
+            format!("allow_host {}:{}", row.host, SSH_POLICY_PORT),
+        ],
+        // Enabled at launch, not by policy.
+        DeniedKind::Gpg => Vec::new(),
     }
 }
 
@@ -263,6 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sidecar_shared = &args[3];
     let connections_log = format!("{}/connections.jsonl", sidecar_shared);
     let details_log = format!("{}/denied-requests.jsonl", sidecar_shared);
+    let relay_log = format!("{}/relay.jsonl", sidecar_shared);
 
     let sigint_flag = Arc::new(AtomicBool::new(false));
     {
@@ -298,6 +414,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn_pos = 0;
     let mut details_file = None;
     let mut details_pos = 0;
+    let mut relay_file = None;
+    let mut relay_pos = 0;
     let mut show_detail = false;
     let mut detail_scroll = 0;
 
@@ -351,6 +469,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 detail: None,
                                 count: 0,
                                 last_seen: ts,
+                                kind: DeniedKind::Egress,
                             });
                             entry.count += 1;
                             entry.last_seen = ts;
@@ -420,29 +539,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // The relay's own decisions. The file only exists in a session
+        // launched with --ssh or --gpg, so the open is retried every pass
+        // rather than once. A rotation replays the retained tail and inflates
+        // `count`, exactly as it does for connections.jsonl; the dedup map
+        // absorbs it.
+        if relay_file.is_none() {
+            if let Ok(f) = fs::File::open(&relay_log) {
+                relay_file = Some(io::BufReader::new(f));
+            }
+        }
+        if let Some(ref mut reader) = relay_file {
+            if let Ok(meta) = reader.get_ref().metadata() {
+                if meta.len() < relay_pos {
+                    relay_pos = 0;
+                }
+            }
+            let _ = reader.seek(SeekFrom::Start(relay_pos));
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line) {
+                if n == 0 {
+                    break;
+                }
+                if !line.ends_with('\n') {
+                    let _ = reader.seek(SeekFrom::Current(-(line.len() as i64)));
+                    break;
+                }
+                if let Ok(ev) = serde_json::from_str::<RelayEvent>(&line) {
+                    ingest_relay_event(&mut denied_reqs, ev);
+                }
+                line.clear();
+            }
+            if let Ok(pos) = reader.stream_position() {
+                relay_pos = pos;
+            }
+        }
+
         let mut denied_list: Vec<DeniedEntry> = denied_reqs.values().cloned().collect();
         denied_list.sort_by_key(|d| std::cmp::Reverse(d.last_seen));
         let mut connections_list = connections.clone();
         connections_list.sort_by_key(|entry| std::cmp::Reverse(entry.ts.unwrap_or(0)));
 
-        // Only loaded while the Rules view is active — cheap either way (a
-        // small file, and this loop already re-reads connections.jsonl at
-        // ~10Hz), but no point parsing it every frame when it's not shown.
-        let (policy_lines, base_lines, baseline_lines): (
-            Vec<String>,
-            HashSet<String>,
-            HashSet<String>,
-        ) = if view == View::Rules {
-            let lines = load_policy_lines(sidecar_policy);
-            let base = fs::read_to_string(format!("{}/policy.base", sidecar_policy))
+        // `base_lines` is read every pass, not only in the Rules view: the `h`
+        // handler consults it from the Requests view to decide whether the
+        // session has a CA behind an L7 rule, and an empty set there made `h`
+        // report "no L7 rule" for every sandbox. All three files are small,
+        // and this loop already re-reads connections.jsonl at ~10Hz.
+        let base_lines: HashSet<String> =
+            fs::read_to_string(format!("{}/policy.base", sidecar_policy))
                 .map(|s| s.lines().map(|l| l.to_string()).collect())
                 .unwrap_or_default();
+        let (policy_lines, baseline_lines): (Vec<String>, HashSet<String>) = if view == View::Rules
+        {
+            let lines = load_policy_lines(sidecar_policy);
             let baseline = fs::read_to_string(format!("{}/policy.baseline", sidecar_policy))
                 .map(|s| s.lines().map(|l| l.to_string()).collect())
                 .unwrap_or_default();
-            (lines, base, baseline)
+            (lines, baseline)
         } else {
-            (Vec::new(), HashSet::new(), HashSet::new())
+            (Vec::new(), HashSet::new())
         };
 
         terminal.draw(|f| {
@@ -472,11 +627,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .and_then(|d| d.detail.clone())
                             .unwrap_or_else(|| "No detailed request is available for this denial yet.".to_string());
                         if let Some(row) = denied_list.get(selected_idx) {
-                            if row.method.as_deref() == Some("CONNECT") {
-                                text.push_str(&format!(
-                                    "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.allowed_routes]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
-                                    row.host, row.port
-                                ));
+                            match row.kind {
+                                DeniedKind::Egress if row.method.as_deref() == Some("CONNECT") => {
+                                    text.push_str(&format!(
+                                        "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.allowed_routes]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
+                                        row.host, row.port
+                                    ));
+                                }
+                                DeniedKind::Ssh => {
+                                    text.push_str(&format!(
+                                        "\n\nThe relay refused to run ssh to this destination: the forwarded agent lives in the sidecar, and it will only be used for a host the policy names on port 22.\n\n[a] adds both lines this needs:\n\n  allow_signing {host}\n  allow_host {host}:22\n\nThe relay re-reads the policy on every call, so a retry works without relaunching. To make it permanent, add to AGENTS.md:\n\n[network]\nallowed_hosts = [\"{host}:22\"]",
+                                        host = row.host
+                                    ));
+                                }
+                                DeniedKind::Gpg => {
+                                    text.push_str(
+                                        "\n\nThe relay refused to run gpg. Signing is not something the network policy can grant: gpg has no destination to name, so it is enabled by the launch flag alone. Relaunch the sandbox with --gpg.",
+                                    );
+                                }
+                                DeniedKind::Egress => {}
                             }
                         }
                         let detail = Paragraph::new(text)
@@ -503,12 +672,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let method_style = match method {
                                 "GET" | "POST" | "PUT" | "DELETE" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                                 "CONNECT" => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                                // Not the proxy's verdict: a different gate
+                                // refused these, so they read differently.
+                                "SSH" | "GPG" => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                                 _ => Style::default().fg(Color::White),
+                            };
+                            // gpg has no destination and no port; a 0 in the
+                            // column would read as a real one.
+                            let port_cell = if d.kind == DeniedKind::Gpg {
+                                String::new()
+                            } else {
+                                d.port.to_string()
                             };
                             Row::new(vec![
                                 ratatui::text::Span::styled(method.to_string(), method_style),
                                 ratatui::text::Span::raw(d.host.clone()),
-                                ratatui::text::Span::raw(d.port.to_string()),
+                                ratatui::text::Span::raw(port_cell),
                                 ratatui::text::Span::raw(d.info_cell()),
                             ]).style(style)
                         });
@@ -652,7 +831,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let legend_text = match view {
                 View::Requests | View::Connections if show_detail => "↑/↓ scroll   [d]/[Esc] Back   [q] Quit",
-                View::Requests => "↑/↓ select   [d] Details   [a] Allow domain   [h] Allow HTTP route   [A] Allow IP\n[v] Connections view   [r] Rules view   [c] Clear   [q]/[Esc] Quit",
+                View::Requests => "↑/↓ select   [d] Details   [a] Allow (domain / SSH host)   [h] Allow HTTP route   [A] Allow IP\n[v] Connections view   [r] Rules view   [c] Clear   [q]/[Esc] Quit",
                 View::Connections => "↑/↓ select   [d] Details   [v] Denied requests   [r] Rules view   [q]/[Esc] Quit",
                 View::Rules => "↑/↓ select   [x] Remove rule (blocked for built-in/AGENTS.md rules)\n[r] Requests view   [q]/[Esc] Quit",
             };
@@ -748,22 +927,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if view == View::Requests && !show_detail =>
                     {
                         if !denied_list.is_empty() && selected_idx < denied_list.len() {
-                            let row = &denied_list[selected_idx];
+                            let row = denied_list[selected_idx].clone();
                             let host = row.host.clone();
                             let port = row.port;
                             let method = row.method.clone();
+                            let kind = row.kind;
 
                             let mut guard_msg: Option<String> = None;
                             let mut detail = String::new();
                             let mut policy = load_policy_lines(sidecar_policy);
 
                             match key.code {
+                                KeyCode::Char('a') if kind == DeniedKind::Gpg => {
+                                    guard_msg = Some(
+                                        "GPG signing is enabled by launching with --gpg, not by the network policy — gpg has no destination to name. Relaunch the sandbox."
+                                            .to_string(),
+                                    );
+                                }
                                 KeyCode::Char('a') => {
-                                    detail = format!("allow_host {}:{}", host, port);
-                                    policy.push(detail.clone());
+                                    // An SSH row takes two lines: allow_signing
+                                    // is what the relay reads, and the :22 host
+                                    // rule is what the exit summary renders back
+                                    // as TOML so the grant can be made permanent.
+                                    let lines = grant_lines(&row);
+                                    detail = lines.join(" + ");
+                                    for line in lines {
+                                        if !policy.contains(&line) {
+                                            policy.push(line);
+                                        }
+                                    }
                                 }
                                 KeyCode::Char('A') => {
-                                    if !ip_available(&host) {
+                                    if !ip_available(kind, &host) {
                                         guard_msg = Some(format!(
                                             "'{}' is not an IP — use 'a' to allow the domain instead",
                                             host
@@ -774,7 +969,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('h') => {
-                                    if !h_available(method.as_deref()) {
+                                    if kind != DeniedKind::Egress {
+                                        guard_msg = Some(
+                                            "This is a relay decision, not an HTTP one — there is no route to allow. Use 'a'."
+                                                .to_string(),
+                                        );
+                                    } else if !h_available(kind, method.as_deref()) {
                                         guard_msg = Some(
                                             "No HTTP method known yet for this row — allow the domain first with 'a'; 'h' becomes available once a real request is seen"
                                                 .to_string(),
@@ -862,8 +1062,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_allowed_request, connection_detail_text, ingest_connection_event, is_denied_event,
-        ConnEvent, DeniedEntry,
+        clear_allowed_request, connection_detail_text, grant_lines, h_available,
+        ingest_connection_event, ingest_relay_event, ip_available, is_denied_event, ConnEvent,
+        DeniedEntry, DeniedKind, RelayEvent, GPG_ROW_HOST, GPG_ROW_PORT, SSH_POLICY_PORT,
     };
     use std::collections::HashMap;
 
@@ -948,6 +1149,7 @@ mod tests {
                 detail: Some("GET /zen HTTP/1.1\r\nAuthorization: <redacted>".to_string()),
                 count: 1,
                 last_seen: 1,
+                kind: DeniedKind::Egress,
             },
         );
 
@@ -978,6 +1180,7 @@ mod tests {
                 detail: None,
                 count: 1,
                 last_seen: 1,
+                kind: DeniedKind::Egress,
             },
         );
         denied_reqs.insert(
@@ -990,6 +1193,7 @@ mod tests {
                 detail: None,
                 count: 1,
                 last_seen: 1,
+                kind: DeniedKind::Egress,
             },
         );
         let mut selected_idx = 1;
@@ -1004,5 +1208,177 @@ mod tests {
         assert!(!denied_reqs.contains_key(&("other.example.com".to_string(), 443)));
         assert_eq!(denied_reqs.len(), 1);
         assert_eq!(selected_idx, 0);
+    }
+
+    // ── relay denials ───────────────────────────────────────────────────────
+
+    fn relay(cmd: &str, dest: Option<&str>, allowed: bool, reason: &str) -> RelayEvent {
+        RelayEvent {
+            cmd: cmd.to_string(),
+            dest: dest.map(str::to_string),
+            allowed,
+            reason: Some(reason.to_string()),
+            ts: Some(7),
+        }
+    }
+
+    #[test]
+    fn a_denied_ssh_relay_line_becomes_a_requests_row() {
+        let mut denied = HashMap::new();
+        ingest_relay_event(
+            &mut denied,
+            relay(
+                "ssh",
+                Some("github.com"),
+                false,
+                "denied by allow_signing policy",
+            ),
+        );
+
+        // Filed under the policy port, not whatever ssh dialled: :22 is what an
+        // allowed_hosts entry has to say for the relay to be authorized.
+        let row = denied
+            .get(&("github.com".to_string(), SSH_POLICY_PORT))
+            .expect("a row for the refused destination");
+        assert_eq!(row.kind, DeniedKind::Ssh);
+        assert_eq!(row.method.as_deref(), Some("SSH"));
+        assert_eq!(row.count, 1);
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("denied by allow_signing policy")
+        );
+    }
+
+    #[test]
+    fn repeated_relay_denials_are_one_row() {
+        let mut denied = HashMap::new();
+        for _ in 0..3 {
+            ingest_relay_event(
+                &mut denied,
+                relay("ssh", Some("github.com"), false, "denied"),
+            );
+        }
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied.values().next().unwrap().count, 3);
+    }
+
+    #[test]
+    fn an_allowed_relay_line_is_not_a_denial() {
+        let mut denied = HashMap::new();
+        ingest_relay_event(&mut denied, relay("ssh", Some("github.com"), true, ""));
+        assert!(denied.is_empty());
+    }
+
+    #[test]
+    fn a_relay_line_without_a_destination_is_dropped() {
+        // "could not determine destination": there is no host to write a rule
+        // for, so offering one would be a lie. `ctl relay` still shows it.
+        let mut denied = HashMap::new();
+        ingest_relay_event(
+            &mut denied,
+            relay("ssh", None, false, "could not determine destination"),
+        );
+        assert!(denied.is_empty());
+    }
+
+    #[test]
+    fn a_gpg_denial_is_shown_but_offers_no_host_rule() {
+        let mut denied = HashMap::new();
+        ingest_relay_event(
+            &mut denied,
+            relay("gpg", None, false, "gpg signing not enabled"),
+        );
+
+        let row = denied
+            .get(&(GPG_ROW_HOST.to_string(), GPG_ROW_PORT))
+            .expect("a row for the refused gpg call");
+        assert_eq!(row.kind, DeniedKind::Gpg);
+        // Nothing in the policy grants signing; it comes from --gpg at launch.
+        assert!(grant_lines(row).is_empty());
+    }
+
+    #[test]
+    fn granting_an_ssh_row_writes_both_lines() {
+        let mut denied = HashMap::new();
+        ingest_relay_event(
+            &mut denied,
+            relay("ssh", Some("github.com"), false, "denied"),
+        );
+        let row = &denied[&("github.com".to_string(), SSH_POLICY_PORT)];
+
+        assert_eq!(
+            grant_lines(row),
+            vec![
+                "allow_signing github.com".to_string(),
+                "allow_host github.com:22".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_egress_row_still_grants_exactly_one_host_rule() {
+        let row = DeniedEntry {
+            host: "example.com".to_string(),
+            port: 8443,
+            reason: None,
+            method: Some("CONNECT".to_string()),
+            detail: None,
+            count: 1,
+            last_seen: 1,
+            kind: DeniedKind::Egress,
+        };
+        assert_eq!(grant_lines(&row), vec!["allow_host example.com:8443"]);
+    }
+
+    /// Whatever the keypress writes has to be something `install_policy`
+    /// accepts, or the grant fails at the moment the user asks for it.
+    #[test]
+    fn the_lines_a_grant_writes_are_lines_the_proxy_parses() {
+        let mut denied = HashMap::new();
+        ingest_relay_event(
+            &mut denied,
+            relay("ssh", Some("github.com"), false, "denied"),
+        );
+        let row = &denied[&("github.com".to_string(), SSH_POLICY_PORT)];
+
+        let text = grant_lines(row).join("\n") + "\n";
+        let cfg = agent_sandbox_proxy::policy::parse_policy(&text)
+            .unwrap_or_else(|e| panic!("the proxy rejected a TUI grant: {e}\n{text}"));
+        assert_eq!(cfg.allow_signing, vec!["github.com".to_string()]);
+        assert!(cfg.is_allowed("github.com", 22));
+    }
+
+    #[test]
+    fn relay_rows_offer_neither_h_nor_a_capital_a() {
+        // Nothing about a relay decision is HTTP, and it authorizes a host
+        // rather than an address.
+        assert!(!h_available(DeniedKind::Ssh, Some("SSH")));
+        assert!(!h_available(DeniedKind::Gpg, Some("GPG")));
+        assert!(!ip_available(DeniedKind::Ssh, "10.0.0.1"));
+        assert!(!ip_available(DeniedKind::Gpg, "10.0.0.1"));
+
+        // Unchanged for the proxy's own denials.
+        assert!(h_available(DeniedKind::Egress, Some("GET")));
+        assert!(!h_available(DeniedKind::Egress, Some("CONNECT")));
+        assert!(ip_available(DeniedKind::Egress, "10.0.0.1"));
+        assert!(!ip_available(DeniedKind::Egress, "example.com"));
+    }
+
+    /// A sidecar built before `ts` existed still produces usable rows.
+    #[test]
+    fn a_relay_line_without_a_timestamp_is_still_ingested() {
+        let mut denied = HashMap::new();
+        ingest_relay_event(
+            &mut denied,
+            RelayEvent {
+                cmd: "ssh".to_string(),
+                dest: Some("github.com".to_string()),
+                allowed: false,
+                reason: None,
+                ts: None,
+            },
+        );
+        let row = &denied[&("github.com".to_string(), SSH_POLICY_PORT)];
+        assert!(row.last_seen > 0);
     }
 }

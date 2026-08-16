@@ -179,6 +179,12 @@ agent-sandbox ctl relay                     # what the SSH/GPG relay allowed or 
 In the TUI: `a` allow domain, `h` allow HTTP route, `A` allow IP, `v` connections
 view, `r` rules view (`x` removes), `d` details, `c` clear, `q` quit.
 
+The denied list also carries the **relay's** refusals, which the proxy never
+sees: an SSH destination the policy did not authorize shows as method `SSH` on
+port 22, and `a` writes both the `allow_signing` entry the relay reads and the
+`:22` host rule the exit summary renders back as TOML. A refused `gpg` call is
+shown read-only — signing comes from `--gpg` at launch, and no rule grants it.
+
 For a host denied at `CONNECT`, the encrypted method and path are not visible
 yet. The documented trick is a placeholder route that makes the proxy terminate
 TLS so the real request becomes observable:
@@ -202,6 +208,7 @@ inside — if you need to know what was denied, ask the user to run `ctl logs` o
 | Change | Applies |
 | --- | --- |
 | `ctl proxy allow` / `rm` / `reset` | live, immediately |
+| SSH relay authorization (`ctl proxy allow <host>:22`) | live — the relay re-reads the policy on every call |
 | `ctl mounts add` / `rm` | live (not under `--krun`) |
 | A new L7 route needing TLS interception | **relaunch** (session CA is mounted at launch) |
 | `[ports]` | **relaunch** |

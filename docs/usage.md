@@ -179,7 +179,7 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
 1. **Start the Sandbox**: Run `agent-sandbox --proxy`. With no `[network]` block yet, requests are recorded and the ones that do not match a rule are denied.
 2. **Open the TUI**: In a **separate terminal**, run `agent-sandbox ctl tui`. This interactive interface lists the requests the sandbox is making, including the denied ones.
 3. **Approve**: Use the following keybindings to update the policy in real time:
-   - `a`: Allow domain
+   - `a`: Allow domain — or, on an SSH row, authorize the relay for that host
    - `h`: Allow HTTP route (domain + method) (creates a `[[network.allowed_routes]]` rule)
    - `A`: Allow IP
    - `v`: Switch between the live Connections view and denied requests
@@ -219,6 +219,35 @@ path = "/noop"
 ```
 
 Retry the request, inspect the resulting L7 denial, then replace `/noop` with the required path or path pattern. The placeholder path itself remains denied; remove the temporary rule when training is complete.
+
+#### Relay denials in the TUI
+
+The relay is a second gate, and it refuses requests the proxy never sees: under
+`--proxy --ssh` the real `ssh` runs in the sidecar, authorized by
+`allow_signing` rather than by a host/port rule. Those decisions appear in the
+same denied-requests list, with `SSH` in the Method column and port `22` — the
+port an `allowed_hosts` entry has to name, whatever port `ssh` itself dialled.
+`a` on such a row writes both lines the grant needs:
+
+```
+allow_signing github.com
+allow_host github.com:22
+```
+
+`relay-server` re-reads the policy on every call, so a retry works without
+relaunching, and the exit summary renders the pair back as
+`allowed_hosts = ["github.com:22"]` — one entry, from which a relaunch
+re-derives `allow_signing`. `h` and `A` are refused on these rows: nothing
+about a relay decision is HTTP, and it authorizes a host rather than an
+address.
+
+A refused **`gpg`** call is shown too, but read-only. Signing has no
+destination for a policy to name, so it is enabled by launching with `--gpg`
+and by nothing else; `a` says so rather than writing a rule that would not
+help. `agent-sandbox ctl relay` remains the full record, including SSH calls
+whose destination could not be read out of the command line — those have no
+host to write a rule for, so the TUI leaves them out rather than offering a
+fix it cannot deliver.
 
 ### Git Integration Details
 
