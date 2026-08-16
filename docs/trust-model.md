@@ -89,6 +89,7 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
 - **L7 Filtering (`[[network.allowed_routes]]`)**: Restricts HTTPS traffic by method and URL path. 
   - Rules use glob matching (`*` matches a single segment, `**` matches multiple).
   - L7 filtering requires MITM decryption. The proxy automatically activates MITM for domains with L7 rules.
+  - **The MITM path also pins the tunnel to the host it authorized.** After terminating TLS it requires the tunnel's inner SNI to equal the `CONNECT` authority and denies a mismatch (`sni-mismatch`). So an `[[network.allowed_routes]]` rule does double duty: it filters by method and path, **and** it closes domain fronting for that host (see [What the policy covers](#what-the-policy-covers)). A blind (non-L7) host has no such check — the proxy never sees its inner SNI.
 - **Secret Injection**: When `--secrets` is passed, the launcher reads `~/.config/agent-sandbox/secrets.toml` and cross-references it with the `[[network.allowed_routes]]` blocks that name a `secret`. It then calls `secretspec export` on the host to fetch the actual secrets, delivering them to the sidecar via a read-only memory mount. Secrets never enter the sandbox environment.
   - **Scoped to the rule, not the host.** A secret is bound to the host, method and path the operator authorized, and the proxy injects it only into requests matching that route — decided per request, so a keep-alive connection carrying several requests is not one decision. A host can have other `[[network.allowed_routes]]` entries without a `secret`; those are proxied plainly. This matters because `AGENTS.md` is untrusted and controls the *other* rules on that host: it cannot widen where an authorized token goes. Matching uses the normalised path, so `..` segments and percent-encoding cannot move a secret off its route.
   - **Verbatim Copy-Pasting**: To authorize secret injection, the operator copies the exact `[[network.allowed_routes]]` block from `AGENTS.md` into `~/.config/agent-sandbox/secrets.toml`. Every field must match, the port included; an omitted field takes its default (`method = "GET"`, `path = "/"`, `header = "Authorization"`) and is then matched exactly rather than acting as a wildcard. If a secret is requested in `AGENTS.md` but not authorized, the launcher halts at startup and displays the exact snippet required.
@@ -217,11 +218,49 @@ Hostnames are normalised before matching, so a trailing dot (`github.com.`) and 
 IPv4-mapped IPv6 literal (`[::ffff:10.0.0.1]`) match the same rules as their plain forms.
 Deny lists are therefore enforcing rather than advisory, in every mode.
 
-Two limits remain by design. First, non-secret HTTPS stays blind: unless a host is subject to L7 filtering or secret injection, traffic after `CONNECT` is opaque, so
-allowing a relay-like host still allows what that host can reach. Second, egress is
-`CONNECT`-only: UDP, QUIC/HTTP3, ICMP and raw TCP have no path out at all, which is why some
-tools need `HTTP_PROXY` honoured explicitly (`NODE_USE_ENV_PROXY=1` is set for Node) and why
-SSH is rewritten through a generated `ProxyCommand`.
+Two limits remain by design. **First, non-secret HTTPS stays blind:** unless a host is subject
+to L7 filtering or secret injection, traffic after `CONNECT` is opaque, so allowing a relay-like
+host still allows what that host can reach. Two consequences of that opacity are worth stating
+plainly, because they mean the blind-HTTPS allowlist bounds *which named hosts* are reachable,
+not *whether* arbitrary data can leave or a chosen origin can be reached through them:
+
+- **Domain fronting on shared CDNs.** The proxy authorises the `CONNECT` authority and then
+  byte-pumps raw TLS to it; the tunnel's inner SNI is chosen by the sandbox and never seen by
+  the proxy. On a multi-tenant CDN edge that routes by inner SNI, an allowlisted host fronts to
+  **any co-tenant of that edge**. Two hosts on the default `claude` profile illustrate it:
+  `channels.nixos.org` and `index.crates.io` are Fastly-fronted, so a blind allow of either
+  makes any Fastly tenant reachable (e.g. `crates.io`) by presenting that tenant's name as the
+  inner SNI. This takes a deliberately crafted request — ordinary traffic never hits it — but it
+  is available to an agent that goes looking. To pin a host to its own origin and close fronting,
+  give it an `[[network.allowed_routes]]` rule so it takes the SNI-checked MITM path (above). The
+  minimal rule forces MITM without otherwise restricting the host's traffic:
+
+  ```toml
+  [network]
+  allowed_hosts = ["channels.nixos.org:443"]
+
+  # Force the MITM path so the tunnel is pinned to this host (closes CDN fronting),
+  # without otherwise restricting its traffic. `/**` matches every path; `*` every method.
+  [[network.allowed_routes]]
+  host   = "channels.nixos.org:443"
+  method = "*"
+  path   = "/**"
+  ```
+
+  This decrypts the host at the proxy: a session CA is mounted and trusted in-sandbox
+  automatically once any route is present. MITM is HTTP/1.1 only, so confirm an h2-only host
+  still works after adding the rule.
+
+- **General-purpose hosts are data channels in their own right.** Even a single allowlisted host
+  can be bidirectional regardless of fronting — `github.com:443` over git-over-HTTPS is clone-in
+  and push-out to any repository. So treat the egress allowlist as *surface reduction* — it keeps
+  an agent off the open internet and on a named set of hosts — rather than as exfiltration-proof
+  containment. Where the latter is the goal, scope such a host to a pull-through cache or specific
+  routes rather than allowing it wholesale.
+
+**Second, egress is `CONNECT`-only:** UDP, QUIC/HTTP3, ICMP and raw TCP have no path out at all,
+which is why some tools need `HTTP_PROXY` honoured explicitly (`NODE_USE_ENV_PROXY=1` is set for
+Node) and why SSH is rewritten through a generated `ProxyCommand`.
 
 ### Changing the proxy policy mid-session
 
