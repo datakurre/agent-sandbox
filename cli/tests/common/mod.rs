@@ -207,20 +207,29 @@ impl World {
         self
     }
 
-    /// Stub `gpgconf` on `$PATH` (the same trick `podman` already uses) to
-    /// report a fake agent socket under the test's `$XDG_RUNTIME_DIR`, and
-    /// create that socket file so `--gpg` finds a live agent to forward.
+    /// Put an executable of our own first on `$PATH`, the same trick the
+    /// `podman` stub uses.  `script` is a whole shell script, `#!` line and all.
+    ///
+    /// For the commands the launcher shells out to that are not podman: the
+    /// host browser's Chromium and its proxy, `gpgconf`, and whatever the next
+    /// one turns out to be.
+    pub fn stub_bin(self, name: &str, script: &str) -> Self {
+        let path = self.root.join("bin").join(name);
+        fs::write(&path, script).expect("write stub binary");
+        make_executable(&path);
+        self
+    }
+
+    /// Stub `gpgconf` to report a fake agent socket under the test's
+    /// `$XDG_RUNTIME_DIR`, and create that socket file so `--gpg` finds a live
+    /// agent to forward.
     pub fn gpg_agent_forwarded(self) -> Self {
         let socket = self.runtime_dir().join("gnupg/S.gpg-agent");
         fs::create_dir_all(socket.parent().expect("socket parent")).expect("gpg socket dir");
         fs::write(&socket, "").expect("stub gpg socket");
 
-        let gpgconf = self.root.join("bin/gpgconf");
-        fs::write(&gpgconf, format!("#!/bin/sh\necho '{}'\n", socket.display()))
-            .expect("write gpgconf stub");
-        make_executable(&gpgconf);
-
-        self
+        let script = format!("#!/bin/sh\necho '{}'\n", socket.display());
+        self.stub_bin("gpgconf", &script)
     }
 
     pub fn run(&self, args: &[&str]) -> Outcome {

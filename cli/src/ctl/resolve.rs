@@ -163,7 +163,48 @@ pub fn require_sidecar(sandbox: &str) -> Result<String> {
     Ok(sidecar)
 }
 
-pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<String> {
+/// Why `try_resolve_sandbox` came back empty-handed.
+///
+/// `message` is what `resolve_sandbox` prints after its own prefix: a headline
+/// phrase, then any listing lines, already indented.
+pub struct Unresolved {
+    pub message: String,
+    /// Set when sandboxes did match and only the choice between them was
+    /// missing.  A caller for which a sandbox is optional still wants to say
+    /// something about this one: it walks away from candidates that are right
+    /// there, rather than from an empty machine.
+    pub ambiguous: bool,
+}
+
+impl Unresolved {
+    fn not_found(message: impl Into<String>) -> Self {
+        Unresolved {
+            message: message.into(),
+            ambiguous: false,
+        }
+    }
+
+    fn ambiguous(lines: Vec<String>) -> Self {
+        Unresolved {
+            message: lines.join("\n"),
+            ambiguous: true,
+        }
+    }
+}
+
+/// `resolve_sandbox` without the exit: the outer `Err` is a podman or
+/// environment failure, the inner one is "no sandbox, and here is how to say
+/// it".
+///
+/// Every command that acts *on* a sandbox wants the exiting wrapper below.
+/// This one is for the commands a sandbox is merely useful to --
+/// `agent-sandbox browser` seeds its allow list from one if there is one and
+/// starts perfectly well if there is not, which it cannot do if resolving
+/// takes the process down with it.
+pub fn try_resolve_sandbox(
+    explicit: Option<&str>,
+    want_running: bool,
+) -> Result<std::result::Result<String, Unresolved>> {
     if let Some(explicit) = explicit {
         // Try to inspect the explicit container ID or name
         let mut cmd = Command::new("podman");
@@ -183,63 +224,61 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
             }
             if valid_matches.len() == 1 {
                 if want_running && !sandbox_running(&valid_matches[0])? {
-                    eprintln!(
-                        "agent-sandbox ctl: '{}' is not running",
+                    return Ok(Err(Unresolved::not_found(format!(
+                        "'{}' is not running",
                         sandbox_word(&valid_matches[0])
-                    );
-                    std::process::exit(1);
+                    ))));
                 }
-                return Ok(valid_matches[0].clone());
+                return Ok(Ok(valid_matches[0].clone()));
             } else if valid_matches.len() > 1 {
-                eprintln!(
-                    "agent-sandbox ctl: '{}' is ambiguous, matches multiple sandboxes:",
+                let mut lines = vec![format!(
+                    "'{}' is ambiguous, matches multiple sandboxes:",
                     explicit
-                );
+                )];
                 for m in &valid_matches {
-                    eprintln!(
+                    lines.push(format!(
                         "  {}\t{}",
                         sandbox_word(m),
                         sandbox_workspace(m).unwrap_or_default()
-                    );
-                    eprintln!("    full name: {}", m);
+                    ));
+                    lines.push(format!("    full name: {}", m));
                 }
-                std::process::exit(1);
+                return Ok(Err(Unresolved::ambiguous(lines)));
             }
-            eprintln!(
-                "agent-sandbox ctl: no container named or id matching '{}'",
+            return Ok(Err(Unresolved::not_found(format!(
+                "no container named or id matching '{}'",
                 explicit
-            );
-            std::process::exit(1);
+            ))));
         }
         let stdout = String::from_utf8(output.stdout)?;
         let parts: Vec<&str> = stdout.trim().split_whitespace().collect();
         if parts.len() < 3 || parts[1] != "sandbox" {
-            eprintln!(
-                "agent-sandbox ctl: container '{}' is not an agent-sandbox",
+            return Ok(Err(Unresolved::not_found(format!(
+                "container '{}' is not an agent-sandbox",
                 explicit
-            );
-            std::process::exit(1);
+            ))));
         }
         let is_running = parts[2] == "true";
         if want_running && !is_running {
-            eprintln!("agent-sandbox ctl: '{}' is not running", explicit);
-            std::process::exit(1);
+            return Ok(Err(Unresolved::not_found(format!(
+                "'{}' is not running",
+                explicit
+            ))));
         }
         let mut name = parts[0];
         if name.starts_with('/') {
             name = &name[1..];
         }
-        return Ok(name.to_string());
+        return Ok(Ok(name.to_string()));
     }
 
     let rows = sandbox_containers_rows(!want_running)?;
     if rows.is_empty() {
-        if want_running {
-            eprintln!("agent-sandbox ctl: no running sandboxes.");
+        return Ok(Err(Unresolved::not_found(if want_running {
+            "no running sandboxes."
         } else {
-            eprintln!("agent-sandbox ctl: no sandboxes found.");
-        }
-        std::process::exit(1);
+            "no sandboxes found."
+        })));
     }
 
     let pwd = env::current_dir()?.to_string_lossy().to_string();
@@ -250,17 +289,31 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
         }
     }
     if matches.is_empty() {
-        eprintln!("agent-sandbox ctl: no sandbox running for current workspace.");
-        std::process::exit(1);
+        return Ok(Err(Unresolved::not_found(
+            "no sandbox running for current workspace.",
+        )));
     }
     if matches.len() == 1 {
-        return Ok(matches[0].0.clone());
+        return Ok(Ok(matches[0].0.clone()));
     }
 
-    eprintln!("agent-sandbox ctl: several sandboxes are running for this workspace; pass --container NAME:");
-    eprintln!("  NAME\tCREATED\tSTATUS");
+    let mut lines = vec![
+        "several sandboxes are running for this workspace; pass --container NAME:".to_string(),
+        "  NAME\tCREATED\tSTATUS".to_string(),
+    ];
     for (name, status, created) in &matches {
-        eprintln!("  {}\t{}\t{}", sandbox_word(name), created, status);
+        lines.push(format!("  {}\t{}\t{}", sandbox_word(name), created, status));
     }
-    std::process::exit(1);
+    Ok(Err(Unresolved::ambiguous(lines)))
+}
+
+/// The sandbox a command was pointed at, or a message and exit 1.
+pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<String> {
+    match try_resolve_sandbox(explicit, want_running)? {
+        Ok(name) => Ok(name),
+        Err(unresolved) => {
+            eprintln!("agent-sandbox ctl: {}", unresolved.message);
+            std::process::exit(1);
+        }
+    }
 }

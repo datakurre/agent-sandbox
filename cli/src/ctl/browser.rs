@@ -1074,16 +1074,29 @@ pub fn run(args: BrowserArgs) -> Result<()> {
 /// list is still a browser, and someone may well want one before the sandbox
 /// it will test exists.  Only an explicitly named sandbox that cannot be found
 /// is worth more than one line.
+///
+/// Hence `try_resolve_sandbox` rather than `resolve_sandbox`: the latter exits
+/// the process on a sandbox it cannot find, which took `agent-sandbox browser`
+/// down with it whenever a sandbox was running for some *other* workspace --
+/// the one case the old `sandbox_containers()` pre-check did not cover, since
+/// "something is running" and "something is running here" are different
+/// questions.
 fn resolve_target(args: &BrowserArgs) -> std::result::Result<String, String> {
     let explicit = args.container.as_deref().or(args.word.as_deref());
-    match sandbox_containers() {
-        Err(e) if explicit.is_none() => Err(format!(
+    match try_resolve_sandbox(explicit, true) {
+        Ok(Ok(name)) => Ok(name),
+        // Naming a sandbox that cannot be found is a mistake worth hearing
+        // about, and so is walking away from several that match.  Having no
+        // sandbox at all is just the browser-first order of work.
+        Ok(Err(unresolved)) if explicit.is_some() || unresolved.ambiguous => {
+            Err(unresolved.message)
+        }
+        Ok(Err(_)) => Ok(String::new()),
+        Err(e) => Err(format!(
             "cannot ask podman what is running ({}); the allow list comes from \
              --allow and profiles only",
             e
         )),
-        Ok(running) if running.is_empty() && explicit.is_none() => Ok(String::new()),
-        _ => resolve_sandbox(explicit, true).map_err(|e| e.to_string()),
     }
 }
 
