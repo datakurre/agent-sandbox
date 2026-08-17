@@ -97,7 +97,12 @@ fn list_role(args: &[&str]) -> Result<()> {
                 let name = parts[1];
                 let status = parts[2];
                 let target = container_label(name, "agent-sandbox.target");
-                println!("{}\t{}\t{}\t{}", id, name, status, target);
+                let target = if target.is_empty() {
+                    target
+                } else {
+                    sandbox_word(&target)
+                };
+                println!("{}\t{}\t{}\t{}", id, short_name(name), status, target);
             }
         }
     }

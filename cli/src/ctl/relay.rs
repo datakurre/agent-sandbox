@@ -65,14 +65,14 @@ pub fn run(args: RelayArgs) -> Result<()> {
     if policy_dir.is_empty() {
         eprintln!(
             "agent-sandbox ctl relay: cannot find the policy mount for sandbox '{}'",
-            sandbox
+            sandbox_word(&sandbox)
         );
         std::process::exit(1);
     }
 
     let policy = load_signing_policy(&policy_dir);
     let hosts = &policy.ssh_hosts;
-    println!("{}", sandbox);
+    println!("{}", sandbox_word(&sandbox));
     println!(
         "  gpg signing    {}",
         if policy.gpg_enabled {

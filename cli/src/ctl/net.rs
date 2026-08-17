@@ -51,7 +51,10 @@ pub fn run(args: NetArgs) -> Result<()> {
     let log_path = "/sidecar_shared/connections.jsonl";
 
     if args.follow {
-        eprintln!("agent-sandbox-net: following {} (Ctrl-C to stop)", sidecar);
+        eprintln!(
+            "agent-sandbox-net: following {} (Ctrl-C to stop)",
+            sandbox_word(&sandbox)
+        );
         let mut tail_child = Command::new("podman")
             .arg("exec")
             .arg(&sidecar)
@@ -79,7 +82,7 @@ pub fn run(args: NetArgs) -> Result<()> {
             .arg(&sidecar)
             .status()?;
         if !exists.success() {
-            println!("\n{} stopped.", sidecar);
+            println!("\n{} stopped.", sandbox_word(&sandbox));
             std::process::exit(0);
         }
         std::process::exit(status.code().unwrap_or(1));

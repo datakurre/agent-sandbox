@@ -178,11 +178,13 @@ fn policy_dir(
     if dir.is_empty() {
         eprintln!(
             "agent-sandbox ctl proxy: cannot find the policy mount for sandbox '{}'",
-            sandbox_name
+            sandbox_word(&sandbox_name)
         );
         std::process::exit(1);
     }
-    Ok((sandbox_name, dir))
+    // The session word, not the container name: the callers only print this,
+    // and a browser's own name comes back from the branch above unchanged.
+    Ok((sandbox_word(&sandbox_name), dir))
 }
 
 /// Find the one running browser's policy directory, or say which ones there

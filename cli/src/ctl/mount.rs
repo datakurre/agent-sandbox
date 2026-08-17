@@ -148,7 +148,7 @@ fn container_pid(sandbox: &str) -> Result<String> {
     if !out.status.success() || pid.is_empty() || pid == "0" {
         eprintln!(
             "agent-sandbox ctl mounts: '{}' has no running process",
-            sandbox
+            sandbox_word(sandbox)
         );
         std::process::exit(1);
     }
@@ -169,7 +169,7 @@ fn run_ls(args: TargetArgs) -> Result<()> {
     }
 
     for sandbox in names {
-        println!("{}", sandbox);
+        println!("{}", sandbox_word(&sandbox));
         println!(
             "  workspace   {}",
             sandbox_workspace(&sandbox).unwrap_or_default()
@@ -302,7 +302,8 @@ fn run_add(args: AddArgs) -> Result<()> {
     if !made.success() {
         eprintln!(
             "agent-sandbox ctl mounts: could not create {} in {}",
-            args.container_path, sandbox
+            args.container_path,
+            sandbox_word(&sandbox)
         );
         std::process::exit(1);
     }
@@ -326,7 +327,9 @@ fn run_add(args: AddArgs) -> Result<()> {
     }
     println!(
         "Mounted {} to {}:{}",
-        host_path, sandbox, args.container_path
+        host_path,
+        sandbox_word(&sandbox),
+        args.container_path
     );
     Ok(())
 }
@@ -361,7 +364,11 @@ fn run_rm(args: RmArgs) -> Result<()> {
         );
         std::process::exit(1);
     }
-    println!("Unmounted {}:{}", sandbox, args.container_path);
+    println!(
+        "Unmounted {}:{}",
+        sandbox_word(&sandbox),
+        args.container_path
+    );
     Ok(())
 }
 

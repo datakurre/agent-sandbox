@@ -102,9 +102,32 @@ fn a_dry_run_removes_nothing_at_all() {
     );
 }
 
+/// The session word is the name the launcher hands out, the only one the other
+/// commands take back, and unique across sandboxes. Purge listed podman's
+/// container name instead -- workspace-qualified and prefixed -- so what it
+/// offered to remove was not what the reader had ever typed.
+#[test]
+fn sandboxes_are_listed_by_their_session_word() {
+    let out = purgeable_world().run(&["ctl", "purge", "--dry-run"]);
+
+    assert!(
+        out.stdout.contains("\n  quiet\n"),
+        "the sandbox was not listed by its session word: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("agent-sandbox-ws-quiet"),
+        "the podman container name leaked into the listing: {}",
+        out.stdout
+    );
+}
+
 /// The networks purge reclaims are matched by name, and the name is the one
 /// the launcher gives a session's sidecar. A prefix that stops matching is a
 /// silent regression: purge keeps reporting success and reclaims nothing.
+///
+/// Matching is on the full name; only the printing drops the shared
+/// `agent-sandbox-` prefix, so the reported name is the tail of the real one.
 #[test]
 fn only_sidecar_networks_are_considered() {
     let out = World::new()
@@ -118,7 +141,7 @@ fn only_sidecar_networks_are_considered() {
         .run(&["ctl", "purge", "--dry-run"]);
 
     assert!(
-        out.stdout.contains("agent-sandbox-sidecar-deadbeef"),
+        out.stdout.contains("sidecar-deadbeef"),
         "the sidecar network was not recognised: {}",
         out.stdout
     );

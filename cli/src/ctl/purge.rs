@@ -180,7 +180,7 @@ pub fn run(args: PurgeArgs) -> Result<()> {
         if args.all {
             println!("Running sandboxes:");
             for r in &running {
-                println!("  {}", r);
+                println!("  {}", sandbox_word(r));
             }
             println!();
             if args.dry_run {
@@ -196,7 +196,7 @@ pub fn run(args: PurgeArgs) -> Result<()> {
         } else {
             println!("Running sandboxes (kept; pass --all to remove):");
             for r in &running {
-                println!("  {}", r);
+                println!("  {}", sandbox_word(r));
             }
             println!();
         }
@@ -212,7 +212,7 @@ pub fn run(args: PurgeArgs) -> Result<()> {
     if !exited.is_empty() {
         println!("Exited sandboxes:");
         for e in &exited {
-            println!("  {}", e);
+            println!("  {}", sandbox_word(e));
         }
         println!();
         if args.dry_run {
@@ -233,7 +233,7 @@ pub fn run(args: PurgeArgs) -> Result<()> {
     if !orphans_proxy.is_empty() {
         println!("Orphaned proxy sidecars:");
         for o in &orphans_proxy {
-            println!("  {}", o);
+            println!("  {}", short_name(o));
         }
         println!();
         if args.dry_run {
@@ -258,7 +258,7 @@ pub fn run(args: PurgeArgs) -> Result<()> {
     if !networks.is_empty() {
         println!("Leaked sidecar networks:");
         for n in &networks {
-            println!("  {}", n);
+            println!("  {}", short_name(n));
         }
         println!();
         if args.dry_run {
@@ -274,7 +274,7 @@ pub fn run(args: PurgeArgs) -> Result<()> {
                 if ok {
                     removed += 1;
                 } else {
-                    eprintln!("  could not remove {} (still in use?)", n);
+                    eprintln!("  could not remove {} (still in use?)", short_name(n));
                 }
             }
             println!("  removed {}\n", removed);

@@ -60,8 +60,26 @@ pub fn sandbox_running(name: &str) -> Result<bool> {
     Ok(names.iter().any(|n| n == name))
 }
 
+/// The prefix the launcher puts on every container, network and session
+/// directory it creates.  It exists so our objects are recognisable inside
+/// podman's global namespace; it tells a reader of our own output nothing they
+/// do not already know, so it comes off before anything is printed.
+pub const NAME_PREFIX: &str = "agent-sandbox-";
+
+/// What to call a sandbox in output.  The session word is unique across all
+/// sandboxes -- the launcher will not reuse one that suffixes an existing
+/// container -- and it is the selector every command takes, so printing
+/// anything longer gives the reader a name they cannot type back.
 pub fn sandbox_word(name: &str) -> String {
     name.rsplit('-').next().unwrap_or(name).to_string()
+}
+
+/// What to call our other objects -- a sidecar, its network -- which are named
+/// after a launch uuid rather than a session word.  Nobody types these, but
+/// they are listed next to sandboxes, and a bare `sidecar-1a2b3c4d` next to a
+/// bare `quiet` reads as one list instead of two.
+pub fn short_name(name: &str) -> String {
+    name.strip_prefix(NAME_PREFIX).unwrap_or(name).to_string()
 }
 
 pub fn sandbox_proxy_mode(name: &str) -> Result<String> {
@@ -90,7 +108,8 @@ pub fn refuse_if_krun(sandbox: &str, verb: &str, msgs: &[&str]) -> Result<()> {
     if sandbox_runtime(sandbox)? == "krun" {
         eprintln!(
             "agent-sandbox ctl: '{}' is a --krun microVM; {} is not available.",
-            sandbox, verb
+            sandbox_word(sandbox),
+            verb
         );
         for m in msgs {
             eprintln!("               {}", m);
@@ -136,7 +155,7 @@ pub fn require_sidecar(sandbox: &str) -> Result<String> {
     if sidecar.is_empty() {
         eprintln!(
             "agent-sandbox ctl: '{}' is running without a proxy.",
-            sandbox
+            sandbox_word(sandbox)
         );
         eprintln!("               Relaunch it with:  agent-sandbox --proxy");
         std::process::exit(1);
@@ -164,7 +183,10 @@ pub fn resolve_sandbox(explicit: Option<&str>, want_running: bool) -> Result<Str
             }
             if valid_matches.len() == 1 {
                 if want_running && !sandbox_running(&valid_matches[0])? {
-                    eprintln!("agent-sandbox ctl: '{}' is not running", valid_matches[0]);
+                    eprintln!(
+                        "agent-sandbox ctl: '{}' is not running",
+                        sandbox_word(&valid_matches[0])
+                    );
                     std::process::exit(1);
                 }
                 return Ok(valid_matches[0].clone());

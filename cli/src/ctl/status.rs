@@ -64,10 +64,10 @@ pub fn run(args: StatusArgs) -> Result<()> {
 
     let mode = sandbox_proxy_mode(&sandbox)?;
     match mode.as_str() {
-        "proxy" => row("proxy", &format!("on  ({})", sidecar)),
+        "proxy" => row("proxy", &format!("on  ({})", short_name(&sidecar))),
         "off" => row("proxy", "off  (direct network access)"),
         _ => {
-            let s = format!("on  ({})", sidecar);
+            let s = format!("on  ({})", short_name(&sidecar));
             row("proxy", if !sidecar.is_empty() { &s } else { "unknown" })
         }
     }
