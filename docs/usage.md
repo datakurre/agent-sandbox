@@ -272,8 +272,14 @@ When using Git inside the sandbox, be aware of how the integration flags interac
   `--proxy --ssh` it is the sidecar, so `relay-server` reads the file the
   launcher wrote beside the policy and passes `-o UserKnownHostsFile=…`: the
   sandbox's copy would be on the wrong side of the boundary, and the sidecar
-  runs as `root`, whose home is `/root` rather than the image's `HOME`. Naming
-  your own file (`ssh -o UserKnownHostsFile=…`) turns the injection off.
+  runs as `root`, whose home is `/root` rather than the image's `HOME`.
+- The relay refuses an `ssh` that tries to decide any of this for itself:
+  `UserKnownHostsFile`, `GlobalKnownHostsFile`, `StrictHostKeyChecking`,
+  `VerifyHostKeyDNS`, and `-F` (an alternate config could set any of them out
+  of sight). It also refuses `-J` / `ProxyJump`, which would pass the
+  destination check and then connect somewhere else. If a host's key is not
+  trusted, the fix is a `[[network.known_hosts]]` entry in `trusted.toml`, not
+  a flag — that is the whole point of having the file.
 
 ### Bundled OpenCode skills
 

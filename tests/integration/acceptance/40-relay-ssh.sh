@@ -43,12 +43,21 @@ out="$(sandbox_run --workspace --proxy --ssh -- \
 assert_contains "$out" "successfully authenticated" "an SSH probe to an allowed host"
 assert_not_contains "$out" "Host key verification failed" "the relay's pinned known_hosts"
 
-# The pinning is a default, not a cage: a caller who names their own
-# known-hosts file gets it, which is the escape hatch for a self-hosted forge
-# whose key is not in the pinned set.
+# Which keys are trusted is the operator's decision, made in trusted.toml, and
+# the sandbox does not get to revisit it per invocation. These two options are
+# the whole of how you would try, and both are refused.
 out="$(sandbox_run --workspace --proxy --ssh -- \
   bash -c 'ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -T git@github.com 2>&1 || true')"
-assert_contains "$out" "successfully authenticated" "an SSH probe with a caller-supplied known_hosts"
+assert_not_contains "$out" "successfully authenticated" "an SSH probe overriding known_hosts"
+assert_contains "$out" "trusted.toml" "the refusal pointing at where keys are authorized"
+
+# A jump host passes the destination check -- the destination really is the
+# allowed host -- and then connects somewhere else with the forwarded agent
+# along for the ride.
+out="$(sandbox_run --workspace --proxy --ssh -- \
+  bash -c 'ssh -o ConnectTimeout=10 -J nowhere.invalid -T git@github.com 2>&1 || true')"
+assert_not_contains "$out" "successfully authenticated" "an SSH probe through a jump host"
+assert_contains "$out" "denied" "the refusal of a jump host"
 
 # One entry, two ports: the relay reads 22 out of the list exactly as it would
 # out of a lone ":22" entry, and the proxy still allows 443.
