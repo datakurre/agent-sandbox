@@ -183,7 +183,7 @@ fn the_policy_the_sidecar_is_handed_carries_the_declared_rules_and_a_deny_baseli
         policy
     );
 
-    // `policy.base` is what `ctl proxy reset` restores, so a session that never
+    // `policy.base` is what `ctl policy reset` restores, so a session that never
     // edits its policy has to start with the two identical.
     let base = fs::read_to_string(dir.join("policy.base")).expect("the reset baseline");
     assert_eq!(
@@ -269,35 +269,80 @@ fn an_l7_policy_is_accepted_and_still_denies_by_default() {
 }
 
 #[test]
-fn a_proxy_profile_that_does_not_exist_refuses_the_launch() {
-    let out = proxied_world().run(&["--workspace", "--proxy-profile", "nope", "opencode"]);
+fn a_policy_that_does_not_exist_refuses_the_launch() {
+    let out = proxied_world().run(&[
+        "--workspace",
+        "--proxy",
+        "--policy",
+        "nope",
+        "opencode",
+    ]);
 
     assert!(!out.reached_podman_run());
     assert!(
         out.stderr.contains("nope"),
-        "the error should name the profile: {}",
+        "the error should name the policy: {}",
         out.stderr
     );
 }
 
 #[test]
-fn a_proxy_profile_supplies_the_policy_when_agents_md_has_none() {
+fn a_policy_without_proxy_refuses_the_launch() {
+    let out = proxied_world().run(&["--workspace", "--policy", "development", "opencode"]);
+
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr.contains("--policy") && out.stderr.contains("--proxy"),
+        "the error should explain --policy needs --proxy: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_policy_merges_with_agents_md() {
     let out = proxied_world()
         .home_file(
-            ".config/agent-sandbox/profiles/development.toml",
+            ".config/agent-sandbox/policies/development.toml",
             "[network]\nallowed_hosts = [\"registry.npmjs.org:443\"]\n",
         )
-        .run(&["--workspace", "--proxy-profile", "development", "opencode"]);
+        .run(&[
+            "--workspace",
+            "--proxy",
+            "--policy",
+            "development",
+            "opencode",
+        ]);
 
     assert!(
         out.reached_podman_run(),
-        "a host-owned profile is a complete policy on its own: {}",
+        "a host-owned policy is a complete policy on its own: {}",
         out.stderr
     );
     assert!(out
         .run_call()
         .values_of("--label")
         .contains(&"agent-sandbox.proxy=proxy"));
+}
+
+#[test]
+fn an_agent_named_policy_loads_implicitly_under_proxy() {
+    let out = proxied_world()
+        .home_file(
+            ".config/agent-sandbox/policies/opencode.toml",
+            "[network]\nallowed_hosts = [\"registry.npmjs.org:443\"]\n",
+        )
+        .run(&["--workspace", "--proxy", "opencode"]);
+
+    assert!(
+        out.reached_podman_run(),
+        "the agent-named policy alone is a complete policy: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("opencode.toml"),
+        "the load should be reported: {}",
+        out.stderr
+    );
 }
 
 #[test]

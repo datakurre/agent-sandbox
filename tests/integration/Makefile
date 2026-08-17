@@ -68,7 +68,7 @@ check:
 	@command -v podman >/dev/null 2>&1 \
 	  || { echo "podman is not on PATH: this tier cannot run here."; exit 1; }
 	@test -x "$(AGENT_SANDBOX_BIN)" \
-	  || { echo "no launcher at $(AGENT_SANDBOX_BIN); run: make -C tests/integration build"; exit 1; }
+	  || { echo "no launcher at $(AGENT_SANDBOX_BIN); run: make -C tests/integration image"; exit 1; }
 	@podman image exists localhost/agent-sandbox:latest \
 	  || { echo "image not loaded; run: make -C tests/integration image"; exit 1; }
 	@echo "podman $$(podman --version | awk '{print $$3}'), launcher $(AGENT_SANDBOX_BIN)"

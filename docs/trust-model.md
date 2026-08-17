@@ -17,7 +17,7 @@ By design, `agent-sandbox` includes options that pierce the sandbox boundary. No
 
 The command exists to make the capability above narrower, not to make the sandbox wider. It is worth being precise about what it does and does not decide.
 
-**What bounds it.** The browser is launched with `--proxy-server` pointing at an `agent-sandbox-proxy` of its own, on a loopback port only that instance knows, denying by default. That proxy is the bound: it is the same binary, the same policy format, and the same `agent-sandbox ctl proxy` commands as the sidecar's, and it writes the same connection log — so what the browser fetched is accounted for, and shown as a traffic summary when it closes.
+**What bounds it.** The browser is launched with `--proxy-server` pointing at an `agent-sandbox-proxy` of its own, on a loopback port only that instance knows, denying by default. That proxy is the bound: it is the same binary, the same policy format, and the same `agent-sandbox ctl policy` commands as the sidecar's, and it writes the same connection log — so what the browser fetched is accounted for, and shown as a traffic summary when it closes.
 
 **A second, weaker layer.** A managed Chromium policy (`URLBlocklist: ["*"]` plus a `URLAllowlist` derived from the same rules, and a pinned `ProxySettings`) is written per instance. It exists for one specific gap: a CDP client can ask for a browser context with a proxy of its own, which the first layer would never see, and `URLBlocklist` is enforced in the browser process regardless of the proxy a context uses. It is best-effort in two ways worth stating plainly:
 
@@ -30,7 +30,7 @@ The command exists to make the capability above narrower, not to make the sandbo
 
 **Where the default allow list comes from.** The `[ports]` block of the `AGENTS.md` in the current directory, plus whatever the target sandbox already publishes on loopback. That is a repo-controlled file deciding, before you have started anything, that the browser may reach `127.0.0.1:<port>` — so a `[ports]` entry naming a port the sandbox never publishes points the browser at whatever else answers there on your machine. It is bounded to the exact ports named, one address and one port per rule, with everything else still denied; it is no wider than what the same file already gets when you pass `--ports`; and `--no-published-ports` declines it entirely. Read a strange repo's `[ports]` the way you would read its `[mounts]`.
 
-**Two policies, one escalation.** `agent-sandbox ctl proxy allow <host>:443 --browser` widens the browser; the same command without `--browser` widens a sandbox. Both apply within a second without a restart. For a browser both layers are updated — the proxy's policy and the managed `URLAllowlist` — because a permission only one of them holds is a browser that refuses what the proxy allows.
+**Two policies, one escalation.** `agent-sandbox ctl policy allow <host>:443 --browser` widens the browser; the same command without `--browser` widens a sandbox. Both apply within a second without a restart. For a browser both layers are updated — the proxy's policy and the managed `URLAllowlist` — because a permission only one of them holds is a browser that refuses what the proxy allows.
 
 ### Running Containers: `--podman` vs `--privileged`
 If you want the agent to be able to run its own containers, `agent-sandbox` supports two distinct models:
@@ -82,8 +82,8 @@ It is opt-in and should stay that way. The honest reasons to reach for it are ru
 The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` for granular controls.
 
 - **Default Policy**: The policy is always **deny by default**. To allow all traffic, specify `allowed_hosts = ["*"]` or `allowed_hosts = ["*:port"]`.
-- **Policy sources**: `--proxy` uses the workspace `AGENTS.md` network policy only. `--proxy-profile NAME` uses the explicit host-owned profile only and implies `--proxy`. Supplying both merges the profile and `AGENTS.md` additively. Profiles may be repeated and are never loaded implicitly.
-- **Profile trust**: Profiles are read from `$XDG_CONFIG_HOME/agent-sandbox/profiles/` or `~/.config/agent-sandbox/profiles/` and are host-controlled configuration. `AGENTS.md` remains project-controlled configuration. Neither source can add a deny directive; the firewall remains deny-by-default.
+- **Policy sources**: `--proxy` uses the workspace `AGENTS.md` network policy, plus `~/.config/agent-sandbox/policies/<agent>.toml` if one exists for the launched agent. `--policy NAME` additionally merges the named host-owned policy, and requires `--proxy` — passing `--policy` without `--proxy` refuses the launch rather than turning the proxy on implicitly. `--policy` may be repeated.
+- **Policy trust**: Policies are read from `$XDG_CONFIG_HOME/agent-sandbox/policies/` or `~/.config/agent-sandbox/policies/` and are host-controlled configuration. `AGENTS.md` remains project-controlled configuration. Neither source can add a deny directive; the firewall remains deny-by-default.
 - **Wildcards**: Wildcards are supported for domains (e.g., `*.github.com:443`). A strict domain like `github.com:443` matches that exact domain and **does not** match subdomains like `status.github.com:443`. A wildcard matches both the subdomains and the apex, so `*.github.com:443` alone covers `github.com` as well.
 - Domain matching is case-insensitive.
 - **L7 Filtering (`[[network.allowed_routes]]`)**: Restricts HTTPS traffic by method and URL path. 
@@ -100,11 +100,11 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
   - The relay's `ssh` is pointed at that file explicitly (`-o UserKnownHostsFile=`), because it runs in the sidecar as `root`, whose home is `/root` rather than the image's `HOME`. The injection is unconditional: the relay **refuses** an invocation that sets `UserKnownHostsFile`, `GlobalKnownHostsFile`, `StrictHostKeyChecking` or `VerifyHostKeyDNS` itself, and refuses `-F` for the same reason — an alternate config could set any of them out of sight. Which keys are trusted is settled in `trusted.toml`, on the host, and is not a decision the sandbox gets to revisit per invocation.
   - The relay also refuses `-J` / `ProxyJump`, which would otherwise pass the destination check and then connect somewhere else entirely: `ssh -J evil.example git@github.com` really is destined for github.com, and reaches it by first authenticating to `evil.example` with the forwarded agent. `ProxyCommand`, `LocalCommand`, `PermitLocalCommand` and `ProxyUseFdpass` were already refused, for the neighbouring reason that they run a command of the caller's choosing next to that socket.
   - Port forwards (`-L`, `-R`, `-D`, `-W`) are *not* refused. They do not move the connection off the authorized host; what they can reach is whatever that host is willing to forward, which is the host's decision rather than the sandbox's.
-- When L7 filtering is active, the launcher mounts a session CA and the entrypoint exports a merged trust bundle (`SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`) for in-sandbox clients. With no `[[network.allowed_routes]]` in the launch policy nothing is ever intercepted, so no CA is mounted and ordinary HTTPS stays end-to-end authenticated. The corollary is that an L7 rule added mid-session (`ctl proxy allow --l7`, or `h` in the TUI) has no CA behind it; both say so rather than leaving you with certificate errors. Declare the rule in `AGENTS.md` and relaunch.
+- When L7 filtering is active, the launcher mounts a session CA and the entrypoint exports a merged trust bundle (`SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CERTS`) for in-sandbox clients. With no `[[network.allowed_routes]]` in the launch policy nothing is ever intercepted, so no CA is mounted and ordinary HTTPS stays end-to-end authenticated. The corollary is that an L7 rule added mid-session (`ctl policy allow --l7`, or `h` in the TUI) has no CA behind it; both say so rather than leaving you with certificate errors. Declare the rule in `AGENTS.md` and relaunch.
 - Non-secret HTTPS remains blind `CONNECT` + byte pump. Only domains subject to L7 filtering or secret injection are decrypted.
 - **Relay Architecture**: When `--proxy` is combined with `--ssh` or `--gpg`, the direct socket mounts are replaced with a relay server running in the sidecar. Each flag still gates only its own capability: `--gpg` alone is sufficient for commit signing, exactly as without `--proxy`, while `--ssh` push/pull additionally needs an `allowed_hosts` entry naming the destination in `AGENTS.md`.
 - An invalid `[network]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote. See [Configuration](configuration.md#rules-the-launcher-refuses) for the combinations that are rejected.
-- `--proxy` with no `AGENTS.md` defaults to deny all. Profile-only launches likewise default to deny all when the selected profiles contain no allow rules.
+- `--proxy` with no `AGENTS.md`, no matching agent policy, and no `--policy` defaults to deny all.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
 - **Composes with a loopback-bound published port; refuses a wider one, and `--shared-network`.** Publishing is ingress: podman forwards the host's port into the proxy's internal network without giving the sandbox a route out of it, so a `[ports]` entry bound to loopback leaves the egress policy intact and is allowed. A bind the rest of the network can reach is refused — anything out there could pull what the agent serves, which the proxy never sees, making the policy advisory for pulled bytes. A raw `-p` through `--podman-args` is refused because the launcher does not parse it and cannot tell the two apart. `--shared-network` is refused outright: the shared bridge is a route around the proxy in its own right. `--host-loopback-port` is *accepted* — it is a mounted socket, not a route, so no network mode excludes it — but accepted is not the same as covered: see the capability list above for what it costs.
 - The proxy accounts each connection itself (host, byte counts each way, verdict), so metering adds no packet capture and no per-byte disk overhead.
@@ -134,7 +134,7 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
 - `agent-sandbox ctl status` — one screen: proxy mode, rule and traffic counts, ports.
 - `agent-sandbox ctl net` / `net -f` — the summary above for the session so far, or a live feed.
 - `agent-sandbox ctl logs [-f]` — the proxy's own log: the policy it started with, and every denial as it happens.
-- `agent-sandbox ctl proxy show|allow|rm|reset|export|check` — read and change the policy of a **running** sandbox.
+- `agent-sandbox ctl policy show|allow|rm|reset|export|check` — read and change the policy of a **running** sandbox.
 - A connection record is written when it *closes*, plus one when it opens, so a long-lived HTTPS tunnel appears as `in flight` under `── still open ──` rather than as traffic. Non-secret HTTPS stays opaque. Denied request heads are available only in the ephemeral `denied-requests.jsonl` stream used by the TUI; sensitive headers are redacted, request heads are capped at 16 KiB, and the stream is capped at 4 MiB.
 - The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--proxy` always prints the summary above when the session ends; what happens to the raw log is set by `--proxy-log LEVEL`:
 
@@ -181,7 +181,7 @@ The first names the ports carried by the rule that matched the host; the second
 appears when the matching rule carried no port of its own and the session-wide
 list decided it.
 
-The same explanation — naming the specific rule, or absence of one, that decided the verdict — is what shows up per-row in `agent-sandbox ctl tui` and in `agent-sandbox ctl proxy check`.
+The same explanation — naming the specific rule, or absence of one, that decided the verdict — is what shows up per-row in `agent-sandbox ctl tui` and in `agent-sandbox ctl policy check`.
 
 Private and loopback destinations are refused by default under `--proxy`,
 with or without any rule of your own — whether they are named directly
@@ -278,7 +278,7 @@ and why SSH is rewritten through a generated `ProxyCommand`.
 ### Changing the proxy policy mid-session
 
 ```console
-$ agent-sandbox ctl proxy show
+$ agent-sandbox ctl policy show
 agent-sandbox-myrepo-4213
   policy      /tmp/agent-sandbox-policy-Xf3a91cD/policy
   default     deny  (only the rules below are reachable)
@@ -288,11 +288,11 @@ agent-sandbox-myrepo-4213
   deny_ip       169.254.0.0/16                     AGENTS.md
   …
 
-$ agent-sandbox ctl proxy allow api.openai.com
+$ agent-sandbox ctl policy allow api.openai.com
   allowed     api.openai.com                    domains
   reloading   the proxy applies this within a second
 
-$ agent-sandbox ctl proxy allow 8443
+$ agent-sandbox ctl policy allow 8443
   allowed     8443                              ports
   reloading   the proxy applies this within a second
 ```
@@ -307,22 +307,22 @@ either — a live edit that changes the `deny_ip` set is refused, so the ranges 
 your host and your LAN are fixed for the life of the sandbox. This is deliberate redundancy:
 the firewall is deny-by-default, so a deny rule is never needed to *close* anything, and the
 baseline exists purely to keep the sidecar's own reachability from becoming the agent's.
-To narrow something you allowed, use `proxy rm allow`/`rm l7`; to see why a target is
-refused, `proxy check HOST[:PORT]`.
+To narrow something you allowed, use `policy rm allow`/`rm l7`; to see why a target is
+refused, `policy check HOST[:PORT]`.
 
 The baseline ranges appear in `show` as ordinary `deny_ip` rules attributed to `AGENTS.md`
 — they are included in `policy.base` alongside any user rules and are therefore restored by
-`reset`. `proxy export` omits them, since they are always enforced regardless of what
+`reset`. `policy export` omits them, since they are always enforced regardless of what
 `AGENTS.md` declares and round-tripping them into a new config would be redundant.
 
 An IP CIDR block in `[network].allowed_hosts` of equal or greater specificity is the only way to
 reach one of those ranges — and it is an *allow*, not a deny, which is why it remains
 available: it is how a corporate git server over a VPN is reached.
 
-Changes take effect for new connections within a second. Connections already established keep running: the proxy checks policy when a connection opens and does not re-check it afterwards, so tightening a rule does not cut a tunnel that is already up — end the session for that. `proxy show` says how many are open when it matters.
+Changes take effect for new connections within a second. Connections already established keep running: the proxy checks policy when a connection opens and does not re-check it afterwards, so tightening a rule does not cut a tunnel that is already up — end the session for that. `policy show` says how many are open when it matters.
 
 Rules added live are session-local. At exit, the launcher prints the new rules as
 a declarative TOML block and explains whether to add them to the project
-`AGENTS.md` or merge them into a reusable profile.
+`AGENTS.md` or merge them into a reusable policy.
 
 `reset` restores the `[network]` policy from `AGENTS.md` rather than emptying the rules, since an empty policy allows everything. The baseline denials are part of what it restores, so a reset cannot drop them either.

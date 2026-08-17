@@ -1,6 +1,6 @@
 # Configuration
 
-`AGENTS.md` in the root of a project can contain a fenced code block tagged `agent-sandbox` with TOML configuration. The launcher reads it when starting the sandbox and uses it to expose ports, bind host paths, and enforce a network firewall policy. Network policies can also be kept as reusable host-owned profiles.
+`AGENTS.md` in the root of a project can contain a fenced code block tagged `agent-sandbox` with TOML configuration. The launcher reads it when starting the sandbox and uses it to expose ports, bind host paths, and enforce a network firewall policy. Network policies can also be kept as reusable host-owned policy files.
 
 Configurations must be written in TOML and placed inside a fenced code block tagged with `agent-sandbox`:
 
@@ -240,7 +240,7 @@ authorization for a connection to port 22.
 
 Under `--proxy` the authorized set is the whole trusted set: the keys are bound
 into the sandbox and the sidecar at launch, and nothing running can add to them.
-`agent-sandbox ctl proxy allow HOST:22` and the TUI's `a` therefore say so when
+`agent-sandbox ctl policy allow HOST:22` and the TUI's `a` therefore say so when
 they authorize a host you have no key for — the rule takes effect, and SSH to it
 will fail host-key verification until you add one and relaunch.
 
@@ -265,21 +265,21 @@ There is no `deny` key. The firewall is deny-by-default, and the only deny rules
 a policy carries are the built-in private and loopback ranges the launcher adds
 to every session. See [Trust model](trust-model.md).
 
-## Reusable Network Profiles
+## Reusable Network Policies
 
-Profiles are explicit, host-owned network policies stored under:
+Policies are explicit, host-owned network policies stored under:
 
 ```text
-$XDG_CONFIG_HOME/agent-sandbox/profiles/<name>.toml
+$XDG_CONFIG_HOME/agent-sandbox/policies/<name>.toml
 ```
 
 When `XDG_CONFIG_HOME` is unset, the default location is:
 
 ```text
-~/.config/agent-sandbox/profiles/<name>.toml
+~/.config/agent-sandbox/policies/<name>.toml
 ```
 
-Profile files are plain TOML and contain only a `[network]` table. They use the
+Policy files are plain TOML and contain only a `[network]` table. They use the
 same `allowed_hosts` and `[[network.allowed_routes]]` syntax as `AGENTS.md`:
 
 ```toml
@@ -287,18 +287,30 @@ same `allowed_hosts` and `[[network.allowed_routes]]` syntax as `AGENTS.md`:
 allowed_hosts = ["github.com:443", "registry.npmjs.org:443"]
 ```
 
-`--proxy-profile NAME` implies `--proxy` and uses the selected profile instead
-of the workspace `AGENTS.md` network block. Supplying both `--proxy` and
-`--proxy-profile` merges the sources additively. The option may be repeated and
-profiles are never loaded implicitly. Invalid or missing profiles refuse the
-launch before the sidecar starts.
+For a sandbox launch, `--policy NAME` requires `--proxy` — passing `--policy`
+without `--proxy` is refused before the sidecar starts, rather than silently
+turning the proxy on. With `--proxy`, a named policy merges additively with the
+workspace's `AGENTS.md` `[network]` block (if any). The option may be repeated.
+Invalid or missing policies refuse the launch before the sidecar starts.
 
-The same profiles are taken by
+An agent also gets its own policy implicitly: launching with `--proxy` checks
+`~/.config/agent-sandbox/policies/<agent>.toml` (the same directory, keyed by
+the agent name from `agents.nix`, e.g. `claude.toml`) and merges it
+automatically if it exists — no `--policy` needed. This is how an
+organization-wide allow list for one agent can apply to every project that
+launches it. Startup prints where policies were looked up and which files
+were actually loaded.
+
+The same policies are taken by
 [`agent-sandbox browser`](browser.md)
-via its own `--proxy-profile`, so one allow list can serve both a sandbox and
-the browser testing it. They stay separate policies — selecting a profile for
-one does not select it for the other.
+via its own `--policy`, so one allow list can serve both a sandbox and
+the browser testing it. They stay separate policies — selecting a policy for
+one does not select it for the other. The browser has its own deny-by-default
+proxy, so `agent-sandbox browser --policy NAME` does not need a sandbox
+`--proxy` flag. Unlike the launcher, the browser always checks the current
+directory's `AGENTS.md` for both `[ports]` and `[network]`; `--policy` only adds
+to that.
 
 Live rules added during a session are not written back automatically. The exit
 summary prints a TOML block that can be added to `AGENTS.md` for project-specific
-access or merged into a profile for reuse.
+access or merged into a policy file for reuse.

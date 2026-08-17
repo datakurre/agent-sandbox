@@ -7,7 +7,7 @@
 //! cannot bound, because the proxy governs what the *sandbox* connects to and a
 //! browser on the host fetches on its own account.  So this command starts a
 //! browser that carries a policy of its own -- the same `agent-sandbox-proxy`
-//! binary, the same policy file format, the same `ctl proxy allow` escalation,
+//! binary, the same policy file format, the same `ctl policy allow` escalation,
 //! the same connection log and exit summary.
 //!
 //! Two layers, and they are not equals:
@@ -28,8 +28,8 @@
 //! CDP, which is the threat this is for.
 
 use super::resolve::*;
-use crate::agents::{format_proxy_policy, parse_proxy, parse_proxy_profile, ProxyPolicy};
-use crate::launch::{proxy_profile_path, BASELINE_DENY_IPS};
+use crate::agents::{format_proxy_policy, parse_policy_file, parse_proxy, ProxyPolicy};
+use crate::launch::{policy_path, BASELINE_DENY_IPS};
 use crate::net_summary;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -78,14 +78,9 @@ pub struct BrowserArgs {
     #[arg(
         long,
         value_name = "NAME",
-        help = "Merge a host-owned network profile; repeatable"
+        help = "Merge a host-owned network policy; repeatable"
     )]
-    pub proxy_profile: Vec<String>,
-    #[arg(
-        long,
-        help = "Also merge the [network] block from AGENTS.md in the current directory"
-    )]
-    pub network: bool,
+    pub policy: Vec<String>,
     #[arg(
         long,
         help = "Do not seed the allow list from ports (neither AGENTS.md [ports] nor a running sandbox's published ports)"
@@ -128,8 +123,8 @@ pub struct BrowserArgs {
 }
 
 /// Session names end up in a directory name, `AGENT_SANDBOX_BROWSER_CDP_PORT`'s
-/// value and a `ctl proxy --browser` argument, so they are checked the same way
-/// a proxy profile name is rather than joined blindly.
+/// value and a `ctl policy --browser` argument, so they are checked the same way
+/// a policy name is rather than joined blindly.
 pub fn valid_session_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
@@ -229,9 +224,10 @@ pub fn declared_loopback_ports(text: &str) -> std::result::Result<Vec<u16>, Stri
 
 /// Turn everything the operator named into one ordered rule list.
 ///
-/// Order is additive and deliberately boring -- published ports, then profiles
-/// and `AGENTS.md`, then `--allow` -- because the proxy resolves specificity
-/// itself and a rule's position in the file has never meant anything.
+/// Order is additive and deliberately boring -- published ports, then
+/// `AGENTS.md` and policies, then `--allow` -- because the proxy resolves
+/// specificity itself and a rule's position in the file has never meant
+/// anything.
 pub fn build_allow_list(
     published: &[u16],
     declared: &ProxyPolicy,
@@ -251,7 +247,7 @@ pub fn build_allow_list(
 
     // `format_proxy_policy` renders a whole file, header and `default` line
     // included; only the rule lines are wanted here.
-    for line in format_proxy_policy(declared, "AGENTS.md and proxy profiles").lines() {
+    for line in format_proxy_policy(declared, "AGENTS.md and policies").lines() {
         let line = line.trim_end();
         if is_rule_line(line) {
             rules.push(line.to_string());
@@ -269,7 +265,7 @@ pub fn build_allow_list(
 /// The lines of a policy file that grant something, as opposed to its header,
 /// its `default` line and the built-in denies.  One definition, because both
 /// layers are derived from it: the allow list at launch and the `URLAllowlist`
-/// rewritten after every `ctl proxy` edit.
+/// rewritten after every `ctl policy` edit.
 fn is_rule_line(line: &str) -> bool {
     let line = line.trim_end();
     line.starts_with("allow_host ")
@@ -278,28 +274,29 @@ fn is_rule_line(line: &str) -> bool {
         || line.starts_with("allow_route\t")
 }
 
-/// `--allow` takes what `ctl proxy allow` takes, so the two are one thing to
+/// `--allow` takes what `ctl policy allow` takes, so the two are one thing to
 /// learn.  A bare port is not accepted here: on the host it would mean "this
 /// port on every host", which is never what someone testing a local app wants.
 fn explicit_allow_line(target: &str) -> String {
-    let host = target.split(':').next().unwrap_or(target);
-    if crate::agents::is_ip_or_cidr(host) {
+    let (host, ports) = crate::agents::parse_host_port(target);
+    if crate::agents::is_ip_or_cidr(&host) {
         // `allow_ip` wants a CIDR; a bare address is a /32 or /128.
-        let (addr, ports) = match target.rsplit_once(':') {
-            Some((a, p)) if !a.is_empty() && p.chars().all(|c| c.is_ascii_digit() || c == '-') => {
-                (a, Some(p))
-            }
-            _ => (target, None),
-        };
-        let cidr = if addr.contains('/') {
-            addr.to_string()
-        } else if addr.contains(':') {
-            format!("{}/128", addr)
+        let cidr = if host.contains('/') {
+            host
+        } else if host.contains(':') && ports.is_some() {
+            // The proxy accepts a bare IPv6 address as a /128, while its
+            // host-with-port syntax requires the address to stay bracketed.
+            host
+        } else if host.contains(':') {
+            format!("{}/128", host)
         } else {
-            format!("{}/32", addr)
+            format!("{}/32", host)
         };
         match ports {
-            Some(p) => format!("allow_ip {}:{}", cidr, p),
+            Some(p) => format!(
+                "allow_ip {}",
+                crate::agents::format_host_port(&cidr, Some(&p))
+            ),
             None => format!("allow_ip {}", cidr),
         }
     } else {
@@ -406,13 +403,13 @@ fn single_port(ports: Option<&str>) -> Option<&str> {
 
 /// The managed policy file, relative to a browser's runtime directory.  Named
 /// once because two commands write it now: this one at launch, and
-/// `ctl proxy` whenever it widens a running browser's policy.
+/// `ctl policy` whenever it widens a running browser's policy.
 pub const MANAGED_POLICY_PATH: &str = "policies/managed/agent-sandbox.json";
 
 /// Rewrite a running browser's `URLAllowlist` to match a new policy.
 ///
 /// Layer 2 was written once, before Chromium started, and never again -- so
-/// `ctl proxy allow <host> --browser`, which the docs offer as the way to widen
+/// `ctl policy allow <host> --browser`, which the docs offer as the way to widen
 /// a browser *while it runs*, widened only the proxy and left the browser
 /// refusing the same host with `ERR_BLOCKED_BY_ADMINISTRATOR`.  The two layers
 /// are supposed to describe one permission; this keeps that true after launch.
@@ -692,13 +689,13 @@ fn port_is_free(port: u16) -> bool {
 
 // ── Discovery ───────────────────────────────────────────────────────────────
 
-/// A browser this user has running, as `ctl proxy --browser` sees it.
+/// A browser this user has running, as `ctl policy --browser` sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instance {
     /// The runtime directory, which is also the policy directory.
     pub dir: String,
     /// The session name -- `--name`, or a uuid8 when it was left out.  What
-    /// `ctl proxy --browser NAME` and `--browser=NAME` match on.
+    /// `ctl policy --browser NAME` and `--browser=NAME` match on.
     pub name: String,
     pub cdp_port: u16,
     pub pid: u32,
@@ -708,7 +705,7 @@ pub struct Instance {
 ///
 /// A crashed browser can leave its runtime directory behind -- `Drop` does not
 /// run on SIGKILL -- so liveness is checked rather than assumed, and the stale
-/// directory is swept while we are here.  Otherwise `ctl proxy allow --browser`
+/// directory is swept while we are here.  Otherwise `ctl policy allow --browser`
 /// would report an ambiguity between a live browser and a dead one.
 pub fn running_instances() -> Vec<Instance> {
     let runtime_root = std::env::var("XDG_RUNTIME_DIR")
@@ -888,27 +885,31 @@ pub fn run(args: BrowserArgs) -> Result<()> {
         ports.into_iter().collect()
     };
 
-    // Declared rules: profiles first, then AGENTS.md if asked for.  Same
-    // parsers and same merge order the launcher uses.
+    // Declared rules: AGENTS.md's [network] block always, same as the ports
+    // above, then any --policy files on top.  Same parsers and same merge
+    // order the launcher uses.
     let mut declared = ProxyPolicy {
         default: vec!["deny".to_string()],
         ..Default::default()
     };
-    for name in &args.proxy_profile {
-        let path = proxy_profile_path(&home, name).map_err(|e| anyhow::anyhow!(e))?;
-        let text = fs::read_to_string(&path).with_context(|| {
-            format!("cannot read proxy profile '{}' ({})", name, path.display())
-        })?;
-        let policy = parse_proxy_profile(&text)
-            .map_err(|e| anyhow::anyhow!("invalid proxy profile '{}': {}", name, e))?;
-        declared.merge(policy);
+    if let Ok(text) = fs::read_to_string("AGENTS.md") {
+        match parse_proxy(&text) {
+            Ok(policy) => declared.merge(policy),
+            // A note, not an error: every other AGENTS.md failure in this
+            // command is one too, and refusing to start a browser over a
+            // block it only reads opportunistically would be its own bug.
+            Err(e) => eprintln!(
+                "browser: invalid [network] block in AGENTS.md ({}); not merged",
+                e
+            ),
+        }
     }
-    if args.network {
-        let path = PathBuf::from("AGENTS.md");
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        let policy =
-            parse_proxy(&text).map_err(|e| anyhow::anyhow!("invalid [network] block: {}", e))?;
+    for name in &args.policy {
+        let path = policy_path(&home, name).map_err(|e| anyhow::anyhow!(e))?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("cannot read policy '{}' ({})", name, path.display()))?;
+        let policy = parse_policy_file(&text)
+            .map_err(|e| anyhow::anyhow!("invalid policy '{}': {}", name, e))?;
         declared.merge(policy);
     }
 
@@ -930,7 +931,7 @@ pub fn run(args: BrowserArgs) -> Result<()> {
 
     // A name is how one of several concurrent sessions is addressed later, so
     // a collision with a live one is refused rather than resolved: reusing the
-    // name would make `ctl proxy allow --browser alice` ambiguous, and sharing
+    // name would make `ctl policy allow --browser alice` ambiguous, and sharing
     // the directory would have two proxies writing one policy file.
     let session = match &args.name {
         Some(name) => {
@@ -1092,7 +1093,7 @@ fn resolve_target(args: &BrowserArgs) -> std::result::Result<String, String> {
         Ok(Err(_)) => Ok(String::new()),
         Err(e) => Err(format!(
             "cannot ask podman what is running ({}); the allow list comes from \
-             --allow and profiles only",
+             --allow, AGENTS.md and policies only",
             e
         )),
     }
@@ -1124,7 +1125,7 @@ fn runtime_root() -> String {
 }
 
 /// The per-invocation directory, named after the session so it is legible in
-/// `ls` and so `ctl proxy --browser alice` has something to match.  Unnamed
+/// `ls` and so `ctl policy --browser alice` has something to match.  Unnamed
 /// sessions fall back to a uuid, which is what several concurrent browsers used
 /// to get in every case.
 fn make_runtime_dir(name: &str) -> Result<String> {
@@ -1171,7 +1172,7 @@ fn print_banner(session: &str, cdp_port: u16, allow: &AllowList, sandbox: Option
         eprintln!("browser: allowed: {}", allowed.join(" "));
     }
     eprintln!(
-        "browser:   agent-sandbox ctl proxy allow <host>:443 --browser {}",
+        "browser:   agent-sandbox ctl policy allow <host>:443 --browser {}",
         session
     );
     eprintln!("browser:");
@@ -1312,7 +1313,7 @@ mod tests {
 
     #[test]
     fn widening_a_running_browser_reaches_the_managed_layer_too() {
-        // Layer 2 was written once at launch, so `ctl proxy allow --browser`
+        // Layer 2 was written once at launch, so `ctl policy allow --browser`
         // widened the proxy and left the browser refusing the same host.
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().to_string_lossy().to_string();
@@ -1422,6 +1423,20 @@ mod tests {
                 "allow_ip 192.168.0.0/16:8080",
             ]
         );
+    }
+
+    #[test]
+    fn bracketed_ipv6_allows_remain_parseable() {
+        let allow = build_allow_list(
+            &[],
+            &ProxyPolicy::default(),
+            &["[::1]:4000".to_string()],
+        );
+        assert_eq!(allow.rules, vec!["allow_ip [::1]:4000"]);
+        let text = policy_file(&allow);
+        let config = agent_sandbox_proxy::policy::parse_policy(&text)
+            .expect("bracketed IPv6 policy must parse");
+        assert!(config.is_allowed("::1", 4000));
     }
 
     #[test]

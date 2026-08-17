@@ -21,7 +21,7 @@ metadata:
 - **Bind a server behind a published port to `0.0.0.0`**, not `127.0.0.1` —
   publishing forwards to the sandbox's interface address, not its loopback.
 - A denied host is the sandbox's egress policy working as intended — ask the
-  user for `ctl proxy allow`, don't unset the proxy or add a browser-level
+  user for `ctl policy allow`, don't unset the proxy or add a browser-level
   proxy of your own to route around it.
 
 # Two browsers, and which one you want
@@ -65,7 +65,7 @@ re-running this costs nothing after the first time within a session.
 
 Under `--proxy`, that first run needs `cache.nixos.org:443` allowed — the same
 requirement any other on-demand nixpkgs fetch has under the sandbox's egress
-policy (see the `nix` skill). Ask the user for `ctl proxy allow` if it's
+policy (see the `nix` skill). Ask the user for `ctl policy allow` if it's
 denied.
 
 For the raw `nix build`/`nix shell` invocation instead — extra fonts, or
@@ -184,7 +184,7 @@ browser = p.chromium.launch(headless=True, proxy=proxy, args=[...])
 ```
 
 A denied host is policy working as configured — ask the user to run
-`agent-sandbox ctl proxy allow <host>:443` on the host, the same escalation the
+`agent-sandbox ctl policy allow <host>:443` on the host, the same escalation the
 `agent-sandbox` skill teaches. Don't unset the proxy or add `--no-proxy-server`
 to route around it.
 
@@ -212,7 +212,7 @@ What they'll see:
 $ agent-sandbox browser
 browser: 'e4c1a80f' -- CDP on 127.0.0.1:9222, egress deny-by-default
 browser: allowed: 127.0.0.1:3000
-browser:   agent-sandbox ctl proxy allow <host>:443 --browser e4c1a80f
+browser:   agent-sandbox ctl policy allow <host>:443 --browser e4c1a80f
 browser:
 browser: now run, keeping whatever flags you already use:
 browser:   agent-sandbox --browser -- claude
@@ -228,17 +228,18 @@ github:datakurre/agent-sandbox#browser` runs it with a pinned one.
 ## What it can reach
 
 With no arguments the browser's allow list is **the loopback ports the running
-sandbox publishes, and nothing else** — so it can load the app under test and
-not the internet. That is the common case for UI work and needs no
-configuration.
+sandbox publishes, plus whatever the current directory's `AGENTS.md` declares
+in `[ports]` and `[network]`, and nothing else** — so it can load the app
+under test and not the internet. That is the common case for UI work and
+needs no configuration.
 
 Anything wider is opt-in, and the escalation is the same shape as everywhere
 else — ask the user, don't route around it:
 
 ```sh
-agent-sandbox ctl proxy allow example.com:443 --browser   # applies within a second, no restart
+agent-sandbox ctl policy allow example.com:443 --browser   # applies within a second, no restart
 agent-sandbox browser --allow example.com:443             # or up front, at start
-agent-sandbox browser --proxy-profile development         # or a reusable profile
+agent-sandbox browser --policy development                # or a reusable policy
 ```
 
 A denied host shows up as a failed request in the page, and appears in the
@@ -314,7 +315,7 @@ b_page.reload()                                    # bob should now see it
 `--keep-profile` is what makes a login survive: without it every session starts
 signed out, which is right for a disposable browser and wrong for a scenario you
 re-run. Each session also has its own allow list —
-`agent-sandbox ctl proxy allow <host>:443 --browser alice` widens only alice.
+`agent-sandbox ctl policy allow <host>:443 --browser alice` widens only alice.
 
 ## What this does and does not bound
 

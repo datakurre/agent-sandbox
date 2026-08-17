@@ -195,7 +195,7 @@ let
     ++ podmanStack
     # No agent-sandbox-allow: policy now lives on a volume the sandbox cannot
     # see, so widening the firewall is a host-side operation
-    # (agent-sandbox ctl proxy allow) by design.
+    # (agent-sandbox ctl policy allow) by design.
     ++ [ dockerAlias sidecarScript proxyScript playwrightPython ]
     ++ relayScripts;
 

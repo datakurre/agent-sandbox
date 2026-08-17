@@ -33,5 +33,5 @@ assert_contains "$mounts" "(none)" "ctl mounts on a sandbox with no added binds"
 
 # An unproxied sandbox has no sidecar, and ctl must say so rather than
 # resolving to some other session's proxy.
-out="$("$AS" ctl proxy show "$word" 2>&1 || true)"
+out="$("$AS" ctl policy show "$word" 2>&1 || true)"
 assert_not_contains "$out" "allow " "the policy of a sandbox launched without --proxy"

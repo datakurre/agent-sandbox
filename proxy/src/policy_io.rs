@@ -26,7 +26,7 @@ fn deny_ip_lines(text: &str) -> std::collections::BTreeSet<String> {
 /// never observes a half-written policy.
 ///
 /// Denies are built-in only.  This is the single writer behind every
-/// `agent-sandbox ctl proxy` mutation and every TUI edit, so refusing any
+/// `agent-sandbox ctl policy` mutation and every TUI edit, so refusing any
 /// change to the `deny_ip` set here is what fixes the baseline at launch:
 /// the ranges protecting the host and its LAN can be neither removed nor
 /// added to for the life of the sandbox.  Widening is still possible, and
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn dropping_a_baseline_deny_is_refused() {
         // The whole point of "denies are built-in only": no live edit, from
-        // `ctl proxy` or the TUI, can take a baseline range out.
+        // `ctl policy` or the TUI, can take a baseline range out.
         let dir = sandbox_dir();
         let err = install(&dir, &["allow_host github.com", "deny_ip 127.0.0.0/8"])
             .expect_err("removing a baseline deny must be refused");
@@ -164,6 +164,6 @@ mod tests {
         let dir = sandbox_dir();
         let base = fs::read_to_string(dir.path().join("policy")).expect("read");
         let lines: Vec<&str> = base.lines().collect();
-        install(&dir, &lines).expect("`ctl proxy reset` must pass the guard");
+        install(&dir, &lines).expect("`ctl policy reset` must pass the guard");
     }
 }

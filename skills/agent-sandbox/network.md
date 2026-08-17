@@ -6,11 +6,11 @@ relevant.
 
 ## Before you start
 
-- **There is no `deny` key and no `ctl proxy deny`.** The firewall is
+- **There is no `deny` key and no `ctl policy deny`.** The firewall is
   deny-by-default already; denying something already denied is a no-op.
 - **Ports matter.** `"github.com:443"` is not the same as `"github.com"` —
   the latter falls back to just 80/443/22.
-- **Most changes are live** (`ctl proxy allow/rm/reset`, `ctl mounts`); an L7
+- **Most changes are live** (`ctl policy allow/rm/reset`, `ctl mounts`); an L7
   route needing TLS interception, `[ports]`, `--secrets`, and any launch flag
   need a **relaunch** — see the table near the bottom before promising either.
 - **Don't propose `"*"` or a bare `"*:443"`** to work around one missing
@@ -76,20 +76,21 @@ If you need one that is not listed, ask the user to relaunch with
 `agent-sandbox --host-loopback-port PORT`; it cannot be turned on in a running
 session. Note that this works under `--proxy` and that what it reaches is *not*
 covered by the egress policy — so it is not a way around a denied host. For that
-the answer is still `ctl proxy allow`.
+the answer is still `ctl policy allow`.
 
 ## Where the policy comes from
 
 | Launch flags | Policy |
 | --- | --- |
-| `--proxy` | the workspace `AGENTS.md` only |
-| `--proxy-profile NAME` | `~/.config/agent-sandbox/profiles/NAME.toml` only; implies `--proxy` |
-| both | merged additively |
+| `--proxy` | the workspace `AGENTS.md`, plus `~/.config/agent-sandbox/policies/<agent>.toml` if it exists for the launched agent |
+| `--proxy --policy NAME` | the above, plus `~/.config/agent-sandbox/policies/NAME.toml`, merged additively |
 
-Profiles are host-owned and never loaded implicitly; `AGENTS.md` is
-project-controlled and therefore untrusted. Neither can express a deny — the
-firewall is deny-by-default and the only deny rules are the built-in private and
-loopback ranges.
+`--policy` requires `--proxy`; using it alone refuses the launch. Policies are
+host-owned; `AGENTS.md` is project-controlled and therefore untrusted. The
+agent-named policy is the one thing loaded implicitly — it applies whenever
+`--proxy` is used with that agent, with no flag needed. Neither can express a
+deny — the firewall is deny-by-default and the only deny rules are the
+built-in private and loopback ranges.
 
 ## Writing a policy block
 
@@ -163,7 +164,7 @@ a full relaunch. These are rejected (messages quoted from the parser):
   `host 'api.github.com:443' is allowed broadly, making the non-secret
   [[network.allowed_routes]] ineffective. Remove the rule or add a secret.`
 
-There is no `deny` key and no `ctl proxy deny` — denying something already denied
+There is no `deny` key and no `ctl policy deny` — denying something already denied
 is a no-op.
 
 ## The loop the user drives
@@ -172,10 +173,10 @@ All of this runs on the host, in another terminal:
 
 ```sh
 agent-sandbox ctl tui                       # live denials, approve interactively
-agent-sandbox ctl proxy allow HOST:PORT     # allow, immediately
-agent-sandbox ctl proxy show                # the effective policy
-agent-sandbox ctl proxy check HOST:PORT     # dry-run a target
-agent-sandbox ctl proxy export >> AGENTS.md # persist the session's policy
+agent-sandbox ctl policy allow HOST:PORT     # allow, immediately
+agent-sandbox ctl policy show                # the effective policy
+agent-sandbox ctl policy check HOST:PORT     # dry-run a target
+agent-sandbox ctl policy export >> AGENTS.md # persist the session's policy
 agent-sandbox ctl net                       # per-host traffic summary
 agent-sandbox ctl logs -f                   # the proxy's log, denials as they happen
 agent-sandbox ctl relay                     # what the SSH/GPG relay allowed or refused
@@ -212,8 +213,8 @@ inside — if you need to know what was denied, ask the user to run `ctl logs` o
 
 | Change | Applies |
 | --- | --- |
-| `ctl proxy allow` / `rm` / `reset` | live, immediately |
-| SSH relay authorization (`ctl proxy allow <host>:22`) | live — the relay re-reads the policy on every call |
+| `ctl policy allow` / `rm` / `reset` | live, immediately |
+| SSH relay authorization (`ctl policy allow <host>:22`) | live — the relay re-reads the policy on every call |
 | `ctl mounts add` / `rm` | live (not under `--krun`) |
 | A new L7 route needing TLS interception | **relaunch** (session CA is mounted at launch) |
 | `[ports]` | **relaunch** |
@@ -222,7 +223,7 @@ inside — if you need to know what was denied, ask the user to run `ctl logs` o
 | Edits to `AGENTS.md` | **relaunch** |
 
 Say which of the two a request needs. Asking a user to relaunch when
-`ctl proxy allow` would have done it wastes their session; the reverse leaves
+`ctl policy allow` would have done it wastes their session; the reverse leaves
 them with certificate errors.
 
 ## Diagnosing from inside

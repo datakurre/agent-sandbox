@@ -47,11 +47,8 @@ agent-sandbox --workspace opencode
 # Add a network firewall enforced by this project's AGENTS.md [network] block
 agent-sandbox --workspace --proxy opencode
 
-# Use a reusable host-owned profile instead of AGENTS.md
-agent-sandbox --workspace --proxy-profile development opencode
-
-# Merge a profile with AGENTS.md (additive)
-agent-sandbox --workspace --proxy --proxy-profile development opencode
+# Merge a reusable host-owned policy with AGENTS.md (--policy requires --proxy)
+agent-sandbox --workspace --proxy --policy development opencode
 
 # Reattach to a running sandbox
 agent-sandbox ctl attach
@@ -77,7 +74,7 @@ agent-sandbox --workspace --browser -- claude
 | Publish a port declared in `AGENTS.md` | `--ports` + `[ports]` in `AGENTS.md` |
 | Mount extra paths, or persist agent state | `--mounts` + `[mounts]` in `AGENTS.md`, or `--agent-mounts` |
 | Allow specific outbound network traffic | `--proxy` + `[network]` in `AGENTS.md` |
-| Use a reusable host-owned network profile | `--proxy-profile NAME` |
+| Merge a reusable host-owned network policy | `--proxy --policy NAME` |
 | Forward SSH keys (e.g. for `git push`) | `--ssh` |
 | Forward GPG agent (e.g. for signed commits) | `--gpg` |
 | Run nested containers inside the sandbox | `--privileged` |

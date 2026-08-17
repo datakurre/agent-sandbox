@@ -45,11 +45,8 @@ agent-sandbox --workspace opencode
 # Add a deny-by-default network firewall enforced by this project's AGENTS.md
 agent-sandbox --workspace --proxy opencode
 
-# Use a reusable host-owned profile instead of AGENTS.md
-agent-sandbox --workspace --proxy-profile development opencode
-
-# Merge a reusable profile with AGENTS.md (additive)
-agent-sandbox --workspace --proxy --proxy-profile development opencode
+# Merge a reusable host-owned policy with AGENTS.md (--policy requires --proxy)
+agent-sandbox --workspace --proxy --policy development opencode
 
 # Reattach to a running sandbox
 agent-sandbox ctl attach

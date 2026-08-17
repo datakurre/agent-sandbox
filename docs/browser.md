@@ -14,7 +14,7 @@ starts a browser that carries a deny-by-default allow list of its own.
 $ agent-sandbox browser
 browser: 'e4c1a80f' -- CDP on 127.0.0.1:9222, egress deny-by-default
 browser: allowed: 127.0.0.1:3000
-browser:   agent-sandbox ctl proxy allow <host>:443 --browser e4c1a80f
+browser:   agent-sandbox ctl policy allow <host>:443 --browser e4c1a80f
 browser:
 browser: now run, keeping whatever flags you already use:
 browser:   agent-sandbox --browser -- claude
@@ -27,7 +27,7 @@ first — the channel is established at launch and cannot be added to a running
 sandbox.
 
 It is the same `agent-sandbox-proxy` the sidecar runs, with the same policy
-format, the same `ctl proxy` commands, and the same traffic summary when the
+format, the same `ctl policy` commands, and the same traffic summary when the
 browser closes. The profile is ephemeral and holds none of your logins.
 
 With no arguments the allow list is **the loopback ports of the app under test,
@@ -43,24 +43,24 @@ in `[network]`. A declared port the sandbox never publishes is still reachable
 from this browser, so `[ports]` in a repo you do not trust is worth the same
 glance as `[mounts]`.
 
-Widen it beyond the app up front, or while it runs:
+`AGENTS.md` in the current directory is always consulted, the same way it is
+for `[ports]`: its `[network]` block, if any, merges into the browser's allow
+list without a flag. Widen it further, up front or while it runs:
 
 ```sh
 agent-sandbox browser --allow example.com:443       # at start
-agent-sandbox browser --proxy-profile development   # a reusable profile
-agent-sandbox browser --network                     # AGENTS.md's [network] block
-agent-sandbox ctl proxy allow example.com:443 --browser   # while it runs
+agent-sandbox browser --policy development          # a reusable policy
+agent-sandbox ctl policy allow example.com:443 --browser   # while it runs
 ```
 
-`ctl proxy allow --browser` updates both layers — the proxy within a second,
+`ctl policy allow --browser` updates both layers — the proxy within a second,
 and the browser's own managed allow list, which Chromium re-reads.
 
 | Flag | What it does |
 | --- | --- |
 | `--cdp-port PORT` | where CDP listens; walks up from 9222 if taken |
 | `--allow HOST[:PORT]` | allow a domain, IP/CIDR or host:port; repeatable |
-| `--proxy-profile NAME` | merge a host-owned profile, the same files `--proxy-profile` takes |
-| `--network` | also merge `[network]` from `AGENTS.md` in the current directory |
+| `--policy NAME` | merge a host-owned policy, the same files the launcher's `--policy` takes |
 | `--no-published-ports` | do not seed the allow list from ports at all — neither `AGENTS.md`'s `[ports]` nor a running sandbox's published ones |
 | `--extension DIR` | load an unpacked extension; repeatable |
 | `--no-extensions` | load none, including any built into the wrapper |
@@ -113,7 +113,7 @@ Each session also has its own allow list, so widening one does not widen the
 others:
 
 ```sh
-agent-sandbox ctl proxy allow shop.example:443 --browser alice
+agent-sandbox ctl policy allow shop.example:443 --browser alice
 ```
 
 A name is required only when more than one browser is running; with one,

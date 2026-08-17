@@ -242,10 +242,10 @@ left out -- the same shape as the host-port directory:
 | `connections.jsonl`, `denied-requests.jsonl` | the proxy's own logs |
 | `policies/managed/agent-sandbox.json` | the Chromium managed policy, bound into place by bwrap |
 | `profile/` | Chromium's `--user-data-dir` |
-| `meta.json` | session name, CDP port, proxy port and pid, so `ctl proxy --browser` and the launcher's `--browser` can find it |
+| `meta.json` | session name, CDP port, proxy port and pid, so `ctl policy --browser` and the launcher's `--browser` can find it |
 
 Reusing the policy file trio rather than inventing a format is what makes
-`agent-sandbox ctl proxy allow --browser` work with no new machinery:
+`agent-sandbox ctl policy allow --browser` work with no new machinery:
 `install_policy` validates and swaps the file atomically, and the proxy's
 existing watcher picks it up within a second.  The managed policy is rewritten
 by the same command, in place and by rename, so the two layers never hold
@@ -265,11 +265,13 @@ None of them is mounted into the sandbox — `ca.pem` is bound in as a single
 file, not by exposing its directory. That is deliberate and load-bearing: the
 agent must not be able to widen the firewall that contains it, nor rewrite the
 log of what it did. Changing policy is therefore a host-side operation
-(`agent-sandbox ctl proxy`), which is why the old in-container
+(`agent-sandbox ctl policy`), which is why the old in-container
 `agent-sandbox-allow` was deleted rather than repaired.
 
 **Policy format.** The proxy enforces the merged declarative `[network]` blocks
-from `AGENTS.md` and any explicitly selected host-owned profiles.
+from `AGENTS.md`, any explicitly selected host-owned policies (`--policy`), and
+the launched agent's own policy file if one exists
+(`~/.config/agent-sandbox/policies/<agent>.toml`).
 `[network].allowed_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
 with a port, a port range, or a comma-separated list of both; an entry written
 without one is matched against the compiled-in `DEFAULT_ALLOW_PORTS`
@@ -284,7 +286,7 @@ the launch rather than being ignored.
 The launcher merges and compiles those blocks into the flat, line-oriented policy file the
 proxy reads (`allow_host`, `allow_ip`, `allow_port`, `allow_route`,
 `secret_route`, `allow_signing`, `deny_ip`, `default`), which is also the
-format `agent-sandbox ctl proxy` edits in place. `signing_enabled` is a ninth
+format `agent-sandbox ctl policy` edits in place. `signing_enabled` is a ninth
 key in that same file, but it is never compiled from `AGENTS.md` -- the
 launcher writes it directly whenever `--gpg` is passed, independent of any
 `[network]` content (see Relay Architecture below).  `secret_route` records a
@@ -297,9 +299,9 @@ ports of every line tied at the winning specificity, so both are in force.
 file, the proxy reads it, and the host-side `proxy` command vets its own writes
 with the same parser, so there is no second implementation to drift.
 
-`agent-sandbox ctl proxy export` prints that policy back as a fenced
+`agent-sandbox ctl policy export` prints that policy back as a fenced
 ```` ```toml agent-sandbox ```` block, since the launcher parses configuration
-only inside that fence; `--plain` drops it for a `--proxy-profile` file, which is
+only inside that fence; `--plain` drops it for a `--policy` file, which is
 plain TOML.  `ctl mounts export` emits the same fence.
 
 The two JSONL streams under `/sidecar_shared` are bounded — `connections.jsonl`
@@ -352,7 +354,7 @@ The mount is gated on the launch policy actually carrying an `allow_route` line.
 With none, `skip_l7` is true for every host and the leaf issuer is never
 reached, so a CA in the sandbox's trust store would grant the proxy the ability
 to intercept anything for no purpose. The cost is that an L7 rule added
-mid-session has no CA behind it; `ctl proxy allow --l7` and the TUI's `h` warn
+mid-session has no CA behind it; `ctl policy allow --l7` and the TUI's `h` warn
 rather than failing later at certificate validation.
 
 The launcher appends a baseline `deny_ip` list (loopback, RFC1918, link-local,
@@ -382,7 +384,7 @@ The sidecar sits on the default bridge as well as the sandbox's internal network
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as
 ordinary `deny_ip` entries rather than compiling it into the proxy means one
-list, visible in `proxy show`, restored by `reset`, and mirrored into the
+list, visible in `policy show`, restored by `reset`, and mirrored into the
 kernel routes by the same `sync_routes` that handles user rules.
 An `allow_ip` entry of equal or greater specificity overrides one of them; that
 is why `is_denied_address` breaks prefix ties toward allow.
@@ -396,7 +398,7 @@ handled by not installing the blackhole at all.  Until it did this, a re-allowed
 range -- including the documented `allowed_hosts = ["10.0.0.0/8"]` for corporate
 git over a VPN, which compiles to `allow_ip` against the baseline -- was
 permitted by the proxy and then dropped on the floor by the route, with
-`proxy show` reporting the rule as in force.
+`policy show` reporting the rule as in force.
 
 The sidecar's nameservers, read from its own `/etc/resolv.conf`, are exempted
 unconditionally.  Resolution happens in the sidecar via libc, before any rule is

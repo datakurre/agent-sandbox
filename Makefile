@@ -13,10 +13,12 @@ unittest:
 # Alias, for muscle memory.
 test: unittest
 
-# Needs a real podman, so it only runs on the host.  See tests/integration.
+# Needs a real podman, so it only runs on the host.  Build and load the image
+# first with: make -C tests/integration image
 integration:
 	$(MAKE) -C tests/integration integration
 
+# Build and load the image first with: make -C tests/integration image
 acceptance:
 	$(MAKE) -C tests/integration acceptance
 

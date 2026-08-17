@@ -816,6 +816,18 @@ fn connect_any(addrs: &[SocketAddr], retry_until: Instant) -> Result<TcpStream, 
     }
 }
 
+/// Remove addresses the policy forbids after DNS resolution. A hostname may
+/// resolve to both permitted and denied addresses, as `localhost` commonly
+/// does with `::1` and `127.0.0.1`; rejecting the whole result would make the
+/// safe address unusable.
+fn permitted_resolved_addresses(config: &ProxyConfig, addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    addrs
+        .iter()
+        .copied()
+        .filter(|addr| !config.is_denied_address(addr.ip()))
+        .collect()
+}
+
 /// Serve one client connection to completion.
 ///
 /// `ingress` decides only how the destination is learned and whether the peer
@@ -974,10 +986,16 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
         }
     };
 
-    // The policy check above ran on the name.  Re-check what it actually
+    // The policy check above ran on the name. Re-check what it actually
     // resolves to, so a denied address cannot be reached via an allowed (or
-    // merely unlisted) hostname.
-    if let Some(bad) = addrs.iter().find(|a| cfg.is_denied_address(a.ip())) {
+    // merely unlisted) hostname. Keep permitted results when DNS returned a
+    // mixture of safe and denied addresses.
+    let permitted_addrs = permitted_resolved_addresses(&cfg, &addrs);
+    if permitted_addrs.is_empty() {
+        let bad = addrs
+            .iter()
+            .find(|a| cfg.is_denied_address(a.ip()))
+            .expect("non-empty DNS results have a denied address here");
         let reason = cfg.why_address_denied(bad.ip());
         reply(&mut client_sock, ingress, b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} ({})", host, port, reason);
@@ -998,7 +1016,7 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
         return;
     }
 
-    let mut remote_sock = match connect_any(&addrs, shared.startup_until) {
+    let mut remote_sock = match connect_any(&permitted_addrs, shared.startup_until) {
         Ok(s) => s,
         Err(e) => {
             reply(&mut client_sock, ingress, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
@@ -1575,7 +1593,7 @@ fn reload_once(path: &str, shared: &Shared) -> bool {
 /// Polling rather than inotify or a signal: `forbid(unsafe_code)` rules out a
 /// hand-rolled handler, `signal_hook` would be the crate's only dependency, and
 /// one `stat` a second is free.  A second is also below the threshold where a
-/// human running `proxy allow` and immediately retrying would notice.
+/// human running `policy allow` and immediately retrying would notice.
 fn watch_policy(path: String, shared: Arc<Shared>) {
     let mut current = policy_stamp(&path);
     loop {
@@ -2340,6 +2358,33 @@ mod tests {
     }
 
     #[test]
+    fn resolved_address_check_keeps_permitted_results_from_a_mixed_lookup() {
+        let c = cfg(
+            "localhost:18096",
+            "",
+            "127.0.0.1/32:18096",
+            "127.0.0.0/8,::1/128",
+        );
+        let addrs = [
+            "[::1]:18096".parse().unwrap(),
+            "127.0.0.1:18096".parse().unwrap(),
+        ];
+
+        assert_eq!(permitted_resolved_addresses(&c, &addrs), vec![addrs[1]]);
+    }
+
+    #[test]
+    fn resolved_address_check_rejects_when_every_result_is_denied() {
+        let c = cfg("localhost:18096", "", "", "127.0.0.0/8,::1/128");
+        let addrs = [
+            "[::1]:18096".parse().unwrap(),
+            "127.0.0.1:18096".parse().unwrap(),
+        ];
+
+        assert!(permitted_resolved_addresses(&c, &addrs).is_empty());
+    }
+
+    #[test]
     fn more_specific_allow_ip_overrides_a_denied_range() {
         let c = cfg("", "", "10.1.0.0/24", "10.0.0.0/8");
         assert!(!c.is_denied_address("10.1.0.5".parse().unwrap()));
@@ -2667,7 +2712,7 @@ mod tests {
 
     #[test]
     fn describe_round_trips_through_parse_policy() {
-        // `proxy show` and the startup log render policy with describe(), and
+        // `policy show` and the startup log render policy with describe(), and
         // the host writes policy files; the two formats must not diverge.
         let original = parse_policy(
             "allow_host github.com\n\

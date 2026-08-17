@@ -1072,7 +1072,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "AGENTS.md's baseline"
                                 };
                                 status_msg = format!(
-                                    "'{}' comes from {} policy and can't be removed here — edit AGENTS.md and relaunch, or `agent-sandbox ctl proxy reset` first",
+                                    "'{}' comes from {} policy and can't be removed here — edit AGENTS.md and relaunch, or `agent-sandbox ctl policy reset` first",
                                     line, label
                                 );
                                 status_kind = StatusKind::Info;

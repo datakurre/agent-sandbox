@@ -270,15 +270,15 @@ pub fn resolve_secrets_logic(
     file: &Path,
     workspace: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    resolve_secrets_logic_with_profiles(policy, config, file, workspace, &[])
+    resolve_secrets_logic_with_policies(policy, config, file, workspace, &[])
 }
 
-pub fn resolve_secrets_logic_with_profiles(
+pub fn resolve_secrets_logic_with_policies(
     policy: &Path,
     config: &Path,
     file: &Path,
     workspace: &Path,
-    profiles: &[std::path::PathBuf],
+    policy_files: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<String>> {
     let secret_routes = policy_secret_routes(policy);
 
@@ -287,8 +287,8 @@ pub fn resolve_secrets_logic_with_profiles(
     }
 
     let mut requested_rules = get_requested_rules(workspace);
-    for profile in profiles {
-        if let Ok(content) = std::fs::read_to_string(profile) {
+    for policy_file in policy_files {
+        if let Ok(content) = std::fs::read_to_string(policy_file) {
             requested_rules.extend(requested_rules_from_toml(&content));
         }
     }

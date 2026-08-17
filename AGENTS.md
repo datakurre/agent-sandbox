@@ -30,7 +30,7 @@ deliberately keeps no second copy to drift out of date.
 | --- | --- |
 | [`docs/index.md`](docs/index.md) | what the project is, installation, quick start |
 | [`docs/usage.md`](docs/usage.md) | every flag, `ctl` subcommands, the TUI, bundled skills, Git integration |
-| [`docs/configuration.md`](docs/configuration.md) | `AGENTS.md` `[ports]`/`[mounts]`/`[network]` syntax, secrets, network profiles |
+| [`docs/configuration.md`](docs/configuration.md) | `AGENTS.md` `[ports]`/`[mounts]`/`[network]` syntax, secrets, network policies |
 | [`docs/trust-model.md`](docs/trust-model.md) | what each flag exposes, what the firewall does and does not cover |
 | [`docs/architecture.md`](docs/architecture.md) | image, entrypoint, launcher call flow, proxy sidecar, policy format, relay, startup ordering |
 | [`docs/development.md`](docs/development.md) | adding an integration, an agent, or an image tool; implementation constraints |

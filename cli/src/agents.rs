@@ -530,6 +530,16 @@ pub fn parse_host_port(s: &str) -> (String, Option<String>) {
     (s.to_string(), None)
 }
 
+pub fn format_host_port(host: &str, port: Option<&str>) -> String {
+    match port {
+        Some(port) if host.contains(':') && !host.starts_with('[') => {
+            format!("[{}]:{}", host, port)
+        }
+        Some(port) => format!("{}:{}", host, port),
+        None => host.to_string(),
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct ProxyPolicy {
     pub allow_host: Vec<String>,
@@ -671,17 +681,14 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
             for item in allow_set {
                 let (host_part, port_part) = parse_host_port(&item);
                 if host_part != "*" {
-                    let combined = match &port_part {
-                        Some(p) => format!("{}:{}", host_part, p),
-                        None => host_part.clone(),
-                    };
+                    let combined = format_host_port(&host_part, port_part.as_deref());
                     if is_ip_or_cidr(&host_part) {
                         if !policy.allow_ip.contains(&combined) {
                             policy.allow_ip.push(combined);
                         }
                     } else {
                         _proxy_domain("[network].allowed_hosts", &host_part)?;
-                        // One line per entry, so `ctl proxy show` and
+                        // One line per entry, so `ctl policy show` and
                         // `rm allow` operate on the entry as it was written --
                         // including a comma-separated port list, which the
                         // proxy parses on one line. The proxy also unions the
@@ -731,10 +738,7 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     let (host_part, port_part) = parse_host_port(host_val);
 
                     if host_part != "*" {
-                        let combined = match &port_part {
-                            Some(p) => format!("{}:{}", host_part, p),
-                            None => host_part.clone(),
-                        };
+                        let combined = format_host_port(&host_part, port_part.as_deref());
                         if is_ip_or_cidr(&host_part) {
                             if !policy.allow_ip.contains(&combined) {
                                 policy.allow_ip.push(combined);
@@ -789,30 +793,31 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
     Ok(policy)
 }
 
-/// Parse a host-owned profile. Profiles are plain TOML rather than Markdown,
-/// but otherwise use exactly the same declarative network syntax as AGENTS.md.
-pub fn parse_proxy_profile(text: &str) -> Result<ProxyPolicy, ConfigError> {
+/// Parse a host-owned policy file. Policy files are plain TOML rather than
+/// Markdown, but otherwise use exactly the same declarative network syntax as
+/// AGENTS.md.
+pub fn parse_policy_file(text: &str) -> Result<ProxyPolicy, ConfigError> {
     let value: Value = text
         .parse()
-        .map_err(|e| ConfigError::msg(format!("malformed TOML in proxy profile: {}", e)))?;
+        .map_err(|e| ConfigError::msg(format!("malformed TOML in policy file: {}", e)))?;
     let table = value
         .as_table()
-        .ok_or_else(|| ConfigError::msg("proxy profile must contain a TOML table"))?;
+        .ok_or_else(|| ConfigError::msg("policy file must contain a TOML table"))?;
     if let Some(unknown) = table.keys().find(|key| *key != "network") {
         return Err(ConfigError::msg(format!(
-            "proxy profile: unknown top-level key '{}'; only [network] is supported",
+            "policy file: unknown top-level key '{}'; only [network] is supported",
             unknown
         )));
     }
     let network = table
         .get("network")
-        .ok_or_else(|| ConfigError::msg("proxy profile must contain a [network] table"))?;
+        .ok_or_else(|| ConfigError::msg("policy file must contain a [network] table"))?;
     if !network.is_table() {
         return Err(ConfigError::msg("[network] must be a table"));
     }
 
     // Reuse the single AGENTS.md validator rather than maintaining a second
-    // parser for the profile format.
+    // parser for the policy file format.
     let wrapped = format!("```toml agent-sandbox\n{}\n```", text);
     parse_proxy(&wrapped)
 }
@@ -854,12 +859,12 @@ pub fn format_proxy_policy(policy: &ProxyPolicy, source: &str) -> String {
 
 /// The reverse of `format_proxy_policy`: renders a running sandbox's current
 /// (possibly live-edited) policy back as an AGENTS.md `[network]` TOML block,
-/// for `agent-sandbox ctl proxy export`.
+/// for `agent-sandbox ctl policy export`.
 ///
 /// Not fully round-trippable: `[network]` only supports `allowed_hosts` (bare
 /// host/IP entries) and `[[network.allowed_routes]]` (`allow_route`), so a non-default
 /// `allow_port` — which can only be added live, via the TUI or
-/// `ctl proxy allow`, never declared in AGENTS.md — is emitted as a trailing
+/// `ctl policy allow`, never declared in AGENTS.md — is emitted as a trailing
 /// advisory comment instead of being silently dropped or invented as an
 /// unsupported TOML key.  `deny_ip` is omitted entirely: the baseline is
 /// built-in, enforced whatever AGENTS.md says, and cannot be changed, so
@@ -970,7 +975,7 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
         out.push_str(
             "# and 'allowed_routes') and were left out of the block above. Re-apply them after\n",
         );
-        out.push_str("# relaunching with `agent-sandbox ctl proxy allow`:\n");
+        out.push_str("# relaunching with `agent-sandbox ctl policy allow`:\n");
         for line in advisory {
             out.push_str(&format!("# {}\n", line));
         }
@@ -1170,7 +1175,7 @@ mod export_tests {
 
     #[test]
     fn the_exit_summary_round_trips_csv_ports() {
-        // `ctl proxy allow github.com:22,443` writes one line, and the exit
+        // `ctl policy allow github.com:22,443` writes one line, and the exit
         // summary renders every live rule back as [network] TOML. That TOML
         // has to be something AGENTS.md accepts, or the advice it prints is
         // advice that does not work.
@@ -1210,8 +1215,8 @@ mod export_tests {
     }
 
     #[test]
-    fn parses_plain_proxy_profiles_with_network_vocabulary() {
-        let policy = parse_proxy_profile(
+    fn parses_plain_policy_files_with_network_vocabulary() {
+        let policy = parse_policy_file(
             "[network]\nallowed_hosts = [\"github.com:443\"]\n\n[[network.allowed_routes]]\nhost = \"api.github.com:443\"\nmethod = \"GET\"\npath = \"/user/repos\"\n",
         )
         .unwrap();
@@ -1223,10 +1228,22 @@ mod export_tests {
     }
 
     #[test]
-    fn merging_profiles_is_additive_and_deduplicates_rules() {
+    fn bracketed_ipv6_policy_targets_round_trip_to_proxy_syntax() {
+        let policy = parse_policy_file(
+            "[network]\nallowed_hosts = [\"[::1]:4000\"]\n",
+        )
+        .unwrap();
+        assert_eq!(policy.allow_ip, vec!["[::1]:4000"]);
+        let text = format_proxy_policy(&policy, "policy");
+        agent_sandbox_proxy::policy::parse_policy(&text)
+            .expect("bracketed IPv6 policy must reach the proxy");
+    }
+
+    #[test]
+    fn merging_policy_files_is_additive_and_deduplicates_rules() {
         let mut first =
-            parse_proxy_profile("[network]\nallowed_hosts = [\"github.com:443\"]\n").unwrap();
-        let second = parse_proxy_profile(
+            parse_policy_file("[network]\nallowed_hosts = [\"github.com:443\"]\n").unwrap();
+        let second = parse_policy_file(
             "[network]\nallowed_hosts = [\"github.com:443\", \"pypi.org:443\"]\n",
         )
         .unwrap();

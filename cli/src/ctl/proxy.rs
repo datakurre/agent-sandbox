@@ -9,7 +9,7 @@ use std::fs;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "agent-sandbox-proxy",
+    name = "agent-sandbox-policy",
     about = "Manage proxy rules for a running sandbox"
 )]
 pub struct ProxyArgs {
@@ -50,11 +50,11 @@ pub struct TargetArgs {
 
 #[derive(Parser, Debug)]
 pub struct ExportArgs {
-    /// A profile is a plain TOML file, so it wants the block without the
+    /// A policy file is plain TOML, so it wants the block without the
     /// Markdown fence `AGENTS.md` needs.
     #[arg(
         long,
-        help = "Print bare TOML, without the ```toml agent-sandbox fence (for a --proxy-profile file)"
+        help = "Print bare TOML, without the ```toml agent-sandbox fence (for a --policy file)"
     )]
     pub plain: bool,
     #[arg(help = "Sandbox name (positional)")]
@@ -177,7 +177,7 @@ fn policy_dir(
     let dir = sidecar_mount(&sidecar, "/sidecar_policy")?;
     if dir.is_empty() {
         eprintln!(
-            "agent-sandbox ctl proxy: cannot find the policy mount for sandbox '{}'",
+            "agent-sandbox ctl policy: cannot find the policy mount for sandbox '{}'",
             sandbox_word(&sandbox_name)
         );
         std::process::exit(1);
@@ -201,13 +201,13 @@ fn browser_policy_dir(explicit: Option<&str>) -> Result<(String, String)> {
     }
     match found.len() {
         0 => {
-            eprintln!("agent-sandbox ctl proxy: no running 'agent-sandbox browser' found.");
+            eprintln!("agent-sandbox ctl policy: no running 'agent-sandbox browser' found.");
             eprintln!("               Start one with: agent-sandbox browser");
             std::process::exit(1);
         }
         1 => Ok((found[0].name.clone(), found[0].dir.clone())),
         _ => {
-            eprintln!("agent-sandbox ctl proxy: several browsers are running; name one:");
+            eprintln!("agent-sandbox ctl policy: several browsers are running; name one:");
             for inst in &found {
                 eprintln!("               {} (CDP {})", inst.name, inst.cdp_port);
             }
@@ -221,7 +221,7 @@ fn parse_lines(lines: &[String]) -> Result<ProxyConfig> {
     match parse_policy(&text) {
         Ok(cfg) => Ok(cfg),
         Err(e) => {
-            eprintln!("agent-sandbox ctl proxy: current policy is invalid: {}", e);
+            eprintln!("agent-sandbox ctl policy: current policy is invalid: {}", e);
             std::process::exit(1);
         }
     }
@@ -229,7 +229,7 @@ fn parse_lines(lines: &[String]) -> Result<ProxyConfig> {
 
 fn apply(policy_dir: &str, lines: Vec<String>) -> Result<()> {
     if let Err(e) = install_policy(policy_dir, &lines) {
-        eprintln!("agent-sandbox ctl proxy: {}", e);
+        eprintln!("agent-sandbox ctl policy: {}", e);
         std::process::exit(1);
     }
     // A browser target has a second layer holding the same permission, and it
@@ -238,7 +238,7 @@ fn apply(policy_dir: &str, lines: Vec<String>) -> Result<()> {
     // does a browser started with `--no-policy-overlay`.
     if let Err(e) = crate::ctl::browser::sync_managed_allowlist(policy_dir, &lines) {
         eprintln!(
-            "agent-sandbox ctl proxy: the proxy has the new policy, but the browser's \
+            "agent-sandbox ctl policy: the proxy has the new policy, but the browser's \
              managed allow list could not be updated ({}); the browser may still refuse it",
             e
         );
@@ -348,8 +348,8 @@ fn show(args: TargetArgs) -> Result<()> {
         } else {
             value.to_string()
         };
-        // A browser's launch rules come from --allow, --proxy-profile and the
-        // sandbox's published ports, so naming AGENTS.md there would be wrong.
+        // A browser's launch rules come from --allow, --policy, AGENTS.md and
+        // the sandbox's published ports, so naming AGENTS.md there would be wrong.
         let source = if !base_lines.contains(line) {
             ""
         } else if args.browser {
@@ -419,7 +419,7 @@ fn allow(args: AllowArgs) -> Result<()> {
     if let Some(method) = args.l7 {
         if is_ip_or_cidr(&args.target) {
             eprintln!(
-                "agent-sandbox ctl proxy: --l7 needs a domain, not an IP/CIDR ('{}')",
+                "agent-sandbox ctl policy: --l7 needs a domain, not an IP/CIDR ('{}')",
                 args.target
             );
             std::process::exit(1);
@@ -530,7 +530,7 @@ fn rm(args: RmArgs) -> Result<()> {
     };
     if !removed {
         eprintln!(
-            "agent-sandbox ctl proxy: no matching rule found for '{}'",
+            "agent-sandbox ctl policy: no matching rule found for '{}'",
             summary
         );
         std::process::exit(1);
@@ -546,7 +546,7 @@ fn reset(args: TargetArgs) -> Result<()> {
         Ok(text) => text,
         Err(_) => {
             eprintln!(
-                "agent-sandbox ctl proxy: no policy.base found for this sandbox (it may not have been launched with --proxy)"
+                "agent-sandbox ctl policy: no policy.base found for this sandbox (it may not have been launched with --proxy)"
             );
             std::process::exit(1);
         }
@@ -593,7 +593,7 @@ fn check(args: CheckArgs) -> Result<()> {
         Some(p) => {
             let Ok(port) = p.parse::<u16>() else {
                 eprintln!(
-                    "agent-sandbox ctl proxy: '{}' names a set of ports, not one target — check a single HOST:PORT at a time",
+                    "agent-sandbox ctl policy: '{}' names a set of ports, not one target — check a single HOST:PORT at a time",
                     p
                 );
                 std::process::exit(1);

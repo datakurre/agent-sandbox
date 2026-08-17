@@ -130,7 +130,7 @@ pub fn run(args: StatusArgs) -> Result<()> {
                     row(
                         "policy",
                         &format!(
-                            "{} rule(s), default {}        agent-sandbox ctl proxy show",
+                            "{} rule(s), default {}        agent-sandbox ctl policy show",
                             rules, default
                         ),
                     );

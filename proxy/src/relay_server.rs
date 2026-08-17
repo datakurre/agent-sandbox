@@ -5,7 +5,7 @@ use relay_protocol::{read_frame, write_frame, CommandType, Frame, RelayHeader};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -187,6 +187,7 @@ fn domain_match(domain: &str, pattern: &str) -> bool {
 }
 
 const RELAY_LOG: &str = "/sidecar_shared/relay.jsonl";
+const RELAY_GPG_HOME: &str = "/tmp/agent-sandbox-relay-gnupg";
 /// Smaller than the proxy's own logs: one line per relay call, and a
 /// commit-signing loop can make a lot of them.  Bounded at all because the TUI
 /// rescans the file from the top when it starts.
@@ -257,6 +258,35 @@ fn validate_gpg_args(args: &[String]) -> bool {
         }
     }
     has_signing_intent
+}
+
+fn prepare_gpg_home() -> io::Result<()> {
+    std::fs::create_dir_all(RELAY_GPG_HOME)?;
+    let mut permissions = std::fs::metadata(RELAY_GPG_HOME)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+    }
+    std::fs::set_permissions(RELAY_GPG_HOME, permissions)?;
+
+    for name in ["S.gpg-agent", "pubring.kbx", "pubring.gpg", "trustdb.gpg"] {
+        let source = if name == "S.gpg-agent" {
+            "/run/host-gpg-agent"
+        } else {
+            match name {
+                "pubring.kbx" => "/run/host-gnupg/pubring.kbx",
+                "pubring.gpg" => "/run/host-gnupg/pubring.gpg",
+                "trustdb.gpg" => "/run/host-gnupg/trustdb.gpg",
+                _ => unreachable!(),
+            }
+        };
+        let target = format!("{RELAY_GPG_HOME}/{name}");
+        if !Path::new(&target).exists() && !Path::new(&target).symlink_metadata().is_ok() {
+            std::os::unix::fs::symlink(source, target)?;
+        }
+    }
+    Ok(())
 }
 
 /// The two authorization axes the relay enforces, read from the same policy
@@ -331,6 +361,16 @@ fn handle_client(mut stream: TcpStream, policy_path: &str, known_hosts: Option<&
                         .as_slice()
                 };
                 let _ = write_frame(&mut stream, &Frame::Stderr(msg.to_vec()));
+                let _ = write_frame(&mut stream, &Frame::Exit(255));
+                return;
+            }
+            if let Err(e) = prepare_gpg_home() {
+                let _ = write_frame(
+                    &mut stream,
+                    &Frame::Stderr(
+                        format!("relay-server: failed to prepare GPG home: {e}\n").into_bytes(),
+                    ),
+                );
                 let _ = write_frame(&mut stream, &Frame::Exit(255));
                 return;
             }
@@ -452,7 +492,7 @@ fn handle_client(mut stream: TcpStream, policy_path: &str, known_hosts: Option<&
     if is_ssh {
         cmd.env("SSH_AUTH_SOCK", "/run/host-ssh-agent");
     } else {
-        // gpg uses the host agent mounted at /run/host-gpg-agent by the sidecar
+        cmd.env("GNUPGHOME", RELAY_GPG_HOME);
     }
 
     cmd.stdin(Stdio::piped())
@@ -541,6 +581,10 @@ fn handle_client(mut stream: TcpStream, policy_path: &str, known_hosts: Option<&
     });
 
     let status = child.wait().unwrap();
+    // Stop the reader before joining it. `ctl attach` keeps stdin open for the
+    // lifetime of the attach, while commands such as `ssh -T` can finish
+    // without consuming it.
+    let _ = stream_write_exit.shutdown(Shutdown::Read);
     let _ = t_stdin.join();
     let _ = t_stdout.join();
     let _ = t_stderr.join();

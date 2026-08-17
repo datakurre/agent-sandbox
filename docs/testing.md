@@ -226,7 +226,7 @@ Worth knowing when choosing what to test next:
   the stub a canned `podman ps` reply and assert on what gets printed.
 - **The browser** (`ctl/browser.rs`) has its pure parts covered, and
   `90-browser-ports` drives a real instance — its proxy, its policy files and
-  `ctl proxy allow --browser` — with a stub in place of Chromium. Launching
+  `ctl policy allow --browser` — with a stub in place of Chromium. Launching
   Chromium itself under bwrap is still untested at any tier, which is where the
   managed-policy layer lives.
 

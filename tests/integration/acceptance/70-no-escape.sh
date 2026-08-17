@@ -32,13 +32,15 @@ out="$(sandbox_run --workspace --proxy -- bash -c '
 ')"
 assert_contains "$out" "BLOCKED" "a request with the proxy variables unset"
 
-# The same, for a host the policy does allow: without the proxy in the path
-# there is no route, so this must fail too rather than reaching it directly.
+# The same, for a host the policy does allow: the transparent listener is the
+# fallback for clients that cannot use proxy variables, so this still succeeds
+# through the proxy rather than escaping around it.
 out="$(sandbox_run --workspace --proxy -- bash -c '
   unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
   curl --silent --max-time 12 -o /dev/null -w "%{http_code}" https://example.com/ || echo BLOCKED
 ')"
-assert_contains "$out" "BLOCKED" "a direct request to an allowed host"
+assert_contains "$out" "200" "an allowed request without proxy variables"
+assert_contains "$out" "example.com" "the allowed request appearing in the proxy summary"
 
 # The connection log is the record of what the agent did; the agent must not be
 # able to edit it.

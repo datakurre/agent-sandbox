@@ -32,13 +32,19 @@ pub fn run(args: AttachArgs) -> Result<()> {
         ],
     )?;
 
+    let interactive = args.cmd.is_empty();
     let mut cmd = args.cmd;
     if cmd.is_empty() {
         cmd.push("bash".to_string());
     }
 
     let mut podman = Command::new("podman");
-    podman.arg("exec").arg("-it");
+    podman.arg("exec");
+    if interactive {
+        podman.arg("-it");
+    } else {
+        podman.arg("-i");
+    }
 
     for var in runtime_env(&sandbox) {
         podman.arg("--env").arg(var);

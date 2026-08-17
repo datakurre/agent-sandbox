@@ -106,8 +106,8 @@ assert_denied "$out" "a port nobody declared"
 
 # ── widening a running browser reaches both layers ──────────────────────────
 
-"$AS" ctl proxy allow "127.0.0.1:$widened" --browser "$name" >/dev/null 2>&1 \
-  || _fail "ctl proxy allow --browser failed"
+"$AS" ctl policy allow "127.0.0.1:$widened" --browser "$name" >/dev/null 2>&1 \
+  || _fail "ctl policy allow --browser failed"
 managed="$(cat "$rt/policies/managed/agent-sandbox.json")"
 assert_contains "$managed" "127.0.0.1:$widened" "the managed allow list after widening"
 assert_contains "$managed" "\"URLBlocklist\"" "the managed policy is otherwise intact"

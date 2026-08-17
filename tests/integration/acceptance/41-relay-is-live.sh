@@ -15,7 +15,7 @@ ssh-add -l >/dev/null 2>&1 || skip "the host SSH agent holds no keys"
 require_trusted_host_key github.com
 
 ws="$(make_workspace)"
-cleanup() { kill $launcher 2>/dev/null; rm -rf "$ws"; cleanup_sandboxes; }
+cleanup() { kill $launcher 2>/dev/null; cd / || true; rm -rf "$ws"; cleanup_sandboxes; }
 trap cleanup EXIT
 cd "$ws" || exit 1
 
@@ -27,7 +27,10 @@ allowed_hosts = ["example.com:443"]
 ```
 EOF
 
-sandbox_run --workspace --proxy --ssh -- bash -c 'sleep 180' &
+# Keep the session alive for the whole live-policy exercise. The SSH probes can
+# spend several retry windows on a slow host, so a short fixed sleep can expire
+# before the final narrowing check and make the failure look like a ctl bug.
+sandbox_run --workspace --proxy --ssh -- bash -c 'sleep 3600' &
 launcher=$!
 
 word="$(wait_for_sandbox 90)" || _fail "no sandbox came up"
@@ -46,8 +49,8 @@ assert_contains "$logged" '"ts":' "a timestamp on the relay record"
 
 # Widening it live is exactly what the TUI keypress does: the host rule plus
 # the allow_signing entry the relay actually consults.
-allowed="$("$AS" ctl proxy allow github.com:22 "$word" 2>&1)" \
-  || _fail "ctl proxy allow failed: $allowed"
+allowed="$("$AS" ctl policy allow github.com:22 "$word" 2>&1)" \
+  || _fail "ctl policy allow failed: $allowed"
 assert_contains "$allowed" "ssh (push/pull)" "allow reporting the relay grant"
 sleep 3
 
@@ -59,8 +62,8 @@ out="$("$AS" ctl attach "$word" -- bash -c "$probe 2>&1 || true")"
 assert_contains "$out" "successfully authenticated" "an SSH probe after a live grant"
 
 # And back again.
-removed="$("$AS" ctl proxy rm allow github.com:22 "$word" 2>&1)" \
-  || _fail "ctl proxy rm allow failed: $removed"
+removed="$("$AS" ctl policy rm allow github.com:22 "$word" 2>&1)" \
+  || _fail "ctl policy rm allow failed: $removed"
 sleep 3
 out="$("$AS" ctl attach "$word" -- bash -c "$probe 2>&1 || true")"
 assert_not_contains "$out" "successfully authenticated" "an SSH probe after narrowing again"

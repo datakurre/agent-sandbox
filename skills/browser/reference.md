@@ -182,7 +182,7 @@ Attach with `connect_over_cdp` exactly as in `SKILL.md`.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Screenshot is a flat, uniform color | no usable fonts | check `$FONTCONFIG_FILE` and `fc-list`; rebuild it with the scripts the page needs (see above) |
-| `page.goto()` hangs or times out | proxied sandbox denying the host | check `$HTTPS_PROXY`, pass it explicitly, ask for `ctl proxy allow` |
+| `page.goto()` hangs or times out | proxied sandbox denying the host | check `$HTTPS_PROXY`, pass it explicitly, ask for `ctl policy allow` |
 | "Failed to move to new namespace" / renderer crash | container can't create Chromium's own sandbox | add `--no-sandbox` to `launch(args=[...])` |
 | Renderer crashes under load, blank/partial screenshot | `/dev/shm` too small (often 64 MB in containers) | add `--disable-dev-shm-usage` |
 | `browserType.launch` complains about a missing executable | `PLAYWRIGHT_BROWSERS_PATH` unset — running raw `python3` instead of `playwright-python`, or `export`ed in a separate tool call that didn't carry into this one | use `playwright-python`, or re-derive it in the *same* command as the failing one, see `SKILL.md` |
@@ -190,7 +190,7 @@ Attach with `connect_over_cdp` exactly as in `SKILL.md`.
 | `connect_over_cdp` refuses/times out with the port listed | the channel exists, so nothing is listening on the host's `127.0.0.1:9222` | the browser was closed, or a hand-started Chrome had no separate `--user-data-dir` |
 | `$AGENT_SANDBOX_BROWSER_CDP_PORT` is unset even though the port is reachable | relaunched with a bare `--host-loopback-port` instead of `--browser` | use `--browser`, or add the variable with `-e` |
 | Only one browser reachable when two were started | the second was started after the sandbox, so `--browser` never saw it | start every browser before the sandbox; the channel is set at launch |
-| `ctl proxy … --browser` says several browsers are running | more than one session, so the target is ambiguous | name one: `--browser alice` |
-| A page in the host browser fails to load, `curl` from here reaches it | the browser's allow list is separate from the sandbox's | `agent-sandbox ctl proxy allow <host>:443 --browser` |
+| `ctl policy … --browser` says several browsers are running | more than one session, so the target is ambiguous | name one: `--browser alice` |
+| A page in the host browser fails to load, `curl` from here reaches it | the browser's allow list is separate from the sandbox's | `agent-sandbox ctl policy allow <host>:443 --browser` |
 | `socat` reports it could not bind, or the port answers the wrong service | something in the sandbox already listens on that number | relaunch with `--host-loopback-port 9222:19222` and dial 19222 inside |
 | `host.containers.internal` refuses even though the host's service is up | that name is podman's `--map-guest-addr`, which resolves to the host's *LAN* address, not its loopback | bind the host service to `0.0.0.0` to use that name, or map it with `--host-loopback-port` for a loopback-bound one |

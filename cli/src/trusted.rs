@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 ///
 /// One resolver for the whole file, so the secrets half and the host-key half
 /// can never read different paths.  `XDG_CONFIG_HOME` is honoured because
-/// [`crate::launch::proxy_profile_path`] honours it for the sibling profiles
+/// [`crate::launch::policy_path`] honours it for the sibling policies
 /// directory, and an operator who moved their config expects both to follow.
 pub fn config_path(home: &str) -> PathBuf {
     let config_home = std::env::var("XDG_CONFIG_HOME")
