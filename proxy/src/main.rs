@@ -545,6 +545,14 @@ impl PrefixedStream {
             pos: 0,
         }
     }
+
+    /// Hand back the underlying socket once the prefix is spent, so the
+    /// caller can hand it to something (like `pump`) that wants a real
+    /// `TcpStream` rather than this wrapper.  Any unread prefix bytes are
+    /// lost, which is only safe once the caller knows none remain.
+    fn into_inner(self) -> TcpStream {
+        self.inner
+    }
 }
 
 impl Read for PrefixedStream {
@@ -1027,114 +1035,134 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
     let skip_l7 = is_domain_allowed && !has_l7;
 
     if method != "CONNECT" {
-        if !skip_l7 {
-            // Host-level on purpose: refuse cleartext to a host that carries
-            // any secret route, not only on the routes that would inject.
-            if cfg.is_secret_host(&host) {
-                reply(&mut client_sock, ingress, b"HTTP/1.1 403 Forbidden\r\n\r\n");
-                eprintln!(
-                    "proxy: deny {}:{} (secret injection requires TLS)",
-                    host, port
-                );
-                shared.denied_detail(&host, port, "cleartext-injection", &req_str);
+        // Host-level on purpose: refuse cleartext to a host that carries
+        // any secret route, not only on the routes that would inject.
+        if cfg.is_secret_host(&host) {
+            reply(&mut client_sock, ingress, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            eprintln!(
+                "proxy: deny {}:{} (secret injection requires TLS)",
+                host, port
+            );
+            shared.denied_detail(&host, port, "cleartext-injection", &req_str);
+            shared.record(
+                None,
+                &host,
+                port,
+                "deny",
+                Some("cleartext-injection"),
+                0,
+                0,
+                started.elapsed().as_millis(),
+                Some(method),
+                None,
+                None,
+            );
+            return;
+        }
+        let id = shared.open_event(&host, port);
+        let mut client_stream = PrefixedStream::new(client_sock, req_buf[..n].to_vec());
+        match inject::proxy_http1_with_injection(
+            &mut client_stream,
+            &mut remote_sock,
+            &host,
+            port,
+            &shared,
+        ) {
+            Ok(outcome) => {
+                let (mut up_bytes, mut down_bytes) = (outcome.up_bytes, outcome.down_bytes);
+                if outcome.upgraded {
+                    // `101 Switching Protocols`: everything past here is
+                    // opaque (WebSocket frames, most commonly), so this
+                    // connection finishes the way a CONNECT tunnel does —
+                    // spliced byte-for-byte, not parsed.
+                    let client_tcp = client_stream.into_inner();
+                    match (client_tcp.try_clone(), remote_sock.try_clone()) {
+                        (Ok(client_read), Ok(remote_write)) => {
+                            let upstream_thread =
+                                thread::spawn(move || pump(client_read, remote_write));
+                            down_bytes += pump(remote_sock, client_tcp);
+                            up_bytes += upstream_thread.join().unwrap_or(0);
+                        }
+                        _ => {
+                            eprintln!(
+                                "proxy: cannot duplicate sockets for upgraded {}:{}",
+                                host, port
+                            );
+                        }
+                    }
+                }
                 shared.record(
+                    id.as_deref(),
+                    &host,
+                    port,
+                    "allow",
                     None,
+                    up_bytes,
+                    down_bytes,
+                    started.elapsed().as_millis(),
+                    outcome.method.as_deref(),
+                    outcome.path.as_deref(),
+                    outcome.status,
+                );
+            }
+            Err(inject::ProxyHttpError::L7Denied {
+                method,
+                path,
+                reason,
+            }) => {
+                eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+                shared.denied_http_detail(
+                    &host,
+                    port,
+                    &format!("L7 denied: {}", reason),
+                    &method,
+                    &path,
+                );
+                shared.record(
+                    id.as_deref(),
                     &host,
                     port,
                     "deny",
-                    Some("cleartext-injection"),
+                    Some(&format!("L7 denied: {}", reason)),
                     0,
                     0,
                     started.elapsed().as_millis(),
-                    Some(method),
-                    None,
-                    None,
+                    Some(&method),
+                    Some(&path),
+                    Some(403),
                 );
-                return;
             }
-            let id = shared.open_event(&host, port);
-            let mut client_stream = PrefixedStream::new(client_sock, req_buf[..n].to_vec());
-            match inject::proxy_http1_with_injection(
-                &mut client_stream,
-                &mut remote_sock,
-                &host,
-                port,
-                &shared,
-            ) {
-                Ok(outcome) => {
-                    shared.record(
-                        id.as_deref(),
-                        &host,
-                        port,
-                        "allow",
-                        None,
-                        outcome.up_bytes,
-                        outcome.down_bytes,
-                        started.elapsed().as_millis(),
-                        outcome.method.as_deref(),
-                        outcome.path.as_deref(),
-                        outcome.status,
-                    );
+            Err(inject::ProxyHttpError::Io {
+                method,
+                path,
+                status,
+                secret_missing,
+                error,
+            }) => {
+                eprintln!(
+                    "proxy: injected HTTP proxying failed {}:{}: {}",
+                    host, port, error
+                );
+                let mut detail = format!("inject-http: {}", short_err(&error));
+                if secret_missing {
+                    detail.push_str(" (secret missing: domain configured for secret injection in policy, but --secrets was not enabled)");
                 }
-                Err(inject::ProxyHttpError::L7Denied {
-                    method,
-                    path,
-                    reason,
-                }) => {
-                    eprintln!("proxy: deny {}:{} ({})", host, port, reason);
-                    shared.denied_http_detail(
-                        &host,
-                        port,
-                        &format!("L7 denied: {}", reason),
-                        &method,
-                        &path,
-                    );
-                    shared.record(
-                        id.as_deref(),
-                        &host,
-                        port,
-                        "deny",
-                        Some(&format!("L7 denied: {}", reason)),
-                        0,
-                        0,
-                        started.elapsed().as_millis(),
-                        Some(&method),
-                        Some(&path),
-                        Some(403),
-                    );
-                }
-                Err(inject::ProxyHttpError::Io {
-                    method,
-                    path,
+                shared.record(
+                    id.as_deref(),
+                    &host,
+                    port,
+                    "error",
+                    Some(&detail),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    method.as_deref(),
+                    path.as_deref(),
                     status,
-                    secret_missing,
-                    error,
-                }) => {
-                    eprintln!(
-                        "proxy: injected HTTP proxying failed {}:{}: {}",
-                        host, port, error
-                    );
-                    let mut detail = format!("inject-http: {}", short_err(&error));
-                    if secret_missing {
-                        detail.push_str(" (secret missing: domain configured for secret injection in policy, but --secrets was not enabled)");
-                    }
-                    shared.record(
-                        id.as_deref(),
-                        &host,
-                        port,
-                        "error",
-                        Some(&detail),
-                        0,
-                        0,
-                        started.elapsed().as_millis(),
-                        method.as_deref(),
-                        path.as_deref(),
-                        status,
-                    );
-                }
+                );
             }
-            return;
         }
+        return;
     } else if port == 443 {
         if !skip_l7 && shared.session_ca.is_some() {
             // A transparent client is already sending TLS; only a client that
@@ -1416,7 +1444,9 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
         }
     }
 
-    if method == "CONNECT" && !skip_l7 {
+    // Non-CONNECT traffic always returned above; anything reaching here is a
+    // CONNECT tunnel.
+    if !skip_l7 {
         reply(&mut client_sock, ingress, b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!(
             "proxy: deny CONNECT {}:{} (L7 rules require TLS interception on port 443)",
@@ -1443,35 +1473,21 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
     // metered "sent" total.
     let mut head_up: u64 = 0;
 
-    if method == "CONNECT" {
-        // A transparent client never asked for a tunnel and has no HTTP parser
-        // waiting for the answer; its ClientHello is already in `prelude`.
-        if ingress.speaks_http()
-            && client_sock
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .is_err()
-        {
+    // A transparent client never asked for a tunnel and has no HTTP parser
+    // waiting for the answer; its ClientHello is already in `prelude`.
+    if ingress.speaks_http()
+        && client_sock
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .is_err()
+    {
+        return;
+    }
+    // Forward any data that arrived alongside the CONNECT head.
+    if !prelude.is_empty() {
+        if remote_sock.write_all(&prelude).is_err() {
             return;
         }
-        // Forward any data that arrived alongside the CONNECT head.
-        if !prelude.is_empty() {
-            if remote_sock.write_all(&prelude).is_err() {
-                return;
-            }
-            head_up += prelude.len() as u64;
-        }
-    } else {
-        // This path splices the client's bytes straight through, so the request
-        // line is the one addressed to *this proxy* unless it is converted:
-        // origin servers are entitled to origin-form, and some insist on it.
-        // A transparent client already sent origin-form, which the rewrite
-        // leaves alone.
-        let (head, _) = split_head_and_extra(&req_buf[..n]);
-        let head = inject::rewrite_request_target(head).unwrap_or_else(|| head.to_vec());
-        if remote_sock.write_all(&head).is_err() || remote_sock.write_all(&prelude).is_err() {
-            return;
-        }
-        head_up += (head.len() + prelude.len()) as u64;
+        head_up += prelude.len() as u64;
     }
 
     let (client_read, remote_write) = match (client_sock.try_clone(), remote_sock.try_clone()) {

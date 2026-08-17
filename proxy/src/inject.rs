@@ -559,6 +559,12 @@ pub struct HttpExchangeOutcome {
     pub path: Option<String>,
     pub status: Option<u16>,
     pub secret_missing: bool,
+    /// The last response was `101 Switching Protocols`.  What follows on the
+    /// connection (WebSocket frames, most commonly) is not HTTP, so this
+    /// function stopped rather than trying to parse another request head out
+    /// of it; the caller owns the two streams and should splice them
+    /// byte-for-byte from here on.
+    pub upgraded: bool,
 }
 
 #[derive(Debug)]
@@ -611,10 +617,10 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
     let mut last_path: Option<String> = None;
     let mut last_status: Option<u16> = None;
 
-    let mut io_loop = || -> io::Result<()> {
+    let mut io_loop = || -> io::Result<bool> {
         loop {
             let Some(request_head) = read_head(client)? else {
-                return Ok(());
+                return Ok(false);
             };
             let request_text = std::str::from_utf8(&request_head).map_err(|_| {
                 io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
@@ -698,7 +704,16 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             })?;
             let status = response_status_code(response_text)?;
             last_status = Some(status);
-            
+
+            if status == 101 {
+                // Switching Protocols: the exchange that got us here is the
+                // last HTTP-shaped thing on this connection.  Reading another
+                // request head out of what comes next (WebSocket frames, most
+                // commonly) would desync the parser, so stop instead of
+                // looping.
+                return Ok(true);
+            }
+
             if response_has_no_body(&method, status) {
                 continue;
             }
@@ -714,18 +729,19 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
 
             // Close-delimited response body: once this drains, the exchange ends.
             down_bytes += copy_to_eof(upstream, client)?;
-            return Ok(());
+            return Ok(false);
         }
     };
 
     match io_loop() {
-        Ok(()) => Ok(HttpExchangeOutcome {
+        Ok(upgraded) => Ok(HttpExchangeOutcome {
             up_bytes,
             down_bytes,
             method: last_method,
             path: last_path,
             status: last_status,
             secret_missing,
+            upgraded,
         }),
         Err(e) if e.kind() == ErrorKind::PermissionDenied => {
             Err(ProxyHttpError::L7Denied {
@@ -829,6 +845,54 @@ mod tests {
         assert_eq!(rendered.matches("Authorization: Bearer injected-secret").count(), 2);
         assert!(!rendered.contains("Authorization: old"));
         assert!(!rendered.contains("authorization: old2"));
+    }
+
+    #[test]
+    fn a_second_absolute_form_request_on_the_same_connection_is_also_rewritten() {
+        // The reported failure: a browser configured with this proxy sends
+        // absolute-form requests for as long as a connection stays open, not
+        // just for the first one. A caller that only rewrites the first
+        // request line and then splices the rest raw (as the un-intercepted
+        // fast path used to) leaves later requests addressed to the proxy
+        // itself, which most origins -- Vite's dev server among them --
+        // cannot resolve and answer with their SPA-fallback document instead
+        // of the asset that was actually asked for.
+        let client_in = b"GET http://example.com/assets/app.js HTTP/1.1\r\nHost: example.com\r\n\r\n\
+                          GET http://example.com/assets/app.css HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\njs\
+                            HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ncss";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
+        let rendered = String::from_utf8(upstream.written).expect("utf8 output");
+        assert!(rendered.contains("GET /assets/app.js HTTP/1.1"));
+        assert!(rendered.contains("GET /assets/app.css HTTP/1.1"));
+        assert!(!rendered.contains("http://example.com"));
+    }
+
+    #[test]
+    fn a_101_response_stops_the_loop_instead_of_parsing_websocket_frames_as_http() {
+        let client_in = b"GET /socket HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let outcome = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
+        assert!(outcome.upgraded);
+        assert_eq!(outcome.status, Some(101));
     }
 
     #[test]
