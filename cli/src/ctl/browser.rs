@@ -127,9 +127,9 @@ pub struct BrowserArgs {
     pub name: Option<String>,
 }
 
-/// Session names end up in a directory name, an MCP server name and a `ctl
-/// proxy --browser` argument, so they are checked the same way a proxy profile
-/// name is rather than joined blindly.
+/// Session names end up in a directory name, `AGENT_SANDBOX_BROWSER_CDP_PORT`'s
+/// value and a `ctl proxy --browser` argument, so they are checked the same way
+/// a proxy profile name is rather than joined blindly.
 pub fn valid_session_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
@@ -764,10 +764,8 @@ pub fn running_instances() -> Vec<Instance> {
 /// dialable from where the agent runs.
 ///
 /// One browser keeps the bare port, which is all a single session needs and
-/// what the entrypoint accepted before names existed -- it also keeps that
-/// common case on the plain `playwright` MCP server rather than one named
-/// after a uuid.  Several are named, so the entrypoint can define one server
-/// per browser and the agent can say which user it is acting as.
+/// what the entrypoint accepted before names existed.  Several are named, so
+/// an agent reading the variable can tell which port belongs to which user.
 pub fn cdp_port_env(attached: &[(String, u16)]) -> String {
     if let [(_, port)] = attached {
         return port.to_string();

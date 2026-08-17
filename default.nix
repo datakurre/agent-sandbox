@@ -64,6 +64,32 @@ let
     exec ${agentSandboxRust}/bin/agent-sandbox-proxy "$@"
   '';
 
+  # Wraps the two-step `nix build` + `nix shell` dance from the browser skill
+  # into one command, so PLAYWRIGHT_BROWSERS_PATH can never fail to survive
+  # into the command that needs it. A script, not a baked-in closure: the
+  # browser binaries are heavy and most sessions never touch one, so this
+  # stays an on-demand nixpkgs fetch like every other tool in the `nix` skill
+  # rather than growing the image. FONTCONFIG_FILE is already exported
+  # image-wide, so this only needs to shell in python3 + the playwright package.
+  playwrightPython = pkgs.writeShellApplication {
+    name = "playwright-python";
+    runtimeInputs = [ pkgs.nix ];
+    text = ''
+      # The single-quoted --expr strings below are Nix syntax for the nested
+      # `nix build`/`nix shell` to evaluate, not shell variables to expand
+      # here -- shellcheck's suggestion to double-quote them would be wrong.
+      # shellcheck disable=SC2016
+      PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
+        'with (builtins.getFlake "nixpkgs").legacyPackages.''${builtins.currentSystem}; playwright-driver.browsers' \
+        --no-link --print-out-paths)
+      export PLAYWRIGHT_BROWSERS_PATH
+      # shellcheck disable=SC2016
+      exec nix shell --impure --expr \
+        'with (builtins.getFlake "nixpkgs").legacyPackages.''${builtins.currentSystem}; python3.withPackages (ps: [ ps.playwright ])' \
+        --command python3 "$@"
+    '';
+  };
+
   # The SSH/GPG relay, in both halves: relay-server runs in the sidecar next to
   # the forwarded host sockets, relay-ssh/relay-gpg run in the sandbox, which
   # has no socket of its own under --proxy.  Individually wrapped rather than
@@ -163,12 +189,6 @@ let
       stdenv.cc.cc.lib
       zlib
       glibcLocales
-      # Microsoft's Playwright MCP server, pre-wired to nixpkgs' own browsers.
-      # On the image rather than fetched with `nix run` so it also works under
-      # --proxy, where cache.nixos.org is not reachable unless someone allowed
-      # it.  Serves both browser modes: --cdp-endpoint against a host browser,
-      # and --headless --isolated entirely in here.
-      playwright-mcp
       fontconfig
     ]
     ++ imageFonts
@@ -176,7 +196,7 @@ let
     # No agent-sandbox-allow: policy now lives on a volume the sandbox cannot
     # see, so widening the firewall is a host-side operation
     # (agent-sandbox ctl proxy allow) by design.
-    ++ [ dockerAlias sidecarScript proxyScript ]
+    ++ [ dockerAlias sidecarScript proxyScript playwrightPython ]
     ++ relayScripts;
 
   tools = baseTools ++ agentTools;

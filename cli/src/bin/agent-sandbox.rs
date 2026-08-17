@@ -494,7 +494,7 @@ Ports:
   --shared-network                   {shared_network} Joins the shared bridge network so sibling
                                            containers can reach this one by name.
   --browser                          {browser} Attaches every running 'agent-sandbox browser'
-                                           session, wiring up playwright-mcp automatically.
+                                           session, mapping its CDP port in automatically.
   --host-loopback-port PORT          {host_ports} Makes a host 127.0.0.1:PORT reachable at the
                                            sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP
                                            port). Repeatable; takes HOST:SANDBOX to remap.
@@ -2568,7 +2568,7 @@ mod tests {
 
     /// The pair has to agree: whatever number the mapping puts the browser on
     /// inside is the number the agent is told to dial.  Advertising the host's
-    /// 9222 while the listener is on 19222 points playwright-mcp at nothing.
+    /// 9222 while the listener is on 19222 points a CDP client at nothing.
     #[test]
     fn an_explicit_remap_wins_and_is_what_gets_advertised() {
         let mut ports = vec![HostPort {

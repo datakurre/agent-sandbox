@@ -170,7 +170,7 @@ agent-sandbox --workspace --browser -- claude    # attach it to the sandbox
 ```
 
 See [Cooperative Browser](browser.md) for multi-user sessions, extensions,
-the Playwright MCP wiring, and the two-layer security model.
+CDP wiring, and the two-layer security model.
 
 ### Building a policy interactively
 
@@ -297,9 +297,8 @@ The image includes five OpenCode skills at `/home/user/.agents/skills`:
   and supporting services, entered with `devenv shell -- <command>`.
 - `browser` for browser automation, in both shapes: headless inside the sandbox
   from nixpkgs, and the cooperative host browser `agent-sandbox browser` starts.
-  It covers screenshotting a page for visual analysis, driving it via Playwright
-  or the bundled `playwright-mcp` server, and which of the two browsers a given
-  task wants.
+  It covers screenshotting a page for visual analysis, driving it via
+  Playwright, and which of the two browsers a given task wants.
 
 Each skill is a `SKILL.md` with the common path plus reference files with
 advanced patterns. `nix-flake` additionally carries `uv2nix.md` (packaging

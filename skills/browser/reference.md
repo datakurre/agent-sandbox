@@ -1,7 +1,29 @@
 # Browser — advanced patterns
 
-Read `SKILL.md` first. The headless sections assume `PLAYWRIGHT_BROWSERS_PATH`
-is exported as shown there.
+Read `SKILL.md` first. The headless sections assume `playwright-python` is
+what you reach for; this file covers what it wraps and when to bypass it.
+
+## The raw `nix build`/`nix shell` invocation
+
+`playwright-python script.py` (see `SKILL.md`) is this, wrapped into one
+command:
+
+```sh
+export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
+  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; playwright-driver.browsers' \
+  --no-link --print-out-paths) && \
+nix shell --impure --expr \
+  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; python3.withPackages (ps: [ ps.playwright ])' \
+  --command python3 script.py
+```
+
+Reach for this instead of the wrapper when the shell needs more than
+`python3` + Playwright — extra fonts (below), other packages — or when
+running outside this image, where `playwright-python` isn't on `PATH`.
+**Don't rely on the `export` surviving into a later tool call** — if your
+next command is a separate shell invocation, this variable is gone. Keep it
+and whatever uses it in one invocation, or write it into the script/session
+you're about to run rather than a throwaway shell line.
 
 ## Fonts, in full
 
@@ -57,6 +79,25 @@ in headless mode:
 ```python
 page.pdf(path="page.pdf", format="A4")
 ```
+
+## Output directory
+
+Write screenshots, traces, and PDFs to a fixed scratch directory rather than
+scattering them wherever a script happens to run — `/tmp/playwright-output`
+is a reasonable default. Create it fresh at the top of a script:
+
+```python
+import os
+import shutil
+OUTPUT_DIR = "/tmp/playwright-output"
+shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+os.makedirs(OUTPUT_DIR)
+```
+
+This is container-local, not a host mount — it disappears with the session.
+Read results back with the agent's own tools (e.g. Claude Code's `Read` for a
+screenshot) before the session ends rather than expecting the directory to
+persist.
 
 ## Raw CDP fallback
 
@@ -136,95 +177,6 @@ number: `--host-loopback-port 9222:19222` puts the host's 9222 on the sandbox's
 
 Attach with `connect_over_cdp` exactly as in `SKILL.md`.
 
-## playwright-mcp flags
-
-`playwright-mcp` is on the image PATH — no `nix run`, and it works under
-`--proxy` without reaching `cache.nixos.org`. From `playwright-mcp --help`:
-
-| Flag | What it does |
-| --- | --- |
-| `--headless` | run without a visible browser (default is headed — always pass this here) |
-| `--isolated` | keep the profile in memory, don't persist it to disk |
-| `--browser <name>` | defaults to chromium (`PLAYWRIGHT_MCP_BROWSER`) |
-| `--viewport-size <WxH>` | e.g. `1280x720` |
-| `--user-agent <ua>` | override the UA string |
-| `--proxy-server <url>` / `--proxy-bypass <domains>` | explicit proxy, same reasoning as the scripted path |
-| `--output-dir <path>` | where screenshots/snapshots get written |
-| `--storage-state <path>` | reuse cookies/local storage across runs |
-| `--no-sandbox` | disable Chromium's own sandbox (container default) |
-| `--port <port>` | serve over SSE instead of stdio |
-| `--cdp-endpoint <url>` | drive a browser already running, instead of launching one |
-
-`--allowed-origins` / `--blocked-origins` exist too, but its own documentation
-says they are not a security boundary — the proxy is what bounds a host
-browser, and the sandbox's `--proxy` policy is what bounds a headless one.
-
-## Registering it yourself
-
-The entrypoint writes an MCP config at `~/.config/agent-sandbox/mcp.json` when
-`AGENT_SANDBOX_BROWSER_CDP_PORT` is set (host browser) or
-`AGENT_SANDBOX_BROWSER_MCP=headless` is set (a headless one in here) — one
-entry per server, in the shape `{"mcpServers": {"<name>": {"command": ...,
-"args": [...]}}}`. `AGENT_SANDBOX_BROWSER_MCP=off` turns the whole thing off.
-
-Claude Code picks it up automatically (`--mcp-config`, appended for you).
-Every other agent has to register it with its own mechanism — there are only
-two shapes that mechanism takes:
-
-| Agent | Mechanism | Config it writes |
-| --- | --- | --- |
-| `codex` | CLI subcommand | `~/.codex/config.toml` |
-| `copilot` | CLI subcommand (identical syntax to `codex`) | `~/.copilot/mcp-config.json` |
-| `antigravity` (`agy`) | config-file merge, same `mcpServers` shape as `mcp.json` — no reshaping | `~/.gemini/config/mcp_config.json` (global) or `./.agents/mcp_config.json` (workspace) |
-| `opencode` | config-file merge, different shape (`mcp` key, `type`/`command` array/`enabled`) | `~/.config/opencode/opencode.json` (global) or project `opencode.json` |
-
-**`codex` / `copilot`** — both take `<name> -- <command> <args...>`, so the
-same loop registers every server in the file with either:
-
-```sh
-agent_mcp_cli=codex   # or: copilot
-jq -r '.mcpServers | to_entries[] | "\(.key)\t\(.value.command)\t\(.value.args | join(" "))"' \
-  ~/.config/agent-sandbox/mcp.json |
-while IFS=$'\t' read -r name command args; do
-  "$agent_mcp_cli" mcp add "$name" -- "$command" $args
-done
-```
-
-**`antigravity`** — its config already uses the same `mcpServers` shape, so
-this is a plain merge, not a reshape:
-
-```sh
-CONFIG=~/.gemini/config/mcp_config.json   # or ./.agents/mcp_config.json, workspace-local
-mkdir -p "$(dirname "$CONFIG")"
-if [ -f "$CONFIG" ]; then
-  jq -s '.[0] * {mcpServers: .[1].mcpServers}' "$CONFIG" ~/.config/agent-sandbox/mcp.json \
-    > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-else
-  jq '{mcpServers: .mcpServers}' ~/.config/agent-sandbox/mcp.json > "$CONFIG"
-fi
-```
-
-**`opencode`** — its `mcp` key wants a different per-server shape
-(`type`/`command` as one array/`enabled`), so reshape while merging:
-
-```sh
-CONFIG=~/.config/opencode/opencode.json   # or a project-local opencode.json
-NEW=$(jq '{mcp: (.mcpServers | map_values({type: "local", command: ([.command] + .args), enabled: true}))}' \
-  ~/.config/agent-sandbox/mcp.json)
-mkdir -p "$(dirname "$CONFIG")"
-if [ -f "$CONFIG" ]; then
-  jq --argjson new "$NEW" '. * $new' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-else
-  jq -n --argjson new "$NEW" '{"$schema": "https://opencode.ai/config.json"} * $new' > "$CONFIG"
-fi
-```
-
-Every snippet above merges rather than overwrites, since these are host-mounted
-state files that may already carry the operator's own servers. Running
-something else, or one of these has drifted? The ingredients are always the
-server name/command/args in `~/.config/agent-sandbox/mcp.json` — check your
-own CLI's docs or `--help` for how it takes MCP servers.
-
 ## Debugging checklist
 
 | Symptom | Cause | Fix |
@@ -233,10 +185,10 @@ own CLI's docs or `--help` for how it takes MCP servers.
 | `page.goto()` hangs or times out | proxied sandbox denying the host | check `$HTTPS_PROXY`, pass it explicitly, ask for `ctl proxy allow` |
 | "Failed to move to new namespace" / renderer crash | container can't create Chromium's own sandbox | add `--no-sandbox` to `launch(args=[...])` |
 | Renderer crashes under load, blank/partial screenshot | `/dev/shm` too small (often 64 MB in containers) | add `--disable-dev-shm-usage` |
-| `browserType.launch` complains about a missing executable | `PLAYWRIGHT_BROWSERS_PATH` unset — likely `export`ed in a separate tool call that didn't carry into this one | re-derive it in the *same* command as the failing one, see `SKILL.md` |
+| `browserType.launch` complains about a missing executable | `PLAYWRIGHT_BROWSERS_PATH` unset — running raw `python3` instead of `playwright-python`, or `export`ed in a separate tool call that didn't carry into this one | use `playwright-python`, or re-derive it in the *same* command as the failing one, see `SKILL.md` |
 | `$AGENT_SANDBOX_HOST_PORTS` is unset, or missing the port | launched without `--browser`, so nothing reaches the host's `127.0.0.1:9222` | ask the user to run `agent-sandbox browser`, then relaunch with `--browser`, see `SKILL.md` |
 | `connect_over_cdp` refuses/times out with the port listed | the channel exists, so nothing is listening on the host's `127.0.0.1:9222` | the browser was closed, or a hand-started Chrome had no separate `--user-data-dir` |
-| No `browser_*` MCP tools, but CDP works from a script | relaunched with a bare `--host-loopback-port` instead of `--browser`, so nothing set `AGENT_SANDBOX_BROWSER_CDP_PORT` | use `--browser`, or add the variable with `-e` |
+| `$AGENT_SANDBOX_BROWSER_CDP_PORT` is unset even though the port is reachable | relaunched with a bare `--host-loopback-port` instead of `--browser` | use `--browser`, or add the variable with `-e` |
 | Only one browser reachable when two were started | the second was started after the sandbox, so `--browser` never saw it | start every browser before the sandbox; the channel is set at launch |
 | `ctl proxy … --browser` says several browsers are running | more than one session, so the target is ambiguous | name one: `--browser alice` |
 | A page in the host browser fails to load, `curl` from here reaches it | the browser's allow list is separate from the sandbox's | `agent-sandbox ctl proxy allow <host>:443 --browser` |

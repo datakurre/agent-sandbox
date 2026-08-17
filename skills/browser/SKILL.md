@@ -13,11 +13,11 @@ metadata:
   click in themselves.
 - **Never run `playwright install`** — the nixpkgs driver is already paired
   with the Python package; that command tries to hit a CDN and isn't needed.
-- **`export`ed variables may not survive your next tool call.** Many agent
-  harnesses run each shell command fresh, with no memory of a previous
-  `export`. Keep `PLAYWRIGHT_BROWSERS_PATH` / `FONTCONFIG_FILE` in the *same*
-  command as whatever uses them (`&&`-chained, or one script) rather than
-  trusting "set it once" — see below.
+- **Use `playwright-python script.py`**, not a raw `python3` call — it derives
+  `PLAYWRIGHT_BROWSERS_PATH` and runs your script in one shot, so there's
+  nothing to `export` and lose to the next tool call. The raw derivation still
+  matters if you need extra fonts or are running outside this image — see
+  below and `reference.md`.
 - **Bind a server behind a published port to `0.0.0.0`**, not `127.0.0.1` —
   publishing forwards to the sandbox's interface address, not its loopback.
 - A denied host is the sandbox's egress policy working as intended — ask the
@@ -32,7 +32,7 @@ metadata:
 | The user can watch and click | no | yes |
 | Real fonts, GPU, their logins | no | yes |
 | Egress policy | the sandbox's `--proxy` policy | a separate allow list of its own |
-| Start it with | `nix shell` + Playwright, below | ask the user to run `agent-sandbox browser` |
+| Start it with | `playwright-python`, below | ask the user to run `agent-sandbox browser` |
 
 **Default to headless.** It needs nothing from the user, so it costs no round
 trip. Reach for the host browser only when the task actually needs a visible
@@ -54,26 +54,22 @@ install`, it tries to hit a CDN and isn't needed.
 ## Get the browser
 
 ```sh
-export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
-  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; playwright-driver.browsers' \
-  --no-link --print-out-paths)
+playwright-python script.py
 ```
 
-The build resolves to a cached, content-addressed store path, so re-running
-this line costs nothing after the first time. **Don't rely on the `export`
-surviving into a later tool call** — if your next command is a separate shell
-invocation, this variable is gone. Put the `export` and the command that needs
-it in one invocation:
+`playwright-python` is on the image `PATH`. It derives `PLAYWRIGHT_BROWSERS_PATH`
+and execs `python3` with the matching Playwright package, both in the one
+process — the env var never has to survive into a separate tool call. The
+underlying build resolves to a cached, content-addressed store path, so
+re-running this costs nothing after the first time within a session.
 
-```sh
-export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
-  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; playwright-driver.browsers' \
-  --no-link --print-out-paths) && \
-nix shell --impure --expr '...' --command python3 script.py
-```
+Under `--proxy`, that first run needs `cache.nixos.org:443` allowed — the same
+requirement any other on-demand nixpkgs fetch has under the sandbox's egress
+policy (see the `nix` skill). Ask the user for `ctl proxy allow` if it's
+denied.
 
-or write it into the script/session you're about to run rather than a
-throwaway shell line.
+For the raw `nix build`/`nix shell` invocation instead — extra fonts, or
+running outside this image — see `reference.md`.
 
 ## Fonts
 
@@ -94,8 +90,10 @@ Two cases still need attention:
     --no-link --print-out-paths)
   ```
 
-  Same caveat as `PLAYWRIGHT_BROWSERS_PATH` above: chain this into the same
-  command as the script that needs it, don't `export` it as a standalone step.
+  This is the manual/advanced path, so the same caveat as the raw
+  `PLAYWRIGHT_BROWSERS_PATH` derivation in `reference.md` applies: chain this
+  into the same command as the script that needs it, don't `export` it as a
+  standalone step.
 
 - **Knowing the failure mode.** With no usable fonts, headless Chromium fails
   *silently*: `page.goto()` succeeds, `page.title()` and `page.content()` return
@@ -104,19 +102,25 @@ Two cases still need attention:
   anything else. `echo $FONTCONFIG_FILE` and `fc-list` say which fonts are
   actually wired in.
 
-## Script it: navigate, screenshot, click
+## Wait for the app
 
-This still needs `$PLAYWRIGHT_BROWSERS_PATH` in its environment — the
-Playwright driver reads it at launch. Set it in the same command:
+Navigating before the target is actually listening produces a stale tab
+followed by `ERR_EMPTY_RESPONSE` — easy to mistake for a browser problem when
+it's really a timing one. Wait for a real response first:
 
 ```sh
-export PLAYWRIGHT_BROWSERS_PATH=$(nix build --impure --expr \
-  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; playwright-driver.browsers' \
-  --no-link --print-out-paths) && \
-nix shell --impure --expr \
-  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem};
-   [ (python3.withPackages (ps: [ ps.playwright ])) fontconfig dejavu_fonts liberation_ttf ]' \
-  --command python3 script.py
+for i in $(seq 1 30); do
+  curl -sf http://127.0.0.1:8000/ >/dev/null && break
+  sleep 1
+done
+```
+
+Adjust the URL and port to whatever the app under test actually serves.
+
+## Script it: navigate, screenshot, click
+
+```sh
+playwright-python script.py
 ```
 
 ```python
@@ -129,6 +133,13 @@ with sync_playwright() as p:
         args=["--no-sandbox", "--disable-dev-shm-usage"],  # container defaults
     )
     page = browser.new_page(viewport={"width": 1280, "height": 800})
+
+    # Attach before navigating -- messages logged during page.goto() itself
+    # are otherwise missed.
+    page.on("console", lambda msg: print(f"[{msg.type}] {msg.text}"))
+    page.on("pageerror", lambda exc: print(f"pageerror: {exc}"))
+    page.on("requestfailed", lambda req: print(f"failed: {req.url} {req.failure}"))
+
     page.goto("https://example.com", wait_until="load")
 
     page.screenshot(path="page.png")              # for visual/image analysis
@@ -140,31 +151,17 @@ with sync_playwright() as p:
     browser.close()
 ```
 
+`msg.type` is `"log"` / `"warning"` / `"error"` / etc.; `msg.text` is the
+formatted message. This is the way to see what a page's own script is doing —
+network failures, thrown exceptions, `console.log` debugging output — the
+same signal DevTools' console gives a human, and it's cheap enough to leave in
+by default rather than adding only after something looks wrong.
+
 Then read `page.png` with your own image-viewing tool (e.g. Claude Code's
 `Read`) to actually look at it — this skill gets the pixels on disk, not in
 front of the model. Prefer `aria_snapshot()` or `page.content()` over a
 screenshot when the task is pure text/structure, not appearance — it's cheaper
 and immune to the fonts gotcha.
-
-## JavaScript console and errors
-
-Attach listeners before navigating — messages logged during `page.goto()`
-itself are otherwise missed:
-
-```python
-page.on("console", lambda msg: print(f"[{msg.type}] {msg.text}"))
-page.on("pageerror", lambda exc: print(f"pageerror: {exc}"))
-page.on("requestfailed", lambda req: print(f"failed: {req.url} {req.failure}"))
-
-page.goto("https://example.com", wait_until="load")
-
-print(page.evaluate("window.location.href"))     # run arbitrary JS, get the result back
-```
-
-`msg.type` is `"log"` / `"warning"` / `"error"` / etc.; `msg.text` is the
-formatted message. This is the way to see what a page's own script is doing —
-network failures, thrown exceptions, `console.log` debugging output — the
-same signal DevTools' console gives a human.
 
 ## Sandbox network
 
@@ -222,7 +219,8 @@ browser:   agent-sandbox --browser -- claude
 ```
 
 `--browser` attaches whatever browsers are running: it maps their CDP ports and
-tells the agent which is which, so the MCP tools below need no further setup.
+tells the agent which is which, via `$AGENT_SANDBOX_BROWSER_CDP_PORT` (see
+below).
 
 If they don't have Chromium on their host, `nix run
 github:datakurre/agent-sandbox#browser` runs it with a pinned one.
@@ -262,15 +260,11 @@ curl -s http://127.0.0.1:9222/json/version
 Port missing from the list means this session has no channel to it — say so and
 ask for the relaunch, rather than guessing at other ports.
 
-## Drive it: MCP tools, or a script
+## Drive it: connect over CDP
 
-With `AGENT_SANDBOX_BROWSER_CDP_PORT` set, `playwright-mcp` is already
-configured against that browser and you have `browser_navigate`,
-`browser_click`, `browser_snapshot` and `browser_take_screenshot` as native
-tools. Prefer these for interactive, turn-by-turn work.
-
-For a fixed sequence, connect directly. A remote connection, not a local
-launch, so `PLAYWRIGHT_BROWSERS_PATH` and `FONTCONFIG_FILE` aren't needed:
+With `AGENT_SANDBOX_BROWSER_CDP_PORT` set, connect a Playwright script
+directly to that port. A remote connection, not a local launch, so
+`PLAYWRIGHT_BROWSERS_PATH` and `FONTCONFIG_FILE` aren't needed:
 
 ```python
 from playwright.sync_api import sync_playwright
@@ -305,11 +299,9 @@ Ask for both up front. The channel is established at launch, so a second browser
 started after the sandbox is not reachable until the next relaunch — which is
 the one round trip worth avoiding.
 
-With two attached, each becomes its own MCP server (`playwright-alice`,
-`playwright-bob`), so say which user you are acting as by choosing the server.
-One attached browser is always the plain `playwright` instead, whatever it is
-named — so don't look for `playwright-alice` until there are actually two. From
-a script, hold both connections at once:
+With two attached, alice is on 9222 and bob on 9223 (see above) — say which
+user you are acting as by choosing the port you connect to. From a script,
+hold both connections at once:
 
 ```python
 alice = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
@@ -353,4 +345,5 @@ and dead from the host.
 raw CDP fallback, driving a browser the user already had open (rather than one
 `agent-sandbox browser` started), a version-skew note between
 `python3Packages.playwright` and `playwright-driver` on nixpkgs-unstable, the
-`playwright-mcp` flag list, and a debugging checklist.
+raw `nix build`/`nix shell` invocation `playwright-python` wraps, an output
+directory convention, and a debugging checklist.

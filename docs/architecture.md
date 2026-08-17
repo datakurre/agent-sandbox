@@ -67,17 +67,10 @@ the canonical tree from each tool's own discovery path. See
    the bundled Node-based agent CLIs, which share Node's runtime. An
    operator's own explicit `NODE_USE_ENV_PROXY` setting is left alone.
 5. Puts a `socat` TCP listener in front of each `--host-loopback-port` socket,
-   because the clients that want them speak TCP and not unix sockets.
-6. When `AGENT_SANDBOX_BROWSER_CDP_PORT` or `AGENT_SANDBOX_BROWSER_MCP=headless`
-   is set, writes an MCP config for the bundled `playwright-mcp` at
-   `~/.config/agent-sandbox/mcp.json` — pointing either at the host browser over
-   that loopback port, or at a headless browser in here. That path is a tmpfs
-   and deliberately not one of the agent state directories the launcher mounts
-   from the host, so this never edits your real agent configuration. Claude Code
-   is passed `--mcp-config`, which is additive; every other agent is told where
-   the file is. Neither variable set means nothing is written and nothing is
-   appended.
-7. `exec "$@"`.
+   because the clients that want them speak TCP and not unix sockets. This is
+   also what makes `AGENT_SANDBOX_BROWSER_CDP_PORT` (set by `--browser`)
+   reachable from inside — see [Cooperative Browser](browser.md).
+6. `exec "$@"`.
 
 ## Launcher (`agent-sandbox`)
 

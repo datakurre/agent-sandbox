@@ -211,8 +211,8 @@ Worth knowing when choosing what to test next:
 
 - **The entrypoint** (`cli/src/bin/agent-sandbox-entrypoint.rs`) runs inside the
   container, so only the integration tier reaches it, and it currently reaches
-  it indirectly. Its MCP-config and PATH-probing helpers are pure and could move
-  into the unit tier.
+  it indirectly. Its PATH-probing helper is pure and could move into the unit
+  tier.
 - **The sidecar's route syncing** (`agent-sandbox-sidecar.rs`) shells out to
   `ip`. The parsing halves are unit-tested; the installing halves are not
   covered at either tier.

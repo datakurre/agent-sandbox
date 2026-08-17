@@ -22,8 +22,9 @@ browser:   agent-sandbox --browser -- claude
 
 `--browser` on the launcher is the other half: it finds the browsers this
 command is running, maps each of their CDP ports, and tells the agent which is
-which, so the tooling below needs no further setup. Start the browsers first —
-the channel is established at launch and cannot be added to a running sandbox.
+which via `AGENT_SANDBOX_BROWSER_CDP_PORT` (see below). Start the browsers
+first — the channel is established at launch and cannot be added to a running
+sandbox.
 
 It is the same `agent-sandbox-proxy` the sidecar runs, with the same policy
 format, the same `ctl proxy` commands, and the same traffic summary when the
@@ -93,13 +94,10 @@ Ports are assigned by walking up from 9222, skipping any a live browser has
 already claimed, so you do not have to allocate them yourself. `--cdp-port`
 pins one if you want a fixed number.
 
-Inside the sandbox, **two or more** attached browsers each become their own MCP
-server named after the session — `playwright-alice`, `playwright-bob` — so an
-agent can say which user it is acting as. A single attached browser is always
-the plain `playwright`, whatever it is called, so the one-browser case is not
-made to carry a name it has no use for: `--browser=alice` on its own gives
-`playwright`, not `playwright-alice`. From a script, connect to each port
-directly:
+Inside the sandbox, `AGENT_SANDBOX_BROWSER_CDP_PORT` carries each attached
+browser's port in the same `alice=9222,bob=9223` shape `--browser` was given,
+so an agent can say which user it is acting as by choosing the port. From a
+script, connect to each port directly:
 
 ```python
 alice = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
@@ -164,17 +162,11 @@ managed-policy layer is active it additionally blocks installing anything else
 into the profile. For a Web Store extension rather than an unpacked directory,
 the managed-policy route is `ExtensionInstallForcelist`.
 
-### Browser MCP tools
+### Driving it: `AGENT_SANDBOX_BROWSER_CDP_PORT`
 
-`--browser` sets `AGENT_SANDBOX_BROWSER_CDP_PORT` for you, and that is what
-wires up tooling: the entrypoint writes an MCP config pointing `playwright-mcp`
-(bundled in the image) at each browser, so an agent gets `browser_navigate` /
-`browser_click` / `browser_take_screenshot` with no setup. Claude Code picks the
-config up automatically; other CLIs are told where the file is.
-
-Set `AGENT_SANDBOX_BROWSER_MCP=headless` instead — with `-e`, and without
-`--browser` — for a headless browser inside the sandbox, needing no host
-cooperation at all, or `=off` to write nothing. A launch that sets neither
+`--browser` sets `AGENT_SANDBOX_BROWSER_CDP_PORT` for you, which an agent reads
+to connect a Playwright script to each browser via `connect_over_cdp` — see the
+`browser` skill for the concrete snippet. A launch that never sets `--browser`
 behaves exactly as it did before this existed.
 
 The variable is the underlying interface and `--browser` is a shorthand over it,
