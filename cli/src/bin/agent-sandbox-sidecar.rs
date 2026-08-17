@@ -417,6 +417,10 @@ fn main() -> Result<()> {
         }
         proxy_args.push("--listen".to_string());
         proxy_args.push(format!("{}:8888", sidecar_listen));
+        // The sandbox's /etc/hosts resolves every allowed name to this address,
+        // so a client that ignores HTTPS_PROXY -- nix's libgit2 is the one that
+        // cannot be configured otherwise -- still arrives at the proxy.
+        proxy_args.push("--transparent".to_string());
     }
 
     if config.dry_run {

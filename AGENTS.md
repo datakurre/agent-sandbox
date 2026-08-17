@@ -81,7 +81,7 @@ to them too:
 [network]
 allowed_hosts = [
     "channels.nixos.org:443",
-    "github.com:443",
+    "github.com:443,22",
     "index.crates.io:443",
     "releases.nixos.org:443",
 ]

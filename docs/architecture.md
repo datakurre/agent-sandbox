@@ -149,6 +149,39 @@ without aardvark there is nothing to resolve that name.  That also retires a rac
 nothing ever gated on -- the readiness handshake never proved aardvark had
 published the sidecar's record before the sandbox started.
 
+### Transparent listeners, for clients that cannot be pointed at a proxy
+
+Everything above assumes a client that reads `HTTPS_PROXY`.  One does not, and
+cannot be made to: the libgit2 inside `nix` -- and so inside `devenv` -- fetches
+a flake input through `git_remote_connect` with a null `git_proxy_options`,
+which is `GIT_PROXY_NONE`.  That consults neither the proxy environment nor
+`http.proxy`, and it runs on a *detached* remote, which has no repository and
+therefore no git config to consult at all.  Nix has no proxy setting of its own
+to bridge the gap either -- `http-proxy` is not a `nix.conf` key, and putting it
+in `NIX_CONFIG` earns an "unknown setting" warning and nothing else.  (Nix's
+plain downloads are libcurl and do read the environment; only its git fetches
+take this path.)
+
+So the launcher gives those clients somewhere to land.  Every name the policy
+allows is passed to `podman run` as `--add-host NAME:<sidecar>`, and the proxy
+binds `:80` and `:443` on that same address under `--transparent`.  A "direct"
+connection then arrives at the proxy, which recovers the destination from the
+TLS SNI or the `Host` header instead of from a request line, and runs the
+identical policy, address re-check, interception and logging path a `CONNECT`
+would.  On the TLS path the ClientHello is peeked, not terminated: its bytes are
+replayed to the origin verbatim, or handed to rustls through `PrefixedStream`
+when an L7 rule means the connection has to be intercepted anyway.
+
+This widens nothing.  Only names already in the allow list are mapped; a
+wildcard pattern is not (`/etc/hosts` has no wildcards, and mapping the apex
+would assert an allowance the policy never made); and the mapping is inert for
+every client that does use the proxy, since such a client never resolves the
+name.  A transparent client that is denied gets a closed socket rather than a
+`403`, because it is mid-handshake and would read the status line as a TLS
+record.
+
+### The proxy
+
 The proxy itself is Rust (`proxy/src/main.rs`; `ipnet` for CIDR matching,
 `rustls`/`rcgen`/`webpki-roots` for the MITM path, `ratatui`/`crossterm` for the
 TUI): a thread-per-connection HTTP forward proxy handling `CONNECT` and

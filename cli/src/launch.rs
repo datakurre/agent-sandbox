@@ -380,6 +380,47 @@ pub fn policy_has_allow_rules(policy: &str) -> bool {
         .any(|l| l.starts_with("allow_host ") || l.starts_with("allow_ip "))
 }
 
+/// The host names to resolve to the sidecar in the sandbox's `/etc/hosts`.
+///
+/// Under `--proxy` the sandbox is on an `--internal --disable-dns` network, so
+/// *no* name resolves and everything has to go through the proxy environment.
+/// A client that ignores that environment therefore fails at DNS -- and one
+/// client cannot be made to honour it at all: the libgit2 inside `nix` (so also
+/// inside `devenv`) fetches flake inputs through `git_remote_connect` with a
+/// null `git_proxy_options`, which reads neither `https_proxy` nor `http.proxy`,
+/// on a detached remote that has no git config to read either.
+///
+/// Pointing the allowed names at the sidecar gives those clients somewhere to
+/// land: the proxy's `--transparent` listeners recover the destination from the
+/// TLS SNI or the `Host` header and apply the very same policy.  It widens
+/// nothing -- only names the policy already allows are mapped, and the mapping
+/// is inert for every client that does use the proxy, which never resolves the
+/// name in the first place.
+///
+/// Entries carrying a port suffix are mapped by name; `*.` patterns are
+/// dropped, because `/etc/hosts` has no wildcards and mapping the apex instead
+/// would assert something the policy did not say.  `localhost` is dropped too:
+/// an entry for it would shadow the image's own loopback line and send every
+/// client in the sandbox that talks to its own server off to the sidecar, which
+/// the baseline `deny_ip 127.0.0.0/8` would then refuse.
+pub fn transparent_host_names(allow_host: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in allow_host {
+        let name = entry.split(':').next().unwrap_or(entry).trim();
+        if name.is_empty() || name.contains('*') || name.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        let name = name.to_ascii_lowercase();
+        if name == "localhost" || name.ends_with(".localhost") || name == "localhost.localdomain" {
+            continue;
+        }
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// Whether any host in this policy is subject to TLS interception.
 ///
 /// The proxy only terminates TLS for a host carrying an L7 rule, so with none
@@ -551,6 +592,43 @@ mod tests {
             "deny_ip 10.0.0.0/8\nallow_ip 1.2.3.4\n"
         ));
         assert!(!policy_has_allow_rules("allow_port 443\ndefault deny\n"));
+    }
+
+    #[test]
+    fn only_allowed_names_are_pointed_at_the_sidecar() {
+        // The port suffix is part of the policy entry, not of the name, and one
+        // host declared twice is still one /etc/hosts line.
+        assert_eq!(
+            transparent_host_names(&[
+                "github.com:443,22".to_string(),
+                "GitHub.com".to_string(),
+                "channels.nixos.org".to_string(),
+            ]),
+            vec!["github.com", "channels.nixos.org"]
+        );
+    }
+
+    #[test]
+    fn wildcards_and_addresses_are_left_out_of_etc_hosts() {
+        // /etc/hosts has no wildcards.  Mapping the apex instead would assert
+        // an allowance the policy never made -- `*.example.com` does not permit
+        // `example.com` -- and an address needs no name to resolve at all.
+        assert!(transparent_host_names(&["*.example.com".to_string()]).is_empty());
+        assert!(transparent_host_names(&["*".to_string()]).is_empty());
+        assert!(transparent_host_names(&["1.2.3.4".to_string()]).is_empty());
+        assert!(transparent_host_names(&["".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn loopback_is_never_redirected_at_the_sandbox() {
+        // Mapping localhost would shadow the image's own loopback line, so a
+        // server the agent started in its own container would suddenly be
+        // addressed at the sidecar -- and refused by the baseline deny.  This is
+        // the one name that must never be pointed away.
+        assert!(transparent_host_names(&["localhost:8080".to_string()]).is_empty());
+        assert!(transparent_host_names(&["LOCALHOST".to_string()]).is_empty());
+        assert!(transparent_host_names(&["app.localhost".to_string()]).is_empty());
+        assert!(transparent_host_names(&["localhost.localdomain".to_string()]).is_empty());
     }
 
     #[test]

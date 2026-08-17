@@ -326,7 +326,7 @@ and `~/.gemini/skills` for tools that use those discovery paths.
 | `proxy show\|allow\|rm\|reset\|export\|check [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as a fenced AGENTS.md block (`--plain` for a bare-TOML profile file); `check HOST[:PORT]` dry-runs whether a target would be allowed |
 | `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
 | `relay [-f] [WORD] [--sandbox WORD]` | show whether GPG signing is enabled and which hosts SSH push/pull may reach, plus what the relay has been asked for |
-| `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox |
+| `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox, with the environment the entrypoint built (see below) |
 | `browser [WORD] [--sandbox WORD]` | start a throwaway host browser behind a deny-by-default allow list, for cooperative testing over CDP; `--name` runs several at once (see below) |
 | `purge [--all] [-n] [-f]` | reclaim leftovers; running sandboxes are kept unless `--all`, and `-f` skips the confirmation |
 
@@ -347,6 +347,16 @@ $ agent-sandbox ctl proxy show --sandbox silent
 $ agent-sandbox ctl mounts ls --sandbox silent
 $ agent-sandbox ctl attach silent -- bash
 ```
+
+`attach` reproduces the environment the sandbox's own session runs in. `podman
+exec` would otherwise start from the container's *configured* environment — what
+`podman run` was given — and so miss everything the entrypoint derived at
+startup: the merged CA bundle, `GIT_SSH_COMMAND=relay-ssh`, and the flattened
+host git config from `--git`. That is why `git clone git@github.com:…` used to
+fail in an attached shell while the same clone worked in the session the
+launcher started. The entrypoint records those variables at
+`~/.config/agent-sandbox/env` and `attach` passes them back in; a sandbox from an
+older image simply has no such file and attaches as before.
 
 `purge` defaults to leftovers only: exited sandboxes, sidecars whose sandbox is
 gone, per-session networks nothing is attached to, and temp directories from a

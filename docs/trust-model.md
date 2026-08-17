@@ -152,9 +152,15 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
 ### What the policy covers
 
 The containment itself is separate from the policy: the sandbox gets a single interface on
-an internal network with no route off it, so the proxy is the only reachable destination and
-an agent that ignores `HTTP_PROXY` simply fails. Everything below is the *policy* applied at
-the proxy. Two limits remain by design; they are described at the end of this section.
+an internal network with no route off it, so the proxy is the only reachable destination.
+An agent that ignores `HTTP_PROXY` reaches the proxy anyway — every allowed name resolves to
+the sidecar in the sandbox's `/etc/hosts`, and the proxy's transparent `:80`/`:443` listeners
+take the destination from the `Host` header or the TLS SNI and apply this same policy to it.
+That exists for `nix`'s git fetcher, which cannot be pointed at a proxy by any means
+([architecture](architecture.md#transparent-listeners-for-clients-that-cannot-be-pointed-at-a-proxy));
+it grants nothing extra, since only names the policy already allows are mapped at all.
+Everything below is the *policy* applied at the proxy. Two limits remain by design; they are
+described at the end of this section.
 
 Rules match on host **and** port, written in the same string, e.g.
 `allowed_hosts = ["github.com:443", "api.github.com:443"]`. The port is
@@ -261,9 +267,11 @@ not *whether* arbitrary data can leave or a chosen origin can be reached through
   containment. Where the latter is the goal, scope such a host to a pull-through cache or specific
   routes rather than allowing it wholesale.
 
-**Second, egress is `CONNECT`-only:** UDP, QUIC/HTTP3, ICMP and raw TCP have no path out at all,
-which is why some tools need `HTTP_PROXY` honoured explicitly (`NODE_USE_ENV_PROXY=1` is set for
-Node) and why SSH is rewritten through a generated `ProxyCommand`.
+**Second, egress is HTTP-shaped:** UDP, QUIC/HTTP3, ICMP and raw TCP have no path out at all.
+A connection leaves either as a `CONNECT` tunnel, an absolute-form request, or — on the
+transparent `:80`/`:443` listeners — as a stream the proxy could name from its `Host` header or
+TLS SNI. Anything else has nowhere to go, which is why `NODE_USE_ENV_PROXY=1` is set for Node
+and why SSH is rewritten through a generated `ProxyCommand`.
 
 ### Changing the proxy policy mid-session
 

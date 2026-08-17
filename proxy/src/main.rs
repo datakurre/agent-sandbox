@@ -64,6 +64,22 @@ const READY_PROBE_HOST: &str = "cloudflare.com:443";
 /// instead, which is the whole reason the three paths below are derived rather
 /// than constant.
 const DEFAULT_SHARED_DIR: &str = "/sidecar_shared";
+/// Ports the `--transparent` listeners take over.  They are the origin ports a
+/// client that ignores the proxy environment would dial, which is the whole
+/// point: the launcher resolves every allowed name to the sidecar, so those
+/// dials land here instead of nowhere.
+const TRANSPARENT_HTTP_PORT: u16 = 80;
+const TRANSPARENT_HTTPS_PORT: u16 = 443;
+
+/// The address part of a `HOST:PORT` listen spec, keeping a bracketed IPv6
+/// literal intact.
+fn listen_ip(listen: &str) -> &str {
+    if let Some(end) = listen.rfind(']') {
+        return &listen[..=end];
+    }
+    listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(listen)
+}
+
 /// Written by the proxy, read by the sidecar's readiness gate on the host.
 fn proxy_ready_path(shared_dir: &str) -> String {
     format!("{}/proxy-ready", shared_dir)
@@ -554,6 +570,161 @@ impl Write for PrefixedStream {
     }
 }
 
+/// How a connection reached the proxy.
+///
+/// `Proxy` is the ordinary forward-proxy path: the client addressed *this
+/// process*, in HTTP, and can be answered with an HTTP status line.
+///
+/// The transparent variants exist for clients that ignore the proxy
+/// environment altogether.  The one that forced them is the libgit2 inside
+/// `nix` (and so inside `devenv`): its flake fetcher calls
+/// `git_remote_connect` with a null `git_proxy_options`, which is
+/// `GIT_PROXY_NONE` — so it consults neither `https_proxy` nor `http.proxy`,
+/// and it works on a *detached* remote, which has no repository and therefore
+/// no git config to consult in the first place.  No environment variable and
+/// no config file can redirect it.  So the launcher points every allowed name
+/// at the sidecar in the sandbox's `/etc/hosts` instead, and the "direct"
+/// connection lands here.  The destination is then recovered from the TLS SNI
+/// or the `Host` header rather than from a request line, and everything after
+/// that — policy, address re-check, L7 interception, logging — is the same
+/// code as for a `CONNECT`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ingress {
+    Proxy,
+    TransparentTls,
+    TransparentHttp,
+}
+
+impl Ingress {
+    /// Whether the peer is an HTTP client that can read a status line.  A
+    /// transparent TLS peer is mid-handshake and would only see an
+    /// `HTTP/1.1 403` as protocol garbage, so for it a closed socket is the
+    /// only signal that carries.
+    fn speaks_http(self) -> bool {
+        self != Ingress::TransparentTls
+    }
+}
+
+/// Send an HTTP status line to the client, unless the client is not speaking
+/// HTTP yet.  Errors are dropped: every caller is already on its way out.
+fn reply(sock: &mut TcpStream, ingress: Ingress, resp: &[u8]) {
+    if ingress.speaks_http() {
+        let _ = sock.write_all(resp);
+    }
+}
+
+/// Read one TLS record holding a ClientHello and return it verbatim together
+/// with the SNI host name it carries.
+///
+/// The bytes are returned unparsed as well as parsed because they still belong
+/// to the origin: on the pass-through path they are replayed to the upstream
+/// socket, and on the interception path they are fed back to rustls through
+/// `PrefixedStream`, exactly as the `CONNECT` path replays the bytes that
+/// arrived alongside the request head.
+///
+/// A ClientHello may in principle be fragmented across records; in practice
+/// the first flight is one record, and a client that fragments it simply does
+/// not get the transparent path.
+fn read_client_hello(sock: &mut TcpStream) -> Option<(Vec<u8>, String)> {
+    let mut header = [0u8; 5];
+    read_exact_tolerant(sock, &mut header)?;
+    // Handshake record, and a length that fits TLS's own 2^14 ceiling.
+    if header[0] != 0x16 {
+        return None;
+    }
+    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if len == 0 || len > 16384 {
+        return None;
+    }
+    let mut record = vec![0u8; 5 + len];
+    record[..5].copy_from_slice(&header);
+    read_exact_tolerant(sock, &mut record[5..])?;
+    let sni = parse_client_hello_sni(&record[5..])?;
+    Some((record, sni))
+}
+
+/// `Read::read_exact`, but retrying the interruptions `pump` also tolerates.
+fn read_exact_tolerant(sock: &mut TcpStream, buf: &mut [u8]) -> Option<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match sock.read(&mut buf[filled..]) {
+            Ok(0) => return None,
+            Ok(k) => filled += k,
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+/// Pull the `server_name` extension out of a ClientHello handshake message.
+///
+/// Every length in here is attacker-controlled, so each step is bounds-checked
+/// against the slice rather than trusted: a malformed hello must yield `None`,
+/// never a panic in a thread that is holding a client connection.
+fn parse_client_hello_sni(body: &[u8]) -> Option<String> {
+    let mut p = 0usize;
+    let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
+        let end = p.checked_add(n)?;
+        let out = body.get(*p..end)?;
+        *p = end;
+        Some(out)
+    };
+
+    // Handshake header: type 1 (client_hello) and a 24-bit length.
+    if *take(&mut p, 1)?.first()? != 0x01 {
+        return None;
+    }
+    let _len = take(&mut p, 3)?;
+    // legacy_version (2) + random (32)
+    take(&mut p, 34)?;
+    // legacy_session_id
+    let n = *take(&mut p, 1)?.first()? as usize;
+    take(&mut p, n)?;
+    // cipher_suites
+    let n = u16::from_be_bytes(take(&mut p, 2)?.try_into().ok()?) as usize;
+    take(&mut p, n)?;
+    // legacy_compression_methods
+    let n = *take(&mut p, 1)?.first()? as usize;
+    take(&mut p, n)?;
+
+    // extensions
+    let ext_len = u16::from_be_bytes(take(&mut p, 2)?.try_into().ok()?) as usize;
+    let ext_end = p.checked_add(ext_len)?;
+    while p < ext_end {
+        let ext_type = u16::from_be_bytes(take(&mut p, 2)?.try_into().ok()?);
+        let ext_body_len = u16::from_be_bytes(take(&mut p, 2)?.try_into().ok()?) as usize;
+        let ext_body = take(&mut p, ext_body_len)?;
+        if ext_type != 0x0000 {
+            continue;
+        }
+        // ServerNameList: 2-byte list length, then entries of
+        // { name_type (1), length (2), name }.  Only host_name (0) exists.
+        let mut q = 2usize;
+        while q + 3 <= ext_body.len() {
+            let name_type = ext_body[q];
+            let name_len = u16::from_be_bytes([ext_body[q + 1], ext_body[q + 2]]) as usize;
+            q += 3;
+            let name = ext_body.get(q..q.checked_add(name_len)?)?;
+            q += name_len;
+            if name_type == 0 {
+                return std::str::from_utf8(name).ok().map(|s| s.to_string());
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// The value of the first `Host:` header in a request head.
+fn host_header(head: &str) -> Option<&str> {
+    head.lines()
+        .skip(1)
+        .find(|l| l.len() >= 5 && l[..5].eq_ignore_ascii_case("host:"))
+        .map(|l| l[5..].trim())
+        .filter(|v| !v.is_empty())
+}
+
 /// Copy `src` into `dst` until either side is done, returning the byte count.
 ///
 /// A read timeout means "nothing to say yet", not "hang up" — treating it as
@@ -637,23 +808,56 @@ fn connect_any(addrs: &[SocketAddr], retry_until: Instant) -> Result<TcpStream, 
     }
 }
 
-fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
+/// Serve one client connection to completion.
+///
+/// `ingress` decides only how the destination is learned and whether the peer
+/// can be answered in HTTP; every policy decision below is the same for all
+/// three.
+fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
     let started = Instant::now();
     let _ = client_sock.set_nodelay(true);
     let _ = client_sock.set_read_timeout(Some(HEAD_TIMEOUT));
 
+    // The port the client actually dialled.  On a transparent listener that is
+    // the origin port it believed it was reaching, which is what policy has to
+    // be checked against.
+    let local_port = client_sock.local_addr().map(|a| a.port()).unwrap_or(0);
+
     let mut req_buf = [0u8; HEAD_MAX];
-    let n = match read_head(&mut client_sock, &mut req_buf) {
-        Some(n) => n,
-        None => return,
-    };
+    let n;
+    // Bytes already read from the client that belong to the origin rather than
+    // to us — on the transparent TLS path, the ClientHello we had to consume
+    // to learn where the connection was going.
+    let mut prelude: Vec<u8> = Vec::new();
+
+    if ingress == Ingress::TransparentTls {
+        let (hello, sni) = match read_client_hello(&mut client_sock) {
+            Some(v) => v,
+            None => return,
+        };
+        // Synthesised rather than special-cased, so the whole pipeline below —
+        // policy, resolution, interception, logging — sees the same shape it
+        // sees for a real CONNECT.
+        let head = format!("CONNECT {}:{} HTTP/1.1\r\n\r\n", sni, local_port);
+        if head.len() > req_buf.len() {
+            return;
+        }
+        req_buf[..head.len()].copy_from_slice(head.as_bytes());
+        n = head.len();
+        prelude = hello;
+    } else {
+        n = match read_head(&mut client_sock, &mut req_buf) {
+            Some(n) => n,
+            None => return,
+        };
+    }
 
     let req_str = String::from_utf8_lossy(&req_buf[..n]);
     let first_line = req_str.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
 
     if parts.len() < 3 {
-        let _ = client_sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+        reply(&mut client_sock, ingress, b"HTTP/1.1 400 Bad Request\r\n\r\n");
         return;
     }
 
@@ -674,29 +878,44 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     } else {
         if let Some(idx) = url.find("://") {
             url = &url[idx + 3..];
+        } else if ingress == Ingress::TransparentHttp {
+            // Origin-form: a transparent client believes it is talking to the
+            // origin server, so the authority is only in the Host header.
+            url = host_header(&req_str).unwrap_or("");
         }
         let url_no_path = url.split('/').next().unwrap_or("");
+        let default_port = if ingress == Ingress::TransparentHttp {
+            local_port
+        } else {
+            80
+        };
         if let Some((h, p)) = url_no_path.rsplit_once(':') {
             raw_host = h.to_ascii_lowercase();
-            port = p.parse().unwrap_or(80);
+            port = p.parse().unwrap_or(default_port);
         } else {
             raw_host = url_no_path.to_ascii_lowercase();
-            port = 80;
+            port = default_port;
         }
     }
 
     if raw_host.is_empty() {
-        let _ = client_sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+        reply(&mut client_sock, ingress, b"HTTP/1.1 400 Bad Request\r\n\r\n");
         return;
     }
 
     let host = match normalize_host(&raw_host) {
         Some(h) => h,
         None => {
-            let _ = client_sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            reply(&mut client_sock, ingress, b"HTTP/1.1 400 Bad Request\r\n\r\n");
             return;
         }
     };
+
+    // From here the two paths converge: whatever the client already sent that
+    // is destined for the origin travels as `prelude`.
+    if prelude.is_empty() {
+        prelude = split_head_and_extra(&req_buf[..n]).1.to_vec();
+    }
 
     // One snapshot for this connection's lifetime.  Taken after the head is
     // parsed so a reload landing mid-handshake cannot make the name check and the
@@ -705,7 +924,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
 
     if !shared.is_allowed(&host, port) {
         let reason = cfg.why_denied(&host, port);
-        let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        reply(&mut client_sock, ingress, b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} ({})", host, port, reason);
         shared.denied_detail(&host, port, &reason, &req_str);
         shared.record(
@@ -727,7 +946,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     let addrs = match shared.resolver.resolve(&host, port, shared.startup_until) {
         Ok(a) => a,
         Err(e) => {
-            let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            reply(&mut client_sock, ingress, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             eprintln!("proxy: dns failure {}:{}: {}", host, port, e);
             let detail = format!("dns: {}", short_err(&e));
             shared.record(
@@ -752,7 +971,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     // merely unlisted) hostname.
     if let Some(bad) = addrs.iter().find(|a| cfg.is_denied_address(a.ip())) {
         let reason = cfg.why_address_denied(bad.ip());
-        let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        reply(&mut client_sock, ingress, b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!("proxy: deny {}:{} ({})", host, port, reason);
         shared.denied_detail(&host, port, &reason, &req_str);
         shared.record(
@@ -774,7 +993,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     let mut remote_sock = match connect_any(&addrs, shared.startup_until) {
         Ok(s) => s,
         Err(e) => {
-            let _ = client_sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            reply(&mut client_sock, ingress, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             eprintln!("proxy: connect failure {}:{}: {}", host, port, e);
             let detail = format!("connect: {}", short_err(&e));
             shared.record(
@@ -812,7 +1031,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
             // Host-level on purpose: refuse cleartext to a host that carries
             // any secret route, not only on the routes that would inject.
             if cfg.is_secret_host(&host) {
-                let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+                reply(&mut client_sock, ingress, b"HTTP/1.1 403 Forbidden\r\n\r\n");
                 eprintln!(
                     "proxy: deny {}:{} (secret injection requires TLS)",
                     host, port
@@ -918,9 +1137,12 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
         }
     } else if port == 443 {
         if !skip_l7 && shared.session_ca.is_some() {
-            if client_sock
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .is_err()
+            // A transparent client is already sending TLS; only a client that
+            // asked for a tunnel is waiting to be told it has one.
+            if ingress.speaks_http()
+                && client_sock
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .is_err()
             {
                 return;
             }
@@ -948,9 +1170,8 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
                 }
             };
 
-            let (_, extra) = split_head_and_extra(&req_buf[..n]);
             let mut client_tls =
-                match tls::terminate(PrefixedStream::new(client_sock, extra.to_vec()), &leaf) {
+                match tls::terminate(PrefixedStream::new(client_sock, prelude.clone()), &leaf) {
                     Ok(stream) => stream,
                     Err(e) => {
                         eprintln!(
@@ -1196,7 +1417,7 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     }
 
     if method == "CONNECT" && !skip_l7 {
-        let _ = client_sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        reply(&mut client_sock, ingress, b"HTTP/1.1 403 Forbidden\r\n\r\n");
         eprintln!(
             "proxy: deny CONNECT {}:{} (L7 rules require TLS interception on port 443)",
             host, port
@@ -1223,30 +1444,34 @@ fn handle_client(mut client_sock: TcpStream, shared: Arc<Shared>) {
     let mut head_up: u64 = 0;
 
     if method == "CONNECT" {
-        if client_sock
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .is_err()
+        // A transparent client never asked for a tunnel and has no HTTP parser
+        // waiting for the answer; its ClientHello is already in `prelude`.
+        if ingress.speaks_http()
+            && client_sock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .is_err()
         {
             return;
         }
         // Forward any data that arrived alongside the CONNECT head.
-        let (_, extra) = split_head_and_extra(&req_buf[..n]);
-        if !extra.is_empty() {
-            if remote_sock.write_all(extra).is_err() {
+        if !prelude.is_empty() {
+            if remote_sock.write_all(&prelude).is_err() {
                 return;
             }
-            head_up += extra.len() as u64;
+            head_up += prelude.len() as u64;
         }
     } else {
         // This path splices the client's bytes straight through, so the request
         // line is the one addressed to *this proxy* unless it is converted:
         // origin servers are entitled to origin-form, and some insist on it.
-        let (head, extra) = split_head_and_extra(&req_buf[..n]);
+        // A transparent client already sent origin-form, which the rewrite
+        // leaves alone.
+        let (head, _) = split_head_and_extra(&req_buf[..n]);
         let head = inject::rewrite_request_target(head).unwrap_or_else(|| head.to_vec());
-        if remote_sock.write_all(&head).is_err() || remote_sock.write_all(extra).is_err() {
+        if remote_sock.write_all(&head).is_err() || remote_sock.write_all(&prelude).is_err() {
             return;
         }
-        head_up += (head.len() + extra.len()) as u64;
+        head_up += (head.len() + prelude.len()) as u64;
     }
 
     let (client_read, remote_write) = match (client_sock.try_clone(), remote_sock.try_clone()) {
@@ -1405,6 +1630,9 @@ Usage: agent-sandbox-proxy [OPTIONS]
   --log FILE             append one JSON line per connection event
   --detail-log FILE      bounded sanitized denied-request details
   --listen ADDR          listen address (default 0.0.0.0:8888)
+  --transparent          also listen on :80 and :443 of the --listen address,
+                         taking the destination from the Host header or the
+                         TLS SNI, for clients that ignore the proxy environment
   --shared-dir DIR       where proxy-ready, ca.pem and egress-degraded are
                          written (default /sidecar_shared)
   --no-egress-probe      start serving without waiting for egress to resolve
@@ -1429,6 +1657,7 @@ struct Options {
     log: String,
     detail_log: String,
     listen: String,
+    transparent: bool,
     shared_dir: String,
     no_egress_probe: bool,
     secret_fd: Option<i32>,
@@ -1443,6 +1672,7 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
         log: String::new(),
         detail_log: String::new(),
         listen: "0.0.0.0:8888".to_string(),
+        transparent: false,
         shared_dir: DEFAULT_SHARED_DIR.to_string(),
         no_egress_probe: false,
         secret_fd: None,
@@ -1467,6 +1697,7 @@ fn parse_args(args: &[String]) -> (Options, Option<String>) {
             "--log" => o.log = value(),
             "--detail-log" => o.detail_log = value(),
             "--listen" => o.listen = value(),
+            "--transparent" => o.transparent = true,
             "--shared-dir" => o.shared_dir = value(),
             "--no-egress-probe" => o.no_egress_probe = true,
             "--secret-fd" => {
@@ -1614,6 +1845,28 @@ fn main() {
         }
     };
 
+    let mut transparent_listeners = Vec::new();
+    if opts.transparent {
+        // Same address as the proxy port: on the sidecar that is the address it
+        // holds on the sandbox's --internal network, so these listeners are no
+        // more reachable than the proxy itself.
+        let ip = listen_ip(&opts.listen);
+        for (port, ingress) in [
+            (TRANSPARENT_HTTP_PORT, Ingress::TransparentHttp),
+            (TRANSPARENT_HTTPS_PORT, Ingress::TransparentTls),
+        ] {
+            let addr = format!("{}:{}", ip, port);
+            match TcpListener::bind(&addr) {
+                Ok(l) => transparent_listeners.push((l, ingress)),
+                Err(e) => {
+                    eprintln!("proxy: cannot bind {}: {}", addr, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        eprintln!("proxy: transparent listeners on {}:80 and {}:443", ip, ip);
+    }
+
     // On the host -- `agent-sandbox browser` -- egress readiness is not in
     // question and the 30s ceiling would only be a stall on the way to a
     // browser window, so that caller passes --no-egress-probe.
@@ -1653,6 +1906,21 @@ fn main() {
         let _ = f.write_all(b"ready\n");
     }
 
+    for (l, ingress) in transparent_listeners {
+        let shared = Arc::clone(&shared);
+        if thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || accept_loop(l, shared, ingress))
+            .is_err()
+        {
+            eprintln!("proxy: cannot spawn the {:?} accept loop", ingress);
+        }
+    }
+
+    accept_loop(listener, shared, Ingress::Proxy);
+}
+
+fn accept_loop(listener: TcpListener, shared: Arc<Shared>, ingress: Ingress) {
     for stream in listener.incoming() {
         match stream {
             Ok(client) => {
@@ -1661,7 +1929,7 @@ fn main() {
                 // little stack; the default 8 MiB reservation each adds up.
                 let spawned = thread::Builder::new()
                     .stack_size(256 * 1024)
-                    .spawn(move || handle_client(client, shared));
+                    .spawn(move || serve(client, shared, ingress));
                 if spawned.is_err() {
                     eprintln!("proxy: cannot spawn handler thread");
                 }
@@ -1732,6 +2000,190 @@ mod tests {
         let mut argv = vec!["agent-sandbox-proxy".to_string()];
         argv.extend(extra.iter().map(|s| s.to_string()));
         parse_args(&argv).0
+    }
+
+    /// A ClientHello carrying `sni`, built the way a client builds one, so the
+    /// parser is exercised against the real field order rather than a fixture
+    /// shaped to fit it.
+    fn client_hello(sni: &str) -> Vec<u8> {
+        let mut ext = vec![0x00, 0x00]; // extension_type: server_name
+        let mut list = vec![0x00]; // name_type: host_name
+        list.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        list.extend_from_slice(sni.as_bytes());
+        let mut body = (list.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(&list);
+        ext.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&body);
+
+        let mut hs = vec![0x03, 0x03]; // legacy_version
+        hs.extend_from_slice(&[0u8; 32]); // random
+        hs.push(0x20); // legacy_session_id length
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites
+        hs.extend_from_slice(&[0x01, 0x00]); // legacy_compression_methods
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+
+        let mut msg = vec![0x01]; // client_hello
+        let len = hs.len();
+        msg.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        msg.extend_from_slice(&hs);
+        msg
+    }
+
+    #[test]
+    fn the_transparent_path_takes_its_destination_from_the_sni() {
+        assert_eq!(
+            parse_client_hello_sni(&client_hello("github.com")).as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn a_malformed_client_hello_yields_no_host_rather_than_a_panic() {
+        // Every length in a hello is attacker-controlled, and this parser runs
+        // on a thread holding a live client connection: a truncation must end
+        // the connection, never the thread.
+        let full = client_hello("github.com");
+        for cut in 0..full.len() {
+            assert_eq!(parse_client_hello_sni(&full[..cut]), None, "cut at {}", cut);
+        }
+        assert_eq!(parse_client_hello_sni(&[]), None);
+        // A handshake that is not a ClientHello at all.
+        let mut not_hello = full.clone();
+        not_hello[0] = 0x02;
+        assert_eq!(parse_client_hello_sni(&not_hello), None);
+    }
+
+    #[test]
+    fn a_client_hello_without_sni_has_no_destination_to_offer() {
+        // No SNI means nothing names the origin, so there is nothing to check
+        // policy against -- the connection has to be dropped, not guessed at.
+        let mut hs = vec![0x03, 0x03];
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0x00);
+        hs.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        hs.extend_from_slice(&[0x01, 0x00]);
+        hs.extend_from_slice(&[0x00, 0x00]); // no extensions
+        let mut msg = vec![0x01];
+        let len = hs.len();
+        msg.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        msg.extend_from_slice(&hs);
+        assert_eq!(parse_client_hello_sni(&msg), None);
+    }
+
+    #[test]
+    fn a_transparent_cleartext_request_is_addressed_by_its_host_header() {
+        let head = "GET /repo/info/refs HTTP/1.1\r\nHost: github.com\r\nAccept: */*\r\n\r\n";
+        assert_eq!(host_header(head), Some("github.com"));
+        // Case-insensitive, per RFC 9110, and a port survives.
+        assert_eq!(
+            host_header("GET / HTTP/1.1\r\nhOsT:  example.com:8080  \r\n\r\n"),
+            Some("example.com:8080")
+        );
+        // The request line is skipped, so a target containing "host:" cannot be
+        // mistaken for the header.
+        assert_eq!(host_header("GET /host:1 HTTP/1.1\r\n\r\n"), None);
+        assert_eq!(host_header("GET / HTTP/1.1\r\nHost:\r\n\r\n"), None);
+    }
+
+    /// Drive a whole transparent TLS connection through `serve`, from
+    /// ClientHello to origin and back.
+    ///
+    /// The origin and the transparent listener sit on the same port of two
+    /// different loopback addresses, because `serve` takes the port it is
+    /// policing from the socket the client dialled -- which on a real
+    /// transparent listener is the origin's own port.
+    /// Wrap a handshake message in the TLS record the wire actually carries.
+    fn tls_record(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x16, 0x03, 0x01];
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn a_transparent_tls_connection_is_spliced_to_the_host_its_sni_names() {
+        let origin = TcpListener::bind("127.0.0.1:0").expect("origin");
+        let port = origin.local_addr().unwrap().port();
+        let Ok(front) = TcpListener::bind(format!("127.0.0.2:{}", port)) else {
+            // The same port on another loopback address was taken by something
+            // else; nothing about the proxy is under test in that case.
+            return;
+        };
+
+        let hello = tls_record(&client_hello("localhost"));
+        let expected = hello.clone();
+        let origin_thread = thread::spawn(move || {
+            let (mut sock, _) = origin.accept().expect("origin accept");
+            let mut got = vec![0u8; expected.len()];
+            sock.read_exact(&mut got).expect("origin read");
+            sock.write_all(b"pong").expect("origin write");
+            got
+        });
+
+        let shared = Arc::new(shared_with(&format!("allow_host localhost:{}", port)));
+        let proxy_thread = thread::spawn(move || {
+            let (sock, _) = front.accept().expect("front accept");
+            serve(sock, shared, Ingress::TransparentTls);
+        });
+
+        let mut client = TcpStream::connect(format!("127.0.0.2:{}", port)).expect("client connect");
+        client.write_all(&hello).expect("client write");
+        let mut back = Vec::new();
+        client.read_to_end(&mut back).expect("client read");
+
+        // The ClientHello reaches the origin byte for byte: the proxy consumed
+        // it only to read the SNI, and replayed every byte it took.
+        assert_eq!(origin_thread.join().unwrap(), hello);
+        // And nothing was prepended on the way back.  A `200 Connection
+        // Established` here is what a real TLS client would choke on, and is
+        // exactly the bug this path has to avoid.
+        assert_eq!(back, b"pong");
+        // Let the client→origin pump see EOF so the handler can finish.
+        drop(client);
+        proxy_thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_transparent_connection_to_a_denied_host_is_dropped_not_answered() {
+        let front = TcpListener::bind("127.0.0.1:0").expect("front");
+        let port = front.local_addr().unwrap().port();
+
+        let shared = Arc::new(shared_with("allow_host example.com"));
+        let proxy_thread = thread::spawn(move || {
+            let (sock, _) = front.accept().expect("front accept");
+            serve(sock, shared, Ingress::TransparentTls);
+        });
+
+        let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
+        client
+            .write_all(&tls_record(&client_hello("evil.example.net")))
+            .expect("write");
+        let mut back = Vec::new();
+        client.read_to_end(&mut back).expect("read");
+
+        // A denied transparent client gets a closed socket, never an HTTP
+        // status line: it is mid-handshake and would read one as a TLS record.
+        assert!(back.is_empty(), "got {:?}", String::from_utf8_lossy(&back));
+        proxy_thread.join().unwrap();
+    }
+
+    #[test]
+    fn the_transparent_listeners_share_the_proxys_own_address() {
+        // Never 0.0.0.0 by accident: the sidecar is dual-homed, and a listener
+        // on all interfaces would be reachable from the default bridge.
+        assert_eq!(listen_ip("10.89.0.2:8888"), "10.89.0.2");
+        assert_eq!(listen_ip("[fd00::2]:8888"), "[fd00::2]");
+        assert_eq!(listen_ip("0.0.0.0:8888"), "0.0.0.0");
+    }
+
+    #[test]
+    fn transparent_is_off_unless_asked_for() {
+        // `agent-sandbox browser` runs this binary on the host, where binding
+        // 80 and 443 would be both privileged and wrong.
+        assert!(!args(&[]).transparent);
+        assert!(args(&["--transparent"]).transparent);
     }
 
     #[test]
@@ -2298,7 +2750,7 @@ mod tests {
 
     #[test]
     fn shared_is_allowed_respects_per_target_ports() {
-        // Regression test: `Shared::is_allowed` is the gate `handle_client` actually
+        // Regression test: `Shared::is_allowed` is the gate `serve` actually
         // calls per-connection, and it used to bypass `ProxyConfig::is_allowed`'s
         // per-target port matching by checking the host and the (global) port
         // independently — which let a domain allowed only on one port through on

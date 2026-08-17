@@ -192,6 +192,20 @@ let
     '';
   };
 
+  # The system-level include of the entrypoint's generated gitconfig, so it also
+  # reaches a git that was started without the GIT_CONFIG_* environment the
+  # entrypoint sets -- a `podman exec` shell, or a git spawned by a tool that
+  # scrubs its child environment.  Git ignores an include whose path does not
+  # exist, so this is inert in a container that never wrote one.
+  etcGitconfig = pkgs.writeTextFile {
+    name = "etc-gitconfig";
+    destination = "/etc/gitconfig";
+    text = ''
+      [include]
+      	path = /home/user/.config/agent-sandbox/gitconfig
+    '';
+  };
+
   # Rootless podman container config baked into the image so nested podman is
   # pre-configured. helper_binaries_dir points at the nix store paths so podman
   # inside the image can find crun/fuse-overlayfs without a PATH search.
@@ -246,6 +260,7 @@ let
     # here or it would not be in the closure the image ships.
     imageFontsConf
     nixConf
+    etcGitconfig
     containersConf
     storageConf
     registriesConf

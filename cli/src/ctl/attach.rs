@@ -38,8 +38,52 @@ pub fn run(args: AttachArgs) -> Result<()> {
     }
 
     let mut podman = Command::new("podman");
-    podman.arg("exec").arg("-it").arg(&sandbox).args(&cmd);
+    podman.arg("exec").arg("-it");
+
+    for var in runtime_env(&sandbox) {
+        podman.arg("--env").arg(var);
+    }
+
+    podman.arg(&sandbox).args(&cmd);
 
     let err = podman.exec();
     Err(anyhow::anyhow!("exec failed: {}", err))
+}
+
+/// The environment the entrypoint built after `podman run` handed it the
+/// container's own.
+///
+/// `podman exec` starts from the container's configured environment, which is
+/// what the launcher passed to `podman run` -- so everything the entrypoint
+/// derived at startup (the merged CA bundle, the SSH relay wiring, the
+/// flattened host git config) was missing from an attached shell, and
+/// `git clone git@github.com:...` failed there while succeeding in the session
+/// the launcher started.  The entrypoint writes those variables to
+/// `ENV_FILE`; this reads them back.
+///
+/// Best-effort by design: a sandbox from an older image has no such file, and
+/// attaching to it must still work, just with the barer environment it had
+/// before.
+fn runtime_env(sandbox: &str) -> Vec<String> {
+    const ENV_FILE: &str = "/home/user/.config/agent-sandbox/env";
+
+    let Ok(out) = Command::new("podman")
+        .args(["exec", sandbox, "cat", ENV_FILE])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| {
+            // NAME=VALUE with a non-empty name; anything else would be passed
+            // to podman as a request to *forward* a host variable of that name.
+            l.split_once('=').is_some_and(|(name, _)| !name.is_empty())
+        })
+        .map(|l| l.to_string())
+        .collect()
 }

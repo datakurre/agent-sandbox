@@ -2039,6 +2039,7 @@ fn run() -> Result<i32> {
         }
     }
 
+    let mut sidecar_ip = String::new();
     if want_proxy {
         let uuid_str = uuid::Uuid::new_v4().to_string();
         let uuid = &uuid_str[0..8];
@@ -2196,6 +2197,11 @@ fn run() -> Result<i32> {
             .args(sidecar_dns_args())
             // NET_ADMIN backs the blackhole routes installed for deny_ip.
             .arg("--cap-add=NET_ADMIN")
+            // NET_BIND_SERVICE backs the transparent listeners on :80 and :443.
+            // It is in podman's default set, but asked for explicitly so a host
+            // that narrowed that set does not turn into a sidecar that exits at
+            // bind time for no stated reason.
+            .arg("--cap-add=NET_BIND_SERVICE")
             // The sidecar is infrastructure, not agent workload: keep its
             // policy/log mounts SELinux-safe regardless of --selinux, so proxy
             // readiness does not depend on host labeling conventions.
@@ -2289,7 +2295,6 @@ fn run() -> Result<i32> {
 
         // By address, not by name: the internal network is --disable-dns, so
         // there is no aardvark to resolve the sidecar's container name.
-        let mut sidecar_ip = String::new();
         for _ in 0..20 {
             let out = ProcessCommand::new("podman")
                 .args([
@@ -2335,6 +2340,15 @@ fn run() -> Result<i32> {
         // disagree across curl, requests, Go and undici.
         proxy_env_vars.push("NO_PROXY=localhost,127.0.0.1,::1".to_string());
         proxy_env_vars.push("no_proxy=localhost,127.0.0.1,::1".to_string());
+        // ALL_PROXY as well, because it is the only one some clients read --
+        // notably anything built on Go's x/net/proxy, and curl's SOCKS-agnostic
+        // fallback.  Nix has no proxy setting of its own: `http-proxy` is not a
+        // nix.conf key, and passing it via NIX_CONFIG only earns an "unknown
+        // setting" warning.  Nix's own downloads are libcurl, which reads these
+        // variables; its *git* fetches are the case `--transparent` covers.
+        proxy_env_vars.push(format!("ALL_PROXY=http://{}:8888", sidecar_ip));
+        proxy_env_vars.push(format!("all_proxy=http://{}:8888", sidecar_ip));
+
         if want_relay_ssh || want_relay_gpg {
             proxy_env_vars.push(format!("AGENT_SANDBOX_RELAY_ADDRESS={}:8889", sidecar_ip));
         }
@@ -2434,6 +2448,17 @@ fn run() -> Result<i32> {
 
     podman_cmd.args(&network_args);
     podman_cmd.args(&publish_args);
+
+    // Every allowed name resolves to the sidecar, so a client that ignores the
+    // proxy environment reaches the proxy's transparent listeners instead of
+    // failing at DNS.  `allow_host` is the whole set: a host named by an
+    // `allowed_routes` entry is added to it by the same parser.
+    if want_proxy && !sidecar_ip.is_empty() {
+        for name in launch::transparent_host_names(&merged_policy.allow_host) {
+            podman_cmd.arg("--add-host");
+            podman_cmd.arg(format!("{}:{}", name, sidecar_ip));
+        }
+    }
 
     for proxy_env in proxy_env_vars {
         podman_cmd.arg("-e");

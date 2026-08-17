@@ -243,30 +243,40 @@ fn main() -> Result<()> {
     }
 
     // 6. Git config
-    let gitconfig = home_path.join(".config/agent-sandbox/gitconfig");
-    if env::var("AGENT_SANDBOX_RELAY_GPG").unwrap_or_default() == "1" {
-        if let Some(parent) = gitconfig.parent() {
-            fs::create_dir_all(parent)?;
+    //
+    // Written whole on every start rather than appended to, because ~/.config
+    // survives a container restart and a second generation of these sections
+    // would stack up.  The image includes this file from /etc/gitconfig too, so
+    // it reaches a `git` that was started without the GIT_CONFIG_* environment
+    // below -- a `podman exec` shell, or a git spawned by a tool that scrubs its
+    // child environment.
+    let run_gitconfig = home_path.join(".config/agent-sandbox/gitconfig");
+    if let Some(parent) = run_gitconfig.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut gitconfig_file = fs::File::create(&run_gitconfig)?;
+
+    // git's own libcurl honours http_proxy, but only when it is in the
+    // environment; recording it as config covers the invocations where it is
+    // not, and costs nothing where it is.
+    if let Ok(proxy) = env::var("http_proxy") {
+        if !proxy.is_empty() {
+            writeln!(gitconfig_file, "[http]\n\tproxy = {}", proxy)?;
         }
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&gitconfig)?;
-        file.write_all(b"[gpg]\n\tprogram = relay-gpg\n")?;
+    }
+
+    if env::var("AGENT_SANDBOX_RELAY_GPG").unwrap_or_default() == "1" {
+        writeln!(gitconfig_file, "[gpg]\n\tprogram = relay-gpg")?;
     }
 
     if env::var("AGENT_SANDBOX_NO_GPG_SIGN").unwrap_or_default() == "1" {
-        if let Some(parent) = gitconfig.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&gitconfig)?;
         // Tags as well as commits: the host config that switched signing on
         // usually switches on both, and either one fails the same way without
         // a forwarded agent.
-        file.write_all(b"[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n")?;
+        writeln!(
+            gitconfig_file,
+            "[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false"
+        )?;
     }
 
     let base_count: usize = env::var("AGENT_SANDBOX_GIT_CONFIG_COUNT")
@@ -283,12 +293,12 @@ fn main() -> Result<()> {
         }
     }
 
-    if gitconfig.exists() {
+    if run_gitconfig.exists() {
         env::set_var("GIT_CONFIG_COUNT", (base_count + 1).to_string());
         env::set_var(format!("GIT_CONFIG_KEY_{}", base_count), "include.path");
         env::set_var(
             format!("GIT_CONFIG_VALUE_{}", base_count),
-            gitconfig.to_string_lossy().to_string(),
+            run_gitconfig.to_string_lossy().to_string(),
         );
     } else {
         env::set_var("GIT_CONFIG_COUNT", base_count.to_string());
@@ -348,7 +358,17 @@ fn main() -> Result<()> {
     // the agent's own command line is not something to do to every session.
     let mcp_args = browser_mcp_setup();
 
-    // 10. exec "$@"
+    // 10. Leave the runtime environment somewhere `ctl attach` can find it.
+    //
+    // `podman exec` inherits the *container's* environment -- what `podman run`
+    // was given -- not the environment this process built on top of it.  So an
+    // attached shell had none of what the steps above set: no merged CA bundle,
+    // no `GIT_SSH_COMMAND=relay-ssh`, no `GIT_CONFIG_*`.  That is why
+    // `git clone git@github.com:...` failed in an attached shell while the same
+    // clone worked in the session the launcher started.
+    write_attach_env(&home_path);
+
+    // 11. exec "$@"
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
         let err = Command::new(&args[1]).args(&args[2..]).args(&mcp_args).exec();
@@ -419,6 +439,73 @@ fn mcp_servers(cdp_ports: Option<&str>, mode: &str) -> Vec<(String, Vec<String>)
         // Neither asked for: a default launch must behave exactly as it did
         // before this step existed.
         None => Vec::new(),
+    }
+}
+
+/// Where the entrypoint records the environment it built, for `ctl attach`.
+const ATTACH_ENV: &str = ".config/agent-sandbox/env";
+
+/// Variables an attached shell needs that only exist because this process set
+/// them.  Anything the launcher passed to `podman run` is already inherited by
+/// `podman exec` and is deliberately not repeated here.
+///
+/// `GIT_CONFIG_*` is written as the count plus that many key/value pairs, since
+/// git reads them positionally and a partial set is worse than none.
+const ATTACH_ENV_VARS: &[&str] = &[
+    "PATH",
+    "SSL_CERT_FILE",
+    "NIX_SSL_CERT_FILE",
+    "GIT_SSL_CAINFO",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSH_COMMAND",
+];
+
+fn write_attach_env(home_path: &Path) {
+    let path = home_path.join(ATTACH_ENV);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let mut lines = String::new();
+    for name in ATTACH_ENV_VARS {
+        if let Ok(value) = env::var(name) {
+            // A value with a newline in it cannot survive a line-per-variable
+            // file, and `attach` would otherwise pass the tail as its own
+            // variable.  None of these ever legitimately contains one.
+            if !value.contains('\n') {
+                lines.push_str(&format!("{}={}\n", name, value));
+            }
+        }
+    }
+
+    if let Ok(count) = env::var("GIT_CONFIG_COUNT") {
+        if let Ok(n) = count.parse::<usize>() {
+            lines.push_str(&format!("GIT_CONFIG_COUNT={}\n", n));
+            for i in 0..n {
+                for name in [
+                    format!("GIT_CONFIG_KEY_{}", i),
+                    format!("GIT_CONFIG_VALUE_{}", i),
+                ] {
+                    if let Ok(value) = env::var(&name) {
+                        if !value.contains('\n') {
+                            lines.push_str(&format!("{}={}\n", name, value));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Written whole, not appended: a container that restarts must not end up
+    // with two generations of the same variable in one file.
+    if let Err(e) = fs::write(&path, lines) {
+        eprintln!(
+            "agent-sandbox: could not write {}: {} ('ctl attach' will get a barer environment)",
+            path.display(),
+            e
+        );
     }
 }
 

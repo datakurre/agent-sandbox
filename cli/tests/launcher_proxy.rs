@@ -59,6 +59,50 @@ fn the_sandbox_joins_the_sidecars_internal_network_and_nothing_else() {
 }
 
 #[test]
+fn every_allowed_name_resolves_to_the_sidecar() {
+    // The sandbox's network has no DNS at all, so a client that ignores the
+    // proxy variables would otherwise fail at resolution.  Pointing the allowed
+    // names at the sidecar sends it to the transparent listeners instead --
+    // which is the only way to reach nix's libgit2, whose flake fetches consult
+    // neither the proxy environment nor `http.proxy`.
+    let out = proxied_world().file("AGENTS.md", ALLOW_EXAMPLE).run(&[
+        "--workspace",
+        "--proxy",
+        "opencode",
+    ]);
+
+    assert!(out
+        .run_call()
+        .has_pair("--add-host", "example.com:10.89.7.2"));
+}
+
+#[test]
+fn a_host_named_only_by_a_route_is_mapped_too() {
+    // An `allowed_routes` host is subject to interception rather than a plain
+    // tunnel, and reaching the proxy is a precondition for either.
+    let out = proxied_world().file("AGENTS.md", L7_ROUTE).run(&[
+        "--workspace",
+        "--proxy",
+        "opencode",
+    ]);
+    let run = out.run_call();
+
+    assert!(run.has_pair("--add-host", "api.example.com:10.89.7.2"));
+    assert!(run.has_pair("--add-host", "github.com:10.89.7.2"));
+}
+
+#[test]
+fn an_unproxied_launch_maps_no_names() {
+    // Without --proxy there is no sidecar to point anything at, and the sandbox
+    // resolves names for itself.
+    let out = World::new()
+        .file("AGENTS.md", ALLOW_EXAMPLE)
+        .run(&["--workspace", "opencode"]);
+
+    assert!(out.run_call().values_of("--add-host").is_empty());
+}
+
+#[test]
 fn the_proxy_address_is_handed_over_in_every_spelling_clients_read() {
     let out = proxied_world().file("AGENTS.md", ALLOW_EXAMPLE).run(&[
         "--workspace",
