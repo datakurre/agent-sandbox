@@ -568,8 +568,8 @@ fn browser_mcp_setup() -> Vec<String> {
         return vec!["--mcp-config".to_string(), MCP_CONFIG.to_string()];
     }
     eprintln!(
-        "agent-sandbox: browser MCP config written to {} (register it with e.g. `codex mcp add`)",
-        MCP_CONFIG
+        "agent-sandbox: browser MCP config written to {} (see the browser skill's reference.md, \"Registering it yourself\", to wire it into {})",
+        MCP_CONFIG, agent
     );
     Vec::new()
 }

@@ -163,14 +163,67 @@ browser, and the sandbox's `--proxy` policy is what bounds a headless one.
 
 The entrypoint writes an MCP config at `~/.config/agent-sandbox/mcp.json` when
 `AGENT_SANDBOX_BROWSER_CDP_PORT` is set (host browser) or
-`AGENT_SANDBOX_BROWSER_MCP=headless` is set (a headless one in here). Claude
-Code picks it up automatically; other CLIs need one registration, e.g.:
+`AGENT_SANDBOX_BROWSER_MCP=headless` is set (a headless one in here) — one
+entry per server, in the shape `{"mcpServers": {"<name>": {"command": ...,
+"args": [...]}}}`. `AGENT_SANDBOX_BROWSER_MCP=off` turns the whole thing off.
+
+Claude Code picks it up automatically (`--mcp-config`, appended for you).
+Every other agent has to register it with its own mechanism — there are only
+two shapes that mechanism takes:
+
+| Agent | Mechanism | Config it writes |
+| --- | --- | --- |
+| `codex` | CLI subcommand | `~/.codex/config.toml` |
+| `copilot` | CLI subcommand (identical syntax to `codex`) | `~/.copilot/mcp-config.json` |
+| `antigravity` (`agy`) | config-file merge, same `mcpServers` shape as `mcp.json` — no reshaping | `~/.gemini/config/mcp_config.json` (global) or `./.agents/mcp_config.json` (workspace) |
+| `opencode` | config-file merge, different shape (`mcp` key, `type`/`command` array/`enabled`) | `~/.config/opencode/opencode.json` (global) or project `opencode.json` |
+
+**`codex` / `copilot`** — both take `<name> -- <command> <args...>`, so the
+same loop registers every server in the file with either:
 
 ```sh
-codex mcp add playwright -- playwright-mcp --headless --isolated
+agent_mcp_cli=codex   # or: copilot
+jq -r '.mcpServers | to_entries[] | "\(.key)\t\(.value.command)\t\(.value.args | join(" "))"' \
+  ~/.config/agent-sandbox/mcp.json |
+while IFS=$'\t' read -r name command args; do
+  "$agent_mcp_cli" mcp add "$name" -- "$command" $args
+done
 ```
 
-`AGENT_SANDBOX_BROWSER_MCP=off` turns the whole thing off.
+**`antigravity`** — its config already uses the same `mcpServers` shape, so
+this is a plain merge, not a reshape:
+
+```sh
+CONFIG=~/.gemini/config/mcp_config.json   # or ./.agents/mcp_config.json, workspace-local
+mkdir -p "$(dirname "$CONFIG")"
+if [ -f "$CONFIG" ]; then
+  jq -s '.[0] * {mcpServers: .[1].mcpServers}' "$CONFIG" ~/.config/agent-sandbox/mcp.json \
+    > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+else
+  jq '{mcpServers: .mcpServers}' ~/.config/agent-sandbox/mcp.json > "$CONFIG"
+fi
+```
+
+**`opencode`** — its `mcp` key wants a different per-server shape
+(`type`/`command` as one array/`enabled`), so reshape while merging:
+
+```sh
+CONFIG=~/.config/opencode/opencode.json   # or a project-local opencode.json
+NEW=$(jq '{mcp: (.mcpServers | map_values({type: "local", command: ([.command] + .args), enabled: true}))}' \
+  ~/.config/agent-sandbox/mcp.json)
+mkdir -p "$(dirname "$CONFIG")"
+if [ -f "$CONFIG" ]; then
+  jq --argjson new "$NEW" '. * $new' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+else
+  jq -n --argjson new "$NEW" '{"$schema": "https://opencode.ai/config.json"} * $new' > "$CONFIG"
+fi
+```
+
+Every snippet above merges rather than overwrites, since these are host-mounted
+state files that may already carry the operator's own servers. Running
+something else, or one of these has drifted? The ingredients are always the
+server name/command/args in `~/.config/agent-sandbox/mcp.json` — check your
+own CLI's docs or `--help` for how it takes MCP servers.
 
 ## Debugging checklist
 
