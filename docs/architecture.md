@@ -376,11 +376,15 @@ far side of the boundary, and an implicit `~/.ssh/known_hosts` would not be
 found either, since the sidecar runs as uid 0 and OpenSSH expands `~` from
 `getpwuid` — `/root` — rather than from the image's `HOME=/home/user`. Options
 are prepended rather than appended because ssh keeps the first value it sees
-for a keyword and stops reading options at the destination; the policy check
-and the dangerous-option scan both run over the caller's argv alone, so neither
-is affected. The injection is skipped entirely when the caller already passed a
-`UserKnownHostsFile` of their own — see [Trust model](trust-model.md) for what
-that does and does not bound.
+for a keyword and stops reading options at the destination.
+
+The injection is unconditional, because argv that would work around it is
+refused: `refused_ssh_option` rejects the four host-key options, `-F`, `-J` /
+`ProxyJump`, and the four exec options, and it scans the same walk of argv that
+finds the destination (`split_ssh_args`) so an option cannot be acted on by ssh
+without having been seen by the check. Both run over the caller's argv alone,
+so the options the relay prepends are not themselves scanned. See
+[Trust model](trust-model.md) for what each of those would otherwise buy.
 The sidecar sits on the default bridge as well as the sandbox's internal network,
 so without it a policy with no rules -- which is exactly what a bare `--proxy` runs -- could
 be asked to reach the host and its LAN on the sandbox's behalf.  Writing it as

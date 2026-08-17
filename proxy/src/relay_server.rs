@@ -23,56 +23,153 @@ use std::thread;
 /// the image's `HOME=/home/user` would never be read.
 const DEFAULT_KNOWN_HOSTS: &str = "/sidecar_policy/known_hosts";
 
-/// Whether the caller already set `keyword` themselves.
+/// The options that point `ssh` at the authorized keys, ready to be
+/// *prepended*: ssh takes the first value it sees for a keyword, and options
+/// have to come before the destination.
 ///
-/// ssh hands the `-o` string to the same parser that reads ssh_config, so all
-/// three spellings are legal: `-o Key=Val`, `-oKey=Val`, and `-o "Key Val"`.
-/// The match is anchored at the option *name*, so a value that merely contains
-/// the keyword -- `-o ProxyJump=userknownhostsfile.example.com` -- does not
-/// count.
-fn has_ssh_option(args: &[String], keyword: &str) -> bool {
-    let mut expect_value = false;
-    for arg in args {
-        let opt = if expect_value {
-            expect_value = false;
-            arg.as_str()
-        } else if arg == "-o" {
-            expect_value = true;
-            continue;
-        } else if arg.starts_with("-o") && arg.len() > 2 {
-            &arg[2..]
-        } else {
-            continue;
-        };
-        let name = opt
-            .split(|c: char| c == '=' || c.is_whitespace())
-            .next()
-            .unwrap_or("");
-        if name.eq_ignore_ascii_case(keyword) {
-            return true;
-        }
-    }
-    false
-}
-
-/// The options that point `ssh` at the pinned file, ready to be *prepended*:
-/// ssh takes the first value it sees for a keyword, and options have to come
-/// before the destination.
-///
-/// Skipped whole when the caller named a known-hosts file of their own -- the
-/// escape hatch for a self-hosted forge, and the reason `GlobalKnownHostsFile`
-/// is not forced separately: pinning our file on top of theirs would narrow
-/// them further than they asked.
-fn known_hosts_args(args: &[String], path: &str) -> Vec<String> {
-    if has_ssh_option(args, "UserKnownHostsFile") {
-        return Vec::new();
-    }
+/// Unconditional, because a caller who set either of these themselves is
+/// refused outright before we get here.  There is no per-invocation opt-out:
+/// which keys are trusted is settled in `trusted.toml`, on the host.
+fn known_hosts_args(path: &str) -> Vec<String> {
     vec![
         "-o".to_string(),
         format!("UserKnownHostsFile={}", path),
         "-o".to_string(),
         "GlobalKnownHostsFile=/dev/null".to_string(),
     ]
+}
+
+/// Options whose next argument is a value rather than the host.  Complete list
+/// from ssh(1), shared by everything here that has to walk argv the way ssh
+/// does -- a table that disagrees with itself between two walkers is a way for
+/// an option to be scanned by one and acted on by the other.
+const TAKES_ARG: &[&str] = &[
+    "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p",
+    "-Q", "-R", "-S", "-W", "-w",
+];
+
+/// Would make ssh run a command of the caller's choosing: arbitrary execution
+/// in the sidecar, next to the forwarded agent socket.
+const EXEC_OPTIONS: &[&str] = &[
+    "proxycommand",
+    "proxyusefdpass",
+    "localcommand",
+    "permitlocalcommand",
+];
+
+/// Would change *who ssh actually connects to*, which is the one thing
+/// `allow_signing` exists to decide.  `ssh -J evil.example git@github.com`
+/// passes the destination check -- the destination really is github.com --
+/// and then opens a connection to evil.example and authenticates to it with
+/// the forwarded agent on the way.
+const JUMP_OPTIONS: &[&str] = &["proxyjump"];
+
+/// Would move host-key verification off the keys the operator authorized:
+/// another file, or no checking at all, or keys fetched from DNS.
+const HOST_KEY_OPTIONS: &[&str] = &[
+    "userknownhostsfile",
+    "globalknownhostsfile",
+    "stricthostkeychecking",
+    "verifyhostkeydns",
+];
+
+/// The argv entries ssh would read as options, and the destination if one
+/// could be identified.
+///
+/// One walk, so the arguments that get scanned for dangerous options and the
+/// argument that gets checked against the policy can never be a different set.
+/// On an argument neither of us understands it stops and reports no
+/// destination, which the caller turns into a refusal -- everything collected
+/// up to that point is still returned, so the scan sees it too.
+fn split_ssh_args(args: &[String]) -> (Vec<&str>, Option<String>) {
+    let mut options = Vec::new();
+    let mut skip_next = false;
+    let mut saw_separator = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            options.push(arg.as_str());
+            continue;
+        }
+        if saw_separator || !arg.starts_with('-') {
+            // First non-option after the flags is the destination; whatever
+            // follows is the remote command, which is not ours to police.
+            let dest = match arg.split_once('@') {
+                Some((_, host)) => host,
+                None => arg.as_str(),
+            };
+            return (options, Some(dest.to_string()));
+        }
+        options.push(arg.as_str());
+        if arg == "--" {
+            saw_separator = true;
+            continue;
+        }
+        // Pure flag with no argument (e.g. -4, -6, -v, -N).
+        if arg.len() == 2 && !TAKES_ARG.contains(&arg.as_str()) {
+            continue;
+        }
+        if TAKES_ARG.contains(&arg.as_str()) {
+            skip_next = true;
+            continue;
+        }
+        // Combined form: -p2222 -- the value is inline, so nothing to skip.
+        if TAKES_ARG.contains(&&arg[..2]) {
+            continue;
+        }
+        // Bundled single-char flags without arguments: -vvv, -46.
+        let no_arg_chars = "1246AaCfGgKkMNnqsTtVvXxYy";
+        if arg[1..].chars().all(|c| no_arg_chars.contains(c)) {
+            continue;
+        }
+        // Unrecognized: fail closed rather than guess what ssh will make of it.
+        return (options, None);
+    }
+    (options, None)
+}
+
+fn extract_ssh_destination(args: &[String]) -> Option<String> {
+    split_ssh_args(args).1
+}
+
+/// Why this ssh invocation is refused, if it is.
+///
+/// Scans only what ssh would read as options, so a repository path or remote
+/// command containing one of these words -- `git-upload-pack
+/// /srv/userknownhostsfile.git` is a legitimate request -- is not a spurious
+/// denial.  *Within* an option the match is a plain substring, deliberately:
+/// over-refusing a spelling nobody anticipated (`-4oUserKnownHostsFile=x`) is
+/// the safe direction for a gate, and the cost is refusing an option that
+/// merely mentions one of these words in a value, which nothing legitimate
+/// does.
+///
+/// `-F` is refused as a category: an alternate config file can set any of the
+/// above out of sight, so allowing it would mean the list below bounds
+/// nothing.
+fn refused_ssh_option(args: &[String]) -> Option<&'static str> {
+    let (options, _) = split_ssh_args(args);
+    for opt in options {
+        let lower = opt.to_ascii_lowercase();
+        if EXEC_OPTIONS.iter().any(|name| lower.contains(name)) {
+            return Some("dangerous options detected");
+        }
+        if JUMP_OPTIONS.iter().any(|name| lower.contains(name)) || opt == "-J" {
+            return Some(
+                "a jump host would move the connection off the host the policy authorized",
+            );
+        }
+        if HOST_KEY_OPTIONS.iter().any(|name| lower.contains(name)) {
+            return Some(
+                "host keys are authorized on the host, in trusted.toml, and cannot be \
+                 overridden per invocation -- add a [[network.known_hosts]] entry instead",
+            );
+        }
+        if opt == "-F" || (opt.starts_with("-F") && opt.len() > 2) {
+            return Some("an alternate ssh config could set any of the options above out of sight");
+        }
+    }
+    None
 }
 
 fn domain_match(domain: &str, pattern: &str) -> bool {
@@ -132,61 +229,6 @@ fn log_relay(cmd: &str, dest: Option<&str>, allowed: bool, reason: &str) {
         );
         let _ = file.write_all(line.as_bytes());
     }
-}
-
-fn extract_ssh_destination(args: &[String]) -> Option<String> {
-    // Options whose next argument is a value (not a host).
-    // Complete list from ssh(1) man page.
-    const TAKES_ARG: &[&str] = &[
-        "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o",
-        "-p", "-Q", "-R", "-S", "-W", "-w",
-    ];
-
-    let mut skip_next = false;
-    let mut saw_separator = false;
-
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if saw_separator || !arg.starts_with('-') {
-            // First non-option after flags is the destination.
-            let dest = match arg.split_once('@') {
-                Some((_, host)) => host,
-                None => arg.as_str(),
-            };
-            return Some(dest.to_string());
-        }
-        if arg == "--" {
-            saw_separator = true;
-            continue;
-        }
-        // Pure flag with no argument (e.g., -4, -6, -v, -N, etc.)
-        if arg.len() == 2 && !TAKES_ARG.contains(&arg.as_str()) {
-            continue;
-        }
-        // Exact match for a flag that takes a separate argument
-        if TAKES_ARG.contains(&arg.as_str()) {
-            skip_next = true;
-            continue;
-        }
-        // Combined form: -p2222 → first two chars are the option, rest is value.
-        // Safely skip these as they consume the value inline.
-        let prefix = &arg[..2];
-        if TAKES_ARG.contains(&prefix) {
-            continue;
-        }
-        // Bundled single-char flags without argument: -vvv, -46, etc.
-        // Only valid if every character is a known no-arg flag.
-        let no_arg_chars = "1246AaCfGgKkMNnqsTtVvXxYy";
-        if arg[1..].chars().all(|c| no_arg_chars.contains(c)) {
-            continue;
-        }
-        // Unrecognized option — fail closed rather than guess.
-        return None;
-    }
-    None
 }
 
 fn validate_gpg_args(args: &[String]) -> bool {
@@ -299,24 +341,36 @@ fn handle_client(mut stream: TcpStream, policy_path: &str, known_hosts: Option<&
         CommandType::Ssh => {
             let host = extract_ssh_destination(&req.args);
 
-            // Check for dangerous SSH arguments
-            for arg in &req.args {
-                let lower = arg.to_ascii_lowercase();
-                if lower.contains("proxycommand")
-                    || lower.contains("proxyusefdpass")
-                    || lower.contains("localcommand")
-                    || lower.contains("permitlocalcommand")
-                {
-                    eprintln!("relay-server: ssh command contains dangerous options");
-                    let _ = write_frame(
-                        &mut stream,
-                        &Frame::Stderr(
-                            b"agent-sandbox: ssh denied: dangerous options detected\n".to_vec(),
-                        ),
-                    );
-                    let _ = write_frame(&mut stream, &Frame::Exit(255));
-                    return;
-                }
+            // Refused argv is refused whatever the destination: an option that
+            // moves the connection or the trust anchor is not something the
+            // policy check downstream can compensate for.
+            if let Some(reason) = refused_ssh_option(&req.args) {
+                eprintln!("relay-server: ssh denied: {}", reason);
+                log_relay("ssh", host.as_deref(), false, reason);
+                let _ = write_frame(
+                    &mut stream,
+                    &Frame::Stderr(format!("agent-sandbox: ssh denied: {}\n", reason).into_bytes()),
+                );
+                let _ = write_frame(&mut stream, &Frame::Exit(255));
+                return;
+            }
+
+            // The keys are the operator's, so an ssh the relay cannot point at
+            // them is an ssh it should not run.  Unreachable in a healthy
+            // session -- a policy authorizing SSH to a host with no key for it
+            // never got past the launcher -- so say that rather than letting
+            // ssh produce its own opaque failure.
+            if known_hosts.is_none() {
+                let reason = "no authorized host keys in this sandbox -- add a \
+                              [[network.known_hosts]] entry to trusted.toml and relaunch";
+                eprintln!("relay-server: ssh denied: {}", reason);
+                log_relay("ssh", host.as_deref(), false, reason);
+                let _ = write_frame(
+                    &mut stream,
+                    &Frame::Stderr(format!("agent-sandbox: ssh denied: {}\n", reason).into_bytes()),
+                );
+                let _ = write_frame(&mut stream, &Frame::Exit(255));
+                return;
             }
             match host {
                 Some(dest) => {
@@ -382,7 +436,7 @@ fn handle_client(mut stream: TcpStream, policy_path: &str, known_hosts: Option<&
     // `req.args` alone, so neither sees these.
     if is_ssh {
         if let Some(path) = known_hosts {
-            cmd.args(known_hosts_args(&req.args, path));
+            cmd.args(known_hosts_args(path));
         }
     }
     cmd.args(&req.args);
@@ -622,91 +676,186 @@ mod tests {
         assert_eq!(extract_ssh_destination(&args), Some("github.com".into()));
     }
 
-    // ── known_hosts injection ───────────────────────────────────────────────
+    // ── host-key authorization ──────────────────────────────────────────────
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
-    fn has_ssh_option_reads_all_three_spellings() {
-        let sep = vec!["-o".into(), "UserKnownHostsFile=/x".into()];
-        let combined = vec!["-oUserKnownHostsFile=/x".into()];
-        let spaced = vec!["-o".into(), "UserKnownHostsFile /x".into()];
-        for args in [&sep, &combined, &spaced] {
-            assert!(
-                has_ssh_option(args, "UserKnownHostsFile"),
-                "missed {:?}",
-                args
+    fn the_keys_are_pinned_unconditionally() {
+        // No skip branch any more: a caller who names their own file is
+        // refused, so there is nothing left to defer to.
+        assert_eq!(
+            known_hosts_args("/run/kh"),
+            args(&[
+                "-o",
+                "UserKnownHostsFile=/run/kh",
+                "-o",
+                "GlobalKnownHostsFile=/dev/null",
+            ])
+        );
+    }
+
+    #[test]
+    fn an_ordinary_git_invocation_is_not_refused() {
+        assert!(refused_ssh_option(&args(&[
+            "-o",
+            "SendEnv=GIT_PROTOCOL",
+            "git@github.com",
+            "git-upload-pack",
+            "user/repo.git",
+        ]))
+        .is_none());
+        assert!(refused_ssh_option(&args(&["-p", "2222", "-4", "git@github.com"])).is_none());
+        assert!(refused_ssh_option(&args(&["-T", "git@github.com"])).is_none());
+    }
+
+    #[test]
+    fn overriding_the_host_keys_is_refused_in_every_spelling() {
+        for spelling in [
+            vec!["-o", "UserKnownHostsFile=/dev/null"],
+            vec!["-oUserKnownHostsFile=/dev/null"],
+            vec!["-o", "UserKnownHostsFile /dev/null"],
+            vec!["-o", "userknownhostsfile=/dev/null"],
+            vec!["-o", "GlobalKnownHostsFile=/dev/null"],
+            vec!["-o", "StrictHostKeyChecking=no"],
+            vec!["-oStrictHostKeyChecking=accept-new"],
+            vec!["-o", "VerifyHostKeyDNS=yes"],
+        ] {
+            let mut argv = spelling.clone();
+            argv.push("git@github.com");
+            let reason = refused_ssh_option(&args(&argv))
+                .unwrap_or_else(|| panic!("not refused: {:?}", spelling));
+            assert!(reason.contains("trusted.toml"), "{reason}");
+        }
+    }
+
+    /// `-4oUserKnownHostsFile=x` bundles a no-arg flag with `-o`. Nobody writes
+    /// that on purpose, which is exactly why the scan matches on a substring
+    /// rather than parsing: over-refusing an unanticipated spelling is the safe
+    /// direction.
+    #[test]
+    fn a_bundled_spelling_is_refused_too() {
+        assert!(refused_ssh_option(&args(&["-4oUserKnownHostsFile=/dev/null"])).is_some());
+    }
+
+    /// An alternate config could set any of them out of sight, which would
+    /// make the list bound nothing.
+    #[test]
+    fn an_alternate_ssh_config_is_refused() {
+        for argv in [
+            vec!["-F", "/tmp/ssh_config", "git@github.com"],
+            vec!["-F/tmp/ssh_config", "git@github.com"],
+        ] {
+            let reason = refused_ssh_option(&args(&argv))
+                .unwrap_or_else(|| panic!("not refused: {:?}", argv));
+            assert!(reason.contains("config"), "{reason}");
+        }
+    }
+
+    /// A jump host passes the destination check and then connects somewhere
+    /// else entirely, with the forwarded agent along for the ride -- so the
+    /// destination gate has to refuse it rather than measure it.
+    #[test]
+    fn a_jump_host_is_refused_even_with_an_allowed_destination() {
+        for argv in [
+            vec!["-J", "evil.example", "git@github.com"],
+            vec!["-o", "ProxyJump=evil.example", "git@github.com"],
+        ] {
+            assert_eq!(
+                extract_ssh_destination(&args(&argv)),
+                Some("github.com".into()),
+                "the destination check alone would pass this: {:?}",
+                argv
             );
+            let reason = refused_ssh_option(&args(&argv))
+                .unwrap_or_else(|| panic!("not refused: {:?}", argv));
+            assert!(reason.contains("jump host"), "{reason}");
         }
     }
 
     #[test]
-    fn has_ssh_option_ignores_case_of_the_keyword() {
-        let args = vec!["-ouserknownhostsfile=/x".into()];
-        assert!(has_ssh_option(&args, "UserKnownHostsFile"));
+    fn the_exec_options_are_still_refused() {
+        for opt in [
+            "ProxyCommand=nc evil 22",
+            "LocalCommand=id",
+            "PermitLocalCommand=yes",
+            "ProxyUseFdpass=yes",
+        ] {
+            assert!(
+                refused_ssh_option(&args(&["-o", opt, "git@github.com"])).is_some(),
+                "{opt}"
+            );
+        }
+    }
+
+    /// The scan reads what ssh reads as options and stops at the destination,
+    /// so a repository path is never mistaken for one.
+    #[test]
+    fn a_remote_command_is_not_scanned() {
+        assert!(refused_ssh_option(&args(&[
+            "git@github.com",
+            "git-upload-pack",
+            "/srv/userknownhostsfile.git",
+        ]))
+        .is_none());
+        assert!(refused_ssh_option(&args(&[
+            "git@github.com",
+            "git-upload-pack",
+            "/srv/proxycommand.git",
+        ]))
+        .is_none());
     }
 
     #[test]
-    fn has_ssh_option_matches_the_name_not_the_value() {
-        // The keyword appearing inside somebody else's value is not a match:
-        // matching it would silently drop our pinning.
-        let args = vec![
-            "-o".into(),
-            "ProxyJump=userknownhostsfile.example.com".into(),
-            "github.com".into(),
-        ];
-        assert!(!has_ssh_option(&args, "UserKnownHostsFile"));
-    }
-
-    #[test]
-    fn has_ssh_option_is_not_fooled_by_a_flag_that_starts_with_o() {
-        let args = vec!["-obscure".into()];
-        assert!(!has_ssh_option(&args, "UserKnownHostsFile"));
-    }
-
-    #[test]
-    fn known_hosts_args_pins_by_default() {
-        let args = vec!["git@github.com".into()];
+    fn the_injected_options_do_not_move_the_destination() {
+        // They are prepended to argv, but every check the relay makes runs over
+        // the caller's args alone -- so the destination the policy was checked
+        // against is the destination ssh will use.
+        let caller = args(&[
+            "-o",
+            "SendEnv=GIT_PROTOCOL",
+            "git@github.com",
+            "git-upload-pack",
+            "user/repo.git",
+        ]);
+        let mut full = known_hosts_args("/run/kh");
+        full.extend(caller.iter().cloned());
         assert_eq!(
-            known_hosts_args(&args, "/run/kh"),
-            vec![
-                "-o".to_string(),
-                "UserKnownHostsFile=/run/kh".to_string(),
-                "-o".to_string(),
-                "GlobalKnownHostsFile=/dev/null".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn known_hosts_args_defers_to_a_caller_who_named_their_own_file() {
-        let args = vec![
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "git@selfhosted.example".into(),
-        ];
-        assert!(known_hosts_args(&args, "/run/kh").is_empty());
-    }
-
-    #[test]
-    fn known_hosts_args_do_not_move_the_destination() {
-        // The injected options are prepended to argv, but every check the
-        // relay makes runs over the caller's args alone -- so the destination
-        // the policy was checked against is the destination ssh will use.
-        let args = vec![
-            "-o".into(),
-            "SendEnv=GIT_PROTOCOL".into(),
-            "git@github.com".into(),
-            "git-upload-pack".into(),
-            "user/repo.git".into(),
-        ];
-        let mut full = known_hosts_args(&args, "/run/kh");
-        full.extend(args.iter().cloned());
-        assert_eq!(
-            extract_ssh_destination(&args),
+            extract_ssh_destination(&caller),
             extract_ssh_destination(&full)
         );
         assert_eq!(extract_ssh_destination(&full), Some("github.com".into()));
+    }
+
+    /// The two walks have to agree: an option the scan never sees is an option
+    /// the policy check cannot compensate for.
+    #[test]
+    fn everything_before_the_destination_is_scanned() {
+        let argv = args(&[
+            "-4",
+            "-p",
+            "2222",
+            "-o",
+            "SendEnv=GIT_PROTOCOL",
+            "git@github.com",
+            "git-upload-pack",
+        ]);
+        let (options, dest) = split_ssh_args(&argv);
+        assert_eq!(dest, Some("github.com".into()));
+        assert_eq!(
+            options,
+            vec!["-4", "-p", "2222", "-o", "SendEnv=GIT_PROTOCOL"]
+        );
+    }
+
+    #[test]
+    fn an_argument_neither_of_us_understands_fails_closed() {
+        let argv = args(&["--frobnicate", "git@github.com"]);
+        let (options, dest) = split_ssh_args(&argv);
+        assert_eq!(dest, None, "an unparseable argv has no trusted destination");
+        assert_eq!(options, vec!["--frobnicate"], "and is still scanned");
     }
 
     #[test]
