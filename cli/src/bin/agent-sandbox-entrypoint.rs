@@ -9,6 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 fn main() -> Result<()> {
     // 1. nix-store load db
@@ -357,6 +359,21 @@ fn main() -> Result<()> {
     write_attach_env(&home_path);
 
     // 10. exec "$@"
+    if let Ok(ready_file) = env::var("AGENT_SANDBOX_READY_FILE") {
+        if !ready_file.is_empty() {
+            fs::write(&ready_file, "ready\n")
+                .with_context(|| format!("failed to signal readiness at {}", ready_file))?;
+
+            if let Ok(ack_file) = env::var("AGENT_SANDBOX_READY_ACK_FILE") {
+                if !ack_file.is_empty() {
+                    while !Path::new(&ack_file).exists() {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+    }
+
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
         let err = Command::new(&args[1]).args(&args[2..]).exec();

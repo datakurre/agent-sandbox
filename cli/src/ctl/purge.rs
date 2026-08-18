@@ -134,7 +134,7 @@ fn leaked_networks() -> Vec<String> {
         .collect()
 }
 
-/// `/tmp/agent-sandbox-{sidecar,policy,secrets}-<uuid>`, left behind when a
+/// `/tmp/agent-sandbox-{sidecar,policy,secrets,status}-<uuid>`, left behind when a
 /// launcher was killed before its cleanup guard could run.  The connection
 /// logs are deliberately not included: they outlive their session by design,
 /// so the summary stays re-renderable.
@@ -143,6 +143,7 @@ fn leaked_dirs() -> Vec<PathBuf> {
         SIDECAR_PREFIX,
         "agent-sandbox-policy-",
         "agent-sandbox-secrets-",
+        "agent-sandbox-status-",
     ];
     let uid = nix::unistd::getuid().as_raw();
     let mut found = Vec::new();

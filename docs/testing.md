@@ -61,7 +61,16 @@ milliseconds rather than timing out.
 
 The stub also snapshots the directories the launcher mounts into the sidecar,
 because the launcher's own cleanup removes them on the way out; `World::captured`
-is how a test sees the policy the proxy was actually handed.
+is how a test sees the policy the proxy was actually handed. Readiness tests
+cover the container-mounted marker, early Podman exit diagnostics, and exit-code
+propagation. The real launcher wait has no timeout: it continues until the
+marker appears or Podman exits/checking it fails.
+
+The launcher lifecycle tests also verify that readiness is represented by a
+container-mounted marker and that status chatter is absent from non-interactive
+runs. Interactive status is terminal-dependent, so the stub-podman tests focus
+on the machine-readable contract while the sidecar and entrypoint readiness
+markers define the actual startup boundary.
 
 **The documentation build**, with `--strict`. MkDocs' Python-Markdown swallows
 a malformed list or fence silently rather than erroring, so a warning here is a

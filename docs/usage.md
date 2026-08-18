@@ -219,7 +219,23 @@ may be repeated. Policy files are plain TOML and use the same declarative
 allowed_hosts = ["github.com:443", "registry.npmjs.org:443"]
 ```
 
-Startup prints where policies were looked up (the `~/.config/agent-sandbox/policies` directory, honoring `$XDG_CONFIG_HOME`) and which files were actually loaded.
+Startup groups policy discovery under an `agent-sandbox: startup` heading,
+with indented `policy:` entries showing where policies were looked up (the
+`~/.config/agent-sandbox/policies` directory, honoring `$XDG_CONFIG_HOME`) and
+which files were actually loaded.
+
+When both standard input and output are terminals, the launcher renders the
+session lifecycle as one animated spinner/status line on standard error: it
+shows sandbox startup, proxy readiness and network configuration when
+applicable, then command startup until the container entrypoint has finished
+initialization. The status line clears before the command's own prompt appears.
+Entrypoint readiness waits indefinitely for its marker, or until Podman exits or
+readiness checking fails. On exit it replaces
+the line with closing, proxy shutdown, and resource removal before cleanup, then
+summarizes successful cleanup as `closed (proxy stopped, resources released)`.
+The status line is suppressed for non-interactive launches, so piped and
+machine-readable use remains unchanged. The summary is shown only after cleanup
+has completed.
 
 At session exit, rules added live through the TUI or `agent-sandbox ctl policy allow` are printed as a TOML block. Add that block to `AGENTS.md` for project-specific persistence, or merge it into a policy file for reuse across projects.
 

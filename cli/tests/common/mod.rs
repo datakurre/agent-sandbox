@@ -40,15 +40,16 @@ const STUB_PODMAN: &str = r#"#!/bin/sh
   printf '%s\n' '=== end of call ==='
 } >> "$STUB_PODMAN_LOG"
 
-# Stand in for the sidecar's readiness handshake.  The launcher waits up to 35s
-# for a `ready` file in the directory it bind-mounts at /sidecar_shared, so a
-# stub that never writes one turns every --proxy test into a 35s timeout.  The
-# mount argument names the directory, so the stub can answer from its own argv.
+# Stand in for the sidecar and entrypoint readiness handshakes. The mount
+# argument names the directory, so the stub can answer from its own argv.
 if [ "$1" = run ]; then
   for a in "$@"; do
     case "$a" in
       */sidecar_shared:rw)
-        : > "${a%%:*}/ready"
+        [ "${STUB_PODMAN_SKIP_READY:-}" = 1 ] || : > "${a%%:*}/ready"
+        ;;
+      */agent-sandbox-status:rw)
+        [ "${STUB_PODMAN_SKIP_READY:-}" = 1 ] || : > "${a%%:*}/ready"
         ;;
       # The launcher's cleanup removes the policy and secret directories on the
       # way out, so a test that wants to see what the sidecar was handed has to

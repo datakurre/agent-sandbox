@@ -99,6 +99,22 @@ are unit-tested without a podman.  Call flow:
    final command (`bash` by default, the selected agent's command when one is
    named positionally, and anything after `--` overrides both).
 
+For interactive terminals the launcher renders one animated spinner/status line
+on standard error. It replaces the line as phases change: `starting sandbox`,
+then (with `--proxy`) `starting proxy`, `proxy ready` only after the sidecar
+readiness marker, `configuring network`, and `starting command`. The
+entrypoint pauses after writing its readiness marker until the launcher
+acknowledges that it has cleared the status line; only then does it exec the
+command. This handshake ensures the command's own prompt cannot overwrite or
+be overwritten by the spinner. The entrypoint readiness wait has no time
+limit: it ends only when the marker appears, the Podman process exits, or
+readiness checking fails.
+When the command exits, `CleanupGuard` renders `closing sandbox`,
+`stopping proxy` when a sidecar exists, and `removing resources` before the
+potentially slow cleanup; it finishes with `closed (proxy stopped, resources
+released)` after the sidecar, network, and temporary directories have been
+reclaimed. Non-interactive launches do not receive this status line.
+
 `--git` passes the host's *effective* configuration as `GIT_CONFIG_*`
 environment variables rather than mounting `.gitconfig`: `[include]` directives
 are evaluated on the host, and keys naming a host-only path (`gpg.*.program`,

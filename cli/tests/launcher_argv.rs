@@ -40,6 +40,27 @@ fn every_launch_is_labelled_so_ctl_can_find_it_without_guessing() {
 }
 
 #[test]
+fn every_launch_waits_for_entrypoint_readiness() {
+    let out = World::new().run(&["opencode"]);
+    let run = out.run_call();
+
+    assert_eq!(
+        run.env_value("AGENT_SANDBOX_READY_FILE"),
+        Some("/run/agent-sandbox-status/ready")
+    );
+    assert_eq!(
+        run.env_value("AGENT_SANDBOX_READY_ACK_FILE"),
+        Some("/run/agent-sandbox-status/ack")
+    );
+    assert!(
+        run.mount_to("/run/agent-sandbox-status")
+            .is_some_and(|mount| mount.ends_with(":/run/agent-sandbox-status:rw")),
+        "readiness mount missing: {}",
+        run.joined()
+    );
+}
+
+#[test]
 fn the_image_is_the_last_argument_before_the_agent_command() {
     let out = World::new().run(&["opencode"]);
     let run = out.run_call();
@@ -57,6 +78,36 @@ fn the_image_is_the_last_argument_before_the_agent_command() {
 fn the_launcher_forwards_podmans_exit_code() {
     let world = World::new().podman_reply("run", "", 42);
     assert_eq!(world.run(&["opencode"]).code, Some(42));
+}
+
+#[test]
+fn an_entrypoint_exit_before_readiness_keeps_diagnostics_and_exit_code() {
+    let out = World::new()
+        .env("STUB_PODMAN_SKIP_READY", "1")
+        .podman_reply("run", "", 42)
+        .run(&["opencode"]);
+
+    assert_eq!(out.code, Some(42));
+    assert!(
+        out.stderr.contains("command exited before the sandbox became ready"),
+        "missing early-exit diagnostic:\n{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn lifecycle_status_is_silent_for_noninteractive_launches() {
+    let out = World::new().run(&["opencode"]);
+
+    assert!(
+        !out.stdout.contains("starting sandbox")
+            && !out.stderr.contains("starting sandbox")
+            && !out.stderr.contains("ready")
+            && !out.stderr.contains("closed"),
+        "machine-readable launches must not receive lifecycle chatter:\nstdout: {}\nstderr: {}",
+        out.stdout,
+        out.stderr
+    );
 }
 
 #[test]
@@ -105,8 +156,12 @@ fn without_workspace_nothing_from_the_host_is_mounted_and_no_workspace_is_labell
     assert!(
         run.values_of("-v")
             .iter()
-            .all(|m| m.contains("/etc/passwd") || m.contains("/etc/group")),
-        "only the synthesized passwd/group files: {}",
+            .all(|m| {
+                m.contains("/etc/passwd")
+                    || m.contains("/etc/group")
+                    || m.contains("/run/agent-sandbox-status")
+            }),
+        "only synthesized identity and readiness mounts: {}",
         run.joined()
     );
 }

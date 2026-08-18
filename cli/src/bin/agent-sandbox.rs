@@ -583,9 +583,37 @@ struct CleanupGuard {
     sidecar_shared: String,
     sidecar_policy: String,
     sidecar_secrets: String,
+    status_dir: String,
     host_port_dir: String,
     session_word: String,
     policies: Vec<String>,
+    status_line: StatusLine,
+}
+
+struct StartupInfo {
+    header_printed: bool,
+}
+
+impl StartupInfo {
+    fn new() -> Self {
+        StartupInfo {
+            header_printed: false,
+        }
+    }
+
+    fn policy(&mut self, message: &str) {
+        if !self.header_printed {
+            eprintln!("agent-sandbox: startup");
+            self.header_printed = true;
+        }
+        eprintln!("  policy: {}", message);
+    }
+}
+
+struct StatusLine {
+    enabled: bool,
+    frame: usize,
+    active: bool,
 }
 
 impl CleanupGuard {
@@ -595,9 +623,52 @@ impl CleanupGuard {
             sidecar_shared: String::new(),
             sidecar_policy: String::new(),
             sidecar_secrets: String::new(),
+            status_dir: String::new(),
             host_port_dir: String::new(),
             session_word: String::new(),
             policies: Vec::new(),
+            status_line: StatusLine::new(
+                std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+            ),
+        }
+    }
+
+    fn status(&mut self, message: &str) {
+        self.status_line.active = true;
+        self.status_line.render(message);
+    }
+
+    fn tick_status(&mut self, message: &str) {
+        self.status_line.tick(message);
+    }
+
+    fn clear_status(&self) {
+        self.status_line.clear();
+    }
+
+    fn finish_status(&self) {
+        self.status_line.clear();
+        self.status_line.finish();
+    }
+
+    fn run_status_command(&mut self, command: &mut ProcessCommand, message: &str) -> bool {
+        let Ok(mut child) = command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) => {
+                    self.tick_status(message);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(_) => return false,
+            }
         }
     }
 
@@ -727,26 +798,33 @@ impl CleanupGuard {
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        // Before the sidecar's early return: a session can have host-port
-        // sockets without ever having had a proxy, and leaving them behind
-        // would leave a live-looking path to the host's loopback in a runtime
-        // directory that outlives the sandbox.
-        if !self.host_port_dir.is_empty() {
-            let _ = fs::remove_dir_all(&self.host_port_dir);
-        }
+        self.status("closing sandbox");
 
         if self.sidecar_id.is_empty() {
+            // A session can have host-port sockets without ever having had a
+            // proxy; those are still resources that must be removed.
+            self.status("removing resources");
+            if !self.host_port_dir.is_empty() {
+                let _ = fs::remove_dir_all(&self.host_port_dir);
+            }
+            if !self.status_dir.is_empty() {
+                let _ = fs::remove_dir_all(&self.status_dir);
+            }
+            self.status_line.success("closed (resources released)");
             return;
         }
 
-        let _ = ProcessCommand::new("podman")
-            .args(["stop", "-t", "1", &self.sidecar_id])
-            .output();
+        self.status("stopping proxy");
+        let _ = self.run_status_command(
+            ProcessCommand::new("podman").args(["stop", "-t", "1", &self.sidecar_id]),
+            "stopping proxy",
+        );
         // Not --rm: a sidecar that exits before signalling readiness has to
         // stay around long enough for `podman logs` to say why.
-        let _ = ProcessCommand::new("podman")
-            .args(["rm", "-f", &self.sidecar_id])
-            .output();
+        let _ = self.run_status_command(
+            ProcessCommand::new("podman").args(["rm", "-f", &self.sidecar_id]),
+            "stopping proxy",
+        );
 
         if !self.sidecar_shared.is_empty() {
             let log = format!("{}/connections.jsonl", self.sidecar_shared);
@@ -758,6 +836,7 @@ impl Drop for CleanupGuard {
             // The aggregate report, not the per-record feed: a busy session has
             // hundreds of connections and what the operator wants at exit is
             // where the traffic went.
+            self.clear_status();
             let had_failures = records
                 .iter()
                 .any(|r| matches!(r.verdict.as_deref(), Some("deny") | Some("error")));
@@ -770,25 +849,27 @@ impl Drop for CleanupGuard {
             self.save_log(&log, had_failures);
         }
 
+        self.status("removing resources");
+        if !self.host_port_dir.is_empty() {
+            let _ = fs::remove_dir_all(&self.host_port_dir);
+        }
+
         // podman tears a --rm container down asynchronously after `stop`
         // returns, so a single attempt here loses the race often enough to
         // leak one --internal network per session -- and each of those holds a
         // subnet from the rootless pool until `agent-sandbox ctl purge`
         // reclaims it.
         for _ in 0..20 {
-            if ProcessCommand::new("podman")
-                .args(["network", "rm", &self.sidecar_id])
-                .output()
-                .is_ok()
-            {
-                if ProcessCommand::new("podman")
-                    .args(["network", "exists", &self.sidecar_id])
-                    .status()
-                    .map(|s| !s.success())
-                    .unwrap_or(true)
-                {
-                    break;
-                }
+            let _ = self.run_status_command(
+                ProcessCommand::new("podman").args(["network", "rm", &self.sidecar_id]),
+                "removing resources",
+            );
+            let exists = self.run_status_command(
+                ProcessCommand::new("podman").args(["network", "exists", &self.sidecar_id]),
+                "removing resources",
+            );
+            if !exists {
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
@@ -797,10 +878,64 @@ impl Drop for CleanupGuard {
             &self.sidecar_shared,
             &self.sidecar_policy,
             &self.sidecar_secrets,
+            &self.status_dir,
         ] {
             if !dir.is_empty() {
                 let _ = fs::remove_dir_all(dir);
             }
+        }
+        self.status_line
+            .success("closed (proxy stopped, resources released)");
+    }
+}
+
+impl StatusLine {
+    fn new(enabled: bool) -> Self {
+        StatusLine {
+            enabled,
+            frame: 0,
+            active: false,
+        }
+    }
+
+    fn render(&self, message: &str) {
+        if !self.enabled {
+            return;
+        }
+        // Keep the frame sequence in sync with throbber's DEFAULT_F.
+        let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = spinner[self.frame % spinner.len()];
+        eprint!("\r\x1b[2Kagent-sandbox: {} {}", spinner, message);
+        let _ = std::io::stderr().flush();
+    }
+
+    fn tick(&mut self, message: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.frame = self.frame.wrapping_add(1);
+        self.active = true;
+        self.render(message);
+    }
+
+    fn clear(&self) {
+        if self.enabled && self.active {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
+    }
+
+    fn finish(&self) {
+        if self.enabled && self.active {
+            eprintln!();
+        }
+    }
+
+    fn success(&self, message: &str) {
+        if self.enabled && self.active {
+            eprint!("\r\x1b[2Kagent-sandbox: ✔ {}", message);
+            let _ = std::io::stderr().flush();
+            eprintln!();
         }
     }
 }
@@ -1850,13 +1985,14 @@ fn run() -> Result<i32> {
 
     let mut merged_policy = agents::ProxyPolicy::default();
     merged_policy.default = vec!["deny".to_string()];
+    let mut startup_info = StartupInfo::new();
 
     if use_agents_network && agents_md_path.exists() {
         let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
         match parse_proxy(&text) {
             Ok(policy) => {
                 merged_policy.merge(policy);
-                eprintln!("agent-sandbox: policy: loaded {}", agents_md_path.display());
+                startup_info.policy(&format!("loaded {}", agents_md_path.display()));
             }
             Err(e) => {
                 eprintln!("agent-sandbox: {}", e);
@@ -1889,10 +2025,10 @@ fn run() -> Result<i32> {
             let text = match fs::read_to_string(&policy_file_path) {
                 Ok(text) => text,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!(
-                        "agent-sandbox: policy: looking for policies in {}",
+                    startup_info.policy(&format!(
+                        "looking for policies in {}",
                         launch::policies_dir(&home).display()
-                    );
+                    ));
                     return Err(anyhow::anyhow!(
                         "agent-sandbox: cannot read policy '{}': {} ({})",
                         policy_name,
@@ -1913,10 +2049,7 @@ fn run() -> Result<i32> {
                 anyhow::anyhow!("agent-sandbox: invalid policy '{}': {}", policy_name, e)
             })?;
             merged_policy.merge(policy);
-            eprintln!(
-                "agent-sandbox: policy: loaded {}",
-                policy_file_path.display()
-            );
+            startup_info.policy(&format!("loaded {}", policy_file_path.display()));
         }
 
         // An agent-named policy applies without being asked for by name, the
@@ -1939,16 +2072,16 @@ fn run() -> Result<i32> {
                     anyhow::anyhow!("agent-sandbox: invalid policy for agent '{}': {}", agent, e)
                 })?;
                 merged_policy.merge(policy);
-                eprintln!(
-                    "agent-sandbox: policy: loaded {} (agent '{}')",
+                startup_info.policy(&format!(
+                    "loaded {} (agent '{}')",
                     agent_policy_path.display(),
                     agent
-                );
+                ));
             } else {
-                eprintln!(
-                    "agent-sandbox: policy: looking for policies in {}",
+                startup_info.policy(&format!(
+                    "looking for policies in {}",
                     launch::policies_dir(&home).display()
-                );
+                ));
             }
         }
 
@@ -2006,6 +2139,14 @@ fn run() -> Result<i32> {
     }
 
     let mut cleanup_guard = CleanupGuard::new();
+    cleanup_guard.status("starting sandbox");
+    let status_dir = format!(
+        "/tmp/agent-sandbox-status-{}",
+        &uuid::Uuid::new_v4().to_string()[0..8]
+    );
+    fs::create_dir_all(&status_dir)?;
+    let _ = fs::set_permissions(&status_dir, fs::Permissions::from_mode(0o700));
+    cleanup_guard.status_dir = status_dir.clone();
     let mut proxy_env_vars: Vec<String> = Vec::new();
     let image = env::var("AGENT_SANDBOX_IMAGE").unwrap_or_default();
 
@@ -2119,6 +2260,7 @@ fn run() -> Result<i32> {
 
     let mut sidecar_ip = String::new();
     if want_proxy {
+        cleanup_guard.status("starting proxy");
         let uuid_str = uuid::Uuid::new_v4().to_string();
         let uuid = &uuid_str[0..8];
         let sidecar_id = format!("agent-sandbox-sidecar-{}", uuid);
@@ -2345,6 +2487,7 @@ fn run() -> Result<i32> {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
                 .unwrap_or(false);
             if !running {
+                cleanup_guard.clear_status();
                 eprintln!("agent-sandbox: the proxy sidecar exited before signalling readiness:");
                 if let Ok(logs_out) = ProcessCommand::new("podman")
                     .args(["logs", &sidecar_id])
@@ -2356,15 +2499,19 @@ fn run() -> Result<i32> {
                 }
                 return Ok(1);
             }
+            cleanup_guard.tick_status("starting proxy");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
         if !sidecar_ready {
+            cleanup_guard.clear_status();
             eprintln!("agent-sandbox: warning: proxy did not signal readiness in 35s");
             eprintln!(
                 "               (continuing; check: podman logs {})",
                 sidecar_id
             );
+        } else {
+            cleanup_guard.status("proxy ready");
         }
 
         let degraded_path = format!("{}/egress-degraded", sidecar_shared);
@@ -2380,6 +2527,7 @@ fn run() -> Result<i32> {
             );
         }
 
+        cleanup_guard.status("configuring network");
         network_args.push("--network".to_string());
         network_args.push(sidecar_id.clone());
 
@@ -2535,6 +2683,18 @@ fn run() -> Result<i32> {
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.config,U=true"]);
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.cache,U=true"]);
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.local,U=true"]);
+    podman_cmd.args([
+        "-e",
+        "AGENT_SANDBOX_READY_FILE=/run/agent-sandbox-status/ready",
+    ]);
+    podman_cmd.args([
+        "-e",
+        "AGENT_SANDBOX_READY_ACK_FILE=/run/agent-sandbox-status/ack",
+    ]);
+    podman_cmd.args([
+        "-v",
+        &format!("{}:/run/agent-sandbox-status:rw", status_dir),
+    ]);
 
     podman_cmd.args(&network_args);
     podman_cmd.args(&publish_args);
@@ -2582,10 +2742,55 @@ fn run() -> Result<i32> {
 
     // Not exec'd: returning is what drops the cleanup guard, which stops the
     // sidecar and prints its traffic summary.
-    match podman_cmd.status() {
+    cleanup_guard.status("starting command");
+    let mut child = match podman_cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            cleanup_guard.clear_status();
+            eprintln!("Failed to run podman: {}", e);
+            return Ok(1);
+        }
+    };
+    let ready_path = format!("{}/ready", status_dir);
+    loop {
+        if Path::new(&ready_path).exists() {
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                cleanup_guard.clear_status();
+                eprintln!(
+                    "agent-sandbox: command exited before the sandbox became ready ({}).",
+                    status
+                );
+                return Ok(status.code().unwrap_or(1));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                cleanup_guard.clear_status();
+                eprintln!("agent-sandbox: could not check sandbox readiness: {}", e);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(1);
+            }
+        }
+        cleanup_guard.tick_status("starting command");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    cleanup_guard.finish_status();
+    if let Err(e) = fs::write(format!("{}/ack", status_dir), "ack\n") {
+        eprintln!(
+            "agent-sandbox: could not acknowledge sandbox readiness: {}",
+            e
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(1);
+    }
+    match child.wait() {
         Ok(st) => Ok(st.code().unwrap_or(1)),
         Err(e) => {
-            eprintln!("Failed to run podman: {}", e);
+            eprintln!("Failed to wait for podman: {}", e);
             Ok(1)
         }
     }
