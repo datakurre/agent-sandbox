@@ -588,3 +588,37 @@ fn help_lists_exactly_the_agents_the_catalog_declares() {
         "the help text must come from the catalog, not a second copy of it"
     );
 }
+
+#[test]
+fn help_options_share_a_description_column() {
+    let out = World::new().run(&["--help"]);
+
+    for line in out.stdout.lines().filter(|line| {
+        line.starts_with("  --") || line.starts_with("  -e,")
+    }) {
+        assert!(
+            line.len() > 45,
+            "help option is missing its aligned description: {line:?}"
+        );
+        assert!(
+            line.as_bytes()[45] != b' ',
+            "help option description does not start at column 45: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn ctl_help_commands_share_a_description_column() {
+    let out = World::new().run(&["ctl", "--help"]);
+
+    assert_eq!(out.code, Some(0));
+    for line in out.stdout.lines().filter(|line| {
+        line.starts_with("  ") && !line.starts_with("  -") && line.contains("     ")
+    }) {
+        assert_eq!(
+            line.find(|character: char| character.is_ascii_uppercase()),
+            Some(11),
+            "ctl command description is not aligned: {line:?}"
+        );
+    }
+}

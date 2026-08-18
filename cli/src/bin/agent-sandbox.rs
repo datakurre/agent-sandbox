@@ -27,7 +27,8 @@ use tempfile::Builder;
 #[command(
     name = "agent-sandbox",
     about = "Agent sandbox control CLI",
-    version = "0.1.0"
+    version = "0.1.0",
+    term_width = 100
 )]
 struct CtlCli {
     #[command(subcommand)]
@@ -60,6 +61,51 @@ enum CtlCommands {
     Tui(ctl::tui::TuiArgs),
     #[command(about = "Reclaim leftover containers, networks and directories")]
     Purge(ctl::purge::PurgeArgs),
+}
+
+const HELP_OPTION_WIDTH: usize = 36;
+const HELP_STATUS_WIDTH: usize = 5;
+const HELP_DESCRIPTION_INDENT: usize = 2 + HELP_OPTION_WIDTH + 1 + HELP_STATUS_WIDTH + 1;
+const HELP_MAX_WIDTH: usize = 100;
+
+fn print_help_option(name: &str, status: Option<&str>, description: &str) {
+    let status = status.unwrap_or("");
+    let indent = " ".repeat(HELP_DESCRIPTION_INDENT);
+    let mut first_line = true;
+    let mut emit = |line: &str| {
+        if first_line {
+            println!(
+                "  {:<option_width$} {:<status_width$} {}",
+                name,
+                status,
+                line,
+                option_width = HELP_OPTION_WIDTH,
+                status_width = HELP_STATUS_WIDTH
+            );
+            first_line = false;
+        } else {
+            println!("{indent}{line}");
+        }
+    };
+
+    for source_line in description.lines() {
+        let mut line = String::new();
+        for word in source_line.split_whitespace() {
+            if !line.is_empty()
+                && HELP_DESCRIPTION_INDENT + line.len() + 1 + word.len() > HELP_MAX_WIDTH
+            {
+                emit(&line);
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            emit(&line);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -439,98 +485,67 @@ fn print_usage(
 ) {
     let fmt = |b: bool| if b { "[on ]" } else { "[off]" };
     let agent_mounts_all = matches!(want_agent_mounts_mode, AgentMountsMode::All);
-    // A raw string, not `\n\` continuations: a backslash-newline in a Rust
-    // string literal swallows the *following* line's leading whitespace, which
-    // is what flattened every indented line of this text after the rewrite.
     println!(
         r#"agent-sandbox [FLAGS] [AGENT] [-- COMMAND...]
 
 Runs an AI coding agent inside a rootless podman container.
 Use flags to opt-in to integrations like mounting the current directory,
 forwarding SSH, or exposing Git identity.
+"#
+    );
+    print_help_option("agent-sandbox", None, "launch interactive bash (no agent state mounted)");
+    print_help_option("agent-sandbox opencode", None, "launch opencode with its own state mounted");
+    print_help_option("agent-sandbox --agent-mounts", None, "launch interactive bash with every agent's state mounted");
+    print_help_option("agent-sandbox --podman opencode", None, "launch opencode with podman enabled");
+    print_help_option("agent-sandbox opencode -- bash", None, "launch bash with opencode's state mounted");
+    print_help_option("agent-sandbox --privileged opencode", None, "pass --privileged to podman run");
+    print_help_option("agent-sandbox ctl --help", None, "manage sandboxes that are already running");
+    print_help_option("agent-sandbox browser", None, "start a throwaway host browser behind a deny-by-default allow list, for cooperative testing over CDP");
+    println!("\nAgents:\n  {agent_list}");
+    println!("\nIntegrations (use --X to enable, --no-X to disable):");
+    print_help_option("--workspace", Some(fmt(want_workspace)), "Mounts the host's current working directory into /workspace/<dirname>.");
+    print_help_option("--name NAME", None, "Use NAME instead of a random ctl selector.");
+    print_help_option("--ssh", Some(fmt(want_ssh)), "Forwards the host's SSH_AUTH_SOCK to the container.");
+    print_help_option("--git", Some(fmt(want_git)), "Passes the host's Git configuration (with a blocklist) and identity env vars.");
+    print_help_option("--gpg", Some(fmt(want_gpg)), "Enables host GnuPG agent forwarding and git commit signing behavior.");
+    print_help_option("--gpg-private", Some(fmt(want_gpg_private)), "Exposes ~/.gnupg even if it holds on-disk secret keys.");
+    print_help_option("--devenv", Some(fmt(want_devenv)), "Persists ~/.local/share/devenv across sessions.");
+    print_help_option("--nix", Some(fmt(want_nix)), "Mounts the host /nix/store for native Nix execution.");
+    print_help_option("--podman", Some(fmt(want_podman)), "Forwards the host rootless Podman socket (sibling containers).");
+    print_help_option("--selinux", Some(fmt(want_selinux)), "Applies SELinux shared relabeling (:z) to writable binds.");
+    print_help_option("--proxy", Some(fmt(want_proxy)), "Deny-by-default network firewall enforcing AGENTS.md's [network] policy.");
+    print_help_option("--policy NAME", None, "Merge a host-owned reusable network policy for sandbox launches; requires --proxy.");
+    print_help_option("--no-policy", None, "Ignore selected and implicit host-owned policies; keep the proxy and AGENTS.md policy.");
+    print_help_option("--secrets", Some(fmt(want_secrets)), "Injects secretspec-resolved credentials into proxied requests. Requires --proxy.");
+    print_help_option("--krun", Some(fmt(want_krun)), "Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).");
 
-  agent-sandbox                      launch interactive bash (no agent state mounted)
-  agent-sandbox opencode             launch opencode with its own state mounted
-  agent-sandbox --agent-mounts       launch interactive bash with every agent's state mounted
-  agent-sandbox --podman opencode    launch opencode with podman enabled
-  agent-sandbox opencode -- bash     launch bash with opencode's state mounted
-  agent-sandbox --privileged opencode
-                                     pass --privileged to podman run
-  agent-sandbox ctl --help           manage sandboxes that are already running
-  agent-sandbox browser              start a throwaway host browser behind a deny-by-default
-                                     allow list, for cooperative testing over CDP
+    println!("\nPorts:");
+    print_help_option("--ports / --no-ports", Some(fmt(want_ports)), "Honors [ports] declarations from AGENTS.md.");
+    print_help_option("--ports-any-interface", None, "Permits port binds outside of loopback interfaces.");
+    print_help_option("--shared-network", Some(fmt(want_shared_network)), "Joins the shared bridge network so sibling containers can reach this one by name.");
+    print_help_option("--browser", Some(fmt(want_browser)), "Attaches every running 'agent-sandbox browser' session, mapping its CDP port in automatically.");
+    print_help_option("--host-loopback-port PORT", Some(fmt(want_host_ports)), "Makes a host 127.0.0.1:PORT reachable at the sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP port). Repeatable; takes HOST:SANDBOX to remap.");
 
-Agents:
-  {agent_list}
+    println!("\nMounts:");
+    print_help_option("--mounts / --no-mounts", Some(fmt(want_mounts)), "Honors [mounts] declarations from AGENTS.md.");
 
-Integrations (use --X to enable, --no-X to disable):
-  --workspace       {workspace} Mounts the host's current working directory into /workspace/<dirname>.
-  --name NAME                     Use NAME instead of a random ctl selector.
-  --ssh             {ssh} Forwards the host's SSH_AUTH_SOCK to the container.
-  --git             {git} Passes the host's Git configuration (with a blocklist) and identity env vars.
-  --gpg             {gpg} Enables host GnuPG agent forwarding and git commit signing behavior.
-  --gpg-private     {gpg_private} Exposes ~/.gnupg even if it holds on-disk secret keys.
-  --devenv          {devenv} Persists ~/.local/share/devenv across sessions.
-  --nix             {nix} Mounts the host /nix/store for native Nix execution.
-  --podman          {podman} Forwards the host rootless Podman socket (sibling containers).
-  --selinux         {selinux} Applies SELinux shared relabeling (:z) to writable binds.
-  --proxy           {proxy} Deny-by-default network firewall enforcing AGENTS.md's [network] policy.
-  --policy NAME             Merge a host-owned reusable network policy for sandbox launches; requires --proxy.
-  --no-policy                Ignore selected and implicit host-owned policies; keep the proxy and AGENTS.md policy.
-  --secrets         {secrets} Injects secretspec-resolved credentials into proxied requests. Requires --proxy.
-  --krun            {krun} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
+    println!("\nAgent state:");
+    print_help_option("--agent-mounts", Some(fmt(agent_mounts_all)), "Mount every agent's state, not just the one launched.");
+    print_help_option("--agent-mounts=AGENT[,AGENT...]", None, "Mount only these agents' state (plus any launched agent).\nOnly the \"=\" form takes a list.");
+    print_help_option("--no-agent-mounts", None, "Mount no agent state, even for the launched agent.");
 
-Ports:
-  --ports / --no-ports               {ports} Honors [ports] declarations from AGENTS.md.
-  --ports-any-interface                    Permits port binds outside of loopback interfaces.
-  --shared-network                   {shared_network} Joins the shared bridge network so sibling
-                                           containers can reach this one by name.
-  --browser                          {browser} Attaches every running 'agent-sandbox browser'
-                                           session, mapping its CDP port in automatically.
-  --host-loopback-port PORT          {host_ports} Makes a host 127.0.0.1:PORT reachable at the
-                                           sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP
-                                           port). Repeatable; takes HOST:SANDBOX to remap.
-
-Mounts:
-  --mounts / --no-mounts             {mounts} Honors [mounts] declarations from AGENTS.md.
-
-Agent state:
-  --agent-mounts                     {agent_mounts} Mount every agent's state, not just the one launched.
-  --agent-mounts=AGENT[,AGENT...]    Mount only these agents' state (plus any launched agent).
-                                     Only the "=" form takes a list.
-  --no-agent-mounts                  Mount no agent state, even for the launched agent.
-
-Podman / Environment:
-  --privileged              pass --privileged to podman run (for nested podman)
-  --krun-memory MiB         guest RAM under --krun (default 4096, must exceed 128)
-  --krun-cpus N             guest vCPUs under --krun (1-16, default: host affinity)
-  -e, --env NAME=VAL        pass environment variable to podman
-  --podman-args             treat all following args (until --) as podman args
-
---podman, --ssh, --gpg and --krun each interact with the sandbox boundary
+    println!("\nPodman / Environment:");
+    print_help_option("--privileged", None, "pass --privileged to podman run (for nested podman)");
+    print_help_option("--krun-memory MiB", None, "guest RAM under --krun (default 4096, must exceed 128)");
+    print_help_option("--krun-cpus N", None, "guest vCPUs under --krun (1-16, default: host affinity)");
+    print_help_option("-e, --env NAME=VAL", None, "pass environment variable to podman");
+    print_help_option("--podman-args", None, "treat all following args (until --) as podman args");
+    println!(
+        "\n--podman, --ssh, --gpg and --krun each interact with the sandbox boundary
 differently -- --podman in particular is a full sandbox escape; prefer
 --privileged for nested containers. See the trust model:
 https://datakurre.github.io/agent-sandbox/trust-model/
-Full flag reference and examples: https://datakurre.github.io/agent-sandbox/usage/"#,
-        agent_list = agent_list,
-        workspace = fmt(want_workspace),
-        ssh = fmt(want_ssh),
-        git = fmt(want_git),
-        gpg = fmt(want_gpg),
-        gpg_private = fmt(want_gpg_private),
-        devenv = fmt(want_devenv),
-        nix = fmt(want_nix),
-        podman = fmt(want_podman),
-        selinux = fmt(want_selinux),
-        proxy = fmt(want_proxy),
-        secrets = fmt(want_secrets),
-        krun = fmt(want_krun),
-        ports = fmt(want_ports),
-        shared_network = fmt(want_shared_network),
-        host_ports = fmt(want_host_ports),
-        browser = fmt(want_browser),
-        mounts = fmt(want_mounts),
-        agent_mounts = fmt(agent_mounts_all)
+Full flag reference and examples: https://datakurre.github.io/agent-sandbox/usage/"
     );
 }
 
