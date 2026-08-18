@@ -300,6 +300,12 @@ fn enforce_selinux_mount_flags(mount_opt: &str, want_selinux: bool) -> String {
         let opts = parts[2..].join(":");
         let mut opt_list: Vec<&str> = opts.split(',').collect();
 
+        // Overlay mounts have their own volume semantics; Podman rejects the
+        // combination of its `O` option with SELinux relabeling.
+        if opt_list.contains(&"O") {
+            return mount_opt.to_string();
+        }
+
         if want_selinux {
             if !opt_list.contains(&"z") && !opt_list.contains(&"Z") {
                 opt_list.push("Z");
@@ -512,7 +518,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--devenv", Some(fmt(want_devenv)), "Persists ~/.local/share/devenv across sessions.");
     print_help_option("--nix", Some(fmt(want_nix)), "Mounts the host /nix/store for native Nix execution.");
     print_help_option("--podman", Some(fmt(want_podman)), "Forwards the host rootless Podman socket (sibling containers).");
-    print_help_option("--selinux", Some(fmt(want_selinux)), "Applies SELinux shared relabeling (:z) to writable binds.");
+    print_help_option("--selinux", Some(fmt(want_selinux)), "Applies SELinux shared relabeling (:z) to ordinary writable binds; special volume modes are unchanged.");
     print_help_option("--proxy", Some(fmt(want_proxy)), "Deny-by-default network firewall enforcing AGENTS.md's [network] policy.");
     print_help_option("--policy NAME", None, "Merge a host-owned reusable network policy for sandbox launches; requires --proxy.");
     print_help_option("--no-policy", None, "Ignore selected and implicit host-owned policies; keep the proxy and AGENTS.md policy.");
@@ -2726,6 +2732,10 @@ mod tests {
         assert_eq!(
             enforce_selinux_mount_flags("/a:/b:rw,Z", true),
             "/a:/b:rw,Z"
+        );
+        assert_eq!(
+            enforce_selinux_mount_flags("/nix:/nix:O", true),
+            "/nix:/nix:O"
         );
     }
 

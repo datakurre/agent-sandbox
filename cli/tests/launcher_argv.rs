@@ -261,6 +261,26 @@ fn without_selinux_no_relabelling_flag_is_added() {
     );
 }
 
+#[test]
+fn selinux_does_not_add_a_relabel_to_the_nix_overlay_mount() {
+    let out = World::new().run(&["--nix", "--selinux", "opencode"]);
+    let run = out.run_call();
+
+    assert!(
+        run.values_of("-v").contains(&"/nix:/nix:O"),
+        "the Nix overlay must remain an overlay mount: {}",
+        run.joined()
+    );
+    assert!(
+        !run
+            .values_of("-v")
+            .iter()
+            .any(|mount| *mount == "/nix:/nix:O,Z"),
+        "SELinux relabeling must not be combined with the Nix overlay: {}",
+        run.joined()
+    );
+}
+
 // ── declared ports ──────────────────────────────────────────────────────────
 
 const PORTS_AGENTS_MD: &str = "\

@@ -80,7 +80,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Workspace & identity | `--devenv` | Persists `~/.local/share/devenv` across sessions. |
 | Workspace & identity | `--nix` | Mounts the host `/nix/store` for native Nix execution. |
 | Container runtime | `--podman` | Forwards the host rootless Podman socket (sibling containers). See [Trust model](trust-model.md). |
-| Container runtime | `--selinux` | Applies SELinux shared relabeling (`:z`) to writable binds in the sandbox container. |
+| Container runtime | `--selinux` | Applies SELinux shared relabeling (`:z`) to ordinary writable binds in the sandbox container; special modes such as the Nix overlay are left unchanged. |
 | Container runtime | `--krun` | Runs the sandbox as a KVM microVM with its own kernel, using `podman --runtime krun`. See [Trust model](trust-model.md). |
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
