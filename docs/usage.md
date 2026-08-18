@@ -346,7 +346,8 @@ user-owned skills instead, mount a replacement tree with
 `AGENTS.md` under `[mounts]`. A more specific child mount can replace only one
 bundled skill. The canonical tree is also linked from
 `~/.claude/skills`, `~/.codex/skills`, `~/.copilot/skills`, `~/.cursor/skills`,
-and `~/.gemini/skills` for tools that use those discovery paths.
+`~/.gemini/skills`, and `~/.gemini/config/skills` for tools that use those
+discovery paths.
 
 ## Managing running sandboxes
 

@@ -351,6 +351,8 @@ let
         mkdir -p "home/user/.$tool"
         ln -s /home/user/.agents/skills "home/user/.$tool/skills"
       done
+      mkdir -p home/user/.gemini/config
+      ln -s /home/user/.agents/skills home/user/.gemini/config/skills
       mkdir -p workspace
       chmod 1777 workspace
       mkdir -p tmp
