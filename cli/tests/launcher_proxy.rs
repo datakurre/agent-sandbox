@@ -346,6 +346,86 @@ fn an_agent_named_policy_loads_implicitly_under_proxy() {
 }
 
 #[test]
+fn no_policy_skips_the_implicit_agent_policy_but_keeps_agents_md() {
+    let out = proxied_world()
+        .file("AGENTS.md", ALLOW_EXAMPLE)
+        .home_file(
+            ".config/agent-sandbox/policies/opencode.toml",
+            "[network]\nallowed_hosts = [\"registry.npmjs.org:443\"]\n",
+        )
+        .run(&["--workspace", "--proxy", "--no-policy", "opencode"]);
+
+    let run = out.run_call();
+    assert!(
+        run.values_of("--add-host")
+            .contains(&"example.com:10.89.7.2"),
+        "AGENTS.md should remain active: {}",
+        out.stderr
+    );
+    assert!(
+        !run.values_of("--add-host")
+            .contains(&"registry.npmjs.org:10.89.7.2"),
+        "the implicit agent policy should be skipped: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("opencode.toml"),
+        "the skipped policy should not be reported as loaded: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn no_policy_neutralizes_earlier_named_policies() {
+    let out = proxied_world().run(&[
+        "--workspace",
+        "--proxy",
+        "--policy",
+        "missing",
+        "--no-policy",
+        "opencode",
+    ]);
+
+    assert!(
+        out.reached_podman_run(),
+        "a policy cleared by --no-policy must not be read: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_policy_after_no_policy_reenables_host_owned_policy_loading() {
+    let out = proxied_world()
+        .home_file(
+            ".config/agent-sandbox/policies/development.toml",
+            "[network]\nallowed_hosts = [\"registry.npmjs.org:443\"]\n",
+        )
+        .run(&[
+            "--workspace",
+            "--proxy",
+            "--policy",
+            "old",
+            "--no-policy",
+            "--policy",
+            "development",
+            "opencode",
+        ]);
+
+    assert!(
+        out.reached_podman_run(),
+        "the final policy selection should be active: {}",
+        out.stderr
+    );
+    assert!(
+        out.run_call()
+            .values_of("--add-host")
+            .contains(&"registry.npmjs.org:10.89.7.2"),
+        "the later policy should be loaded: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn secrets_declared_but_not_enabled_warn_rather_than_being_injected() {
     let agents_md = "\
 ```toml agent-sandbox

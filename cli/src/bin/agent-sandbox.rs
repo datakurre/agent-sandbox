@@ -476,6 +476,7 @@ Integrations (use --X to enable, --no-X to disable):
   --selinux         {selinux} Applies SELinux shared relabeling (:z) to writable binds.
   --proxy           {proxy} Deny-by-default network firewall enforcing AGENTS.md's [network] policy.
   --policy NAME             Merge a host-owned reusable network policy for sandbox launches; requires --proxy.
+  --no-policy                Ignore selected and implicit host-owned policies; keep the proxy and AGENTS.md policy.
   --secrets         {secrets} Injects secretspec-resolved credentials into proxied requests. Requires --proxy.
   --krun            {krun} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
 
@@ -813,6 +814,7 @@ fn run() -> Result<i32> {
     let mut want_proxy = false;
     let mut use_agents_network = false;
     let mut policies: Vec<String> = Vec::new();
+    let mut policy_enabled = true;
     let mut want_secrets = false;
     let mut want_krun = false;
     let mut want_privileged = false;
@@ -987,6 +989,10 @@ fn run() -> Result<i32> {
                 want_proxy = false;
                 use_agents_network = false;
             }
+            "--no-policy" => {
+                policies.clear();
+                policy_enabled = false;
+            }
             "--secrets" => want_secrets = true,
             "--no-secrets" => want_secrets = false,
             "--krun" => want_krun = true,
@@ -1047,6 +1053,7 @@ fn run() -> Result<i32> {
                     }
                     requested_name = Some(v.to_string());
                 } else if arg == "--policy" || arg.starts_with("--policy=") {
+                    policy_enabled = true;
                     let value = match arg.strip_prefix("--policy=") {
                         Some(v) => v.to_string(),
                         None => {
@@ -1809,7 +1816,7 @@ fn run() -> Result<i32> {
         }
     }
 
-    if want_proxy {
+    if want_proxy && policy_enabled {
         for policy_name in &policies {
             let policy_file_path = policy_path(&home, policy_name)?;
             let text = fs::read_to_string(&policy_file_path).map_err(|e| {
@@ -1835,7 +1842,7 @@ fn run() -> Result<i32> {
         // organization's allow list for `claude`) reaches every project that
         // agent launches in, without each project or --policy having to name
         // it.  Absence is not an error -- most agents will not have one.
-        if !agent.is_empty() {
+        if policy_enabled && !agent.is_empty() {
             let agent_policy_path = policy_path(&home, &agent)?;
             if agent_policy_path.exists() {
                 let text = fs::read_to_string(&agent_policy_path).map_err(|e| {
@@ -2147,7 +2154,7 @@ fn run() -> Result<i32> {
                 .iter()
                 .filter_map(|name| policy_path(&home, name).ok())
                 .collect();
-            if !agent.is_empty() {
+            if policy_enabled && !agent.is_empty() {
                 if let Ok(path) = policy_path(&home, &agent) {
                     if path.exists() {
                         policy_paths.push(path);

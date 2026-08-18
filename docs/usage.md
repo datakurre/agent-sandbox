@@ -63,7 +63,7 @@ agent-sandbox = pkgs.symlinkJoin {
 
 ### Flags
 
-Most flags in the table below have a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it — the exceptions are the ones taking a value (`--policy`, `--krun-memory`, `--krun-cpus`) and `--ports-any-interface`. For sandbox launches, `--policy` requires `--proxy`; passing it without `--proxy` refuses the launch rather than turning the proxy on implicitly. `agent-sandbox browser --policy NAME` is separate and uses the browser's own proxy. A `--no-proxy` after `--proxy --policy NAME` still turns the sandbox proxy off, dropping the policies with it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
+Most flags in the table below have a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it — the exceptions are the ones taking a value (`--policy`, `--krun-memory`, `--krun-cpus`) and `--ports-any-interface`. For sandbox launches, `--policy` requires `--proxy`; passing it without `--proxy` refuses the launch rather than turning the proxy on implicitly. `--no-policy` is different from `--no-proxy`: it keeps the deny-by-default proxy and the workspace `AGENTS.md` policy, while skipping all host-owned policy files selected before it, including the implicit per-agent policy. A later `--policy NAME` re-enables host-owned policy loading. `agent-sandbox browser --policy NAME` is separate and uses the browser's own proxy. A `--no-proxy` after `--proxy --policy NAME` still turns the sandbox proxy off, dropping the policies with it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
 
 `--gpg-agent` and `--gpg-sign` were merged and removed; use `--gpg` / `--no-gpg`.
 
@@ -82,8 +82,9 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Container runtime | `--krun` | Runs the sandbox as a KVM microVM with its own kernel, using `podman --runtime krun`. See [Trust model](trust-model.md). |
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
-| Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces the workspace `AGENTS.md` `[network]` policy, plus a matching `~/.config/agent-sandbox/policies/<agent>.toml` if one exists. Prints a per-host traffic summary when the session ends. See details below. |
+| Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy that enforces the workspace `AGENTS.md` `[network]` policy, plus a matching `~/.config/agent-sandbox/policies/<agent>.toml` if one exists (unless `--no-policy` is given). Prints a per-host traffic summary when the session ends. See details below. |
 | Network & firewall | `--policy NAME` | For sandbox launches, merges a host-owned reusable policy from `~/.config/agent-sandbox/policies/NAME.toml` additively with `AGENTS.md`; requires `--proxy` and may be repeated. The browser subcommand uses its own proxy. |
+| Network & firewall | `--no-policy` | Keeps `--proxy` and the workspace `AGENTS.md` policy, but skips all selected and implicit host-owned policy files. A later `--policy NAME` re-enables them. |
 | Network & firewall | `--secrets` | Uses `secretspec` to resolve and inject HTTP headers (e.g., `Authorization`) into the proxied requests each `[[network.allowed_routes]]` rule authorises — that rule's host, method and path, and no others. Requires `--proxy`. See [Configuration](configuration.md#secrets). |
 | Ports & mounts | `--ports` | Honors `[ports]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--ports-any-interface` | Permits port binds outside of loopback interfaces. |
@@ -195,7 +196,7 @@ The proxy sources are additive, and selected explicitly:
 
 | Flags | Network policy |
 | --- | --- |
-| `--proxy` | The workspace `AGENTS.md`, plus `~/.config/agent-sandbox/policies/<agent>.toml` if it exists |
+| `--proxy` | The workspace `AGENTS.md`, plus `~/.config/agent-sandbox/policies/<agent>.toml` if it exists and `--no-policy` was not given |
 | `--proxy --policy development` | The above, plus the named host-owned policy |
 
 For sandbox launches, `--policy` requires `--proxy` — using it alone refuses

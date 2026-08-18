@@ -293,7 +293,14 @@ turning the proxy on. With `--proxy`, a named policy merges additively with the
 workspace's `AGENTS.md` `[network]` block (if any). The option may be repeated.
 Invalid or missing policies refuse the launch before the sidecar starts.
 
-An agent also gets its own policy implicitly: launching with `--proxy` checks
+`--no-policy` clears named policies collected earlier on the command line and
+skips the implicit per-agent policy, but does not disable the proxy or the
+workspace's `AGENTS.md` policy. A later `--policy NAME` re-enables host-owned
+policy loading, so `--policy old --no-policy --policy new` loads only `new`
+and the current agent's implicit policy.
+
+Unless `--no-policy` is given, an agent also gets its own policy implicitly:
+launching with `--proxy` checks
 `~/.config/agent-sandbox/policies/<agent>.toml` (the same directory, keyed by
 the agent name from `agents.nix`, e.g. `claude.toml`) and merges it
 automatically if it exists — no `--policy` needed. This is how an
