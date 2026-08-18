@@ -231,6 +231,12 @@ struct SecretRoute {
     path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSecret {
+    pub name: String,
+    pub binding: String,
+}
+
 /// Read the `secret_route` routes out of a compiled policy file.
 fn policy_secret_routes(policy: &Path) -> Vec<SecretRoute> {
     let mut routes = Vec::new();
@@ -270,7 +276,10 @@ pub fn resolve_secrets_logic(
     file: &Path,
     workspace: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    resolve_secrets_logic_with_policies(policy, config, file, workspace, &[])
+    Ok(resolve_secrets_with_policies(policy, config, file, workspace, &[])?
+        .into_iter()
+        .map(|secret| secret.binding)
+        .collect())
 }
 
 pub fn resolve_secrets_logic_with_policies(
@@ -280,6 +289,19 @@ pub fn resolve_secrets_logic_with_policies(
     workspace: &Path,
     policy_files: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<String>> {
+    Ok(resolve_secrets_with_policies(policy, config, file, workspace, policy_files)?
+        .into_iter()
+        .map(|secret| secret.binding)
+        .collect())
+}
+
+pub fn resolve_secrets_with_policies(
+    policy: &Path,
+    config: &Path,
+    file: &Path,
+    workspace: &Path,
+    policy_files: &[std::path::PathBuf],
+) -> anyhow::Result<Vec<ResolvedSecret>> {
     let secret_routes = policy_secret_routes(policy);
 
     if secret_routes.is_empty() {
@@ -520,10 +542,13 @@ pub fn resolve_secrets_logic_with_policies(
             } else {
                 secret_value.to_string()
             };
-            lines.push(format!(
-                "{}\t{}\t{}\t{}\t{}{}",
-                domain, method, path, header, prefix, val_str
-            ));
+            lines.push(ResolvedSecret {
+                name: secret_name.clone(),
+                binding: format!(
+                    "{}\t{}\t{}\t{}\t{}{}",
+                    domain, method, path, header, prefix, val_str
+                ),
+            });
         } else {
             anyhow::bail!(
                 "agent-sandbox: secretspec output missing required secret '{}'\n",

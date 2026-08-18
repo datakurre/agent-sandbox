@@ -5,7 +5,7 @@ use agent_sandbox_cli::ctl;
 use agent_sandbox_cli::gpg::{scan_gnupg_home, GpgScanStatus};
 use agent_sandbox_cli::launch;
 use agent_sandbox_cli::net_summary;
-use agent_sandbox_cli::secrets::resolve_secrets_logic_with_policies;
+use agent_sandbox_cli::secrets::resolve_secrets_with_policies;
 use agent_sandbox_cli::trusted;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -1851,13 +1851,6 @@ fn run() -> Result<i32> {
     let mut merged_policy = agents::ProxyPolicy::default();
     merged_policy.default = vec!["deny".to_string()];
 
-    if want_proxy {
-        eprintln!(
-            "agent-sandbox: policy: looking for policies in {}",
-            launch::policies_dir(&home).display()
-        );
-    }
-
     if use_agents_network && agents_md_path.exists() {
         let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
         match parse_proxy(&text) {
@@ -1893,14 +1886,29 @@ fn run() -> Result<i32> {
     if want_proxy && policy_enabled {
         for policy_name in &policies {
             let policy_file_path = policy_path(&home, policy_name)?;
-            let text = fs::read_to_string(&policy_file_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "agent-sandbox: cannot read policy '{}': {} ({})",
-                    policy_name,
-                    e,
-                    policy_file_path.display()
-                )
-            })?;
+            let text = match fs::read_to_string(&policy_file_path) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!(
+                        "agent-sandbox: policy: looking for policies in {}",
+                        launch::policies_dir(&home).display()
+                    );
+                    return Err(anyhow::anyhow!(
+                        "agent-sandbox: cannot read policy '{}': {} ({})",
+                        policy_name,
+                        e,
+                        policy_file_path.display()
+                    ));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "agent-sandbox: cannot read policy '{}': {} ({})",
+                        policy_name,
+                        e,
+                        policy_file_path.display()
+                    ));
+                }
+            };
             let policy = parse_policy_file(&text).map_err(|e| {
                 anyhow::anyhow!("agent-sandbox: invalid policy '{}': {}", policy_name, e)
             })?;
@@ -1935,6 +1943,11 @@ fn run() -> Result<i32> {
                     "agent-sandbox: policy: loaded {} (agent '{}')",
                     agent_policy_path.display(),
                     agent
+                );
+            } else {
+                eprintln!(
+                    "agent-sandbox: policy: looking for policies in {}",
+                    launch::policies_dir(&home).display()
                 );
             }
         }
@@ -2235,7 +2248,7 @@ fn run() -> Result<i32> {
                     }
                 }
             }
-            let bindings = match resolve_secrets_logic_with_policies(
+            let resolved_secrets = match resolve_secrets_with_policies(
                 Path::new(&format!("{}/policy", sidecar_policy)),
                 &config,
                 &manifest,
@@ -2245,14 +2258,21 @@ fn run() -> Result<i32> {
                 Ok(bindings) => bindings,
                 Err(e) => return refuse(e.to_string().trim_end()),
             };
-            if bindings.is_empty() {
+            if resolved_secrets.is_empty() {
                 eprintln!(
                     "agent-sandbox: --secrets resolved no bindings; nothing will be injected."
                 );
             } else {
+                for secret in &resolved_secrets {
+                    eprintln!("agent-sandbox: secret: injected {}", secret.name);
+                }
                 // Written 0600 and mounted read-only: the values never reach
                 // the sandbox, only the proxy that injects them.
                 let path = format!("{}/bindings", sidecar_secrets);
+                let bindings = resolved_secrets
+                    .iter()
+                    .map(|secret| secret.binding.as_str())
+                    .collect::<Vec<_>>();
                 fs::write(&path, format!("{}\n", bindings.join("\n")))?;
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
                 sidecar_extra_mounts.push("-v".to_string());

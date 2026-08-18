@@ -164,7 +164,7 @@ fn without_proxy_no_proxy_variables_are_set_at_all() {
 #[test]
 fn the_policy_the_sidecar_is_handed_carries_the_declared_rules_and_a_deny_baseline() {
     let world = proxied_world().file("AGENTS.md", ALLOW_EXAMPLE);
-    let out = world.run(&["--workspace", "--proxy", "opencode"]);
+    let out = world.run(&["--workspace", "--proxy"]);
 
     assert!(out.sidecar_call().is_some(), "a sidecar was started");
     let dir = world.captured("sidecar_policy");
@@ -189,6 +189,11 @@ fn the_policy_the_sidecar_is_handed_carries_the_declared_rules_and_a_deny_baseli
     assert_eq!(
         policy, base,
         "an unedited session's policy and its reset baseline are the same policy"
+    );
+    assert!(
+        !out.stderr.contains("looking for policies"),
+        "a launch with no host-owned policy lookup should not search: {}",
+        out.stderr
     );
 }
 
@@ -284,6 +289,11 @@ fn a_policy_that_does_not_exist_refuses_the_launch() {
         "the error should name the policy: {}",
         out.stderr
     );
+    assert!(
+        out.stderr.contains("looking for policies"),
+        "a missing named policy should report the lookup: {}",
+        out.stderr
+    );
 }
 
 #[test]
@@ -294,6 +304,18 @@ fn a_policy_without_proxy_refuses_the_launch() {
     assert!(
         out.stderr.contains("--policy") && out.stderr.contains("--proxy"),
         "the error should explain --policy needs --proxy: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_missing_implicit_agent_policy_reports_the_lookup() {
+    let out = proxied_world().run(&["--workspace", "--proxy", "opencode"]);
+
+    assert!(out.reached_podman_run(), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("looking for policies"),
+        "a missing implicit agent policy should report the lookup: {}",
         out.stderr
     );
 }
@@ -310,12 +332,16 @@ fn a_policy_merges_with_agents_md() {
             "--proxy",
             "--policy",
             "development",
-            "opencode",
         ]);
 
     assert!(
         out.reached_podman_run(),
         "a host-owned policy is a complete policy on its own: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("looking for policies"),
+        "a successfully loaded named policy should not report a failed lookup: {}",
         out.stderr
     );
     assert!(out
@@ -341,6 +367,11 @@ fn an_agent_named_policy_loads_implicitly_under_proxy() {
     assert!(
         out.stderr.contains("opencode.toml"),
         "the load should be reported: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("looking for policies"),
+        "an existing implicit policy should not report a failed lookup: {}",
         out.stderr
     );
 }
@@ -450,6 +481,53 @@ secret = \"API_TOKEN\"
         "a declared secret that is not enabled must say so: {}",
         out.stderr
     );
+}
+
+#[test]
+fn injected_secrets_are_reported_by_name_without_exposing_values() {
+    let agents_md = "\
+```toml agent-sandbox
+[network]
+[[network.allowed_routes]]
+host = \"api.example.com:443\"
+method = \"GET\"
+path = \"/v1/*\"
+secret = \"API_TOKEN\"
+```
+";
+    let world = proxied_world()
+        .file("AGENTS.md", agents_md)
+        .file("secretspec.toml", "")
+        .home_file(
+            ".config/agent-sandbox/trusted.toml",
+            "\
+[[network.allowed_routes]]
+host = \"api.example.com:443\"
+method = \"GET\"
+path = \"/v1/*\"
+secret = \"API_TOKEN\"
+",
+        )
+        .stub_bin(
+            "secretspec",
+            "#!/bin/sh\nprintf '%s\\n' '{\"secrets\":{\"API_TOKEN\":\"super-secret\"}}'\n",
+        );
+    let out = world.run(&["--workspace", "--proxy", "--secrets", "opencode"]);
+
+    assert!(out.reached_podman_run(), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("agent-sandbox: secret: injected API_TOKEN"),
+        "the injected secret should be reported by name: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("super-secret"),
+        "the secret value must not be printed: {}",
+        out.stderr
+    );
+    let bindings = fs::read_to_string(world.captured("sidecar_secrets").join("bindings"))
+        .expect("the sidecar should receive the resolved binding");
+    assert!(bindings.contains("super-secret"));
 }
 
 #[test]
