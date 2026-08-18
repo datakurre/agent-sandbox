@@ -466,8 +466,7 @@ fn which(cmd: &str) -> Result<PathBuf, ()> {
     Err(())
 }
 
-fn ensure_skills_symlinks(home_path: &Path) {
-    let canonical_skills = Path::new("/home/user/.agents/skills");
+fn ensure_skills_symlinks_impl(home_path: &Path, canonical_skills: &Path) {
     if !canonical_skills.exists() {
         return;
     }
@@ -494,6 +493,10 @@ fn ensure_skills_symlinks(home_path: &Path) {
     }
 }
 
+fn ensure_skills_symlinks(home_path: &Path) {
+    ensure_skills_symlinks_impl(home_path, Path::new("/home/user/.agents/skills"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,14 +505,28 @@ mod tests {
     fn test_ensure_skills_symlinks_creates_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        ensure_skills_symlinks(home);
+        let fake_canonical = tmp.path().join("canonical_skills");
+        fs::create_dir_all(&fake_canonical).unwrap();
+
+        ensure_skills_symlinks_impl(home, &fake_canonical);
+
         let link = home.join(".gemini/config/skills");
         assert!(fs::symlink_metadata(&link).is_ok());
-        if Path::new("/home/user/.agents/skills").exists() {
-            assert_eq!(
-                fs::read_link(&link).unwrap(),
-                Path::new("/home/user/.agents/skills")
-            );
-        }
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            fake_canonical
+        );
+    }
+
+    #[test]
+    fn test_ensure_skills_symlinks_noop_when_canonical_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let missing_canonical = tmp.path().join("nonexistent_skills");
+
+        ensure_skills_symlinks_impl(home, &missing_canonical);
+
+        let link = home.join(".gemini/config/skills");
+        assert!(fs::symlink_metadata(&link).is_err());
     }
 }
