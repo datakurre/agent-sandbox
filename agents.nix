@@ -38,7 +38,12 @@
       ".local/share/antigravity-cli"
       ".config/antigravity-cli"
       ".cache/antigravity-cli"
-      ".gemini"
+      ".gemini/antigravity-cli"
+      ".gemini/config/projects"
+    ];
+    stateFiles = [
+      ".gemini/config/config.json"
+      ".gemini/config/mcp_config.json"
     ];
   }
   {

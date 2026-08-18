@@ -348,7 +348,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // 9. Leave the runtime environment somewhere `ctl attach` can find it.
+    // 9. Ensure skill compatibility symlinks exist inside home directory.
+    ensure_skills_symlinks(&home_path);
+
+    // 10. Leave the runtime environment somewhere `ctl attach` can find it.
     //
     // `podman exec` inherits the *container's* environment -- what `podman run`
     // was given -- not the environment this process built on top of it.  So an
@@ -358,7 +361,7 @@ fn main() -> Result<()> {
     // clone worked in the session the launcher started.
     write_attach_env(&home_path);
 
-    // 10. exec "$@"
+    // 11. exec "$@"
     if let Ok(ready_file) = env::var("AGENT_SANDBOX_READY_FILE") {
         if !ready_file.is_empty() {
             fs::write(&ready_file, "ready\n")
@@ -461,4 +464,52 @@ fn which(cmd: &str) -> Result<PathBuf, ()> {
         }
     }
     Err(())
+}
+
+fn ensure_skills_symlinks(home_path: &Path) {
+    let canonical_skills = Path::new("/home/user/.agents/skills");
+    if !canonical_skills.exists() {
+        return;
+    }
+
+    let links = [
+        home_path.join(".claude/skills"),
+        home_path.join(".codex/skills"),
+        home_path.join(".copilot/skills"),
+        home_path.join(".cursor/skills"),
+        home_path.join(".gemini/skills"),
+        home_path.join(".gemini/config/skills"),
+    ];
+
+    for link in &links {
+        if !link.exists() {
+            if fs::symlink_metadata(link).is_ok() {
+                let _ = fs::remove_file(link);
+            }
+            if let Some(parent) = link.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = std::os::unix::fs::symlink(canonical_skills, link);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_skills_symlinks_creates_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        ensure_skills_symlinks(home);
+        let link = home.join(".gemini/config/skills");
+        assert!(fs::symlink_metadata(&link).is_ok());
+        if Path::new("/home/user/.agents/skills").exists() {
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                Path::new("/home/user/.agents/skills")
+            );
+        }
+    }
 }
