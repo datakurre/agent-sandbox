@@ -428,7 +428,6 @@ fn print_usage(
     want_podman: bool,
     want_selinux: bool,
     want_proxy: bool,
-    want_proxy_log: Option<ProxyLogLevel>,
     want_secrets: bool,
     want_krun: bool,
     want_ports: bool,
@@ -440,14 +439,6 @@ fn print_usage(
 ) {
     let fmt = |b: bool| if b { "[on ]" } else { "[off]" };
     let agent_mounts_all = matches!(want_agent_mounts_mode, AgentMountsMode::All);
-    // Same width as fmt's markers so the column does not jog.
-    let proxy_log_state = match want_proxy_log {
-        None => "[ask]",
-        Some(ProxyLogLevel::Off) => "[off]",
-        Some(ProxyLogLevel::Denied) => "[den]",
-        Some(ProxyLogLevel::All) => "[all]",
-    };
-
     // A raw string, not `\n\` continuations: a backslash-newline in a Rust
     // string literal swallows the *following* line's leading whitespace, which
     // is what flattened every indented line of this text after the rewrite.
@@ -485,7 +476,6 @@ Integrations (use --X to enable, --no-X to disable):
   --selinux         {selinux} Applies SELinux shared relabeling (:z) to writable binds.
   --proxy           {proxy} Deny-by-default network firewall enforcing AGENTS.md's [network] policy.
   --policy NAME             Merge a host-owned reusable network policy for sandbox launches; requires --proxy.
-  --proxy-log LEVEL {proxy_log} What to do with the connection log at exit (off/denied/all); implies --proxy.
   --secrets         {secrets} Injects secretspec-resolved credentials into proxied requests. Requires --proxy.
   --krun            {krun} Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).
 
@@ -532,7 +522,6 @@ Full flag reference and examples: https://datakurre.github.io/agent-sandbox/usag
         podman = fmt(want_podman),
         selinux = fmt(want_selinux),
         proxy = fmt(want_proxy),
-        proxy_log = proxy_log_state,
         secrets = fmt(want_secrets),
         krun = fmt(want_krun),
         ports = fmt(want_ports),
@@ -542,30 +531,6 @@ Full flag reference and examples: https://datakurre.github.io/agent-sandbox/usag
         mounts = fmt(want_mounts),
         agent_mounts = fmt(agent_mounts_all)
     );
-}
-
-/// What to do with the proxy's connection log when the session ends.  The
-/// summary is printed either way; this only decides whether the raw record
-/// survives the teardown that removes the sidecar's shared directory.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum ProxyLogLevel {
-    /// Never keep it.
-    Off,
-    /// Keep it only if something was denied or failed.
-    Denied,
-    /// Keep every session's log.
-    All,
-}
-
-/// `None` -- the default -- means "ask": a session that had denials offers to
-/// save the log rather than deciding for the operator.
-fn parse_proxy_log_level(s: &str) -> Option<ProxyLogLevel> {
-    match s {
-        "off" => Some(ProxyLogLevel::Off),
-        "denied" => Some(ProxyLogLevel::Denied),
-        "all" => Some(ProxyLogLevel::All),
-        _ => None,
-    }
 }
 
 fn policy_path(home: &str, name: &str) -> Result<PathBuf> {
@@ -578,7 +543,6 @@ struct CleanupGuard {
     sidecar_policy: String,
     sidecar_secrets: String,
     host_port_dir: String,
-    log_level: Option<ProxyLogLevel>,
     session_word: String,
     policies: Vec<String>,
 }
@@ -591,7 +555,6 @@ impl CleanupGuard {
             sidecar_policy: String::new(),
             sidecar_secrets: String::new(),
             host_port_dir: String::new(),
-            log_level: None,
             session_word: String::new(),
             policies: Vec::new(),
         }
@@ -638,34 +601,18 @@ impl CleanupGuard {
             Ok(c) if !c.trim().is_empty() => c,
             _ => return,
         };
-        let style = net_summary::Style::detect();
+        if !had_failures
+            || !should_prompt_for_log(
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            )
+        {
+            return;
+        }
 
+        let style = net_summary::Style::detect();
         let name = self.log_file_name();
-        let save = match self.log_level {
-            Some(ProxyLogLevel::Off) => return,
-            Some(ProxyLogLevel::All) => true,
-            Some(ProxyLogLevel::Denied) => had_failures,
-            None => {
-                if !had_failures {
-                    return;
-                }
-                // Nothing to ask on a non-interactive run, and the evidence is
-                // about to be deleted -- fall back to the temp copy.
-                if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-                    let fallback = format!(
-                        "{}/agent-sandbox-connections-{}.jsonl",
-                        env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
-                        std::process::id()
-                    );
-                    if fs::write(&fallback, &contents).is_ok() {
-                        Self::announce(Path::new(&fallback), style);
-                    }
-                    return;
-                }
-                Self::prompt(&name)
-            }
-        };
-        if !save {
+        if !Self::prompt(&name) {
             return;
         }
 
@@ -827,6 +774,10 @@ fn fail(message: &str) -> ! {
     std::process::exit(1);
 }
 
+fn should_prompt_for_log(stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    stdin_is_terminal && stdout_is_terminal
+}
+
 /// Same, for after: prints and hands back the exit code, so the caller's
 /// `return` runs the cleanup on its way out.
 fn refuse(message: &str) -> Result<i32> {
@@ -862,7 +813,6 @@ fn run() -> Result<i32> {
     let mut want_proxy = false;
     let mut use_agents_network = false;
     let mut policies: Vec<String> = Vec::new();
-    let mut want_proxy_log: Option<ProxyLogLevel> = None;
     let mut want_secrets = false;
     let mut want_krun = false;
     let mut want_privileged = false;
@@ -1096,29 +1046,6 @@ fn run() -> Result<i32> {
                         fail(&format!("agent-sandbox: --name: {}", e));
                     }
                     requested_name = Some(v.to_string());
-                } else if arg == "--proxy-log" || arg.starts_with("--proxy-log=") {
-                    let value = match arg.strip_prefix("--proxy-log=") {
-                        Some(v) => v.to_string(),
-                        None => {
-                            i += 1;
-                            if i >= args.len() {
-                                fail("agent-sandbox: --proxy-log needs an argument (off, denied, all)");
-                            }
-                            args[i].clone()
-                        }
-                    };
-                    match parse_proxy_log_level(&value) {
-                        Some(level) => want_proxy_log = Some(level),
-                        None => fail(&format!(
-                            "agent-sandbox: --proxy-log: unknown level '{}' (valid: off, denied, all)",
-                            value
-                        )),
-                    }
-                    // Asking what to do with the proxy's log is asking for the
-                    // proxy; --no-proxy after this still wins, as with every
-                    // other flag here.
-                    want_proxy = true;
-                    use_agents_network = true;
                 } else if arg == "--policy" || arg.starts_with("--policy=") {
                     let value = match arg.strip_prefix("--policy=") {
                         Some(v) => v.to_string(),
@@ -1198,7 +1125,6 @@ fn run() -> Result<i32> {
             want_podman,
             want_selinux,
             want_proxy,
-            want_proxy_log,
             want_secrets,
             want_krun,
             want_ports,
@@ -2115,7 +2041,6 @@ fn run() -> Result<i32> {
         cleanup_guard.sidecar_id = sidecar_id.clone();
         cleanup_guard.sidecar_shared = sidecar_shared.clone();
         cleanup_guard.sidecar_policy = sidecar_policy.clone();
-        cleanup_guard.log_level = want_proxy_log;
         cleanup_guard.session_word = session_word.clone();
         cleanup_guard.policies = policies.clone();
 
@@ -2730,15 +2655,10 @@ mod tests {
     }
 
     #[test]
-    fn proxy_log_levels() {
-        assert_eq!(parse_proxy_log_level("off"), Some(ProxyLogLevel::Off));
-        assert_eq!(parse_proxy_log_level("denied"), Some(ProxyLogLevel::Denied));
-        assert_eq!(parse_proxy_log_level("all"), Some(ProxyLogLevel::All));
-        // Refused rather than silently treated as a default: the level decides
-        // whether the record of a denied session survives.
-        assert_eq!(parse_proxy_log_level("ALL"), None);
-        assert_eq!(parse_proxy_log_level("yes"), None);
-        assert_eq!(parse_proxy_log_level(""), None);
+    fn log_prompt_requires_both_terminals() {
+        assert!(!should_prompt_for_log(false, true));
+        assert!(!should_prompt_for_log(true, false));
+        assert!(!should_prompt_for_log(false, false));
     }
 
     /// The saved name has to survive several sandboxes writing into one

@@ -99,7 +99,6 @@ A few flags are one-off pass-throughs rather than persistent toggles, so they ha
 | --- | --- |
 | `-e NAME=VAL`, `--env NAME=VAL` | Injects an environment variable. |
 | `--privileged` | Enables nested podman inside the sandbox (safe — see [Trust model](trust-model.md)). |
-| `--proxy-log off\|denied\|all` | What to do with the proxy's connection log when the session ends; implies `--proxy`. Unset, a session that had denials offers to save one. See [Trust model](trust-model.md). |
 | `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel (including `-v/--volume` and `-p/--publish`). |
 
 There is no `--port` flag: declare ports in `AGENTS.md` and pass `--ports`, or

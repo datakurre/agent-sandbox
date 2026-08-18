@@ -136,16 +136,7 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
 - `agent-sandbox ctl logs [-f]` — the proxy's own log: the policy it started with, and every denial as it happens.
 - `agent-sandbox ctl policy show|allow|rm|reset|export|check` — read and change the policy of a **running** sandbox.
 - A connection record is written when it *closes*, plus one when it opens, so a long-lived HTTPS tunnel appears as `in flight` under `── still open ──` rather than as traffic. Non-secret HTTPS stays opaque. Denied request heads are available only in the ephemeral `denied-requests.jsonl` stream used by the TUI; sensitive headers are redacted, request heads are capped at 16 KiB, and the stream is capped at 4 MiB.
-- The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--proxy` always prints the summary above when the session ends; what happens to the raw log is set by `--proxy-log LEVEL`:
-
-  | `--proxy-log` | at exit |
-  | --- | --- |
-  | *(unset)* | if anything was denied or failed, offers to save the log to the current directory; on a non-interactive run it is kept at `$TMPDIR/agent-sandbox-connections-<pid>.jsonl` instead |
-  | `off` | discarded |
-  | `denied` | saved to the current directory if anything was denied or failed |
-  | `all` | saved to the current directory every session |
-
-  Saved logs are named `agent-sandbox-connections-<session>-<timestamp>.jsonl`, and the summary prints the path as a terminal hyperlink. `agent-sandbox-network-summary <log>` re-renders a saved log. `--proxy-log` implies `--proxy`.
+- The connection log lives on a host temp directory for the lifetime of the session and is removed at exit. `--proxy` always prints the summary above when the session ends. If anything was denied or failed, an interactive terminal run offers to save the raw log to the current directory; non-interactive runs silently discard it. Saved logs are named `agent-sandbox-connections-<session>-<timestamp>.jsonl`, and the summary prints the path as a terminal hyperlink. `agent-sandbox-network-summary <log>` re-renders a saved log.
 
 - Neither the policy nor the log is reachable from inside the sandbox, so the agent can neither widen its own firewall nor edit the record of its traffic.
 - The connection log is bounded at 16 MiB during a session, and the TUI's request-detail stream at 4 MiB. When a limit is reached the oldest records are dropped — cut at a record boundary, keeping the newest half of the budget — so a busy or long-lived container cannot accumulate an unbounded log, and the recent history survives the trim.

@@ -460,6 +460,19 @@ fn an_unknown_flag_stops_the_launch_rather_than_reaching_podman() {
 }
 
 #[test]
+fn proxy_log_flag_is_removed() {
+    let out = World::new().run(&["--proxy-log", "denied", "opencode"]);
+
+    assert!(!out.reached_podman_run());
+    assert!(out.failed());
+    assert!(
+        out.stderr.contains("--proxy-log") && out.stderr.contains("not an agent-sandbox flag"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
 fn a_removed_flag_says_what_replaced_it() {
     let out = World::new().run(&["--port", "3000", "opencode"]);
 
