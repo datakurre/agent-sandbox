@@ -90,8 +90,10 @@ are unit-tested without a podman.  Call flow:
 4. Add `[ports]` and `[mounts]` declared in `AGENTS.md` (`cli/src/agents.rs`),
    under `--ports`/`--mounts`.  An invalid block refuses the launch.
 5. Create ephemeral `/etc/passwd` and `/etc/group` with the host user's uid/gid,
-   and name the container `agent-sandbox-<workspace>-<word>`, where the word is
-   the selector every `ctl` command accepts.
+   and name the container `agent-sandbox-<workspace>-<selector>`, where the
+   selector is the random session word unless `--name NAME` supplies a
+   validated, collision-free custom name. The selector is what every `ctl`
+   command accepts.
 6. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
    final command (`bash` by default, the selected agent's command when one is

@@ -9,6 +9,7 @@ agent-sandbox opencode                           # opencode, no integrations (al
 agent-sandbox --workspace --ssh opencode         # opt in to workspace and SSH
 agent-sandbox --workspace --proxy opencode       # workspace + deny-by-default network firewall
 agent-sandbox --workspace --ssh opencode --no-ssh  # override: drop SSH back out
+agent-sandbox --workspace copilot --name johndoe # use a custom ctl selector
 agent-sandbox copilot                            # github-copilot-cli (copilot)
 agent-sandbox antigravity                        # antigravity-cli (agy)
 agent-sandbox codex                              # codex
@@ -69,6 +70,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Group | Flag | What it does |
 | --- | --- | --- |
 | Workspace & identity | `--workspace` | Mounts the host's current working directory into `/workspace/<dirname>`. |
+| Workspace & identity | `--name NAME` | Uses `NAME` instead of a random session word as the sandbox's `ctl` selector. |
 | Workspace & identity | `--ssh` | Forwards the host's `SSH_AUTH_SOCK` to the container and pre-populates `known_hosts`. |
 | Workspace & identity | `--git` | Passes host Git configurations (with a blocklist) and identity env vars. |
 | Workspace & identity | `--gpg` | Enables host GnuPG agent forwarding and git commit signing behavior. |
@@ -342,10 +344,22 @@ and `~/.gemini/skills` for tools that use those discovery paths.
 
 New sandboxes are shown by a single session word, such as `silent`. Use that
 word with any targetable command, either positionally or as `--sandbox silent`.
-The full Podman name remains internal. If the same word is present on more than
-one sandbox, the command refuses to guess and prints the matching workspaces and
-full names. The word may be omitted when only one sandbox is running or when
-exactly one matches the current directory.
+The full Podman name remains internal. `--name johndoe` replaces the random word
+with `johndoe`, so the same commands accept `johndoe` explicitly:
+
+```console
+$ agent-sandbox --workspace copilot --name johndoe
+$ agent-sandbox ctl attach johndoe
+$ agent-sandbox ctl status --sandbox johndoe
+```
+
+Names use letters, numbers, `.`, `_`, and `-`, and cannot already be in use.
+If the same selector is present on more than one sandbox, the command refuses
+to guess and prints the matching workspaces and full names. The selector may be
+omitted when exactly one running sandbox matches the current directory. This
+implicit lookup depends on `--workspace`; a sandbox launched with only
+`--name johndoe` still works with explicit `ctl ... johndoe` commands, but has
+no workspace label for bare local lookup.
 
 For example:
 

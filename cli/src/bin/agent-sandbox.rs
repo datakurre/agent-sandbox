@@ -474,6 +474,7 @@ Agents:
 
 Integrations (use --X to enable, --no-X to disable):
   --workspace       {workspace} Mounts the host's current working directory into /workspace/<dirname>.
+  --name NAME                     Use NAME instead of a random ctl selector.
   --ssh             {ssh} Forwards the host's SSH_AUTH_SOCK to the container.
   --git             {git} Passes the host's Git configuration (with a blocklist) and identity env vars.
   --gpg             {gpg} Enables host GnuPG agent forwarding and git commit signing behavior.
@@ -868,6 +869,7 @@ fn run() -> Result<i32> {
     let mut want_help = false;
     let mut krun_ram_mib = String::new();
     let mut krun_cpus = String::new();
+    let mut requested_name: Option<String> = None;
     let mut agent = String::new();
     let mut cmd_args: Vec<String> = Vec::new();
     let mut podman_args: Vec<String> = Vec::new();
@@ -1041,6 +1043,17 @@ fn run() -> Result<i32> {
             "--no-krun" => want_krun = false,
             "--podman-args" => parsing_podman = true,
             "--privileged" => want_privileged = true,
+            "--name" => {
+                i += 1;
+                if i >= args.len() {
+                    fail("agent-sandbox: --name needs a name");
+                }
+                let name = args[i].clone();
+                if let Err(e) = launch::valid_session_name(&name) {
+                    fail(&format!("agent-sandbox: --name: {}", e));
+                }
+                requested_name = Some(name);
+            }
             "--" => {
                 i += 1;
                 cmd_args.extend(args[i..].iter().cloned());
@@ -1078,6 +1091,11 @@ fn run() -> Result<i32> {
                     want_browser = true;
                     want_browser_names
                         .extend(v.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                } else if let Some(v) = arg.strip_prefix("--name=") {
+                    if let Err(e) = launch::valid_session_name(v) {
+                        fail(&format!("agent-sandbox: --name: {}", e));
+                    }
+                    requested_name = Some(v.to_string());
                 } else if arg == "--proxy-log" || arg.starts_with("--proxy-log=") {
                     let value = match arg.strip_prefix("--proxy-log=") {
                         Some(v) => v.to_string(),
@@ -1791,11 +1809,22 @@ fn run() -> Result<i32> {
     );
     let existing = ctl::resolve::sandbox_containers_all().unwrap_or_default();
     let mut rng = rand::thread_rng();
-    let session_word = match launch::choose_session_word(&existing, || {
-        rng.gen_range(0..launch::SESSION_WORDS.len())
-    }) {
-        Some(word) => word,
-        None => fail("agent-sandbox: could not allocate a unique session word"),
+    let session_word = match requested_name {
+        Some(name) => {
+            if !launch::session_name_available(&existing, &name) {
+                fail(&format!(
+                    "agent-sandbox: session name '{}' is already in use",
+                    name
+                ));
+            }
+            name
+        }
+        None => match launch::choose_session_word(&existing, || {
+            rng.gen_range(0..launch::SESSION_WORDS.len())
+        }) {
+            Some(word) => word,
+            None => fail("agent-sandbox: could not allocate a unique session word"),
+        },
     };
     let container_name = launch::container_name(&workspace_slug, &session_word);
 

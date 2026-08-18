@@ -59,6 +59,35 @@ fn the_launcher_forwards_podmans_exit_code() {
     assert_eq!(world.run(&["opencode"]).code, Some(42));
 }
 
+#[test]
+fn name_replaces_the_random_session_word_in_the_container_name() {
+    let out = World::new().run(&["--name", "johndoe", "opencode"]);
+    let run = out.run_call();
+
+    assert!(run.has("--name"));
+    assert_eq!(run.value_of("--name"), Some("agent-sandbox-ws-johndoe"));
+    assert_eq!(
+        run.values_of("--label")
+            .iter()
+            .find(|label| label.starts_with("agent-sandbox.command="))
+            .copied(),
+        Some("agent-sandbox.command=opencode .")
+    );
+}
+
+#[test]
+fn name_without_workspace_still_has_an_explicit_selector_but_no_workspace_label() {
+    let out = World::new().run(&["--name=johndoe"]);
+    let run = out.run_call();
+
+    assert_eq!(run.value_of("--name"), Some("agent-sandbox-ws-johndoe"));
+    assert!(!run
+        .values_of("--label")
+        .iter()
+        .any(|label| label.starts_with("agent-sandbox.workspace=")));
+    assert_eq!(run.value_of("--workdir"), Some("/workspace"));
+}
+
 // ── --workspace ─────────────────────────────────────────────────────────────
 
 #[test]

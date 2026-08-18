@@ -29,7 +29,7 @@
 
 use super::resolve::*;
 use crate::agents::{format_proxy_policy, parse_policy_file, parse_proxy, ProxyPolicy};
-use crate::launch::{policy_path, BASELINE_DENY_IPS};
+use crate::launch::{policy_path, valid_session_name, BASELINE_DENY_IPS};
 use crate::net_summary;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -120,25 +120,6 @@ pub struct BrowserArgs {
         help = "Name this session, for simulating several users at once"
     )]
     pub name: Option<String>,
-}
-
-/// Session names end up in a directory name, `AGENT_SANDBOX_BROWSER_CDP_PORT`'s
-/// value and a `ctl policy --browser` argument, so they are checked the same way
-/// a policy name is rather than joined blindly.
-pub fn valid_session_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-    {
-        anyhow::bail!(
-            "invalid session name '{}'; use letters, numbers, '.', '_' or '-'",
-            name
-        );
-    }
-    Ok(())
 }
 
 // ── Allow list ──────────────────────────────────────────────────────────────

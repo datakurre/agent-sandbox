@@ -6,6 +6,7 @@
 //! without a podman.  The rewrite in 0b4289a lost every one of these blocks
 //! silently, because nothing observed the launcher's argv but podman.
 
+use anyhow::Result;
 use std::path::Path;
 
 /// Mount options for the launcher's own writable binds.  Plain `rw` unless
@@ -302,6 +303,27 @@ pub fn sanitize_workspace_slug(basename: &str) -> String {
     mapped.chars().take(32).collect()
 }
 
+pub fn valid_session_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "invalid session name '{}'; use letters, numbers, '.', '_' or '-'",
+            name
+        );
+    }
+    Ok(())
+}
+
+pub fn session_name_available(taken: &[String], session_name: &str) -> bool {
+    let suffix = format!("-{}", session_name);
+    !taken.iter().any(|name| name.ends_with(&suffix))
+}
+
 /// `taken` is the set of existing sandbox container names; a word already
 /// suffixing one of them is not offered again, so `ctl status <word>` stays
 /// unambiguous.  `pick` returns an index into `SESSION_WORDS` and is a
@@ -309,8 +331,7 @@ pub fn sanitize_workspace_slug(basename: &str) -> String {
 pub fn choose_session_word<F: FnMut() -> usize>(taken: &[String], mut pick: F) -> Option<String> {
     for _ in 0..100 {
         let candidate = SESSION_WORDS[pick() % SESSION_WORDS.len()];
-        let suffix = format!("-{}", candidate);
-        if !taken.iter().any(|name| name.ends_with(&suffix)) {
+        if session_name_available(taken, candidate) {
             return Some(candidate.to_string());
         }
     }
@@ -587,6 +608,24 @@ mod tests {
             container_name(&sanitize_workspace_slug("agent-sandbox"), "silent"),
             "agent-sandbox-agent-sandbox-silent"
         );
+    }
+
+    #[test]
+    fn session_names_use_the_same_safe_character_set_as_browser_sessions() {
+        assert!(valid_session_name("johndoe-2.b_c").is_ok());
+        for bad in ["", ".", "..", "john doe", "john/doe", "john$doe"] {
+            assert!(valid_session_name(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn custom_session_names_are_checked_against_existing_suffixes() {
+        let taken = vec![
+            "agent-sandbox-repo-johndoe".to_string(),
+            "agent-sandbox-other-silent".to_string(),
+        ];
+        assert!(!session_name_available(&taken, "johndoe"));
+        assert!(session_name_available(&taken, "alice"));
     }
 
     #[test]
