@@ -33,7 +33,9 @@ agent-sandbox opencode -- devenv shell           # devenv shell with opencode de
 
 To pass arguments directly to podman, use `--podman-args`. All arguments after `--podman-args` will be passed to podman until a `--` sentinel is reached, which marks the start of the container command.
 
-There are also convenient shortcuts like `--privileged` and `-e` for common podman flags.
+There are also convenient shortcuts for common Podman flags, including `-e`/`--env`,
+`-v`/`--volume`, `--mount`, `-p`/`--publish`, `--add-host`, `--env-file`,
+`--hostname`, and `--tmpfs`.
 
 ```sh
 agent-sandbox --privileged opencode               # enable nested podman
@@ -99,6 +101,13 @@ A few flags are one-off pass-throughs rather than persistent toggles, so they ha
 | Flag | What it does |
 | --- | --- |
 | `-e NAME=VAL`, `--env NAME=VAL` | Injects an environment variable. |
+| `-v SPEC`, `--volume SPEC` | Adds a Podman volume. Repeatable. |
+| `--mount SPEC` | Adds a Podman mount. Repeatable. |
+| `-p SPEC`, `--publish SPEC` | Publishes a container port. Repeatable. |
+| `--add-host SPEC` | Adds a Podman host entry. Repeatable. |
+| `--env-file PATH` | Loads environment variables from a file. |
+| `--hostname NAME` | Sets the container hostname. |
+| `--tmpfs SPEC` | Adds a Podman tmpfs mount. Repeatable. |
 | `--privileged` | Enables nested podman inside the sandbox (safe — see [Trust model](trust-model.md)). |
 | `--podman-args ... --` | Passes arguments straight through to `podman` until the `--` sentinel (including `-v/--volume` and `-p/--publish`). |
 

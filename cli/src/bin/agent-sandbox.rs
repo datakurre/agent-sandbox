@@ -539,7 +539,26 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--krun-memory MiB", None, "guest RAM under --krun (default 4096, must exceed 128)");
     print_help_option("--krun-cpus N", None, "guest vCPUs under --krun (1-16, default: host affinity)");
     print_help_option("-e, --env NAME=VAL", None, "pass environment variable to podman");
-    print_help_option("--podman-args", None, "treat all following args (until --) as podman args");
+    print_help_option(
+        "-v, --volume SPEC",
+        None,
+        "pass a volume to podman (repeatable)",
+    );
+    print_help_option("--mount SPEC", None, "pass a mount to podman (repeatable)");
+    print_help_option(
+        "-p, --publish SPEC",
+        None,
+        "publish a container port through podman (repeatable)",
+    );
+    print_help_option("--add-host SPEC", None, "add a host entry through podman (repeatable)");
+    print_help_option("--env-file PATH", None, "load environment variables from a file");
+    print_help_option("--hostname NAME", None, "set the container hostname");
+    print_help_option("--tmpfs SPEC", None, "mount a tmpfs through podman (repeatable)");
+    print_help_option(
+        "--podman-args",
+        None,
+        "treat all following args (until --) as podman args; use this for other options",
+    );
     println!(
         "\n--podman, --ssh, --gpg and --krun each interact with the sandbox boundary
 differently -- --podman in particular is a full sandbox escape; prefer
@@ -1109,6 +1128,45 @@ fn run() -> Result<i32> {
                 } else if let Some(v) = arg.strip_prefix("--env=") {
                     env_args.push("-e".to_string());
                     env_args.push(v.to_string());
+                } else if arg == "-v" || arg == "--volume" || arg == "--mount"
+                    || arg == "-p" || arg == "--publish"
+                    || arg == "--add-host" || arg == "--env-file"
+                    || arg == "--hostname" || arg == "--tmpfs"
+                {
+                    let flag = match arg.as_str() {
+                        "-v" | "--volume" => "-v",
+                        "--mount" => "--mount",
+                        "-p" | "--publish" => "-p",
+                        "--add-host" => "--add-host",
+                        "--env-file" => "--env-file",
+                        "--hostname" => "--hostname",
+                        "--tmpfs" => "--tmpfs",
+                        _ => unreachable!(),
+                    };
+                    i += 1;
+                    if i >= args.len() {
+                        fail(&format!("agent-sandbox: {} needs an argument", arg));
+                    }
+                    podman_args.push(flag.to_string());
+                    podman_args.push(args[i].clone());
+                } else if let Some(v) = arg.strip_prefix("--volume=") {
+                    podman_args.extend(["-v".to_string(), v.to_string()]);
+                } else if let Some(v) = arg.strip_prefix("--mount=") {
+                    podman_args.extend(["--mount".to_string(), v.to_string()]);
+                } else if let Some(v) = arg.strip_prefix("--publish=") {
+                    podman_args.extend(["-p".to_string(), v.to_string()]);
+                } else if let Some(v) = arg.strip_prefix("--add-host=") {
+                    podman_args.extend(["--add-host".to_string(), v.to_string()]);
+                } else if let Some(v) = arg.strip_prefix("--env-file=") {
+                    podman_args.extend(["--env-file".to_string(), v.to_string()]);
+                } else if let Some(v) = arg.strip_prefix("--hostname=") {
+                    podman_args.extend(["--hostname".to_string(), v.to_string()]);
+                } else if let Some(v) = arg.strip_prefix("--tmpfs=") {
+                    podman_args.extend(["--tmpfs".to_string(), v.to_string()]);
+                } else if let Some(v) = arg.strip_prefix("-v").filter(|v| !v.is_empty()) {
+                    podman_args.extend(["-v".to_string(), v.to_string()]);
+                } else if let Some(v) = arg.strip_prefix("-p").filter(|v| !v.is_empty()) {
+                    podman_args.extend(["-p".to_string(), v.to_string()]);
                 } else if arg == "--port" || arg.starts_with("--port=") {
                     fail("agent-sandbox: '--port' was removed. Declare a [ports] block in AGENTS.md and pass --ports,\n               or publish directly with: --podman-args -p HOST:CONTAINER --");
                 } else if arg == "--proxy-train" || arg.starts_with("--proxy-train=") {
@@ -1116,11 +1174,6 @@ fn run() -> Result<i32> {
                 } else if let Some(v) = arg.strip_prefix("-e") {
                     env_args.push("-e".to_string());
                     env_args.push(v.to_string());
-                } else if arg.starts_with("-v") {
-                    fail(&format!(
-                        "agent-sandbox: '{}' is not an agent-sandbox flag.",
-                        arg
-                    ));
                 } else if arg.starts_with("--") {
                     fail(&format!(
                         "agent-sandbox: '{}' is not an agent-sandbox flag.",

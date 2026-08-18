@@ -409,6 +409,63 @@ fn env_is_forwarded_in_both_spellings() {
 }
 
 #[test]
+fn common_podman_args_are_forwarded_in_both_available_spellings() {
+    let out = World::new().run(&[
+        "-v",
+        "cache:/cache",
+        "--volume=src:/src:ro",
+        "--mount",
+        "type=tmpfs,dst=/tmp/work",
+        "-p",
+        "127.0.0.1:9000:9000",
+        "--publish=127.0.0.1:9001:9001",
+        "--add-host",
+        "local.test:127.0.0.1",
+        "--env-file=/tmp/environment",
+        "--hostname",
+        "sandbox-test",
+        "--tmpfs=/tmp/another:rw",
+        "opencode",
+    ]);
+    let run = out.run_call();
+
+    assert!(run.has_pair("-v", "cache:/cache"), "{}", run.joined());
+    assert!(run.has_pair("-v", "src:/src:ro"), "{}", run.joined());
+    assert!(
+        run.has_pair("--mount", "type=tmpfs,dst=/tmp/work"),
+        "{}",
+        run.joined()
+    );
+    assert!(
+        run.has_pair("-p", "127.0.0.1:9000:9000"),
+        "{}",
+        run.joined()
+    );
+    assert!(
+        run.has_pair("-p", "127.0.0.1:9001:9001"),
+        "{}",
+        run.joined()
+    );
+    assert!(
+        run.has_pair("--add-host", "local.test:127.0.0.1"),
+        "{}",
+        run.joined()
+    );
+    assert!(run.has_pair("--env-file", "/tmp/environment"), "{}", run.joined());
+    assert!(run.has_pair("--hostname", "sandbox-test"), "{}", run.joined());
+    assert!(run.has_pair("--tmpfs", "/tmp/another:rw"), "{}", run.joined());
+}
+
+#[test]
+fn common_short_podman_args_accept_attached_values() {
+    let out = World::new().run(&["-vcache:/cache", "-p9000:9000", "opencode"]);
+    let run = out.run_call();
+
+    assert!(run.has_pair("-v", "cache:/cache"), "{}", run.joined());
+    assert!(run.has_pair("-p", "9000:9000"), "{}", run.joined());
+}
+
+#[test]
 fn the_terminal_type_follows_the_host_into_the_container() {
     let out = World::new()
         .env("TERM", "screen-256color")
