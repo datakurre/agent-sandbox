@@ -27,16 +27,28 @@ allowed_hosts = ["example.com:443"]
 ```
 EOF
 
-# Keep the session alive for the whole live-policy exercise. The SSH probes can
-# spend several retry windows on a slow host, so a short fixed sleep can expire
-# before the final narrowing check and make the failure look like a ctl bug.
+# Keep the session alive for the whole live-policy exercise. The relay policy is
+# polled below instead of using a fixed delay, so this only needs to outlive the
+# session itself.
 sandbox_run --workspace --proxy --ssh -- bash -c 'sleep 3600' &
 launcher=$!
 
 word="$(wait_for_sandbox 90)" || _fail "no sandbox came up"
 pass_note "session word is [$word]"
 
-probe='ssh -o ConnectTimeout=10 -T git@github.com'
+probe='ssh -o ConnectTimeout=5 -o ConnectionAttempts=1 -T git@github.com'
+
+wait_for_relay_grant() {
+  local output
+  for _ in $(seq 1 20); do
+    output="$("$AS" ctl relay "$word" 2>/dev/null || true)"
+    case "$output" in
+      *"ssh (push/pull) github.com"*) return 0 ;;
+    esac
+    sleep 0.25
+  done
+  return 1
+}
 
 out="$("$AS" ctl attach "$word" -- bash -c "$probe 2>&1 || true")"
 assert_not_contains "$out" "successfully authenticated" "an SSH probe with no :22 rule"
@@ -52,7 +64,7 @@ assert_contains "$logged" '"ts":' "a timestamp on the relay record"
 allowed="$("$AS" ctl policy allow github.com:22 "$word" 2>&1)" \
   || _fail "ctl policy allow failed: $allowed"
 assert_contains "$allowed" "ssh (push/pull)" "allow reporting the relay grant"
-sleep 3
+wait_for_relay_grant || _fail "relay did not observe the live SSH grant"
 
 shown="$("$AS" ctl relay "$word" 2>&1)"
 assert_contains "$shown" "github.com" "the relay's authorized hosts after widening"
@@ -64,6 +76,5 @@ assert_contains "$out" "successfully authenticated" "an SSH probe after a live g
 # And back again.
 removed="$("$AS" ctl policy rm allow github.com:22 "$word" 2>&1)" \
   || _fail "ctl policy rm allow failed: $removed"
-sleep 3
 out="$("$AS" ctl attach "$word" -- bash -c "$probe 2>&1 || true")"
 assert_not_contains "$out" "successfully authenticated" "an SSH probe after narrowing again"
