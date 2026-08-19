@@ -293,6 +293,11 @@ fn selinux_relabels_shared_binds_and_privately_labels_the_synthesized_files() {
         run.joined()
     );
     assert!(
+        run.mount_to("/run/agent-sandbox-status").unwrap().ends_with(":rw,z"),
+        "the status dir takes the shared label: {}",
+        run.joined()
+    );
+    assert!(
         run.values_of("-v")
             .iter()
             .find(|m| m.contains(":/etc/passwd:"))

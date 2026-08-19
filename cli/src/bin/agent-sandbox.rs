@@ -2693,7 +2693,7 @@ fn run() -> Result<i32> {
     ]);
     podman_cmd.args([
         "-v",
-        &format!("{}:/run/agent-sandbox-status:rw", status_dir),
+        &format!("{}:/run/agent-sandbox-status:{}", status_dir, rw_mount_opts),
     ]);
 
     podman_cmd.args(&network_args);
