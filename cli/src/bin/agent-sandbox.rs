@@ -560,6 +560,12 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--env-file PATH", None, "load environment variables from a file");
     print_help_option("--hostname NAME", None, "set the container hostname");
     print_help_option("--tmpfs SPEC", None, "mount a tmpfs through podman (repeatable)");
+    println!("\nProgrammatic mode:");
+    print_help_option(
+        "--programmatic",
+        None,
+        "Run the agent non-interactively with prompt from stdin; return JSON {status, stdout, stderr}.",
+    );
     print_help_option(
         "--podman-args",
         None,
@@ -578,6 +584,17 @@ fn policy_path(home: &str, name: &str) -> Result<PathBuf> {
     launch::policy_path(home, name).map_err(|e| anyhow::anyhow!(e))
 }
 
+static PROGRAMMATIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn emit_programmatic_json(status: i32, stdout: &str, stderr: &str) {
+    let response = serde_json::json!({
+        "status": status,
+        "stdout": stdout,
+        "stderr": stderr,
+    });
+    println!("{}", response);
+}
+
 struct CleanupGuard {
     sidecar_id: String,
     sidecar_shared: String,
@@ -588,20 +605,26 @@ struct CleanupGuard {
     session_word: String,
     policies: Vec<String>,
     status_line: StatusLine,
+    programmatic: bool,
 }
 
 struct StartupInfo {
     header_printed: bool,
+    programmatic: bool,
 }
 
 impl StartupInfo {
-    fn new() -> Self {
+    fn new(programmatic: bool) -> Self {
         StartupInfo {
             header_printed: false,
+            programmatic,
         }
     }
 
     fn policy(&mut self, message: &str) {
+        if self.programmatic {
+            return;
+        }
         if !self.header_printed {
             eprintln!("agent-sandbox: startup");
             self.header_printed = true;
@@ -630,6 +653,7 @@ impl CleanupGuard {
             status_line: StatusLine::new(
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             ),
+            programmatic: false,
         }
     }
 
@@ -798,23 +822,31 @@ impl CleanupGuard {
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        self.status("closing sandbox");
+        if !self.programmatic {
+            self.status("closing sandbox");
+        }
 
         if self.sidecar_id.is_empty() {
             // A session can have host-port sockets without ever having had a
             // proxy; those are still resources that must be removed.
-            self.status("removing resources");
+            if !self.programmatic {
+                self.status("removing resources");
+            }
             if !self.host_port_dir.is_empty() {
                 let _ = fs::remove_dir_all(&self.host_port_dir);
             }
             if !self.status_dir.is_empty() {
                 let _ = fs::remove_dir_all(&self.status_dir);
             }
-            self.status_line.success("closed (resources released)");
+            if !self.programmatic {
+                self.status_line.success("closed (resources released)");
+            }
             return;
         }
 
-        self.status("stopping proxy");
+        if !self.programmatic {
+            self.status("stopping proxy");
+        }
         let _ = self.run_status_command(
             ProcessCommand::new("podman").args(["stop", "-t", "1", &self.sidecar_id]),
             "stopping proxy",
@@ -826,7 +858,7 @@ impl Drop for CleanupGuard {
             "stopping proxy",
         );
 
-        if !self.sidecar_shared.is_empty() {
+        if !self.sidecar_shared.is_empty() && !self.programmatic {
             let log = format!("{}/connections.jsonl", self.sidecar_shared);
             let records = match File::open(&log) {
                 Ok(file) => net_summary::read_records(BufReader::new(file)),
@@ -849,7 +881,9 @@ impl Drop for CleanupGuard {
             self.save_log(&log, had_failures);
         }
 
-        self.status("removing resources");
+        if !self.programmatic {
+            self.status("removing resources");
+        }
         if !self.host_port_dir.is_empty() {
             let _ = fs::remove_dir_all(&self.host_port_dir);
         }
@@ -884,8 +918,10 @@ impl Drop for CleanupGuard {
                 let _ = fs::remove_dir_all(dir);
             }
         }
-        self.status_line
-            .success("closed (proxy stopped, resources released)");
+        if !self.programmatic {
+            self.status_line
+                .success("closed (proxy stopped, resources released)");
+        }
     }
 }
 
@@ -946,7 +982,11 @@ impl StatusLine {
 /// network -- a leaked one holds a subnet from the rootless pool until
 /// `agent-sandbox ctl purge` takes it back.
 fn fail(message: &str) -> ! {
-    eprintln!("{}", message);
+    if PROGRAMMATIC.load(std::sync::atomic::Ordering::Relaxed) {
+        emit_programmatic_json(1, "", message);
+    } else {
+        eprintln!("{}", message);
+    }
     std::process::exit(1);
 }
 
@@ -957,7 +997,11 @@ fn should_prompt_for_log(stdin_is_terminal: bool, stdout_is_terminal: bool) -> b
 /// Same, for after: prints and hands back the exit code, so the caller's
 /// `return` runs the cleanup on its way out.
 fn refuse(message: &str) -> Result<i32> {
-    eprintln!("{}", message);
+    if PROGRAMMATIC.load(std::sync::atomic::Ordering::Relaxed) {
+        emit_programmatic_json(1, "", message);
+    } else {
+        eprintln!("{}", message);
+    }
     Ok(1)
 }
 
@@ -980,6 +1024,7 @@ fn run() -> Result<i32> {
     let mut want_ports = false;
     let mut want_ports_any_interface = false;
     let mut want_shared_network = false;
+    let mut want_programmatic = false;
     let mut want_host_ports: Vec<HostPort> = Vec::new();
     // `--browser`, and the session names it was narrowed to (empty = all).
     let mut want_browser = false;
@@ -1010,13 +1055,14 @@ fn run() -> Result<i32> {
 
     let krun_runtime =
         env::var("AGENT_SANDBOX_KRUN_RUNTIME").unwrap_or_else(|_| "krun".to_string());
-    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\ncodex\t[\"codex\",\".\"]\t[\".codex\"]\t[]".to_string();
+    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\ncodex\t[\"codex\",\".\"]\t[\".codex\"]\t[]\t[\"-p\",\"-\"]".to_string();
     let agent_specs_str = env::var("AGENT_SANDBOX_AGENT_SPECS").unwrap_or(default_agent_specs);
 
     let mut agent_names = Vec::new();
     let mut agent_cmd_json = HashMap::new();
     let mut agent_state_json = HashMap::new();
     let mut agent_state_files_json = HashMap::new();
+    let mut agent_programmatic_json = HashMap::new();
 
     for line in agent_specs_str.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
@@ -1029,6 +1075,9 @@ fn run() -> Result<i32> {
             agent_cmd_json.insert(name.clone(), parts[1].to_string());
             agent_state_json.insert(name.clone(), parts[2].to_string());
             agent_state_files_json.insert(name.clone(), parts[3].to_string());
+            if parts.len() >= 5 {
+                agent_programmatic_json.insert(name.clone(), parts[4].to_string());
+            }
         }
     }
     let agent_list = agent_names.join(" ");
@@ -1123,6 +1172,14 @@ fn run() -> Result<i32> {
 
         match arg.as_str() {
             "-h" | "--help" | "help" => want_help = true,
+            "--programmatic" => {
+                want_programmatic = true;
+                PROGRAMMATIC.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            "--no-programmatic" => {
+                want_programmatic = false;
+                PROGRAMMATIC.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             "--ssh" => want_ssh = true,
             "--no-ssh" => want_ssh = false,
             "--git" => want_git = true,
@@ -1522,6 +1579,29 @@ fn run() -> Result<i32> {
                 ))
             });
         }
+    }
+
+    if want_programmatic {
+        if agent.is_empty() {
+            fail("agent-sandbox: --programmatic requires an agent to be specified.");
+        }
+        let prog_args: Vec<String> = match agent_programmatic_json.get(&agent) {
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(_) => fail(&format!(
+                    "agent-sandbox: invalid programmatic args for agent '{}'",
+                    agent
+                )),
+            },
+            None => Vec::new(),
+        };
+        if prog_args.is_empty() {
+            fail(&format!(
+                "agent-sandbox: agent '{}' does not support programmatic execution.",
+                agent
+            ));
+        }
+        cmd_args.extend(prog_args);
     }
 
     let rw_mount_opts = launch::rw_mount_opts(want_selinux);
@@ -1985,7 +2065,7 @@ fn run() -> Result<i32> {
 
     let mut merged_policy = agents::ProxyPolicy::default();
     merged_policy.default = vec!["deny".to_string()];
-    let mut startup_info = StartupInfo::new();
+    let mut startup_info = StartupInfo::new(want_programmatic);
 
     if use_agents_network && agents_md_path.exists() {
         let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
@@ -2151,17 +2231,21 @@ fn run() -> Result<i32> {
         }
     }
 
-    if !want_proxy && (proxy_configured || secrets_configured) {
+    if !want_programmatic && !want_proxy && (proxy_configured || secrets_configured) {
         eprintln!("agent-sandbox: warning: [network] rules or secrets are configured in AGENTS.md, but proxy is not active.");
         eprintln!("               Launch with --proxy to enforce them.");
     }
 
-    if want_proxy && !want_secrets && secrets_configured {
+    if !want_programmatic && want_proxy && !want_secrets && secrets_configured {
         eprintln!("agent-sandbox: warning: secrets are configured in AGENTS.md [[network.allowed_routes]], but --secrets is not active.");
         eprintln!("               Launch with --secrets to enable them.");
     }
 
     let mut cleanup_guard = CleanupGuard::new();
+    if want_programmatic {
+        cleanup_guard.programmatic = true;
+        cleanup_guard.status_line.enabled = false;
+    }
     cleanup_guard.status("starting sandbox");
     let status_dir = format!(
         "/tmp/agent-sandbox-status-{}",
@@ -2676,7 +2760,7 @@ fn run() -> Result<i32> {
     podman_cmd.arg("run").arg("--rm").arg("--interactive");
     // Only allocate a TTY when there is one to allocate, so piped and CI
     // invocations still work.
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if !want_programmatic && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         podman_cmd.arg("--tty");
     }
     podman_cmd.args(["--userns=keep-id", "--name", &container_name]);
@@ -2763,6 +2847,11 @@ fn run() -> Result<i32> {
     podman_cmd.arg(&image);
     podman_cmd.args(&cmd_args);
 
+    if want_programmatic {
+        podman_cmd.stdout(std::process::Stdio::piped());
+        podman_cmd.stderr(std::process::Stdio::piped());
+    }
+
     // Not exec'd: returning is what drops the cleanup guard, which stops the
     // sidecar and prints its traffic summary.
     cleanup_guard.status("starting command");
@@ -2770,10 +2859,29 @@ fn run() -> Result<i32> {
         Ok(child) => child,
         Err(e) => {
             cleanup_guard.clear_status();
-            eprintln!("Failed to run podman: {}", e);
+            if want_programmatic {
+                emit_programmatic_json(1, "", &format!("Failed to run podman: {}", e));
+            } else {
+                eprintln!("Failed to run podman: {}", e);
+            }
             return Ok(1);
         }
     };
+    let stdout_handle = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut out, &mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err, &mut buf);
+            buf
+        })
+    });
+
     let ready_path = format!("{}/ready", status_dir);
     loop {
         if Path::new(&ready_path).exists() {
@@ -2782,18 +2890,59 @@ fn run() -> Result<i32> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 cleanup_guard.clear_status();
-                eprintln!(
-                    "agent-sandbox: command exited before the sandbox became ready ({}).",
-                    status
-                );
-                return Ok(status.code().unwrap_or(1));
+                let exit_code = status.code().unwrap_or(1);
+                if want_programmatic {
+                    let stdout_bytes = stdout_handle
+                        .map(|h| h.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let stderr_bytes = stderr_handle
+                        .map(|h| h.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let mut err_msg = String::from_utf8_lossy(&stderr_bytes).to_string();
+                    if err_msg.is_empty() {
+                        err_msg = format!(
+                            "agent-sandbox: command exited before the sandbox became ready ({}).",
+                            status
+                        );
+                    }
+                    emit_programmatic_json(
+                        exit_code,
+                        &String::from_utf8_lossy(&stdout_bytes),
+                        err_msg.trim(),
+                    );
+                } else {
+                    eprintln!(
+                        "agent-sandbox: command exited before the sandbox became ready ({}).",
+                        status
+                    );
+                }
+                return Ok(exit_code);
             }
             Ok(None) => {}
             Err(e) => {
                 cleanup_guard.clear_status();
-                eprintln!("agent-sandbox: could not check sandbox readiness: {}", e);
                 let _ = child.kill();
                 let _ = child.wait();
+                if want_programmatic {
+                    let stdout_bytes = stdout_handle
+                        .map(|h| h.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let stderr_bytes = stderr_handle
+                        .map(|h| h.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let err_msg = format!(
+                        "agent-sandbox: could not check sandbox readiness: {}\n{}",
+                        e,
+                        String::from_utf8_lossy(&stderr_bytes)
+                    );
+                    emit_programmatic_json(
+                        1,
+                        &String::from_utf8_lossy(&stdout_bytes),
+                        err_msg.trim(),
+                    );
+                } else {
+                    eprintln!("agent-sandbox: could not check sandbox readiness: {}", e);
+                }
                 return Ok(1);
             }
         }
@@ -2802,19 +2951,61 @@ fn run() -> Result<i32> {
     }
     cleanup_guard.finish_status();
     if let Err(e) = fs::write(format!("{}/ack", status_dir), "ack\n") {
-        eprintln!(
-            "agent-sandbox: could not acknowledge sandbox readiness: {}",
-            e
-        );
         let _ = child.kill();
         let _ = child.wait();
+        if want_programmatic {
+            let stdout_bytes = stdout_handle
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
+            let stderr_bytes = stderr_handle
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
+            let err_msg = format!(
+                "agent-sandbox: could not acknowledge sandbox readiness: {}\n{}",
+                e,
+                String::from_utf8_lossy(&stderr_bytes)
+            );
+            emit_programmatic_json(
+                1,
+                &String::from_utf8_lossy(&stdout_bytes),
+                err_msg.trim(),
+            );
+        } else {
+            eprintln!(
+                "agent-sandbox: could not acknowledge sandbox readiness: {}",
+                e
+            );
+        }
         return Ok(1);
     }
-    match child.wait() {
-        Ok(st) => Ok(st.code().unwrap_or(1)),
-        Err(e) => {
-            eprintln!("Failed to wait for podman: {}", e);
-            Ok(1)
+    if want_programmatic {
+        let status = child.wait();
+        let exit_code = match status {
+            Ok(st) => st.code().unwrap_or(1),
+            Err(e) => {
+                emit_programmatic_json(1, "", &format!("Failed to wait for podman: {}", e));
+                return Ok(1);
+            }
+        };
+        let stdout_bytes = stdout_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        let stderr_bytes = stderr_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        emit_programmatic_json(
+            exit_code,
+            &String::from_utf8_lossy(&stdout_bytes),
+            &String::from_utf8_lossy(&stderr_bytes),
+        );
+        Ok(exit_code)
+    } else {
+        match child.wait() {
+            Ok(st) => Ok(st.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!("Failed to wait for podman: {}", e);
+                Ok(1)
+            }
         }
     }
 }

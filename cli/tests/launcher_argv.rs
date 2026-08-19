@@ -759,3 +759,77 @@ fn ctl_help_commands_share_a_description_column() {
         );
     }
 }
+
+// ── programmatic mode ───────────────────────────────────────────────────────
+
+#[test]
+fn programmatic_mode_appends_agent_prompt_arguments_and_omits_tty() {
+    let out = World::new().run(&["--programmatic", "claude"]);
+    let run = out.run_call();
+
+    assert_eq!(run.command(), vec!["claude", "-p", "-"]);
+    assert!(!run.has("--tty"), "programmatic mode must omit --tty");
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON stdout");
+    assert_eq!(json["status"], 0);
+}
+
+#[test]
+fn programmatic_mode_with_opencode_appends_correct_prompt_flags() {
+    let out = World::new().run(&["--programmatic", "opencode"]);
+    let run = out.run_call();
+
+    assert_eq!(run.command(), vec!["opencode", ".", "--prompt", "-"]);
+}
+
+#[test]
+fn programmatic_mode_requires_an_agent() {
+    let out = World::new().run(&["--programmatic"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert_eq!(json["status"], 1);
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("--programmatic requires an agent to be specified"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+}
+
+#[test]
+fn programmatic_mode_rejects_agent_without_programmatic_args() {
+    let out = World::new()
+        .env("AGENT_SANDBOX_AGENT_SPECS", "solo\t[\"solo\"]\t[]\t[]")
+        .run(&["--programmatic", "solo"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert_eq!(json["status"], 1);
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("does not support programmatic execution"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+}
+
+#[test]
+fn programmatic_mode_on_exit_failure_returns_json_with_nonzero_status() {
+    let world = World::new().podman_reply("run", "", 42);
+    let out = world.run(&["--programmatic", "claude"]);
+
+    assert_eq!(out.code, Some(42));
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert_eq!(json["status"], 42);
+}
+

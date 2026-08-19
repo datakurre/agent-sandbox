@@ -125,6 +125,7 @@ let
         (builtins.toJSON a.command)
         (builtins.toJSON (a.state or [ ]))
         (builtins.toJSON (a.stateFiles or [ ]))
+        (builtins.toJSON (a.programmaticArgs or [ ]))
       ]
     ) agents
   );

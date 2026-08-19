@@ -22,8 +22,8 @@ use std::process::Command;
 /// is unset, pinned here so a change to `agents.nix` cannot silently rewrite
 /// what these tests assert.
 pub const TEST_AGENT_SPECS: &str = concat!(
-    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\n",
-    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]",
+    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\n",
+    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]",
 );
 
 pub const TEST_IMAGE: &str = "localhost/agent-sandbox:test";

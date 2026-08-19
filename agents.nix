@@ -8,6 +8,10 @@
       "opencode"
       "."
     ];
+    programmaticArgs = [
+      "--prompt"
+      "-"
+    ];
     state = [
       ".local/share/opencode"
       ".config/opencode"
@@ -18,6 +22,10 @@
     name = "claude";
     package = pkgs.claude-code;
     command = [ "claude" ];
+    programmaticArgs = [
+      "-p"
+      "-"
+    ];
     state = [ ".claude" ];
     stateFiles = [ ".claude.json" ];
   }
@@ -25,6 +33,10 @@
     name = "copilot";
     package = pkgs.github-copilot-cli;
     command = [ "copilot" ];
+    programmaticArgs = [
+      "-p"
+      "-"
+    ];
     state = [ ".copilot" ];
   }
   {
@@ -33,6 +45,10 @@
     command = [
       "agy"
       "."
+    ];
+    programmaticArgs = [
+      "--prompt"
+      "-"
     ];
     state = [
       ".local/share/antigravity-cli"
@@ -52,6 +68,10 @@
     command = [
       "codex"
       "."
+    ];
+    programmaticArgs = [
+      "-p"
+      "-"
     ];
     state = [
       ".codex"

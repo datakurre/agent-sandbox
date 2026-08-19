@@ -95,6 +95,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Ports & mounts | `--host-loopback-port PORT` | Makes the host's `127.0.0.1:PORT` reachable at the sandbox's own `127.0.0.1:PORT`, and exports the list as `$AGENT_SANDBOX_HOST_PORTS`. Repeatable; takes `HOST:SANDBOX`. See below. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
+| Programmatic mode | `--programmatic` | Runs the agent non-interactively with prompt read from stdin, appending agent-specific prompt arguments, suppressing human-interactive stderr output, and emitting a JSON object with `status`, `stdout`, and `stderr`. |
 
 A few flags are one-off pass-throughs rather than persistent toggles, so they have no `--no-flag` form:
 
