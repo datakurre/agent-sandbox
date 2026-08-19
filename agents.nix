@@ -46,6 +46,9 @@
     modelArg = [
       "--model"
     ];
+    creditLimitArg = [
+      "--max-ai-credits"
+    ];
     state = [ ".copilot" ];
   }
   {

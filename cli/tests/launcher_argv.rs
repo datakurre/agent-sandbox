@@ -804,6 +804,65 @@ fn model_without_programmatic_fails() {
 }
 
 #[test]
+fn programmatic_mode_with_max_ai_credits_appends_flags() {
+    let out = World::new().run(&["--programmatic", "--max-ai-credits", "50", "copilot"]);
+    let run = out.run_call();
+
+    assert_eq!(run.command(), vec!["copilot", "-p", "-", "--max-ai-credits", "50"]);
+}
+
+#[test]
+fn max_ai_credits_without_programmatic_fails() {
+    let out = World::new().run(&["--max-ai-credits", "50", "copilot"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr.contains("--max-ai-credits requires --programmatic"),
+        "unexpected stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn max_ai_credits_rejects_unsupported_agent() {
+    let out = World::new().run(&["--programmatic", "--max-ai-credits", "50", "opencode"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert_eq!(json["status"], 1);
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("does not support the --max-ai-credits flag"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+}
+
+#[test]
+fn max_ai_credits_rejects_non_numeric_value() {
+    let out = World::new().run(&["--programmatic", "--max-ai-credits", "fifty", "copilot"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert_eq!(json["status"], 1);
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("--max-ai-credits must be a positive integer"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+}
+
+#[test]
 fn programmatic_mode_requires_an_agent() {
     let out = World::new().run(&["--programmatic"]);
 

@@ -22,9 +22,10 @@ use std::process::Command;
 /// is unset, pinned here so a change to `agents.nix` cannot silently rewrite
 /// what these tests assert.
 pub const TEST_AGENT_SPECS: &str = concat!(
-    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\n",
-    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\n",
-    "pi\t[\"pi\",\".\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]",
+    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\n",
+    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\n",
+    "copilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\n",
+    "pi\t[\"pi\",\".\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]",
 );
 
 pub const TEST_IMAGE: &str = "localhost/agent-sandbox:test";

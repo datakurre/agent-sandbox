@@ -127,6 +127,7 @@ let
         (builtins.toJSON (a.stateFiles or [ ]))
         (builtins.toJSON (a.programmaticArgs or [ ]))
         (builtins.toJSON (a.modelArg or [ ]))
+        (builtins.toJSON (a.creditLimitArg or [ ]))
       ]
     ) agents
   );
@@ -214,6 +215,20 @@ let
     '';
   };
 
+  nixRegistry = pkgs.writeTextFile {
+    name = "nix-registry";
+    destination = "/etc/nix/registry.json";
+    text = builtins.toJSON {
+      version = 2;
+      flakes = [
+        {
+          from = { id = "nixpkgs"; type = "indirect"; };
+          to = { type = "path"; path = pkgs.path; };
+        }
+      ];
+    };
+  };
+
   # The system-level include of the entrypoint's generated gitconfig, so it also
   # reaches a git that was started without the GIT_CONFIG_* environment the
   # entrypoint sets -- a `podman exec` shell, or a git spawned by a tool that
@@ -282,6 +297,7 @@ let
     # here or it would not be in the closure the image ships.
     imageFontsConf
     nixConf
+    nixRegistry
     etcGitconfig
     containersConf
     storageConf

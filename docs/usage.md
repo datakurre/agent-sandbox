@@ -139,6 +139,7 @@ sandbox's own `127.0.0.1` answers from inside and refuses from the host.
 | --- | --- |
 | `--programmatic` | Runs the agent non-interactively with the prompt read from stdin, appending agent-specific prompt arguments. Suppresses human-interactive stderr output and emits a JSON object with `status`, `stdout`, and `stderr`. |
 | `--model NAME` | Passes the specified model to the agent (e.g., `sonnet`, `opus`, `gemini-1.5-pro`). Requires `--programmatic`. |
+| `--max-ai-credits NUMBER` | Limits the amount of AI credits the `copilot` agent can spend in a single run. The run halts if this limit is reached. Requires `--programmatic`. |
 
 ## Reaching back to the host: `--host-loopback-port`
 
