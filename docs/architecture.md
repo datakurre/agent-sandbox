@@ -37,6 +37,7 @@ Key layers:
 | Path                  | Purpose                                                |
 | --------------------- | ------------------------------------------------------ |
 | `/etc/nix/nix.conf`   | `sandbox = false`, `flakes` enabled                    |
+| `/etc/nix/registry.json` | System flake registry mapping `nixpkgs` to baked source |
 | `/etc/containers/*`   | Pre-configured rootless podman (crun, overlay driver)  |
 | `/usr/bin/env`        | Symlink to coreutils `env` for generic shebangs        |
 | `/lib64/ld-linux-*`   | ELF interpreter for prebuilt npm binaries              |
