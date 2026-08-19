@@ -567,6 +567,11 @@ forwarding SSH, or exposing Git identity.
         "Run the agent non-interactively with prompt from stdin; return JSON {status, stdout, stderr}.",
     );
     print_help_option(
+        "--model NAME",
+        None,
+        "Specify the model to use (requires --programmatic)",
+    );
+    print_help_option(
         "--podman-args",
         None,
         "treat all following args (until --) as podman args; use this for other options",
@@ -1025,6 +1030,7 @@ fn run() -> Result<i32> {
     let mut want_ports_any_interface = false;
     let mut want_shared_network = false;
     let mut want_programmatic = false;
+    let mut want_model: Option<String> = None;
     let mut want_host_ports: Vec<HostPort> = Vec::new();
     // `--browser`, and the session names it was narrowed to (empty = all).
     let mut want_browser = false;
@@ -1055,7 +1061,7 @@ fn run() -> Result<i32> {
 
     let krun_runtime =
         env::var("AGENT_SANDBOX_KRUN_RUNTIME").unwrap_or_else(|_| "krun".to_string());
-    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\ncodex\t[\"codex\",\".\"]\t[\".codex\"]\t[]\t[\"-p\",\"-\"]".to_string();
+    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\ncodex\t[\"codex\",\".\"]\t[\".codex\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\npi\t[\"pi\",\".\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]".to_string();
     let agent_specs_str = env::var("AGENT_SANDBOX_AGENT_SPECS").unwrap_or(default_agent_specs);
 
     let mut agent_names = Vec::new();
@@ -1063,6 +1069,7 @@ fn run() -> Result<i32> {
     let mut agent_state_json = HashMap::new();
     let mut agent_state_files_json = HashMap::new();
     let mut agent_programmatic_json = HashMap::new();
+    let mut agent_model_arg_json = HashMap::new();
 
     for line in agent_specs_str.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
@@ -1077,6 +1084,9 @@ fn run() -> Result<i32> {
             agent_state_files_json.insert(name.clone(), parts[3].to_string());
             if parts.len() >= 5 {
                 agent_programmatic_json.insert(name.clone(), parts[4].to_string());
+            }
+            if parts.len() >= 6 {
+                agent_model_arg_json.insert(name.clone(), parts[5].to_string());
             }
         }
     }
@@ -1179,6 +1189,14 @@ fn run() -> Result<i32> {
             "--no-programmatic" => {
                 want_programmatic = false;
                 PROGRAMMATIC.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            "--model" => {
+                if i + 1 < args.len() {
+                    want_model = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    fail("agent-sandbox: --model requires a value");
+                }
             }
             "--ssh" => want_ssh = true,
             "--no-ssh" => want_ssh = false,
@@ -1602,6 +1620,23 @@ fn run() -> Result<i32> {
             ));
         }
         cmd_args.extend(prog_args);
+
+        if let Some(model) = want_model {
+            let model_args: Vec<String> = match agent_model_arg_json.get(&agent) {
+                Some(s) => match serde_json::from_str(s) {
+                    Ok(v) => v,
+                    Err(_) => fail(&format!("agent-sandbox: invalid model args for agent '{}'", agent)),
+                },
+                None => Vec::new(),
+            };
+            if model_args.is_empty() {
+                fail(&format!("agent-sandbox: agent '{}' does not support the --model flag.", agent));
+            }
+            cmd_args.extend(model_args);
+            cmd_args.push(model);
+        }
+    } else if want_model.is_some() {
+        fail("agent-sandbox: --model requires --programmatic to be specified.");
     }
 
     let rw_mount_opts = launch::rw_mount_opts(want_selinux);

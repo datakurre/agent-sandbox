@@ -13,6 +13,8 @@ agent-sandbox --workspace copilot --name johndoe # use a custom ctl selector
 agent-sandbox copilot                            # github-copilot-cli (copilot)
 agent-sandbox antigravity                        # antigravity-cli (agy)
 agent-sandbox codex                              # codex
+agent-sandbox pi                                 # pi
+echo "prompt" | agent-sandbox --workspace --programmatic pi  # headless pi programmatic mode
 agent-sandbox opencode --selinux                 # enable :z on built-in writable binds
 agent-sandbox                                    # interactive bash (every agent's binary on PATH)
 agent-sandbox opencode -- devenv shell           # devenv shell replacing opencode cmd
@@ -95,7 +97,6 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Ports & mounts | `--host-loopback-port PORT` | Makes the host's `127.0.0.1:PORT` reachable at the sandbox's own `127.0.0.1:PORT`, and exports the list as `$AGENT_SANDBOX_HOST_PORTS`. Repeatable; takes `HOST:SANDBOX`. See below. |
 | Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
-| Programmatic mode | `--programmatic` | Runs the agent non-interactively with prompt read from stdin, appending agent-specific prompt arguments, suppressing human-interactive stderr output, and emitting a JSON object with `status`, `stdout`, and `stderr`. |
 
 A few flags are one-off pass-throughs rather than persistent toggles, so they have no `--no-flag` form:
 
@@ -129,6 +130,15 @@ it cannot tell the two cases apart.
 Whichever you use, the server *inside* the sandbox must bind `0.0.0.0`.
 Publishing forwards to the sandbox's interface address, so a server bound to the
 sandbox's own `127.0.0.1` answers from inside and refuses from the host.
+
+### Programmatic mode
+
+`agent-sandbox` can be run non-interactively for integration with other tools:
+
+| Flag | What it does |
+| --- | --- |
+| `--programmatic` | Runs the agent non-interactively with the prompt read from stdin, appending agent-specific prompt arguments. Suppresses human-interactive stderr output and emits a JSON object with `status`, `stdout`, and `stderr`. |
+| `--model NAME` | Passes the specified model to the agent (e.g., `sonnet`, `opus`, `gemini-1.5-pro`). Requires `--programmatic`. |
 
 ## Reaching back to the host: `--host-loopback-port`
 

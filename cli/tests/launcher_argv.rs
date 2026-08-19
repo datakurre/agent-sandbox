@@ -783,6 +783,27 @@ fn programmatic_mode_with_opencode_appends_correct_prompt_flags() {
 }
 
 #[test]
+fn programmatic_mode_with_model_appends_model_flags() {
+    let out = World::new().run(&["--programmatic", "--model", "sonnet", "claude"]);
+    let run = out.run_call();
+
+    assert_eq!(run.command(), vec!["claude", "-p", "-", "--model", "sonnet"]);
+}
+
+#[test]
+fn model_without_programmatic_fails() {
+    let out = World::new().run(&["--model", "sonnet", "claude"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr.contains("--model requires --programmatic"),
+        "unexpected stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn programmatic_mode_requires_an_agent() {
     let out = World::new().run(&["--programmatic"]);
 
@@ -833,3 +854,20 @@ fn programmatic_mode_on_exit_failure_returns_json_with_nonzero_status() {
     assert_eq!(json["status"], 42);
 }
 
+
+#[test]
+fn programmatic_mode_with_pi_appends_correct_prompt_flags() {
+    let out = World::new().run(&["--programmatic", "pi"]);
+    let run = out.run_call();
+
+    assert_eq!(run.command(), vec!["pi", ".", "-p", "-"]);
+}
+
+#[test]
+fn pi_default_agent_mounts_are_bound() {
+    let out = World::new().run(&["pi"]);
+    let run = out.run_call();
+
+    assert!(run.mount_to("/home/user/.pi").is_some());
+    assert!(run.mount_to("/home/user/.local/share/pi").is_some());
+}

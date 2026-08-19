@@ -1,6 +1,6 @@
 # agent-sandbox
 
-**Sandboxed AI coding environment** built on rootless Podman and Nix. Run AI coding agents — `opencode`, `claude`, `copilot`, `codex`, `antigravity`, or any bundled tool — in an isolated container. All host integrations are **disabled by default**; you opt in only to what you need.
+**Sandboxed AI coding environment** built on rootless Podman and Nix. Run AI coding agents — `opencode`, `claude`, `copilot`, `codex`, `antigravity`, `pi`, or any bundled tool — in an isolated container. All host integrations are **disabled by default**; you opt in only to what you need.
 
 ## What it provides
 

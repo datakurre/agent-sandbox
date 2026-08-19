@@ -103,6 +103,7 @@ fn is_launcher_bind(destination: &str, workspace_dir: &str) -> bool {
         "/home/user/.gitconfig",
         "/home/user/.gnupg",
         "/home/user/.ssh",
+        "/home/user/.pi",
         "/run/",
         "/sidecar_",
         "/nix",

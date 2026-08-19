@@ -148,6 +148,15 @@ prefix = "Bearer "
 host = "registry.npmjs.org:443"
 method = "*"
 path = "/"
+
+# OpenCode Zen: Programmatic agent inference injection
+[[network.allowed_routes]]
+host = "opencode.ai:443"
+method = "POST"
+path = "/zen/v1/*"
+secret = "OPENCODE_API_KEY"
+header = "Authorization"
+prefix = "Bearer "
 ```
 ````
 
@@ -209,6 +218,25 @@ authorize refuses the launch rather than silently injecting nothing, and prints
 the exact block to paste. The proxy terminates TLS for hosts carrying a rule, so
 the sandbox trusts a per-session CA that exists only for the lifetime of that
 sandbox.
+
+For agents like **Pi**, this means you configure the agent to use a dummy key and point it at the real endpoint. The proxy injects the real credential in flight.
+For example, to configure Pi for OpenCode Zen, place this in `.pi/models.json` (or `~/.pi/agent/models.json` globally):
+
+```json
+{
+  "providers": {
+    "opencode-zen": {
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "api": "openai-completions",
+      "apiKey": "dummy-proxy-placeholder",
+      "models": [
+        { "id": "zen-default", "name": "OpenCode Zen Default" }
+      ]
+    }
+  }
+}
+```
+Set `"defaultProvider": "opencode-zen"` and `"defaultModel": "zen-default"` in `.pi/settings.json`, and run the sandbox with `--proxy --secrets`.
 
 #### SSH host keys
 

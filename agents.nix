@@ -12,6 +12,9 @@
       "--prompt"
       "-"
     ];
+    modelArg = [
+      "--model"
+    ];
     state = [
       ".local/share/opencode"
       ".config/opencode"
@@ -26,6 +29,9 @@
       "-p"
       "-"
     ];
+    modelArg = [
+      "--model"
+    ];
     state = [ ".claude" ];
     stateFiles = [ ".claude.json" ];
   }
@@ -36,6 +42,9 @@
     programmaticArgs = [
       "-p"
       "-"
+    ];
+    modelArg = [
+      "--model"
     ];
     state = [ ".copilot" ];
   }
@@ -49,6 +58,9 @@
     programmaticArgs = [
       "--prompt"
       "-"
+    ];
+    modelArg = [
+      "--model"
     ];
     state = [
       ".local/share/antigravity-cli"
@@ -73,8 +85,34 @@
       "-p"
       "-"
     ];
+    modelArg = [
+      "--model"
+    ];
     state = [
       ".codex"
+    ];
+  }
+  {
+    name = "pi";
+    package = pkgs.writeShellScriptBin "pi" ''
+      exec npx -y @earendil-works/pi-coding-agent "$@"
+    '';
+    command = [
+      "pi"
+      "."
+    ];
+    programmaticArgs = [
+      "-p"
+      "-"
+    ];
+    modelArg = [
+      "--model"
+    ];
+    state = [
+      ".pi"
+      ".local/share/pi"
+      ".config/pi"
+      ".cache/pi"
     ];
   }
 ]
