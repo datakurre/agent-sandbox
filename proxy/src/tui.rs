@@ -154,6 +154,7 @@ struct DeniedEntry {
     port: u16,
     reason: Option<String>,
     method: Option<String>,
+    path: Option<String>,
     detail: Option<String>,
     count: u32,
     last_seen: u64,
@@ -214,6 +215,7 @@ fn ingest_relay_event(denied: &mut HashMap<(String, u16), DeniedEntry>, event: R
             port,
             reason: None,
             method: Some(method.to_string()),
+            path: None,
             detail: None,
             count: 0,
             last_seen: ts,
@@ -286,6 +288,20 @@ fn grant_lines(row: &DeniedEntry) -> Vec<String> {
         // Enabled at launch, not by policy.
         DeniedKind::Gpg => Vec::new(),
     }
+}
+
+/// The route policy line that would let an L7-denied row through.
+///
+/// Returns `None` for non-egress decisions (SSH/GPG relay) or before a real
+/// HTTP method is known (e.g. CONNECT-level denials). Uses the path captured
+/// from the error event, or defaults to "/**" when no path was recorded.
+fn route_grant_line(row: &DeniedEntry) -> Option<String> {
+    if row.kind != DeniedKind::Egress {
+        return None;
+    }
+    let method = row.method.as_deref().filter(|m| *m != "CONNECT")?;
+    let path = row.path.as_deref().unwrap_or("/**");
+    Some(format!("allow_route\t{}\t{}\t{}", row.host, method, path))
 }
 
 const NO_CONNECTION_DETAIL: &str = "No connection is selected.";
@@ -483,6 +499,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 port,
                                 reason: None,
                                 method: None,
+                                path: None,
                                 detail: None,
                                 count: 0,
                                 last_seen: ts,
@@ -495,6 +512,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if ev.method.is_some() {
                                 entry.method = ev.method.clone();
+                            }
+                            if ev.path.is_some() {
+                                entry.path = ev.path.clone();
                             }
                             if is_new && denied_reqs.len() > MAX_DENIED_ROWS {
                                 if let Some(oldest) = denied_reqs
@@ -1019,10 +1039,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             "This sandbox launched with no L7 rule, so it does not trust the proxy's session CA — TLS to {} would fail. Declare the rule in AGENTS.md and relaunch.",
                                             host
                                         ));
-                                    } else {
-                                        let m = method.unwrap();
-                                        detail = format!("allow_route {} {}", host, m);
-                                        policy.push(format!("allow_route\t{}\t{}\t/*", host, m));
+                                    } else if let Some(rule) = route_grant_line(&row) {
+                                        let display_val = rule.strip_prefix("allow_route\t").unwrap_or(&rule).replace('\t', " ");
+                                        detail = format!("allow_route {}", display_val);
+                                        if !policy.contains(&rule) {
+                                            policy.push(rule);
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -1188,6 +1210,7 @@ mod tests {
                 port: 443,
                 reason: Some("no matching rule".to_string()),
                 method: Some("GET".to_string()),
+                path: None,
                 detail: Some("GET /zen HTTP/1.1\r\nAuthorization: <redacted>".to_string()),
                 count: 1,
                 last_seen: 1,
@@ -1219,6 +1242,7 @@ mod tests {
                 port: 443,
                 reason: None,
                 method: None,
+                path: None,
                 detail: None,
                 count: 1,
                 last_seen: 1,
@@ -1232,6 +1256,7 @@ mod tests {
                 port: 443,
                 reason: None,
                 method: None,
+                path: None,
                 detail: None,
                 count: 1,
                 last_seen: 1,
@@ -1364,6 +1389,7 @@ mod tests {
             port: 8443,
             reason: None,
             method: Some("CONNECT".to_string()),
+            path: None,
             detail: None,
             count: 1,
             last_seen: 1,
@@ -1422,5 +1448,69 @@ mod tests {
         );
         let row = &denied[&("github.com".to_string(), SSH_POLICY_PORT)];
         assert!(row.last_seen > 0);
+    }
+
+    #[test]
+    fn route_grant_line_generates_exact_route_rule() {
+        let row = DeniedEntry {
+            host: "api.example.com".to_string(),
+            port: 443,
+            reason: None,
+            method: Some("GET".to_string()),
+            path: Some("/api/v1/users".to_string()),
+            detail: None,
+            count: 1,
+            last_seen: 1,
+            kind: DeniedKind::Egress,
+        };
+        let rule = super::route_grant_line(&row);
+        assert_eq!(
+            rule,
+            Some("allow_route\tapi.example.com\tGET\t/api/v1/users".to_string())
+        );
+    }
+
+    #[test]
+    fn route_grant_line_falls_back_to_recursive_wildcard_when_path_is_none() {
+        let row = DeniedEntry {
+            host: "api.example.com".to_string(),
+            port: 443,
+            reason: None,
+            method: Some("POST".to_string()),
+            path: None,
+            detail: None,
+            count: 1,
+            last_seen: 1,
+            kind: DeniedKind::Egress,
+        };
+        let rule = super::route_grant_line(&row);
+        assert_eq!(
+            rule,
+            Some("allow_route\tapi.example.com\tPOST\t/**".to_string())
+        );
+    }
+
+    #[test]
+    fn route_grant_line_returns_none_for_ssh_gpg_and_connect() {
+        let mut row = DeniedEntry {
+            host: "github.com".to_string(),
+            port: 22,
+            reason: None,
+            method: Some("SSH".to_string()),
+            path: None,
+            detail: None,
+            count: 1,
+            last_seen: 1,
+            kind: DeniedKind::Ssh,
+        };
+        assert_eq!(super::route_grant_line(&row), None);
+
+        row.kind = DeniedKind::Gpg;
+        row.method = Some("GPG".to_string());
+        assert_eq!(super::route_grant_line(&row), None);
+
+        row.kind = DeniedKind::Egress;
+        row.method = Some("CONNECT".to_string());
+        assert_eq!(super::route_grant_line(&row), None);
     }
 }

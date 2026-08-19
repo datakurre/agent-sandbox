@@ -202,7 +202,7 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
 2. **Open the TUI**: In a **separate terminal**, run `agent-sandbox ctl tui`. This interactive interface lists the requests the sandbox is making, including the denied ones.
 3. **Approve**: Use the following keybindings to update the policy in real time:
    - `a`: Allow domain — or, on an SSH row, authorize the relay for that host
-   - `h`: Allow HTTP route (domain + method) (creates a `[[network.allowed_routes]]` rule)
+   - `h`: Allow HTTP route (domain + method + path) (creates a `[[network.allowed_routes]]` rule)
    - `A`: Allow IP
    - `v`: Switch between the live Connections view and denied requests
    - `r`: Switch to the Rules view — the live effective policy, with `x` to remove a rule (blocked for rules that came from `AGENTS.md`)
