@@ -85,5 +85,7 @@ allowed_hosts = [
     "github.com:443,22",
     "index.crates.io:443",
     "releases.nixos.org:443",
+    "static.rust-lang.org:443",
+    "tarballs.nixos.org:443",
 ]
 ```
