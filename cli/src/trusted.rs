@@ -315,6 +315,178 @@ pub fn refusal(unauthorized: &[String], path: &Path) -> String {
     out.trim_end().to_string()
 }
 
+/// Returns true if every host in the unauthorized list has at least one built-in pinned key.
+pub fn all_hosts_have_pinned_keys(unauthorized: &[String]) -> bool {
+    !unauthorized.is_empty()
+        && unauthorized.iter().all(|host| {
+            !agent_sandbox_proxy::known_hosts::pinned_keys_for(host).is_empty()
+        })
+}
+
+/// Generates the `[[network.known_hosts]]` TOML block for the given unauthorized hosts.
+pub fn proposed_known_hosts_toml(unauthorized: &[String]) -> String {
+    let mut out = String::new();
+    for host in unauthorized {
+        let pinned = agent_sandbox_proxy::known_hosts::pinned_keys_for(host);
+        for key in pinned {
+            out.push_str("[[network.known_hosts]]\n");
+            out.push_str(&format!("host = \"{}:22\"\n", host));
+            out.push_str(&format!("key = \"{}\"\n\n", key));
+        }
+    }
+    out
+}
+
+/// Formats a git-style unified diff showing the addition to the trusted file.
+pub fn render_diff(path: &Path, addition: &str, style: crate::net_summary::Style) -> String {
+    let path_str = path.display().to_string();
+    let mut out = String::new();
+
+    let file_exists = path.exists();
+    let (old_file, new_file) = if file_exists {
+        (format!("a/{}", path_str), format!("b/{}", path_str))
+    } else {
+        ("/dev/null".to_string(), format!("b/{}", path_str))
+    };
+
+    out.push_str(&style.bold(&format!("--- {}\n", old_file)));
+    out.push_str(&style.bold(&format!("+++ {}\n", new_file)));
+
+    let added_lines: Vec<&str> = addition.trim_end().lines().collect();
+    let count = added_lines.len();
+
+    if file_exists {
+        let existing_content = std::fs::read_to_string(path).unwrap_or_default();
+        let existing_line_count = existing_content.lines().count();
+        let hunk_header = format!(
+            "@@ -{},0 +{},{} @@\n",
+            existing_line_count,
+            existing_line_count + 1,
+            count
+        );
+        out.push_str(&style.cyan(&hunk_header));
+    } else {
+        let hunk_header = format!("@@ -0,0 +1,{} @@\n", count);
+        out.push_str(&style.cyan(&hunk_header));
+    }
+
+    for line in added_lines {
+        let diff_line = format!("+{}\n", line);
+        out.push_str(&style.green(&diff_line));
+    }
+
+    out
+}
+
+/// Appends the addition to `trusted.toml`, creating parent directories and the file if necessary.
+pub fn append_to_trusted_file(path: &Path, addition: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut existing = std::fs::read_to_string(path).unwrap_or_default();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+    if !existing.is_empty() && !existing.ends_with("\n\n") {
+        existing.push('\n');
+    }
+    existing.push_str(addition);
+    std::fs::write(path, existing)?;
+    Ok(())
+}
+
+/// Interactively prompts the operator to trust missing host keys.
+/// Returns `true` if keys were appended and the launch can continue, or `false` if aborted.
+pub fn prompt_and_update(
+    unauthorized: &[String],
+    path: &Path,
+    style: crate::net_summary::Style,
+) -> bool {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    prompt_and_update_io(unauthorized, path, style, stdin.lock(), stdout)
+}
+
+pub fn prompt_and_update_io<R: std::io::BufRead, W: std::io::Write>(
+    unauthorized: &[String],
+    path: &Path,
+    style: crate::net_summary::Style,
+    mut reader: R,
+    mut writer: W,
+) -> bool {
+    let addition = proposed_known_hosts_toml(unauthorized);
+
+    let _ = writeln!(
+        writer,
+        "agent-sandbox: the selected network policy authorizes SSH to:"
+    );
+    for host in unauthorized {
+        let _ = writeln!(writer, "                 - {}", host);
+    }
+    let _ = writeln!(
+        writer,
+        "               but no host key for {} is trusted in {}.",
+        if unauthorized.len() == 1 { "it" } else { "them" },
+        path.display()
+    );
+    let _ = writeln!(
+        writer,
+        "               agent-sandbox can add the published host keys automatically.\n"
+    );
+
+    loop {
+        let _ = write!(writer, "Add to {}? [y/N/d/?] ", path.display());
+        if writer.flush().is_err() {
+            return false;
+        }
+
+        let mut answer = String::new();
+        if reader.read_line(&mut answer).is_err() || answer.is_empty() {
+            return false;
+        }
+
+        match answer.trim().to_lowercase().as_str() {
+            "y" | "yes" => match append_to_trusted_file(path, &addition) {
+                Ok(()) => {
+                    let _ = writeln!(writer, "  Updated {}", path.display());
+                    return true;
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        writer,
+                        "agent-sandbox: failed to update {}: {}",
+                        path.display(),
+                        e
+                    );
+                    return false;
+                }
+            },
+            "d" | "diff" => {
+                let _ = writeln!(writer, "\n{}", render_diff(path, &addition, style));
+            }
+            "?" | "h" | "help" => {
+                let _ = writeln!(
+                    writer,
+                    "\n  y - Add the missing host keys to trusted.toml and continue launch\n  \
+                       n - Do not modify trusted.toml and abort (default)\n  \
+                       d - Show unified diff of changes\n  \
+                       ? - Show this help message\n"
+                );
+            }
+            "n" | "no" | "" => {
+                return false;
+            }
+            other => {
+                let _ = writeln!(
+                    writer,
+                    "Unknown option '{}'. Type 'y', 'n', 'd', or '?'.",
+                    other
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +830,108 @@ mod tests {
         assert!(legacy_path_refusal("/home/nobody").is_none());
 
         std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    // ── automated prompt and diff ──────────────────────────────────────────
+
+    #[test]
+    fn pinned_key_availability_check() {
+        assert!(all_hosts_have_pinned_keys(&["github.com".to_string()]));
+        assert!(all_hosts_have_pinned_keys(&[
+            "github.com".to_string(),
+            "gitlab.com".to_string()
+        ]));
+        assert!(!all_hosts_have_pinned_keys(&[
+            "github.com".to_string(),
+            "git.example.com".to_string()
+        ]));
+        assert!(!all_hosts_have_pinned_keys(&["git.example.com".to_string()]));
+        assert!(!all_hosts_have_pinned_keys(&[]));
+    }
+
+    #[test]
+    fn proposed_known_hosts_toml_generates_valid_known_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = proposed_known_hosts_toml(&["github.com".to_string()]);
+        let path = write(&dir, "trusted.toml", &toml);
+        let loaded = load_known_hosts(&path).expect("valid known hosts");
+        assert!(!loaded.is_empty());
+        assert!(unauthorized_signing_hosts(&["github.com".to_string()], &loaded).is_empty());
+    }
+
+    #[test]
+    fn render_diff_formats_unified_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trusted.toml");
+        let toml = proposed_known_hosts_toml(&["github.com".to_string()]);
+        let style = crate::net_summary::Style::plain();
+
+        // Non-existent file diff
+        let diff = render_diff(&path, &toml, style);
+        assert!(diff.contains("--- /dev/null"), "{diff}");
+        assert!(diff.contains(&format!("+++ b/{}", path.display())), "{diff}");
+        assert!(diff.contains("+[[network.known_hosts]]"), "{diff}");
+
+        // Existing file diff
+        std::fs::write(&path, "# existing content\n").unwrap();
+        let diff_existing = render_diff(&path, &toml, style);
+        assert!(diff_existing.contains(&format!("--- a/{}", path.display())), "{diff_existing}");
+        assert!(diff_existing.contains(&format!("+++ b/{}", path.display())), "{diff_existing}");
+        assert!(diff_existing.contains("@@ -1,0 +2,"), "{diff_existing}");
+    }
+
+    #[test]
+    fn append_to_trusted_file_appends_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/dir/trusted.toml");
+        let toml = proposed_known_hosts_toml(&["github.com".to_string()]);
+
+        // File created in new directory
+        append_to_trusted_file(&path, &toml).expect("append succeeds");
+        let loaded1 = load_known_hosts(&path).expect("loads");
+        assert_eq!(loaded1.len(), 3);
+
+        // Appending again to existing file
+        let toml2 = proposed_known_hosts_toml(&["gitlab.com".to_string()]);
+        append_to_trusted_file(&path, &toml2).expect("second append succeeds");
+        let loaded2 = load_known_hosts(&path).expect("loads");
+        assert_eq!(loaded2.len(), 6);
+    }
+
+    #[test]
+    fn prompt_and_update_io_handles_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trusted.toml");
+        let hosts = vec!["github.com".to_string()];
+        let style = crate::net_summary::Style::plain();
+
+        // Declining ('n')
+        let input = b"n\n";
+        let mut output = Vec::new();
+        let ok = prompt_and_update_io(&hosts, &path, style, &input[..], &mut output);
+        assert!(!ok);
+        assert!(!path.exists());
+
+        // Default on Enter ('')
+        let input = b"\n";
+        let mut output = Vec::new();
+        let ok = prompt_and_update_io(&hosts, &path, style, &input[..], &mut output);
+        assert!(!ok);
+        assert!(!path.exists());
+
+        // Diff, Help, Invalid, then Yes ('d', '?', 'foo', 'y')
+        let input = b"d\n?\nfoo\ny\n";
+        let mut output = Vec::new();
+        let ok = prompt_and_update_io(&hosts, &path, style, &input[..], &mut output);
+        assert!(ok);
+        let out_str = String::from_utf8(output).unwrap();
+        assert!(out_str.contains("--- /dev/null"), "{out_str}");
+        assert!(out_str.contains("Show unified diff"), "{out_str}");
+        assert!(out_str.contains("Unknown option 'foo'"), "{out_str}");
+        assert!(out_str.contains("Updated"), "{out_str}");
+        assert!(path.exists());
+        let loaded = load_known_hosts(&path).unwrap();
+        assert!(!loaded.is_empty());
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

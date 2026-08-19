@@ -2110,7 +2110,7 @@ fn run() -> Result<i32> {
     if let Some(message) = trusted::legacy_path_refusal(&home) {
         fail(&message);
     }
-    let trusted_known_hosts = match trusted::load_known_hosts(&trusted_config) {
+    let mut trusted_known_hosts = match trusted::load_known_hosts(&trusted_config) {
         Ok(hosts) => hosts,
         Err(e) => fail(&e.to_string()),
     };
@@ -2124,7 +2124,30 @@ fn run() -> Result<i32> {
         let unauthorized =
             trusted::unauthorized_signing_hosts(&merged_policy.allow_signing, &trusted_known_hosts);
         if !unauthorized.is_empty() {
-            fail(&trusted::refusal(&unauthorized, &trusted_config));
+            let is_interactive =
+                std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            let mut resolved = false;
+
+            if is_interactive && trusted::all_hosts_have_pinned_keys(&unauthorized) {
+                let style = net_summary::Style::detect();
+                if trusted::prompt_and_update(&unauthorized, &trusted_config, style) {
+                    match trusted::load_known_hosts(&trusted_config) {
+                        Ok(reloaded) => {
+                            trusted_known_hosts = reloaded;
+                            resolved = trusted::unauthorized_signing_hosts(
+                                &merged_policy.allow_signing,
+                                &trusted_known_hosts,
+                            )
+                            .is_empty();
+                        }
+                        Err(e) => fail(&e.to_string()),
+                    }
+                }
+            }
+
+            if !resolved {
+                fail(&trusted::refusal(&unauthorized, &trusted_config));
+            }
         }
     }
 

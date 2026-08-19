@@ -80,6 +80,7 @@ to them too:
 ```toml agent-sandbox
 [network]
 allowed_hosts = [
+    "cache.nixos.org:443",
     "channels.nixos.org:443",
     "github.com:443,22",
     "index.crates.io:443",

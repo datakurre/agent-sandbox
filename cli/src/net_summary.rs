@@ -129,7 +129,7 @@ impl Style {
     /// Wraps text that has *already* been padded.  `pad`/`lpad`/`clip` count
     /// chars, so styling anything on its way into them would widen the cell by
     /// the length of the escape sequence and skew every column after it.
-    fn paint(&self, s: &str, code: &str) -> String {
+    pub fn paint(&self, s: &str, code: &str) -> String {
         if self.on {
             format!("\x1b[{}m{}\x1b[0m", code, s)
         } else {
@@ -137,17 +137,23 @@ impl Style {
         }
     }
 
-    fn bold(&self, s: &str) -> String {
+    pub fn bold(&self, s: &str) -> String {
         self.paint(s, "1")
     }
     pub fn dim(&self, s: &str) -> String {
         self.paint(s, "2")
     }
-    fn red(&self, s: &str) -> String {
+    pub fn red(&self, s: &str) -> String {
         self.paint(s, "31")
     }
-    fn yellow(&self, s: &str) -> String {
+    pub fn green(&self, s: &str) -> String {
+        self.paint(s, "32")
+    }
+    pub fn yellow(&self, s: &str) -> String {
         self.paint(s, "33")
+    }
+    pub fn cyan(&self, s: &str) -> String {
+        self.paint(s, "36")
     }
 
     /// Dims the unit of an already-padded byte count ("  265.2 KiB"), leaving
