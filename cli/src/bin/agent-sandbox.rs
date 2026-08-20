@@ -1130,21 +1130,46 @@ fn run() -> Result<i32> {
                 parse_args.extend(args.iter().cloned());
             }
         } else {
-            for (idx, arg) in args.iter().enumerate() {
-                if arg == "ctl" {
-                    run_ctl = true;
-                    if idx + 1 == args.len() {
-                        parse_args.push("--help".to_string());
-                    } else {
-                        parse_args.extend(args.iter().skip(idx + 1).cloned());
-                    }
+            let dash_dash_idx = args.iter().position(|a| a == "--");
+            let pre_dash = match dash_dash_idx {
+                Some(i) => &args[..i],
+                None => &args[..],
+            };
+
+            let mut is_ctl = false;
+            let mut ctl_idx = 0;
+            let mut i = 0;
+            while i < pre_dash.len() {
+                if pre_dash[i] == "ctl" {
+                    is_ctl = true;
+                    ctl_idx = i;
                     break;
-                } else if ctl_subcommands.contains(&arg.as_str())
-                    && !agent_cmd_json.contains_key(arg)
+                }
+                match pre_dash[i].as_str() {
+                    "--name" | "--model" | "--max-ai-credits" | "--krun-memory" | "--krun-cpus" |
+                    "-e" | "--env" | "-v" | "--volume" | "--mount" | "-p" | "--publish" |
+                    "--add-host" | "--env-file" | "--hostname" | "--tmpfs" |
+                    "--host-loopback-port" | "--policy" => {
+                        i += 2;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+
+            if is_ctl {
+                run_ctl = true;
+                if ctl_idx + 1 == args.len() {
+                    parse_args.push("--help".to_string());
+                } else {
+                    parse_args.extend(args.iter().skip(ctl_idx + 1).cloned());
+                }
+            } else if let Some(first) = args.first() {
+                if ctl_subcommands.contains(&first.as_str()) && !agent_cmd_json.contains_key(first)
                 {
                     run_ctl = true;
-                    parse_args.extend(args.iter().skip(idx).cloned());
-                    break;
+                    parse_args.extend(args.iter().cloned());
                 }
             }
         }

@@ -930,3 +930,45 @@ fn pi_default_agent_mounts_are_bound() {
     assert!(run.mount_to("/home/user/.pi").is_some());
     assert!(run.mount_to("/home/user/.local/share/pi").is_some());
 }
+
+#[test]
+fn command_after_double_dash_is_not_intercepted_by_ctl() {
+    let out = World::new().run(&["--", "make", "purge"]);
+    assert!(
+        out.reached_podman_run(),
+        "container was not launched; stdout: {}\nstderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    let run = out.run_call();
+    assert_eq!(run.command(), vec!["make", "purge"]);
+
+    let out_git = World::new().run(&["--", "git", "log"]);
+    assert!(out_git.reached_podman_run());
+    assert_eq!(out_git.run_call().command(), vec!["git", "log"]);
+
+    let out_status = World::new().run(&["--", "echo", "status"]);
+    assert!(out_status.reached_podman_run());
+    assert_eq!(out_status.run_call().command(), vec!["echo", "status"]);
+
+    let out_agent = World::new().run(&["opencode", "--", "make", "purge"]);
+    assert!(out_agent.reached_podman_run());
+    assert_eq!(out_agent.run_call().command(), vec!["make", "purge"]);
+}
+
+#[test]
+fn flags_with_values_matching_subcommands_are_not_intercepted_by_ctl() {
+    let out = World::new().run(&["--name", "list", "opencode"]);
+    assert!(out.reached_podman_run());
+    let run = out.run_call();
+    assert_eq!(run.value_of("--name"), Some("agent-sandbox-ws-list"));
+
+    let out_env = World::new().run(&["-e", "ACTION=purge", "opencode"]);
+    assert!(out_env.reached_podman_run());
+    assert_eq!(out_env.run_call().env_value("ACTION"), Some("purge"));
+
+    let out_ctl = World::new().run(&["--name", "ctl", "opencode"]);
+    assert!(out_ctl.reached_podman_run(), "container was not launched: stdout: {}\nstderr: {}", out_ctl.stdout, out_ctl.stderr);
+    assert_eq!(out_ctl.run_call().value_of("--name"), Some("agent-sandbox-ws-ctl"));
+}
+
