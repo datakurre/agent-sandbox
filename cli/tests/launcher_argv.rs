@@ -972,3 +972,57 @@ fn flags_with_values_matching_subcommands_are_not_intercepted_by_ctl() {
     assert_eq!(out_ctl.run_call().value_of("--name"), Some("agent-sandbox-ws-ctl"));
 }
 
+#[test]
+fn ctl_subcommands_run_without_ctl_prefix() {
+    for cmd in [
+        "list", "status", "policy", "proxy", "logs", "log", "mount", "mounts",
+        "purge", "tui", "relay", "net", "browser",
+    ] {
+        let out = World::new().run(&[cmd, "--help"]);
+        assert!(
+            !out.reached_podman_run(),
+            "subcommand '{}' unexpectedly reached podman run instead of ctl",
+            cmd
+        );
+        assert_eq!(
+            out.code,
+            Some(0),
+            "subcommand '{}' failed with code {:?}, stderr: {}",
+            cmd,
+            out.code,
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn direct_ctl_list_runs_ctl() {
+    let out = World::new().run(&["list"]);
+    assert!(!out.reached_podman_run(), "direct list reached podman run");
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+#[test]
+fn direct_ctl_proxy_runs_ctl_policy() {
+    let out = World::new().run(&["proxy", "--help"]);
+    assert!(!out.reached_podman_run(), "direct proxy reached podman run");
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+#[test]
+fn agent_name_takes_precedence_over_subcommand_shortcut() {
+    let out = World::new()
+        .env("AGENT_SANDBOX_AGENT_SPECS", "list\t[\"list_agent\"]\t[]\t[]")
+        .run(&["list"]);
+    assert!(out.reached_podman_run(), "agent was not launched: stderr: {}", out.stderr);
+    assert_eq!(out.run_call().command(), vec!["list_agent"]);
+
+    let out_ctl = World::new()
+        .env("AGENT_SANDBOX_AGENT_SPECS", "list\t[\"list_agent\"]\t[]\t[]")
+        .run(&["ctl", "list"]);
+    assert!(!out_ctl.reached_podman_run(), "ctl list reached podman run");
+    assert_eq!(out_ctl.code, Some(0));
+}
+
+
+

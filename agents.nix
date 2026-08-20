@@ -105,6 +105,8 @@
       "."
     ];
     programmaticArgs = [
+      "--mode"
+      "json"
       "-p"
       "-"
     ];

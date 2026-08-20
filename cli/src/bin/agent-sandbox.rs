@@ -23,6 +23,8 @@ use std::process::Command as ProcessCommand;
 use std::thread;
 use tempfile::Builder;
 
+static PROGRAMMATIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-sandbox",
@@ -43,7 +45,7 @@ enum CtlCommands {
     List(ctl::list::ListArgs),
     #[command(about = "Summarise one running sandbox")]
     Status(ctl::status::StatusArgs),
-    #[command(about = "Manage proxy rules")]
+    #[command(about = "Manage proxy rules", alias = "proxy")]
     Policy(ctl::proxy::ProxyArgs),
     #[command(about = "Start a throwaway host browser behind a deny-by-default allow list")]
     Browser(ctl::browser::BrowserArgs),
@@ -578,6 +580,21 @@ forwarding SSH, or exposing Git identity.
         "Specify the model to use (requires --programmatic)",
     );
     print_help_option(
+        "--provider NAME",
+        None,
+        "Specify the provider to use (requires --programmatic)",
+    );
+    print_help_option(
+        "--session ID",
+        None,
+        "Resume an existing agent session (requires --programmatic)",
+    );
+    print_help_option(
+        "--fork ID",
+        None,
+        "Fork from an existing agent session (requires --programmatic)",
+    );
+    print_help_option(
         "--max-ai-credits NUMBER",
         None,
         "Limit the amount of AI credits Copilot can spend in a programmatic run",
@@ -600,14 +617,24 @@ fn policy_path(home: &str, name: &str) -> Result<PathBuf> {
     launch::policy_path(home, name).map_err(|e| anyhow::anyhow!(e))
 }
 
-static PROGRAMMATIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn emit_programmatic_json(status: i32, stdout: &str, stderr: &str) {
-    let response = serde_json::json!({
+fn emit_programmatic_json(
+    status: i32,
+    stdout: &str,
+    stderr: &str,
+    network: Option<serde_json::Value>,
+    policy_error: Option<&str>,
+) {
+    let mut response = serde_json::json!({
         "status": status,
         "stdout": stdout,
         "stderr": stderr,
     });
+    if let Some(net) = network {
+        response["network"] = net;
+    }
+    if let Some(err) = policy_error {
+        response["policy_error"] = serde_json::Value::String(err.to_string());
+    }
     println!("{}", response);
 }
 
@@ -622,6 +649,107 @@ struct CleanupGuard {
     policies: Vec<String>,
     status_line: StatusLine,
     programmatic: bool,
+}
+
+impl CleanupGuard {
+    fn collect_programmatic_network(&self) -> serde_json::Value {
+        if self.sidecar_shared.is_empty() {
+            return serde_json::json!({
+                "summary": [],
+                "denied": [],
+                "proposed_policy": null
+            });
+        }
+        let log = format!("{}/connections.jsonl", self.sidecar_shared);
+        let records = match File::open(&log) {
+            Ok(file) => net_summary::read_records(BufReader::new(file)),
+            Err(_) => Vec::new(),
+        };
+
+        let mut denied_records = Vec::new();
+        let mut host_map: HashMap<String, (u64, u64, u32, Option<String>)> = HashMap::new();
+
+        for r in &records {
+            let is_deny = matches!(r.verdict.as_deref(), Some("deny") | Some("error"));
+            if is_deny {
+                denied_records.push(serde_json::json!({
+                    "host": format!("{}:{}", r.host, r.port),
+                    "verdict": r.verdict,
+                    "err": r.err,
+                    "method": r.method,
+                    "path": r.path,
+                }));
+            }
+            let key = format!("{}:{}", r.host, r.port);
+            let entry = host_map.entry(key).or_insert((0, 0, 0, r.verdict.clone()));
+            entry.0 += r.up.unwrap_or(0);
+            entry.1 += r.down.unwrap_or(0);
+            entry.2 += 1;
+            if is_deny {
+                entry.3 = r.verdict.clone();
+            }
+        }
+
+        let summary: Vec<serde_json::Value> = host_map
+            .into_iter()
+            .map(|(host, (up, down, conns, verdict))| {
+                serde_json::json!({
+                    "host": host,
+                    "bytes_up": up,
+                    "bytes_down": down,
+                    "connections": conns,
+                    "verdict": verdict.unwrap_or_else(|| "allow".to_string())
+                })
+            })
+            .collect();
+
+        let mut proposed = None;
+        if !self.sidecar_policy.is_empty() {
+            let read_lines = |name: &str| -> Vec<String> {
+                fs::read_to_string(format!("{}/{}", self.sidecar_policy, name))
+                    .map(|text| text.lines().map(str::to_string).collect())
+                    .unwrap_or_default()
+            };
+            let active = read_lines("policy");
+            let base: HashSet<String> = read_lines("policy.base").into_iter().collect();
+            let baseline: HashSet<String> = read_lines("policy.baseline").into_iter().collect();
+            let delta = agents::policy_delta_lines(&active, &base, &baseline);
+            if !delta.is_empty() {
+                if let Some(toml) = agents::format_policy_lines_as_network_toml(&delta) {
+                    proposed = Some(toml);
+                }
+            }
+        }
+        if proposed.is_none() && !denied_records.is_empty() {
+            let denied_hosts: Vec<String> = denied_records
+                .iter()
+                .filter_map(|d| d.get("host").and_then(|h| h.as_str()).map(str::to_string))
+                .collect();
+            let mut unique_hosts = Vec::new();
+            for h in denied_hosts {
+                if !unique_hosts.contains(&h) {
+                    unique_hosts.push(h);
+                }
+            }
+            if !unique_hosts.is_empty() {
+                let hosts_formatted = unique_hosts
+                    .iter()
+                    .map(|h| format!("    \"{}\"", h))
+                    .collect::<Vec<_>>()
+                    .join(",\n");
+                proposed = Some(format!(
+                    "```toml agent-sandbox\n[network]\nallowed_hosts = [\n{}\n]\n```\n",
+                    hosts_formatted
+                ));
+            }
+        }
+
+        serde_json::json!({
+            "summary": summary,
+            "denied": denied_records,
+            "proposed_policy": proposed
+        })
+    }
 }
 
 struct StartupInfo {
@@ -992,6 +1120,16 @@ impl StatusLine {
     }
 }
 
+fn is_policy_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("policy")
+        || lower.contains("denied")
+        || lower.contains("trusted.toml")
+        || lower.contains("host key")
+        || lower.contains("known_hosts")
+        || lower.contains("secret")
+}
+
 /// For failures *before* the proxy sidecar exists.  Once it does, the launcher
 /// has to unwind through a `return` instead: `process::exit` skips every
 /// destructor, and the sidecar's is what stops the container and reclaims its
@@ -999,7 +1137,12 @@ impl StatusLine {
 /// `agent-sandbox ctl purge` takes it back.
 fn fail(message: &str) -> ! {
     if PROGRAMMATIC.load(std::sync::atomic::Ordering::Relaxed) {
-        emit_programmatic_json(1, "", message);
+        let policy_err = if is_policy_error(message) {
+            Some(message)
+        } else {
+            None
+        };
+        emit_programmatic_json(1, "", message, None, policy_err);
     } else {
         eprintln!("{}", message);
     }
@@ -1014,7 +1157,12 @@ fn should_prompt_for_log(stdin_is_terminal: bool, stdout_is_terminal: bool) -> b
 /// `return` runs the cleanup on its way out.
 fn refuse(message: &str) -> Result<i32> {
     if PROGRAMMATIC.load(std::sync::atomic::Ordering::Relaxed) {
-        emit_programmatic_json(1, "", message);
+        let policy_err = if is_policy_error(message) {
+            Some(message)
+        } else {
+            None
+        };
+        emit_programmatic_json(1, "", message, None, policy_err);
     } else {
         eprintln!("{}", message);
     }
@@ -1042,6 +1190,9 @@ fn run() -> Result<i32> {
     let mut want_shared_network = false;
     let mut want_programmatic = false;
     let mut want_model: Option<String> = None;
+    let mut want_session: Option<String> = None;
+    let mut want_fork: Option<String> = None;
+    let mut want_provider: Option<String> = None;
     let mut want_max_ai_credits: Option<String> = None;
     let mut want_host_ports: Vec<HostPort> = Vec::new();
     // `--browser`, and the session names it was narrowed to (empty = all).
@@ -1073,7 +1224,7 @@ fn run() -> Result<i32> {
 
     let krun_runtime =
         env::var("AGENT_SANDBOX_KRUN_RUNTIME").unwrap_or_else(|_| "krun".to_string());
-    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\ncodex\t[\"codex\",\".\"]\t[\".codex\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\npi\t[\"pi\",\".\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]".to_string();
+    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\ncodex\t[\"codex\",\".\"]\t[\".codex\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\npi\t[\"pi\",\".\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\",\"-\"]\t[\"--model\"]\t[]".to_string();
     let agent_specs_str = env::var("AGENT_SANDBOX_AGENT_SPECS").unwrap_or(default_agent_specs);
 
     let mut agent_names = Vec::new();
@@ -1116,7 +1267,7 @@ fn run() -> Result<i32> {
 
     if is_ctl_bin || !args.is_empty() {
         let ctl_subcommands = [
-            "load", "list", "status", "policy", "net", "logs", "log", "attach", "mount", "mounts",
+            "load", "list", "status", "policy", "proxy", "net", "logs", "log", "attach", "mount", "mounts",
             "relay", "tui", "purge", "browser",
         ];
         let mut run_ctl = false;
@@ -1136,40 +1287,38 @@ fn run() -> Result<i32> {
                 None => &args[..],
             };
 
-            let mut is_ctl = false;
-            let mut ctl_idx = 0;
             let mut i = 0;
             while i < pre_dash.len() {
-                if pre_dash[i] == "ctl" {
-                    is_ctl = true;
-                    ctl_idx = i;
-                    break;
-                }
                 match pre_dash[i].as_str() {
-                    "--name" | "--model" | "--max-ai-credits" | "--krun-memory" | "--krun-cpus" |
-                    "-e" | "--env" | "-v" | "--volume" | "--mount" | "-p" | "--publish" |
-                    "--add-host" | "--env-file" | "--hostname" | "--tmpfs" |
-                    "--host-loopback-port" | "--policy" => {
+                    "--name" | "--model" | "--provider" | "--session" | "--fork"
+                    | "--max-ai-credits" | "--krun-memory" | "--krun-cpus"
+                    | "-e" | "--env" | "-v" | "--volume" | "--mount" | "-p" | "--publish"
+                    | "--add-host" | "--env-file" | "--hostname" | "--tmpfs"
+                    | "--host-loopback-port" | "--policy" => {
                         i += 2;
                     }
                     _ => {
+                        if pre_dash[i] == "ctl" {
+                            run_ctl = true;
+                            if i + 1 == args.len() {
+                                parse_args.push("--help".to_string());
+                            } else {
+                                parse_args.extend(args.iter().skip(i + 1).cloned());
+                            }
+                            break;
+                        }
+                        if ctl_subcommands.contains(&pre_dash[i].as_str())
+                            && !agent_cmd_json.contains_key(&pre_dash[i])
+                        {
+                            run_ctl = true;
+                            parse_args.extend(args.iter().skip(i).cloned());
+                            break;
+                        }
+                        if agent_cmd_json.contains_key(&pre_dash[i]) {
+                            break;
+                        }
                         i += 1;
                     }
-                }
-            }
-
-            if is_ctl {
-                run_ctl = true;
-                if ctl_idx + 1 == args.len() {
-                    parse_args.push("--help".to_string());
-                } else {
-                    parse_args.extend(args.iter().skip(ctl_idx + 1).cloned());
-                }
-            } else if let Some(first) = args.first() {
-                if ctl_subcommands.contains(&first.as_str()) && !agent_cmd_json.contains_key(first)
-                {
-                    run_ctl = true;
-                    parse_args.extend(args.iter().cloned());
                 }
             }
         }
@@ -1237,6 +1386,30 @@ fn run() -> Result<i32> {
                     i += 1;
                 } else {
                     fail("agent-sandbox: --model requires a value");
+                }
+            }
+            "--provider" => {
+                if i + 1 < args.len() {
+                    want_provider = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    fail("agent-sandbox: --provider requires a value");
+                }
+            }
+            "--session" => {
+                if i + 1 < args.len() {
+                    want_session = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    fail("agent-sandbox: --session requires a value");
+                }
+            }
+            "--fork" => {
+                if i + 1 < args.len() {
+                    want_fork = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    fail("agent-sandbox: --fork requires a value");
                 }
             }
             "--max-ai-credits" => {
@@ -1702,9 +1875,30 @@ fn run() -> Result<i32> {
             cmd_args.extend(limit_args);
             cmd_args.push(limit);
         }
+        if let Some(session) = want_session {
+            cmd_args.push("--session".to_string());
+            cmd_args.push(session);
+        }
+        if let Some(fork) = want_fork {
+            cmd_args.push("--fork".to_string());
+            cmd_args.push(fork);
+        }
+        if let Some(provider) = want_provider {
+            cmd_args.push("--provider".to_string());
+            cmd_args.push(provider);
+        }
     } else {
         if want_model.is_some() {
             fail("agent-sandbox: --model requires --programmatic to be specified.");
+        }
+        if want_session.is_some() {
+            fail("agent-sandbox: --session requires --programmatic to be specified.");
+        }
+        if want_fork.is_some() {
+            fail("agent-sandbox: --fork requires --programmatic to be specified.");
+        }
+        if want_provider.is_some() {
+            fail("agent-sandbox: --provider requires --programmatic to be specified.");
         }
         if want_max_ai_credits.is_some() {
             fail("agent-sandbox: --max-ai-credits requires --programmatic to be specified.");
@@ -1924,7 +2118,9 @@ fn run() -> Result<i32> {
     }
 
     if want_nix {
-        let is_socket = fs::metadata("/nix/var/nix/daemon-socket/socket")
+        let socket_path = env::var("AGENT_SANDBOX_NIX_DAEMON_SOCKET")
+            .unwrap_or_else(|_| "/nix/var/nix/daemon-socket/socket".to_string());
+        let is_socket = fs::metadata(&socket_path)
             .map(|m| {
                 use std::os::unix::fs::FileTypeExt;
                 m.file_type().is_socket()
@@ -2979,7 +3175,7 @@ fn run() -> Result<i32> {
         Err(e) => {
             cleanup_guard.clear_status();
             if want_programmatic {
-                emit_programmatic_json(1, "", &format!("Failed to run podman: {}", e));
+                emit_programmatic_json(1, "", &format!("Failed to run podman: {}", e), None, None);
             } else {
                 eprintln!("Failed to run podman: {}", e);
             }
@@ -3028,6 +3224,8 @@ fn run() -> Result<i32> {
                         exit_code,
                         &String::from_utf8_lossy(&stdout_bytes),
                         err_msg.trim(),
+                        None,
+                        None,
                     );
                 } else {
                     eprintln!(
@@ -3058,6 +3256,8 @@ fn run() -> Result<i32> {
                         1,
                         &String::from_utf8_lossy(&stdout_bytes),
                         err_msg.trim(),
+                        None,
+                        None,
                     );
                 } else {
                     eprintln!("agent-sandbox: could not check sandbox readiness: {}", e);
@@ -3088,6 +3288,8 @@ fn run() -> Result<i32> {
                 1,
                 &String::from_utf8_lossy(&stdout_bytes),
                 err_msg.trim(),
+                None,
+                None,
             );
         } else {
             eprintln!(
@@ -3102,7 +3304,7 @@ fn run() -> Result<i32> {
         let exit_code = match status {
             Ok(st) => st.code().unwrap_or(1),
             Err(e) => {
-                emit_programmatic_json(1, "", &format!("Failed to wait for podman: {}", e));
+                emit_programmatic_json(1, "", &format!("Failed to wait for podman: {}", e), None, None);
                 return Ok(1);
             }
         };
@@ -3112,10 +3314,13 @@ fn run() -> Result<i32> {
         let stderr_bytes = stderr_handle
             .map(|h| h.join().unwrap_or_default())
             .unwrap_or_default();
+        let net = cleanup_guard.collect_programmatic_network();
         emit_programmatic_json(
             exit_code,
             &String::from_utf8_lossy(&stdout_bytes),
             &String::from_utf8_lossy(&stderr_bytes),
+            Some(net),
+            None,
         );
         Ok(exit_code)
     } else {

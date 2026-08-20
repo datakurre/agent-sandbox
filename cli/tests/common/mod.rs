@@ -129,6 +129,10 @@ impl World {
             ("AGENT_SANDBOX_IMAGE".into(), TEST_IMAGE.into()),
             ("AGENT_SANDBOX_AGENT_SPECS".into(), TEST_AGENT_SPECS.into()),
             (
+                "AGENT_SANDBOX_NIX_DAEMON_SOCKET".into(),
+                root.join("run/nonexistent-nix-socket").display().to_string(),
+            ),
+            (
                 "STUB_PODMAN_LOG".into(),
                 root.join("podman.log").display().to_string(),
             ),
