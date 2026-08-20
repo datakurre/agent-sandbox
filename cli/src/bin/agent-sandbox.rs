@@ -275,6 +275,12 @@ fn serve_host_port(socket: &Path, host_port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
+fn selinux_is_enforcing() -> bool {
+    fs::read_to_string("/sys/fs/selinux/enforce")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
 /// Whether a `[ports]` bind address is loopback, which is what decides if a
 /// published port is compatible with `--proxy`.  `parse_ports` has already
 /// reduced the field to an IP literal (`"localhost"` included), so anything
@@ -2407,6 +2413,18 @@ fn run() -> Result<i32> {
             );
             eprintln!(
                 "               proxy does not see what the service on it fetches on its own."
+            );
+        }
+        if selinux_is_enforcing() {
+            eprintln!(
+                "agent-sandbox: SELinux is enforcing; host-loopback sockets may be denied inside"
+            );
+            eprintln!(
+                "               the sandbox. If connections fail, authorize this capability with:"
+            );
+            eprintln!("               sudo setsebool -P container_connect_any 1");
+            eprintln!(
+                "               Inspect AVCs with: sudo ausearch -m avc -ts recent"
             );
         }
 
