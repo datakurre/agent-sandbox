@@ -21,6 +21,13 @@ agent-sandbox opencode -- devenv shell           # devenv shell replacing openco
 agent-sandbox --privileged opencode              # nested podman inside container
 ```
 
+`pi` is the one agent not baked into the image as a Nix package: it resolves
+through `npx -y @earendil-works/pi-coding-agent` at launch. Its `--agent-mounts`
+state persists like any other agent's, but npm's own cache does not — the
+container filesystem is discarded at exit — so it fetches from the npm registry
+on every run, and under `--proxy` it needs at least `"registry.npmjs.org:443"`
+in `allowed_hosts` before it will start at all.
+
 ### Override the container command
 
 Everything after the `--` sentinel replaces the default command:
@@ -67,7 +74,7 @@ agent-sandbox = pkgs.symlinkJoin {
 
 ### Flags
 
-Most flags in the table below have a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it — the exceptions are the ones taking a value (`--policy`, `--krun-memory`, `--krun-cpus`) and `--ports-any-interface`. For sandbox launches, `--policy` requires `--proxy`; passing it without `--proxy` refuses the launch rather than turning the proxy on implicitly. `--no-policy` is different from `--no-proxy`: it keeps the deny-by-default proxy and the workspace `AGENTS.md` policy, while skipping all host-owned policy files selected before it, including the implicit per-agent policy. A later `--policy NAME` re-enables host-owned policy loading. `agent-sandbox browser --policy NAME` is separate and uses the browser's own proxy. A `--no-proxy` after `--proxy --policy NAME` still turns the sandbox proxy off, dropping the policies with it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
+Most flags in the table below have a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it. The exceptions are `--name`, `--policy`, `--krun-memory`, `--krun-cpus` and `--ports-any-interface`. Taking a value is not itself the reason: `--host-loopback-port` takes one and does have `--no-host-loopback-port`, which clears every mapping collected so far. For sandbox launches, `--policy` requires `--proxy`; passing it without `--proxy` refuses the launch rather than turning the proxy on implicitly. `--no-policy` is different from `--no-proxy`: it keeps the deny-by-default proxy and the workspace `AGENTS.md` policy, while skipping all host-owned policy files selected before it, including the implicit per-agent policy. A later `--policy NAME` re-enables host-owned policy loading. `agent-sandbox browser --policy NAME` is separate and uses the browser's own proxy. A `--no-proxy` after `--proxy --policy NAME` still turns the sandbox proxy off, dropping the policies with it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
 
 `--gpg-agent` and `--gpg-sign` were merged and removed; use `--gpg` / `--no-gpg`.
 
@@ -137,9 +144,25 @@ sandbox's own `127.0.0.1` answers from inside and refuses from the host.
 
 | Flag | What it does |
 | --- | --- |
-| `--programmatic` | Runs the agent non-interactively with the prompt read from stdin, appending agent-specific prompt arguments. Suppresses human-interactive stderr output and emits a JSON object with `status`, `stdout`, and `stderr`. |
+| `--programmatic` | Runs the agent non-interactively with the prompt read from stdin, appending agent-specific prompt arguments. Requires an agent to be named. Suppresses human-interactive stderr output and emits a JSON object on stdout. |
 | `--model NAME` | Passes the specified model to the agent (e.g., `sonnet`, `opus`, `gemini-1.5-pro`). Requires `--programmatic`. |
+| `--provider NAME` | Passes `--provider NAME` through to the agent. Requires `--programmatic`. |
+| `--session ID` | Resumes an existing agent session (`--session ID` to the agent). Requires `--programmatic`. |
+| `--fork ID` | Forks from an existing agent session (`--fork ID` to the agent). Requires `--programmatic`. |
 | `--max-ai-credits NUMBER` | Limits the amount of AI credits the `copilot` agent can spend in a single run. The run halts if this limit is reached. Requires `--programmatic`. |
+
+`--model` and `--max-ai-credits` are mapped per agent from `agents.nix`, so an
+agent that declares no equivalent argument refuses the flag rather than
+silently dropping it — `--max-ai-credits` is currently `copilot` only.
+`--provider`, `--session` and `--fork` are passed through verbatim to any agent
+that supports programmatic mode.
+
+The JSON object carries `status`, `stdout` and `stderr` on every run. A run that
+reaches the agent also carries `network`, an object with `summary` (per
+`host:port` byte counts, connection counts and verdict), `denied` (the refused
+requests) and `proposed_policy` (a pasteable `[network]` block for rules added
+live, or for the denied hosts when there were none) — empty when the launch had
+no `--proxy`. A launch that fails on policy carries `policy_error` instead.
 
 ## Reaching back to the host: `--host-loopback-port`
 

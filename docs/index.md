@@ -69,7 +69,7 @@ agent-sandbox --workspace --browser -- claude
 | Goal | Flags to add |
 |------|-------------|
 | Expose current directory at `/workspace/<name>` | `--workspace` |
-| Launch a specific agent | `agent-sandbox <agent>` (`opencode`, `claude`, `copilot`, `codex`, `antigravity`) |
+| Launch a specific agent | `agent-sandbox <agent>` (`opencode`, `claude`, `copilot`, `codex`, `antigravity`, `pi`) |
 | Reattach to a sandbox already running | `agent-sandbox ctl attach` |
 | Publish a port declared in `AGENTS.md` | `--ports` + `[ports]` in `AGENTS.md` |
 | Mount extra paths, or persist agent state | `--mounts` + `[mounts]` in `AGENTS.md`, or `--agent-mounts` |

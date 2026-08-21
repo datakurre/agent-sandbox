@@ -94,8 +94,10 @@ user for the flag that would provide it.
 | `podman` cannot reach a daemon | neither `--podman` nor `--privileged` | ask which one the task needs |
 | A tool or login disappeared | tmpfs home | `nix shell`, or a flag that persists it |
 
-`agent-sandbox ctl attach` and `ctl mounts` do not work at all against a `--krun`
-sandbox; if the user reports that, the shell has to be the sandbox's own command.
+`agent-sandbox ctl attach`, and `ctl mounts add` / `rm`, do not work against a
+`--krun` sandbox — `ctl mounts ls` / `export` still do. If the user reports that,
+the shell has to be the sandbox's own command and mounts have to be declared at
+launch.
 
 ## How to escalate
 

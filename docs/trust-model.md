@@ -42,7 +42,7 @@ If you want the agent to be able to run its own containers, `agent-sandbox` supp
 
 `--krun` runs the sandbox as a KVM microVM. Requires read/write access to `/dev/kvm` (usually the `kvm` group) and a `crun` built with libkrun. Only the sandbox becomes a VM — the proxy sidecar stays an ordinary container, so `--proxy` and every `agent-sandbox ctl` subcommand that works by label are unaffected.
 
-- `agent-sandbox ctl attach` and `agent-sandbox ctl mounts` **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `--podman-args -v ... --`.
+- `agent-sandbox ctl attach`, and `agent-sandbox ctl mounts add` / `rm`, **do not work** against a `--krun` sandbox and refuse with an explanation. crun's libkrun handler implements no `exec`, so there is no way into a running guest; and a host-side bind mount lands in the VMM's mount namespace where the guest cannot see it — `mounts add` would otherwise report success and change nothing. The read-only half, `ctl mounts ls` and `ctl mounts export`, still works. Run the shell as the sandbox's own command (`agent-sandbox --krun -- bash`), and declare mounts up front with `--podman-args -v ... --`.
 - `--podman` is refused under `--krun`; `--privileged` and `--selinux` are accepted with a warning that they are unverified against a guest.
 
 The boundary it adds is **additive, not substitutive** — this is the whole of what it is for, and it is easy to overstate.
