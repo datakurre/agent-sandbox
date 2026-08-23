@@ -23,7 +23,11 @@ use std::process::Command as ProcessCommand;
 use std::thread;
 use tempfile::Builder;
 
-static PROGRAMMATIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Set from `--json`/`--no-json`. `--prompt` (agent input sourcing) is orthogonal and does
+// not touch this: a piped prompt with human-readable output is a legitimate combination,
+// so only the output-format flag suppresses status/warning chatter and switches `fail`
+// and `refuse` to the JSON envelope.
+static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -570,34 +574,44 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--tmpfs SPEC", None, "mount a tmpfs through podman (repeatable)");
     println!("\nProgrammatic mode:");
     print_help_option(
-        "--programmatic",
+        "--prompt -",
         None,
-        "Run the agent non-interactively with prompt from stdin; return JSON {status, stdout, stderr}.",
+        "Feed the named agent its prompt from stdin instead of running it interactively. '-' (stdin) is the only supported value today. Requires an agent.",
+    );
+    print_help_option(
+        "--json",
+        None,
+        "Machine-readable stdout instead of human status/log chatter. With --prompt: one JSON object {type:\"exit\", status, stdout, stderr, network, policy_error} once the agent finishes. Without --prompt (a `-- COMMAND`): one {type:\"output\", stream, line} object per output line as it happens, then a final {type:\"exit\", ...} summary -- so a long-running command still tails live.",
+    );
+    print_help_option(
+        "--no-json",
+        None,
+        "Undo an earlier --json on the same command line (human-readable output again).",
     );
     print_help_option(
         "--model NAME",
         None,
-        "Specify the model to use (requires --programmatic)",
+        "Specify the model to use (requires --prompt)",
     );
     print_help_option(
         "--provider NAME",
         None,
-        "Specify the provider to use (requires --programmatic)",
+        "Specify the provider to use (requires --prompt)",
     );
     print_help_option(
         "--session ID",
         None,
-        "Resume an existing agent session (requires --programmatic)",
+        "Resume an existing agent session (requires --prompt)",
     );
     print_help_option(
         "--fork ID",
         None,
-        "Fork from an existing agent session (requires --programmatic)",
+        "Fork from an existing agent session (requires --prompt)",
     );
     print_help_option(
         "--max-ai-credits NUMBER",
         None,
-        "Limit the amount of AI credits Copilot can spend in a programmatic run",
+        "Limit the amount of AI credits Copilot can spend in a --prompt run",
     );
     print_help_option(
         "--podman-args",
@@ -617,7 +631,12 @@ fn policy_path(home: &str, name: &str) -> Result<PathBuf> {
     launch::policy_path(home, name).map_err(|e| anyhow::anyhow!(e))
 }
 
-fn emit_programmatic_json(
+/// The single closing object of a `--json` run: `{type: "exit", status, stdout, stderr,
+/// network, policy_error}`. Used both for the whole result of a `--prompt`-buffered agent
+/// run, and for the final line of a streamed (`-- COMMAND`) run -- there, `stdout`/`stderr`
+/// are empty because that text already went out as `emit_json_output_line` calls while the
+/// command was running.
+fn emit_json_envelope(
     status: i32,
     stdout: &str,
     stderr: &str,
@@ -625,6 +644,7 @@ fn emit_programmatic_json(
     policy_error: Option<&str>,
 ) {
     let mut response = serde_json::json!({
+        "type": "exit",
         "status": status,
         "stdout": stdout,
         "stderr": stderr,
@@ -638,6 +658,117 @@ fn emit_programmatic_json(
     println!("{}", response);
 }
 
+/// One line of a streamed `--json` run's live output: `{type: "output", stream, line}`.
+fn emit_json_output_line(stream: &str, line: &str) {
+    println!("{}", serde_json::json!({"type": "output", "stream": stream, "line": line}));
+}
+
+/// How the sandboxed command's stdio is handled, derived from `--json`/`--prompt`.
+enum OutputMode {
+    /// Neither flag: podman inherits our stdio directly, nothing is captured.
+    Interactive,
+    /// `--json` with `--prompt`: capture the whole run silently, emit one JSON
+    /// envelope once it exits. Unchanged from the old `--programmatic` behaviour --
+    /// an agent's own turn is one unit of work, not a log to tail.
+    Buffered,
+    /// `--json` without `--prompt` (typically a `-- COMMAND`): emit one JSON object
+    /// per output line as it is produced, then a final summary object. What makes a
+    /// long-running build still tail live under `--json` instead of going silent
+    /// until it exits.
+    Streamed,
+}
+
+/// The reader threads draining a piped child's stdout/stderr, and what `.join()`
+/// hands back once they finish -- the accumulated text for `Buffered`, since nothing
+/// has been printed yet; nothing for `Streamed`, whose lines already went out via
+/// `emit_json_output_line` as they were read.
+enum PipedOutput {
+    Buffered {
+        stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+        stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    },
+    Streamed {
+        stdout: Option<std::thread::JoinHandle<()>>,
+        stderr: Option<std::thread::JoinHandle<()>>,
+    },
+    None,
+}
+
+impl PipedOutput {
+    fn join(self) -> (String, String) {
+        match self {
+            PipedOutput::Buffered { stdout, stderr } => {
+                let out = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
+                let err = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+                (
+                    String::from_utf8_lossy(&out).into_owned(),
+                    String::from_utf8_lossy(&err).into_owned(),
+                )
+            }
+            PipedOutput::Streamed { stdout, stderr } => {
+                if let Some(h) = stdout {
+                    let _ = h.join();
+                }
+                if let Some(h) = stderr {
+                    let _ = h.join();
+                }
+                (String::new(), String::new())
+            }
+            PipedOutput::None => (String::new(), String::new()),
+        }
+    }
+}
+
+fn spawn_buffered_reader<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    stream.map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut s, &mut buf);
+            buf
+        })
+    })
+}
+
+/// Reads complete lines as they arrive and emits each immediately as a `type:
+/// "output"` JSON line. Bytes rather than `BufRead::lines()`, which yields
+/// `Err(InvalidData)` on the first non-UTF-8 byte and would leave the loop with no
+/// way to keep reading -- one stray byte from a build tool (a latin-1 filename, a
+/// progress spinner) would silently swallow the whole rest of the run while the
+/// closing envelope still reported success. `read_until` has no chunk-size ceiling
+/// either, so an oversized single line (a LaTeX log line, say) is still read whole
+/// rather than truncated.
+fn spawn_streamed_reader<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+    stream_name: &'static str,
+) -> Option<std::thread::JoinHandle<()>> {
+    stream.map(|s| {
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(s);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        // Same trimming `lines()` does: drop the delimiter, and the
+                        // `\r` of a CRLF pair with it.
+                        if buf.last() == Some(&b'\n') {
+                            buf.pop();
+                            if buf.last() == Some(&b'\r') {
+                                buf.pop();
+                            }
+                        }
+                        emit_json_output_line(stream_name, &String::from_utf8_lossy(&buf));
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    })
+}
+
 struct CleanupGuard {
     sidecar_id: String,
     sidecar_shared: String,
@@ -648,11 +779,14 @@ struct CleanupGuard {
     session_word: String,
     policies: Vec<String>,
     status_line: StatusLine,
-    programmatic: bool,
+    /// Suppress human status/log chatter because `--json` was requested: stdout must
+    /// stay pure JSON output for a machine consumer. Independent of `--prompt`, which
+    /// only controls where the agent's own prompt comes from.
+    quiet: bool,
 }
 
 impl CleanupGuard {
-    fn collect_programmatic_network(&self) -> serde_json::Value {
+    fn collect_network_summary(&self) -> serde_json::Value {
         if self.sidecar_shared.is_empty() {
             return serde_json::json!({
                 "summary": [],
@@ -754,19 +888,19 @@ impl CleanupGuard {
 
 struct StartupInfo {
     header_printed: bool,
-    programmatic: bool,
+    quiet: bool,
 }
 
 impl StartupInfo {
-    fn new(programmatic: bool) -> Self {
+    fn new(quiet: bool) -> Self {
         StartupInfo {
             header_printed: false,
-            programmatic,
+            quiet,
         }
     }
 
     fn policy(&mut self, message: &str) {
-        if self.programmatic {
+        if self.quiet {
             return;
         }
         if !self.header_printed {
@@ -797,7 +931,7 @@ impl CleanupGuard {
             status_line: StatusLine::new(
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             ),
-            programmatic: false,
+            quiet: false,
         }
     }
 
@@ -966,14 +1100,14 @@ impl CleanupGuard {
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        if !self.programmatic {
+        if !self.quiet {
             self.status("closing sandbox");
         }
 
         if self.sidecar_id.is_empty() {
             // A session can have host-port sockets without ever having had a
             // proxy; those are still resources that must be removed.
-            if !self.programmatic {
+            if !self.quiet {
                 self.status("removing resources");
             }
             if !self.host_port_dir.is_empty() {
@@ -982,13 +1116,13 @@ impl Drop for CleanupGuard {
             if !self.status_dir.is_empty() {
                 let _ = fs::remove_dir_all(&self.status_dir);
             }
-            if !self.programmatic {
+            if !self.quiet {
                 self.status_line.success("closed (resources released)");
             }
             return;
         }
 
-        if !self.programmatic {
+        if !self.quiet {
             self.status("stopping proxy");
         }
         let _ = self.run_status_command(
@@ -1002,7 +1136,7 @@ impl Drop for CleanupGuard {
             "stopping proxy",
         );
 
-        if !self.sidecar_shared.is_empty() && !self.programmatic {
+        if !self.sidecar_shared.is_empty() && !self.quiet {
             let log = format!("{}/connections.jsonl", self.sidecar_shared);
             let records = match File::open(&log) {
                 Ok(file) => net_summary::read_records(BufReader::new(file)),
@@ -1025,7 +1159,7 @@ impl Drop for CleanupGuard {
             self.save_log(&log, had_failures);
         }
 
-        if !self.programmatic {
+        if !self.quiet {
             self.status("removing resources");
         }
         if !self.host_port_dir.is_empty() {
@@ -1062,7 +1196,7 @@ impl Drop for CleanupGuard {
                 let _ = fs::remove_dir_all(dir);
             }
         }
-        if !self.programmatic {
+        if !self.quiet {
             self.status_line
                 .success("closed (proxy stopped, resources released)");
         }
@@ -1136,13 +1270,13 @@ fn is_policy_error(message: &str) -> bool {
 /// network -- a leaked one holds a subnet from the rootless pool until
 /// `agent-sandbox ctl purge` takes it back.
 fn fail(message: &str) -> ! {
-    if PROGRAMMATIC.load(std::sync::atomic::Ordering::Relaxed) {
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
         let policy_err = if is_policy_error(message) {
             Some(message)
         } else {
             None
         };
-        emit_programmatic_json(1, "", message, None, policy_err);
+        emit_json_envelope(1, "", message, None, policy_err);
     } else {
         eprintln!("{}", message);
     }
@@ -1156,13 +1290,13 @@ fn should_prompt_for_log(stdin_is_terminal: bool, stdout_is_terminal: bool) -> b
 /// Same, for after: prints and hands back the exit code, so the caller's
 /// `return` runs the cleanup on its way out.
 fn refuse(message: &str) -> Result<i32> {
-    if PROGRAMMATIC.load(std::sync::atomic::Ordering::Relaxed) {
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
         let policy_err = if is_policy_error(message) {
             Some(message)
         } else {
             None
         };
-        emit_programmatic_json(1, "", message, None, policy_err);
+        emit_json_envelope(1, "", message, None, policy_err);
     } else {
         eprintln!("{}", message);
     }
@@ -1188,7 +1322,10 @@ fn run() -> Result<i32> {
     let mut want_ports = false;
     let mut want_ports_any_interface = false;
     let mut want_shared_network = false;
-    let mut want_programmatic = false;
+    // `--prompt -`: feed the named agent its prompt from stdin (requires an agent).
+    let mut want_prompt_stdin = false;
+    // `--json`: machine-readable stdout. Orthogonal to want_prompt_stdin -- see JSON_OUTPUT.
+    let mut want_json = false;
     let mut want_model: Option<String> = None;
     let mut want_session: Option<String> = None;
     let mut want_fork: Option<String> = None;
@@ -1224,14 +1361,18 @@ fn run() -> Result<i32> {
 
     let krun_runtime =
         env::var("AGENT_SANDBOX_KRUN_RUNTIME").unwrap_or_else(|_| "krun".to_string());
-    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\ncodex\t[\"codex\",\".\"]\t[\".codex\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\npi\t[\"pi\",\".\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\",\"-\"]\t[\"--model\"]\t[]".to_string();
+    // Only reached when the nix launcher wrapper did not export
+    // AGENT_SANDBOX_AGENT_SPECS -- i.e. someone running the raw binary. It is a hand
+    // copy of agents.nix and has drifted from it before; keep the two in step when an
+    // agent's command or prompt arguments change.
+    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\ncodex\t[\"codex\"]\t[\".codex\"]\t[]\t[\"exec\",\"-\"]\t[\"--model\"]\t[]\npi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]".to_string();
     let agent_specs_str = env::var("AGENT_SANDBOX_AGENT_SPECS").unwrap_or(default_agent_specs);
 
     let mut agent_names = Vec::new();
     let mut agent_cmd_json = HashMap::new();
     let mut agent_state_json = HashMap::new();
     let mut agent_state_files_json = HashMap::new();
-    let mut agent_programmatic_json = HashMap::new();
+    let mut agent_prompt_args_json = HashMap::new();
     let mut agent_model_arg_json = HashMap::new();
     let mut agent_credit_limit_arg_json = HashMap::new();
 
@@ -1247,7 +1388,7 @@ fn run() -> Result<i32> {
             agent_state_json.insert(name.clone(), parts[2].to_string());
             agent_state_files_json.insert(name.clone(), parts[3].to_string());
             if parts.len() >= 5 {
-                agent_programmatic_json.insert(name.clone(), parts[4].to_string());
+                agent_prompt_args_json.insert(name.clone(), parts[4].to_string());
             }
             if parts.len() >= 6 {
                 agent_model_arg_json.insert(name.clone(), parts[5].to_string());
@@ -1290,8 +1431,8 @@ fn run() -> Result<i32> {
             let mut i = 0;
             while i < pre_dash.len() {
                 match pre_dash[i].as_str() {
-                    "--name" | "--model" | "--provider" | "--session" | "--fork"
-                    | "--max-ai-credits" | "--krun-memory" | "--krun-cpus"
+                    "--name" | "--prompt" | "--model" | "--provider" | "--session"
+                    | "--fork" | "--max-ai-credits" | "--krun-memory" | "--krun-cpus"
                     | "-e" | "--env" | "-v" | "--volume" | "--mount" | "-p" | "--publish"
                     | "--add-host" | "--env-file" | "--hostname" | "--tmpfs"
                     | "--host-loopback-port" | "--policy" => {
@@ -1372,13 +1513,25 @@ fn run() -> Result<i32> {
 
         match arg.as_str() {
             "-h" | "--help" | "help" => want_help = true,
-            "--programmatic" => {
-                want_programmatic = true;
-                PROGRAMMATIC.store(true, std::sync::atomic::Ordering::Relaxed);
+            "--prompt" => {
+                if i + 1 < args.len() {
+                    let value = args[i + 1].clone();
+                    if value != "-" {
+                        fail("agent-sandbox: --prompt only supports '-' (read the prompt from stdin) today.");
+                    }
+                    want_prompt_stdin = true;
+                    i += 1;
+                } else {
+                    fail("agent-sandbox: --prompt requires a value");
+                }
             }
-            "--no-programmatic" => {
-                want_programmatic = false;
-                PROGRAMMATIC.store(false, std::sync::atomic::Ordering::Relaxed);
+            "--json" => {
+                want_json = true;
+                JSON_OUTPUT.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            "--no-json" => {
+                want_json = false;
+                JSON_OUTPUT.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             "--model" => {
                 if i + 1 < args.len() {
@@ -1821,15 +1974,15 @@ fn run() -> Result<i32> {
         }
     }
 
-    if want_programmatic {
+    if want_prompt_stdin {
         if agent.is_empty() {
-            fail("agent-sandbox: --programmatic requires an agent to be specified.");
+            fail("agent-sandbox: --prompt requires an agent to be specified.");
         }
-        let prog_args: Vec<String> = match agent_programmatic_json.get(&agent) {
+        let prog_args: Vec<String> = match agent_prompt_args_json.get(&agent) {
             Some(s) => match serde_json::from_str(s) {
                 Ok(v) => v,
                 Err(_) => fail(&format!(
-                    "agent-sandbox: invalid programmatic args for agent '{}'",
+                    "agent-sandbox: invalid prompt args for agent '{}'",
                     agent
                 )),
             },
@@ -1837,7 +1990,7 @@ fn run() -> Result<i32> {
         };
         if prog_args.is_empty() {
             fail(&format!(
-                "agent-sandbox: agent '{}' does not support programmatic execution.",
+                "agent-sandbox: agent '{}' does not support --prompt (stdin) execution.",
                 agent
             ));
         }
@@ -1889,19 +2042,19 @@ fn run() -> Result<i32> {
         }
     } else {
         if want_model.is_some() {
-            fail("agent-sandbox: --model requires --programmatic to be specified.");
+            fail("agent-sandbox: --model requires --prompt to be specified.");
         }
         if want_session.is_some() {
-            fail("agent-sandbox: --session requires --programmatic to be specified.");
+            fail("agent-sandbox: --session requires --prompt to be specified.");
         }
         if want_fork.is_some() {
-            fail("agent-sandbox: --fork requires --programmatic to be specified.");
+            fail("agent-sandbox: --fork requires --prompt to be specified.");
         }
         if want_provider.is_some() {
-            fail("agent-sandbox: --provider requires --programmatic to be specified.");
+            fail("agent-sandbox: --provider requires --prompt to be specified.");
         }
         if want_max_ai_credits.is_some() {
-            fail("agent-sandbox: --max-ai-credits requires --programmatic to be specified.");
+            fail("agent-sandbox: --max-ai-credits requires --prompt to be specified.");
         }
     }
 
@@ -2368,7 +2521,7 @@ fn run() -> Result<i32> {
 
     let mut merged_policy = agents::ProxyPolicy::default();
     merged_policy.default = vec!["deny".to_string()];
-    let mut startup_info = StartupInfo::new(want_programmatic);
+    let mut startup_info = StartupInfo::new(want_json);
 
     if use_agents_network && agents_md_path.exists() {
         let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
@@ -2534,19 +2687,19 @@ fn run() -> Result<i32> {
         }
     }
 
-    if !want_programmatic && !want_proxy && (proxy_configured || secrets_configured) {
+    if !want_json && !want_proxy && (proxy_configured || secrets_configured) {
         eprintln!("agent-sandbox: warning: [network] rules or secrets are configured in AGENTS.md, but proxy is not active.");
         eprintln!("               Launch with --proxy to enforce them.");
     }
 
-    if !want_programmatic && want_proxy && !want_secrets && secrets_configured {
+    if !want_json && want_proxy && !want_secrets && secrets_configured {
         eprintln!("agent-sandbox: warning: secrets are configured in AGENTS.md [[network.allowed_routes]], but --secrets is not active.");
         eprintln!("               Launch with --secrets to enable them.");
     }
 
     let mut cleanup_guard = CleanupGuard::new();
-    if want_programmatic {
-        cleanup_guard.programmatic = true;
+    if want_json {
+        cleanup_guard.quiet = true;
         cleanup_guard.status_line.enabled = false;
     }
     cleanup_guard.status("starting sandbox");
@@ -3074,8 +3227,14 @@ fn run() -> Result<i32> {
     let mut podman_cmd = ProcessCommand::new("podman");
     podman_cmd.arg("run").arg("--rm").arg("--interactive");
     // Only allocate a TTY when there is one to allocate, so piped and CI
-    // invocations still work.
-    if !want_programmatic && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    // invocations still work. `want_prompt_stdin` is redundant with the terminal
+    // check in practice (a piped prompt means stdin isn't a terminal either), but
+    // stated explicitly so the no-TTY guarantee doesn't depend on that coincidence.
+    if !want_json
+        && !want_prompt_stdin
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
         podman_cmd.arg("--tty");
     }
     podman_cmd.args(["--userns=keep-id", "--name", &container_name]);
@@ -3162,7 +3321,15 @@ fn run() -> Result<i32> {
     podman_cmd.arg(&image);
     podman_cmd.args(&cmd_args);
 
-    if want_programmatic {
+    let output_mode = if !want_json {
+        OutputMode::Interactive
+    } else if want_prompt_stdin {
+        OutputMode::Buffered
+    } else {
+        OutputMode::Streamed
+    };
+
+    if !matches!(output_mode, OutputMode::Interactive) {
         podman_cmd.stdout(std::process::Stdio::piped());
         podman_cmd.stderr(std::process::Stdio::piped());
     }
@@ -3174,27 +3341,27 @@ fn run() -> Result<i32> {
         Ok(child) => child,
         Err(e) => {
             cleanup_guard.clear_status();
-            if want_programmatic {
-                emit_programmatic_json(1, "", &format!("Failed to run podman: {}", e), None, None);
+            if !matches!(output_mode, OutputMode::Interactive) {
+                emit_json_envelope(1, "", &format!("Failed to run podman: {}", e), None, None);
             } else {
                 eprintln!("Failed to run podman: {}", e);
             }
             return Ok(1);
         }
     };
-    let stdout_handle = child.stdout.take().map(|mut out| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut out, &mut buf);
-            buf
-        })
-    });
-    let stderr_handle = child.stderr.take().map(|mut err| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut err, &mut buf);
-            buf
-        })
+    // `.take()`n from whichever of the several early-return branches below actually
+    // runs; every branch owns the same reader threads, just via a `Option` that lets
+    // more than one branch compile against the same binding.
+    let mut piped = Some(match output_mode {
+        OutputMode::Buffered => PipedOutput::Buffered {
+            stdout: spawn_buffered_reader(child.stdout.take()),
+            stderr: spawn_buffered_reader(child.stderr.take()),
+        },
+        OutputMode::Streamed => PipedOutput::Streamed {
+            stdout: spawn_streamed_reader(child.stdout.take(), "stdout"),
+            stderr: spawn_streamed_reader(child.stderr.take(), "stderr"),
+        },
+        OutputMode::Interactive => PipedOutput::None,
     });
 
     let ready_path = format!("{}/ready", status_dir);
@@ -3206,27 +3373,16 @@ fn run() -> Result<i32> {
             Ok(Some(status)) => {
                 cleanup_guard.clear_status();
                 let exit_code = status.code().unwrap_or(1);
-                if want_programmatic {
-                    let stdout_bytes = stdout_handle
-                        .map(|h| h.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    let stderr_bytes = stderr_handle
-                        .map(|h| h.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    let mut err_msg = String::from_utf8_lossy(&stderr_bytes).to_string();
+                if !matches!(output_mode, OutputMode::Interactive) {
+                    let (out, err) = piped.take().unwrap_or(PipedOutput::None).join();
+                    let mut err_msg = err;
                     if err_msg.is_empty() {
                         err_msg = format!(
                             "agent-sandbox: command exited before the sandbox became ready ({}).",
                             status
                         );
                     }
-                    emit_programmatic_json(
-                        exit_code,
-                        &String::from_utf8_lossy(&stdout_bytes),
-                        err_msg.trim(),
-                        None,
-                        None,
-                    );
+                    emit_json_envelope(exit_code, &out, err_msg.trim(), None, None);
                 } else {
                     eprintln!(
                         "agent-sandbox: command exited before the sandbox became ready ({}).",
@@ -3240,25 +3396,13 @@ fn run() -> Result<i32> {
                 cleanup_guard.clear_status();
                 let _ = child.kill();
                 let _ = child.wait();
-                if want_programmatic {
-                    let stdout_bytes = stdout_handle
-                        .map(|h| h.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    let stderr_bytes = stderr_handle
-                        .map(|h| h.join().unwrap_or_default())
-                        .unwrap_or_default();
+                if !matches!(output_mode, OutputMode::Interactive) {
+                    let (out, err) = piped.take().unwrap_or(PipedOutput::None).join();
                     let err_msg = format!(
                         "agent-sandbox: could not check sandbox readiness: {}\n{}",
-                        e,
-                        String::from_utf8_lossy(&stderr_bytes)
+                        e, err
                     );
-                    emit_programmatic_json(
-                        1,
-                        &String::from_utf8_lossy(&stdout_bytes),
-                        err_msg.trim(),
-                        None,
-                        None,
-                    );
+                    emit_json_envelope(1, &out, err_msg.trim(), None, None);
                 } else {
                     eprintln!("agent-sandbox: could not check sandbox readiness: {}", e);
                 }
@@ -3272,25 +3416,13 @@ fn run() -> Result<i32> {
     if let Err(e) = fs::write(format!("{}/ack", status_dir), "ack\n") {
         let _ = child.kill();
         let _ = child.wait();
-        if want_programmatic {
-            let stdout_bytes = stdout_handle
-                .map(|h| h.join().unwrap_or_default())
-                .unwrap_or_default();
-            let stderr_bytes = stderr_handle
-                .map(|h| h.join().unwrap_or_default())
-                .unwrap_or_default();
+        if !matches!(output_mode, OutputMode::Interactive) {
+            let (out, err) = piped.take().unwrap_or(PipedOutput::None).join();
             let err_msg = format!(
                 "agent-sandbox: could not acknowledge sandbox readiness: {}\n{}",
-                e,
-                String::from_utf8_lossy(&stderr_bytes)
+                e, err
             );
-            emit_programmatic_json(
-                1,
-                &String::from_utf8_lossy(&stdout_bytes),
-                err_msg.trim(),
-                None,
-                None,
-            );
+            emit_json_envelope(1, &out, err_msg.trim(), None, None);
         } else {
             eprintln!(
                 "agent-sandbox: could not acknowledge sandbox readiness: {}",
@@ -3299,29 +3431,18 @@ fn run() -> Result<i32> {
         }
         return Ok(1);
     }
-    if want_programmatic {
+    if !matches!(output_mode, OutputMode::Interactive) {
         let status = child.wait();
         let exit_code = match status {
             Ok(st) => st.code().unwrap_or(1),
             Err(e) => {
-                emit_programmatic_json(1, "", &format!("Failed to wait for podman: {}", e), None, None);
+                emit_json_envelope(1, "", &format!("Failed to wait for podman: {}", e), None, None);
                 return Ok(1);
             }
         };
-        let stdout_bytes = stdout_handle
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
-        let stderr_bytes = stderr_handle
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
-        let net = cleanup_guard.collect_programmatic_network();
-        emit_programmatic_json(
-            exit_code,
-            &String::from_utf8_lossy(&stdout_bytes),
-            &String::from_utf8_lossy(&stderr_bytes),
-            Some(net),
-            None,
-        );
+        let (out, err) = piped.take().unwrap_or(PipedOutput::None).join();
+        let net = cleanup_guard.collect_network_summary();
+        emit_json_envelope(exit_code, &out, &err, Some(net), None);
         Ok(exit_code)
     } else {
         match child.wait() {
