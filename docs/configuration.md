@@ -231,46 +231,53 @@ easy to mix them up:
    `--secrets`/`--proxy` involved. This is the simplest option when you are
    fine with the sandbox holding the key itself.
 2. **Route-scoped secret injection** (this section), for when you deliberately
-   do *not* want the real key inside the sandbox at all. Pi is configured with
-   a dummy key pointed at the real endpoint; the proxy swaps in the real
-   `Authorization` header only on requests matching an authorized route.
+   do *not* want the real key inside the sandbox at all. Pi is given a
+   placeholder credential pointed at the real endpoint; the proxy swaps in the
+   real `Authorization` header only on requests matching an authorized route.
 
 The two coexist without conflict — they configure different provider entries,
-so a real `/login` credential for one provider and a dummy-keyed, proxy-backed
-provider for another can both be present at once.
+so a real `/login` credential for one provider and a placeholder-keyed,
+proxy-backed provider for another can both be present at once.
 
-For option 2, define a custom provider with a dummy key and the real
-`baseUrl`. For example, to configure Pi for OpenCode Zen, place this in
-`.pi/models.json` (or `~/.pi/agent/models.json` globally):
+Option 2 splits further, by where the placeholder credential lives, which
+follows from Pi's own credential resolution order (CLI flag, then
+`~/.pi/agent/auth.json`, then environment variable, then a `models.json`
+provider's inline `apiKey`):
 
-```json
-{
-  "providers": {
-    "opencode-zen": {
-      "baseUrl": "https://opencode.ai/zen/v1",
-      "api": "openai-completions",
-      "apiKey": "dummy-proxy-placeholder",
-      "models": [
-        { "id": "zen-default", "name": "OpenCode Zen Default" }
-      ]
+- **A provider Pi ships natively** — `opencode` (OpenCode Zen), `opencode-go`,
+  and most others in Pi's [provider docs](https://github.com/earendil-works/pi-mono/blob/main/packages/ai/src/env-api-keys.ts)
+  — reads its key from an environment variable (`OPENCODE_API_KEY` for both
+  OpenCode providers). No `models.json` entry is needed at all: run with
+  `--proxy --secrets --provider opencode --model <id> -e OPENCODE_API_KEY=placeholder`.
+  Pi only checks that the variable is non-empty before it will build the
+  request; the byte value never leaves the sandbox because the matching
+  `[[network.allowed_routes]]` rule (the OpenCode Zen example above) has the
+  proxy replace the header in flight. Pi's own built-in catalog for the
+  provider (refreshed live, cached in `~/.pi/agent/models-store.json`) already
+  lists every callable model, so `--model` takes any id from there.
+- **A provider Pi does not ship** — a self-hosted endpoint, or one Pi has no
+  native entry for — has no environment variable to hook, so define it as a
+  custom provider instead, with a placeholder `apiKey` and the real `baseUrl`,
+  in `.pi/models.json` (or `~/.pi/agent/models.json` globally):
+
+  ```json
+  {
+    "providers": {
+      "my-proxied-provider": {
+        "baseUrl": "https://example.com/v1",
+        "api": "openai-completions",
+        "apiKey": "placeholder",
+        "models": [
+          { "id": "my-model", "name": "My Model" }
+        ]
+      }
     }
   }
-}
-```
-Set `"defaultProvider": "opencode-zen"` and `"defaultModel": "zen-default"` in
-`.pi/settings.json`, and run the sandbox with `--proxy --secrets`.
-
-The image ships `~/.pi/agent/models.json` pre-seeded with an `opencode-zen`
-provider listing every model in [OpenCode Zen's public catalog](https://opencode.ai/zen/v1/models)
-(that endpoint is unauthenticated — it lists what exists, not what your key can
-call), written once on first launch and never touched again after, so any edits you
-make to it — by hand, or by adding another provider — are left alone on every
-later launch. Select any of those models directly with `--provider opencode-zen --model
-<id>`; one your key is not entitled to fails at call time with whatever error
-OpenCode Zen gives for that, the same as if you had typed an unknown id by
-hand. A project-local `.pi/models.json` always takes precedence over the
-global one, and is where you add a provider for a different route (like
-`opencode-go`) that the pre-seeded file does not cover.
+  ```
+  Set `"defaultProvider"`/`"defaultModel"` in `.pi/settings.json` to match, or
+  pass `--provider my-proxied-provider --model my-model` on the command line,
+  and run with `--proxy --secrets`. A project-local `.pi/models.json` always
+  takes precedence over the global one.
 
 #### SSH host keys
 

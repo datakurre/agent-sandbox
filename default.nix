@@ -132,6 +132,7 @@ let
         (builtins.toJSON (a.forkArg or [ ]))
         (builtins.toJSON (a.providerArg or [ ]))
         (builtins.toJSON (a.stateFileSeeds or { }))
+        (builtins.toJSON (a.jsonArgs or [ ]))
       ]
     ) agents
   );

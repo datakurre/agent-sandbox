@@ -7,19 +7,37 @@
 # the user's value goes; with no `{}` it is appended, which is the common
 # `--model NAME` shape.
 #
+# `jsonArgs` is the one entry that carries no user value: it is how an agent is
+# told to speak JSON, spliced in when the launcher itself was asked for `--json`,
+# so the agent's own output can go into the result envelope as JSON instead of as
+# a string of escaped JSON. An agent without it is not refused -- its output is
+# just text, and the envelope keeps reporting it as a string.
+#
 # The shape of this file is checked at build time against ./agents-schema.json.
 { pkgs }:
 [
   {
     name = "opencode";
     package = pkgs.opencode;
+    # No ".": the bare command is opencode's TUI, whose `[project]` positional
+    # already defaults to the cwd the sandbox starts it in -- and a positional is
+    # in the way of `run` below.
     command = [
       "opencode"
-      "."
     ];
+    # `opencode run` ("run opencode with a message"), not the TUI's `--prompt`.
+    # The top-level command is the TUI: given `--prompt -` it took "-" as the
+    # prompt *text* and still tried to start the interface, which without a tty
+    # printed the usage banner and exited 1 -- so this agent had no working
+    # programmatic mode at all. `run` takes its message from stdin when no
+    # message positional is given, which is exactly what `--prompt -` asks for,
+    # and it is the only form that has `--format json`.
     programmaticArgs = [
-      "--prompt"
-      "-"
+      "run"
+    ];
+    jsonArgs = [
+      "--format"
+      "json"
     ];
     modelArg = [
       "--model"
@@ -50,6 +68,13 @@
       "-p"
       "-"
     ];
+    # "json (single result)"; the alternative, "stream-json", additionally
+    # requires --verbose and emits the same turn as a line per event. One result
+    # object per run is the closer match to what a buffered --prompt run reports.
+    jsonArgs = [
+      "--output-format"
+      "json"
+    ];
     modelArg = [
       "--model"
     ];
@@ -78,6 +103,11 @@
       "-p"
       "-"
     ];
+    # "'text' (default) or 'json' (JSONL, one JSON object per line)".
+    jsonArgs = [
+      "--output-format"
+      "json"
+    ];
     modelArg = [
       "--model"
     ];
@@ -105,6 +135,11 @@
     programmaticArgs = [
       "--prompt"
       "-"
+    ];
+    # "Output format for print mode (text, json, stream-json)".
+    jsonArgs = [
+      "--output-format"
+      "json"
     ];
     modelArg = [
       "--model"
@@ -142,6 +177,10 @@
       "exec"
       "-"
     ];
+    # `codex exec --json`: "Print events to stdout as JSONL".
+    jsonArgs = [
+      "--json"
+    ];
     modelArg = [
       "--model"
     ];
@@ -174,9 +213,15 @@
     # the prompt automatically whenever one is piped in and no message positional is
     # given -- which is why `command` above must not add one.
     programmaticArgs = [
+      "-p"
+    ];
+    # "Output mode: text (default), json, or rpc". This lived in
+    # programmaticArgs until --json grew per-agent output flags, which meant a
+    # plain `--prompt` run -- one whose output a human reads -- got pi's event
+    # stream too. Here it follows the launcher's own --json instead.
+    jsonArgs = [
       "--mode"
       "json"
-      "-p"
     ];
     modelArg = [
       "--model"
@@ -190,31 +235,23 @@
     providerArg = [
       "--provider"
     ];
+    # No stateFiles/stateFileSeeds: pi ships its own built-in catalogs for
+    # known providers (opencode, opencode-go, ...) and refreshes them itself,
+    # cached under .pi/agent/models-store.json -- which the whole-directory
+    # ".pi" mount below already covers. An earlier revision pre-seeded a
+    # hand-copied OpenCode Zen catalog into a custom "opencode-zen" provider
+    # here on the premise that route-scoped secret injection needed a
+    # models.json-defined provider to carry its dummy key. It doesn't: pi's
+    # built-in "opencode"/"opencode-go" providers already read their key from
+    # $OPENCODE_API_KEY (docs/providers.md's credential resolution order),
+    # so a plain `-e OPENCODE_API_KEY=<placeholder>` satisfies pi's own
+    # pre-flight check and the proxy still swaps in the real header per
+    # matched route -- see the Pi section in docs/configuration.md.
     state = [
       ".pi"
       ".local/share/pi"
       ".config/pi"
       ".cache/pi"
     ];
-    # Nested inside the ".pi" state dir above on purpose: state dirs are a
-    # whole-directory bind mount from the host, so anything the image puts
-    # under .pi is invisible the moment that mount lands, and a host that has
-    # never run pi starts with nothing there.  A stateFiles entry mounts the
-    # single file over the top of that directory mount, seeded once (see
-    # stateFileSeeds) and left alone on every launch after -- the same
-    # "carve a file out of an otherwise host-owned tree" pattern antigravity
-    # uses for .gemini/config/config.json.
-    stateFiles = [ ".pi/agent/models.json" ];
-    # OpenCode's own model catalog is public and unauthenticated at
-    # https://opencode.ai/zen/v1/models -- what a real API key restricts is
-    # *calling* a model, not seeing that it exists. Shipping the full list
-    # means every model is selectable via --provider opencode-zen --model
-    # <id> out of the box; one this account's key doesn't cover just fails
-    # at call time with whatever error OpenCode Zen gives for that, same as
-    # it would if the user had typed the id in by hand. Regenerate
-    # opencode-models.json from that endpoint when the catalog changes.
-    stateFileSeeds = {
-      ".pi/agent/models.json" = builtins.readFile ./opencode-models.json;
-    };
   }
 ]

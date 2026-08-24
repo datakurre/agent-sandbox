@@ -56,6 +56,12 @@
           "minItems": 1,
           "items": { "type": "string", "minLength": 1 }
         },
+        "jsonArgs": {
+          "description": "Arguments that switch the agent's own stdout to JSON, appended after `programmaticArgs` when the launcher is run with `--json --prompt -`. Unlike the flag mappings this carries no user value, and omitting it is not an error: the agent is simply run in its default output mode and the envelope reports its stdout as a string.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
         "modelArg": { "$ref": "#/$defs/flagMapping" },
         "sessionArg": { "$ref": "#/$defs/flagMapping" },
         "forkArg": { "$ref": "#/$defs/flagMapping" },

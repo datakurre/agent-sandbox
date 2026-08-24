@@ -581,7 +581,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option(
         "--json",
         None,
-        "Machine-readable stdout instead of human status/log chatter. With --prompt: one JSON object {type:\"exit\", status, stdout, stderr, network, policy_error} once the agent finishes. Without --prompt (a `-- COMMAND`): one {type:\"output\", stream, line} object per output line as it happens, then a final {type:\"exit\", ...} summary -- so a long-running command still tails live.",
+        "Machine-readable stdout instead of human status/log chatter. With --prompt: one JSON object {type:\"exit\", status, stdout, stdout_format, stderr, network, policy_error} once the agent finishes, and the agent itself is asked for JSON output when it has a spelling for it (agents.nix jsonArgs) -- its events then arrive in `stdout` as a JSON array (stdout_format \"json\") instead of a string of escaped JSON. Without --prompt (a `-- COMMAND`): one {type:\"output\", stream, line} object per output line as it happens, then a final {type:\"exit\", ...} summary -- so a long-running command still tails live.",
     );
     print_help_option(
         "--no-json",
@@ -692,22 +692,62 @@ fn policy_path(home: &str, name: &str) -> Result<PathBuf> {
     launch::policy_path(home, name).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// The single closing object of a `--json` run: `{type: "exit", status, stdout, stderr,
-/// network, policy_error}`. Used both for the whole result of a `--prompt`-buffered agent
-/// run, and for the final line of a streamed (`-- COMMAND`) run -- there, `stdout`/`stderr`
-/// are empty because that text already went out as `emit_json_output_line` calls while the
-/// command was running.
+/// How the closing envelope carries the captured stdout.
+///
+/// An agent run with its own JSON-output flags (agents.nix `jsonArgs`, spliced in by
+/// `--json`) has already produced JSON. Quoting that into a string hands the caller
+/// JSON inside JSON: every brace escaped, and a second parse needed to get at what
+/// the agent actually said. `Json` splices those values in as-is instead.
+enum StdoutPayload {
+    /// stdout as text, in a `"stdout"` string. `stdout_format` is `"text"`.
+    Text,
+    /// stdout parsed as a sequence of JSON values, in a `"stdout"` array -- one
+    /// element per JSONL event, or a single element for an agent that prints one
+    /// result object. `stdout_format` is `"json"`. Always an array, so a consumer
+    /// can iterate it without knowing which of the two shapes the agent emits.
+    Json,
+}
+
+impl StdoutPayload {
+    fn render(&self, stdout: &str) -> (serde_json::Value, &'static str) {
+        if let StdoutPayload::Json = self {
+            // A StreamDeserializer reads whitespace-separated JSON values, which
+            // covers both the JSONL every agent here emits and a pretty-printed
+            // object split over lines.
+            let parsed: Result<Vec<serde_json::Value>, _> =
+                serde_json::Deserializer::from_str(stdout)
+                    .into_iter::<serde_json::Value>()
+                    .collect();
+            // Not every failure is the agent's fault -- a crash before the first
+            // event, or a warning printed onto stdout, leaves text that is not JSON.
+            // Reporting it as the string it is beats dropping it.
+            if let Ok(values) = parsed {
+                return (serde_json::Value::Array(values), "json");
+            }
+        }
+        (serde_json::Value::String(stdout.to_string()), "text")
+    }
+}
+
+/// The single closing object of a `--json` run: `{type: "exit", status, stdout,
+/// stdout_format, stderr, network, policy_error}`. Used both for the whole result of a
+/// `--prompt`-buffered agent run, and for the final line of a streamed (`-- COMMAND`)
+/// run -- there, `stdout`/`stderr` are empty because that text already went out as
+/// `emit_json_output_line` calls while the command was running.
 fn emit_json_envelope(
     status: i32,
     stdout: &str,
+    payload: &StdoutPayload,
     stderr: &str,
     network: Option<serde_json::Value>,
     policy_error: Option<&str>,
 ) {
+    let (stdout, stdout_format) = payload.render(stdout);
     let mut response = serde_json::json!({
         "type": "exit",
         "status": status,
         "stdout": stdout,
+        "stdout_format": stdout_format,
         "stderr": stderr,
     });
     if let Some(net) = network {
@@ -1337,7 +1377,7 @@ fn fail(message: &str) -> ! {
         } else {
             None
         };
-        emit_json_envelope(1, "", message, None, policy_err);
+        emit_json_envelope(1, "", &StdoutPayload::Text, message, None, policy_err);
     } else {
         eprintln!("{}", message);
     }
@@ -1357,7 +1397,7 @@ fn refuse(message: &str) -> Result<i32> {
         } else {
             None
         };
-        emit_json_envelope(1, "", message, None, policy_err);
+        emit_json_envelope(1, "", &StdoutPayload::Text, message, None, policy_err);
     } else {
         eprintln!("{}", message);
     }
@@ -1387,6 +1427,9 @@ fn run() -> Result<i32> {
     let mut want_prompt_stdin = false;
     // `--json`: machine-readable stdout. Orthogonal to want_prompt_stdin -- see JSON_OUTPUT.
     let mut want_json = false;
+    // Set once the agent has actually been handed its own JSON-output flags, which
+    // is what lets the envelope embed its stdout as JSON instead of quoting it.
+    let mut agent_emits_json = false;
     let mut want_model: Option<String> = None;
     let mut want_session: Option<String> = None;
     let mut want_fork: Option<String> = None;
@@ -1425,11 +1468,11 @@ fn run() -> Result<i32> {
     // Only reached when the nix launcher wrapper did not export
     // AGENT_SANDBOX_AGENT_SPECS -- i.e. someone running the raw binary. It is a hand
     // copy of agents.nix and has drifted from it before; keep the two in step when an
-    // agent's command or prompt arguments change. stateFileSeeds is deliberately not
-    // reproduced here: it would mean inlining pi's whole model catalog as a Rust string
-    // literal. The raw binary still seeds every other stateFiles entry with "{}" as
-    // before; it just skips the one real default this fallback has no room for.
-    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--resume\"]\t[\"--resume\",\"{}\",\"--fork-session\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--session-id\"]\t[]\t[]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--conversation\"]\t[]\t[]\ncodex\t[\"codex\"]\t[\".codex\"]\t[]\t[\"exec\",\"-\"]\t[\"--model\"]\t[]\t[]\t[]\t[]\npi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[\".pi/agent/models.json\"]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--fork\"]\t[\"--provider\"]".to_string();
+    // agent's command, prompt arguments or JSON-output arguments change. The
+    // stateFileSeeds column (the second to last) is empty for every agent because no
+    // agent in the catalog seeds one today; a stateFiles entry with no seed is written
+    // as "{}", here as in the nix path.
+    let default_agent_specs = "opencode\t[\"opencode\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"run\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\t{}\t[\"--format\",\"json\"]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--resume\"]\t[\"--resume\",\"{}\",\"--fork-session\"]\t[]\t{}\t[\"--output-format\",\"json\"]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--session-id\"]\t[]\t[]\t{}\t[\"--output-format\",\"json\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--conversation\"]\t[]\t[]\t{}\t[\"--output-format\",\"json\"]\ncodex\t[\"codex\"]\t[\".codex\"]\t[]\t[\"exec\",\"-\"]\t[\"--model\"]\t[]\t[]\t[]\t[]\t{}\t[\"--json\"]\npi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"-p\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--fork\"]\t[\"--provider\"]\t{}\t[\"--mode\",\"json\"]".to_string();
     let agent_specs_str = env::var("AGENT_SANDBOX_AGENT_SPECS").unwrap_or(default_agent_specs);
 
     let mut agent_names = Vec::new();
@@ -1443,6 +1486,7 @@ fn run() -> Result<i32> {
     let mut agent_fork_arg_json = HashMap::new();
     let mut agent_provider_arg_json = HashMap::new();
     let mut agent_state_file_seeds_json = HashMap::new();
+    let mut agent_json_args_json = HashMap::new();
 
     for line in agent_specs_str.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
@@ -1475,6 +1519,9 @@ fn run() -> Result<i32> {
             }
             if parts.len() >= 11 {
                 agent_state_file_seeds_json.insert(name.clone(), parts[10].to_string());
+            }
+            if parts.len() >= 12 {
+                agent_json_args_json.insert(name.clone(), parts[11].to_string());
             }
         }
     }
@@ -2075,6 +2122,26 @@ fn run() -> Result<i32> {
             ));
         }
         cmd_args.extend(prog_args);
+
+        // `--json` is a statement about *this run's* stdout, so it reaches the agent
+        // too: an agent that can emit JSON is told to, and its output then goes into
+        // the closing envelope as JSON rather than as a string of escaped JSON. An
+        // agent with no jsonArgs is left in its default output mode -- unlike the
+        // value-taking flags, there is nothing the user asked for to refuse here.
+        if want_json {
+            let json_args: Vec<String> = match agent_json_args_json.get(&agent) {
+                Some(s) => match serde_json::from_str(s) {
+                    Ok(v) => v,
+                    Err(_) => fail(&format!(
+                        "agent-sandbox: invalid json args for agent '{}'",
+                        agent
+                    )),
+                },
+                None => Vec::new(),
+            };
+            agent_emits_json = !json_args.is_empty();
+            cmd_args.extend(json_args);
+        }
 
         if let Some(model) = want_model {
             cmd_args.extend(agent_flag_args(
@@ -3417,6 +3484,14 @@ fn run() -> Result<i32> {
         OutputMode::Streamed
     };
 
+    // Only a buffered agent run can carry JSON in the envelope: a streamed run's
+    // text has already left, line by line, as `{"type":"output"}` objects.
+    let stdout_payload = if agent_emits_json && matches!(output_mode, OutputMode::Buffered) {
+        StdoutPayload::Json
+    } else {
+        StdoutPayload::Text
+    };
+
     if !matches!(output_mode, OutputMode::Interactive) {
         podman_cmd.stdout(std::process::Stdio::piped());
         podman_cmd.stderr(std::process::Stdio::piped());
@@ -3430,7 +3505,14 @@ fn run() -> Result<i32> {
         Err(e) => {
             cleanup_guard.clear_status();
             if !matches!(output_mode, OutputMode::Interactive) {
-                emit_json_envelope(1, "", &format!("Failed to run podman: {}", e), None, None);
+                emit_json_envelope(
+                    1,
+                    "",
+                    &stdout_payload,
+                    &format!("Failed to run podman: {}", e),
+                    None,
+                    None,
+                );
             } else {
                 eprintln!("Failed to run podman: {}", e);
             }
@@ -3470,7 +3552,7 @@ fn run() -> Result<i32> {
                             status
                         );
                     }
-                    emit_json_envelope(exit_code, &out, err_msg.trim(), None, None);
+                    emit_json_envelope(exit_code, &out, &stdout_payload, err_msg.trim(), None, None);
                 } else {
                     eprintln!(
                         "agent-sandbox: command exited before the sandbox became ready ({}).",
@@ -3490,7 +3572,7 @@ fn run() -> Result<i32> {
                         "agent-sandbox: could not check sandbox readiness: {}\n{}",
                         e, err
                     );
-                    emit_json_envelope(1, &out, err_msg.trim(), None, None);
+                    emit_json_envelope(1, &out, &stdout_payload, err_msg.trim(), None, None);
                 } else {
                     eprintln!("agent-sandbox: could not check sandbox readiness: {}", e);
                 }
@@ -3510,7 +3592,7 @@ fn run() -> Result<i32> {
                 "agent-sandbox: could not acknowledge sandbox readiness: {}\n{}",
                 e, err
             );
-            emit_json_envelope(1, &out, err_msg.trim(), None, None);
+            emit_json_envelope(1, &out, &stdout_payload, err_msg.trim(), None, None);
         } else {
             eprintln!(
                 "agent-sandbox: could not acknowledge sandbox readiness: {}",
@@ -3524,13 +3606,20 @@ fn run() -> Result<i32> {
         let exit_code = match status {
             Ok(st) => st.code().unwrap_or(1),
             Err(e) => {
-                emit_json_envelope(1, "", &format!("Failed to wait for podman: {}", e), None, None);
+                emit_json_envelope(
+                    1,
+                    "",
+                    &stdout_payload,
+                    &format!("Failed to wait for podman: {}", e),
+                    None,
+                    None,
+                );
                 return Ok(1);
             }
         };
         let (out, err) = piped.take().unwrap_or(PipedOutput::None).join();
         let net = cleanup_guard.collect_network_summary();
-        emit_json_envelope(exit_code, &out, &err, Some(net), None);
+        emit_json_envelope(exit_code, &out, &stdout_payload, &err, Some(net), None);
         Ok(exit_code)
     } else {
         match child.wait() {
@@ -3546,6 +3635,56 @@ fn run() -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsonl_from_an_agent_becomes_one_array_element_per_event() {
+        let (value, format) =
+            StdoutPayload::Json.render("{\"type\":\"start\"}\n{\"type\":\"end\"}\n");
+        assert_eq!(format, "json");
+        assert_eq!(value, serde_json::json!([{"type": "start"}, {"type": "end"}]));
+    }
+
+    #[test]
+    fn a_single_result_object_becomes_a_one_element_array() {
+        // claude's `--output-format json` prints one object, pi's `--mode json` a
+        // line per event. Both arrive as an array, so a caller can iterate without
+        // knowing which agent produced it.
+        let (value, format) = StdoutPayload::Json.render("{\"is_error\":false}");
+        assert_eq!(format, "json");
+        assert_eq!(value, serde_json::json!([{"is_error": false}]));
+    }
+
+    #[test]
+    fn a_pretty_printed_object_spanning_lines_still_parses() {
+        let (value, format) = StdoutPayload::Json.render("{\n  \"a\": 1\n}\n");
+        assert_eq!(format, "json");
+        assert_eq!(value, serde_json::json!([{"a": 1}]));
+    }
+
+    #[test]
+    fn output_that_is_not_json_is_reported_as_the_text_it_is() {
+        let (value, format) = StdoutPayload::Json.render("panic: everything\n");
+        assert_eq!(format, "text");
+        assert_eq!(value, serde_json::json!("panic: everything\n"));
+    }
+
+    #[test]
+    fn a_trailing_non_json_line_does_not_silently_drop_the_events_before_it() {
+        // All or nothing: half an event stream reported as a clean array would be
+        // worse than the text, which at least still has the warning in it.
+        let (value, format) = StdoutPayload::Json.render("{\"type\":\"start\"}\nwarning: quota\n");
+        assert_eq!(format, "text");
+        assert_eq!(value, serde_json::json!("{\"type\":\"start\"}\nwarning: quota\n"));
+    }
+
+    #[test]
+    fn a_text_payload_is_never_parsed_even_when_it_would_have_parsed() {
+        // An agent nobody asked for JSON may still print a JSON-looking line. The
+        // envelope's shape follows what the launcher asked for, not what it got.
+        let (value, format) = StdoutPayload::Text.render("{\"looks\":\"structured\"}");
+        assert_eq!(format, "text");
+        assert_eq!(value, serde_json::json!("{\"looks\":\"structured\"}"));
+    }
 
     #[test]
     fn a_bare_host_loopback_port_maps_to_the_same_number_inside() {
