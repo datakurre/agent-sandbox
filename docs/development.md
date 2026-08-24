@@ -32,7 +32,9 @@ Add an entry to `agents.nix`. The entry drives:
 - inclusion of the agent package in the image PATH,
 - accepted agent names in the launcher,
 - command dispatch when selecting that agent,
-- persisted home-state mounts (`state` directories, `stateFiles` files),
+- persisted home-state mounts (`state` directories, `stateFiles` files, and
+  `stateFileSeeds` default content for a `stateFiles` entry, written once the
+  first time the host copy doesn't exist and never touched after),
 - how each launcher flag that reaches the agent is spelled for it
   (`modelArg`, `sessionArg`, `forkArg`, `providerArg`, `creditLimitArg`),
 - the arguments that make it read a prompt from stdin (`programmaticArgs`).

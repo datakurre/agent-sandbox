@@ -196,5 +196,25 @@
       ".config/pi"
       ".cache/pi"
     ];
+    # Nested inside the ".pi" state dir above on purpose: state dirs are a
+    # whole-directory bind mount from the host, so anything the image puts
+    # under .pi is invisible the moment that mount lands, and a host that has
+    # never run pi starts with nothing there.  A stateFiles entry mounts the
+    # single file over the top of that directory mount, seeded once (see
+    # stateFileSeeds) and left alone on every launch after -- the same
+    # "carve a file out of an otherwise host-owned tree" pattern antigravity
+    # uses for .gemini/config/config.json.
+    stateFiles = [ ".pi/agent/models.json" ];
+    # OpenCode's own model catalog is public and unauthenticated at
+    # https://opencode.ai/zen/v1/models -- what a real API key restricts is
+    # *calling* a model, not seeing that it exists. Shipping the full list
+    # means every model is selectable via --provider opencode-zen --model
+    # <id> out of the box; one this account's key doesn't cover just fails
+    # at call time with whatever error OpenCode Zen gives for that, same as
+    # it would if the user had typed the id in by hand. Regenerate
+    # opencode-models.json from that endpoint when the catalog changes.
+    stateFileSeeds = {
+      ".pi/agent/models.json" = builtins.readFile ./opencode-models.json;
+    };
   }
 ]

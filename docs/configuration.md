@@ -219,8 +219,29 @@ the exact block to paste. The proxy terminates TLS for hosts carrying a rule, so
 the sandbox trusts a per-session CA that exists only for the lifetime of that
 sandbox.
 
-For agents like **Pi**, this means you configure the agent to use a dummy key and point it at the real endpoint. The proxy injects the real credential in flight.
-For example, to configure Pi for OpenCode Zen, place this in `.pi/models.json` (or `~/.pi/agent/models.json` globally):
+### Pi: two independent ways to hold a credential
+
+**Pi** supports two unrelated ways to authenticate a model provider, and it is
+easy to mix them up:
+
+1. **Pi's own `/login`**, which writes a real credential into Pi's persisted
+   state (`.pi`, mounted across launches like any other agent's login — see
+   `--agent-mounts` in [Usage](usage.md)). The real key lives inside the
+   sandbox and travels with the container's normal home-state mount — no
+   `--secrets`/`--proxy` involved. This is the simplest option when you are
+   fine with the sandbox holding the key itself.
+2. **Route-scoped secret injection** (this section), for when you deliberately
+   do *not* want the real key inside the sandbox at all. Pi is configured with
+   a dummy key pointed at the real endpoint; the proxy swaps in the real
+   `Authorization` header only on requests matching an authorized route.
+
+The two coexist without conflict — they configure different provider entries,
+so a real `/login` credential for one provider and a dummy-keyed, proxy-backed
+provider for another can both be present at once.
+
+For option 2, define a custom provider with a dummy key and the real
+`baseUrl`. For example, to configure Pi for OpenCode Zen, place this in
+`.pi/models.json` (or `~/.pi/agent/models.json` globally):
 
 ```json
 {
@@ -236,7 +257,20 @@ For example, to configure Pi for OpenCode Zen, place this in `.pi/models.json` (
   }
 }
 ```
-Set `"defaultProvider": "opencode-zen"` and `"defaultModel": "zen-default"` in `.pi/settings.json`, and run the sandbox with `--proxy --secrets`.
+Set `"defaultProvider": "opencode-zen"` and `"defaultModel": "zen-default"` in
+`.pi/settings.json`, and run the sandbox with `--proxy --secrets`.
+
+The image ships `~/.pi/agent/models.json` pre-seeded with an `opencode-zen`
+provider listing every model in [OpenCode Zen's public catalog](https://opencode.ai/zen/v1/models)
+(that endpoint is unauthenticated — it lists what exists, not what your key can
+call), written once on first launch and never touched again after, so any edits you
+make to it — by hand, or by adding another provider — are left alone on every
+later launch. Select any of those models directly with `--provider opencode-zen --model
+<id>`; one your key is not entitled to fails at call time with whatever error
+OpenCode Zen gives for that, the same as if you had typed an unknown id by
+hand. A project-local `.pi/models.json` always takes precedence over the
+global one, and is where you add a provider for a different route (like
+`opencode-go`) that the pre-seeded file does not cover.
 
 #### SSH host keys
 

@@ -72,6 +72,12 @@
           "type": "array",
           "items": { "$ref": "#/$defs/homePath" },
           "uniqueItems": true
+        },
+        "stateFileSeeds": {
+          "description": "Default content for entries in `stateFiles`, written once on the host the first time that file does not exist yet, before it is bind-mounted in -- never overwritten afterward. A `stateFiles` entry with no key here still seeds as `{}`, unchanged from before this field existed.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/homePath" },
+          "additionalProperties": { "type": "string" }
         }
       }
     }

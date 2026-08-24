@@ -131,6 +131,7 @@ let
         (builtins.toJSON (a.sessionArg or [ ]))
         (builtins.toJSON (a.forkArg or [ ]))
         (builtins.toJSON (a.providerArg or [ ]))
+        (builtins.toJSON (a.stateFileSeeds or { }))
       ]
     ) agents
   );

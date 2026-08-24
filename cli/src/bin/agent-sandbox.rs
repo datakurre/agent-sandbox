@@ -1425,8 +1425,11 @@ fn run() -> Result<i32> {
     // Only reached when the nix launcher wrapper did not export
     // AGENT_SANDBOX_AGENT_SPECS -- i.e. someone running the raw binary. It is a hand
     // copy of agents.nix and has drifted from it before; keep the two in step when an
-    // agent's command or prompt arguments change.
-    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--resume\"]\t[\"--resume\",\"{}\",\"--fork-session\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--session-id\"]\t[]\t[]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--conversation\"]\t[]\t[]\ncodex\t[\"codex\"]\t[\".codex\"]\t[]\t[\"exec\",\"-\"]\t[\"--model\"]\t[]\t[]\t[]\t[]\npi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--fork\"]\t[\"--provider\"]".to_string();
+    // agent's command or prompt arguments change. stateFileSeeds is deliberately not
+    // reproduced here: it would mean inlining pi's whole model catalog as a Rust string
+    // literal. The raw binary still seeds every other stateFiles entry with "{}" as
+    // before; it just skips the one real default this fallback has no room for.
+    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--resume\"]\t[\"--resume\",\"{}\",\"--fork-session\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--session-id\"]\t[]\t[]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--conversation\"]\t[]\t[]\ncodex\t[\"codex\"]\t[\".codex\"]\t[]\t[\"exec\",\"-\"]\t[\"--model\"]\t[]\t[]\t[]\t[]\npi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[\".pi/agent/models.json\"]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--fork\"]\t[\"--provider\"]".to_string();
     let agent_specs_str = env::var("AGENT_SANDBOX_AGENT_SPECS").unwrap_or(default_agent_specs);
 
     let mut agent_names = Vec::new();
@@ -1439,6 +1442,7 @@ fn run() -> Result<i32> {
     let mut agent_session_arg_json = HashMap::new();
     let mut agent_fork_arg_json = HashMap::new();
     let mut agent_provider_arg_json = HashMap::new();
+    let mut agent_state_file_seeds_json = HashMap::new();
 
     for line in agent_specs_str.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
@@ -1468,6 +1472,9 @@ fn run() -> Result<i32> {
             }
             if parts.len() >= 10 {
                 agent_provider_arg_json.insert(name.clone(), parts[9].to_string());
+            }
+            if parts.len() >= 11 {
+                agent_state_file_seeds_json.insert(name.clone(), parts[10].to_string());
             }
         }
     }
@@ -2183,6 +2190,10 @@ fn run() -> Result<i32> {
             }
         }
         if let Some(json_str) = agent_state_files_json.get(a) {
+            let seeds: Value = agent_state_file_seeds_json
+                .get(a)
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(Value::Null);
             if let Ok(val) = serde_json::from_str::<Value>(json_str) {
                 if let Some(arr) = val.as_array() {
                     for item in arr {
@@ -2190,7 +2201,11 @@ fn run() -> Result<i32> {
                             let host = format!("{}/{}", home, rel);
                             let container = format!("/home/user/{}", rel);
                             if !Path::new(&host).exists() {
-                                fs::write(&host, "{}").unwrap_or(());
+                                if let Some(parent) = Path::new(&host).parent() {
+                                    fs::create_dir_all(parent).unwrap_or(());
+                                }
+                                let seed = seeds.get(rel).and_then(|v| v.as_str()).unwrap_or("{}");
+                                fs::write(&host, seed).unwrap_or(());
                             }
                             mounts.push("-v".to_string());
                             mounts.push(format!("{}:{}:{}", host, container, rw_mount_opts));

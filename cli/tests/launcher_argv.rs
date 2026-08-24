@@ -236,6 +236,39 @@ fn agent_state_files_are_created_on_the_host_so_the_bind_is_a_file_not_a_directo
 }
 
 #[test]
+fn a_state_file_with_a_seed_is_written_with_that_content_not_empty_braces() {
+    let world = World::new();
+    let out = world.run(&["pi"]);
+
+    assert!(
+        out.run_call()
+            .mount_to("/home/user/.pi/agent/models.json")
+            .is_some()
+    );
+    assert_eq!(
+        std::fs::read_to_string(world.home().join(".pi/agent/models.json")).unwrap(),
+        "SEEDED",
+        "a stateFiles entry with a stateFileSeeds default must be written with \
+         that content on first launch, not the bare \"{{}}\" other state files get"
+    );
+}
+
+#[test]
+fn a_seeded_state_file_is_never_rewritten_once_it_exists() {
+    let world = World::new();
+    std::fs::create_dir_all(world.home().join(".pi/agent")).unwrap();
+    std::fs::write(world.home().join(".pi/agent/models.json"), "USER EDITED").unwrap();
+
+    world.run(&["pi"]);
+
+    assert_eq!(
+        std::fs::read_to_string(world.home().join(".pi/agent/models.json")).unwrap(),
+        "USER EDITED",
+        "an existing host copy must never be overwritten by the seed"
+    );
+}
+
+#[test]
 fn agent_mounts_all_carries_every_agents_state() {
     let out = World::new().run(&["--agent-mounts", "opencode"]);
     let run = out.run_call();
