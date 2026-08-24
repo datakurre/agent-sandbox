@@ -130,7 +130,6 @@
     package = pkgs.google-antigravity-cli;
     command = [
       "agy"
-      "."
     ];
     programmaticArgs = [
       "--prompt"
@@ -197,7 +196,7 @@
   {
     name = "pi";
     package = pkgs.callPackage ./pi-coding-agent.nix { };
-    # No "." here, unlike opencode/antigravity: pi's usage is
+    # No "." here: pi's usage is
     # `pi [options] [@files...] [messages...]`, so a bare positional is a *message*, not
     # the project directory. pi works from the cwd the sandbox already puts it in. Passed
     # anyway, the "." was sent to the model -- as the first interactive turn, and

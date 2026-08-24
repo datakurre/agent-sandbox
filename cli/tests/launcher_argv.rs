@@ -1148,7 +1148,6 @@ fn the_built_in_catalog_spells_session_per_agent() {
             "antigravity",
             vec![
                 "agy",
-                ".",
                 "--prompt",
                 "-",
                 "--output-format",
