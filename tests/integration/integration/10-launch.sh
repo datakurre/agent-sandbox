@@ -22,6 +22,7 @@ for agent in $agents; do
     copilot) cmd=copilot ;;
     antigravity) cmd=agy ;;
     codex) cmd=codex ;;
+    pi) cmd=pi ;;
     *) continue ;;
   esac
   out="$(sandbox_run -- bash -c "command -v $cmd" 2>&1)"

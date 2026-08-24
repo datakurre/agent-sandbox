@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/datakurre/agent-sandbox/agents-schema.json",
+  "title": "agent-sandbox agent catalog",
+  "description": "The shape of agents.nix. Validated at build time by the `agents-schema` check, against the catalog rendered to JSON with each agent's `package` reduced to its store path.",
+  "type": "array",
+  "minItems": 1,
+  "items": { "$ref": "#/$defs/agent" },
+  "$defs": {
+    "flagMapping": {
+      "description": "The arguments an agent spells a value-taking launcher flag with. The user's value replaces a `{}` token, or is appended when there is none. Omit the key entirely to say the agent does not support the flag -- the launcher then refuses the run. An empty list is rejected rather than read as 'unsupported', so a mapping that was meant to be filled in cannot pass for a deliberate omission.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "allOf": [
+        {
+          "description": "At most one `{}` placeholder: the value is spliced in exactly once.",
+          "not": {
+            "type": "array",
+            "contains": { "const": "{}" },
+            "minContains": 2
+          }
+        }
+      ]
+    },
+    "homePath": {
+      "description": "A path under the container's $HOME, relative and without traversal.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+$"
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "package", "command"],
+      "properties": {
+        "name": {
+          "description": "The subcommand that launches this agent, and the key the launcher's per-agent state mounts are named after.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "package": {
+          "description": "Store path of the derivation providing the agent's binary.",
+          "type": "string",
+          "pattern": "^/nix/store/[a-z0-9]{32}-.+$"
+        },
+        "command": {
+          "description": "argv the container runs for an interactive launch. A bare positional here is passed to the agent verbatim, so it must be one the agent actually accepts -- several agents read a positional as the first prompt, not as a project directory.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "programmaticArgs": {
+          "description": "Arguments appended to `command` for a `--prompt -` run, making the agent read its prompt from stdin and exit. Omit the key to say the agent has no non-interactive mode; the launcher then refuses `--prompt` for it.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "modelArg": { "$ref": "#/$defs/flagMapping" },
+        "sessionArg": { "$ref": "#/$defs/flagMapping" },
+        "forkArg": { "$ref": "#/$defs/flagMapping" },
+        "providerArg": { "$ref": "#/$defs/flagMapping" },
+        "creditLimitArg": { "$ref": "#/$defs/flagMapping" },
+        "state": {
+          "description": "Directories under $HOME that persist the agent's login and history across launches.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/homePath" },
+          "uniqueItems": true
+        },
+        "stateFiles": {
+          "description": "Individual files under $HOME that persist, for agents that keep state outside a directory of their own.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/homePath" },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

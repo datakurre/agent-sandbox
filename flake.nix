@@ -49,6 +49,10 @@
         # `default` so a plain install does not carry a browser closure;
         # `agent-sandbox browser` from that install uses a Chromium on PATH.
         browser = default.passthru.browserLauncher;
+        # Exposed standalone (agents.nix already wires this into the image) so
+        # `nix build .#pi-coding-agent` can verify or update it without a full image
+        # rebuild.
+        pi-coding-agent = pkgs.callPackage ./pi-coding-agent.nix { };
       });
 
       apps = lib.genAttrs systems (

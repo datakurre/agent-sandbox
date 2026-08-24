@@ -35,7 +35,7 @@ under `secretspec run` instead of hard-coding anything.
 
 ## Manifest shape
 
-Verified against the bundled `secretspec` (0.17.1):
+Verified against the bundled `secretspec` (0.19.1):
 
 ```toml
 [project]
@@ -96,8 +96,8 @@ seems to need the plaintext, it almost certainly needs `secretspec run` instead.
 
 ### Two things that will bite you here
 
-**A reason is required.** Version 0.17 defaults `require_reason` to `"agents"`,
-so an agent-driven invocation without `--reason` fails:
+**A reason is required.** `require_reason` defaults to `"agents"`, so an
+agent-driven invocation without `--reason` fails:
 
 ```
 Accessing secrets requires a reason. Provide one with --reason "<why you are

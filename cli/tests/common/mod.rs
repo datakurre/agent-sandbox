@@ -18,14 +18,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The agent catalog the launcher falls back to when `AGENT_SANDBOX_AGENT_SPECS`
-/// is unset, pinned here so a change to `agents.nix` cannot silently rewrite
-/// what these tests assert.
+/// A stand-in agent catalog, pinned here so a change to `agents.nix` cannot
+/// silently rewrite what these tests assert. It is deliberately *not* a copy of
+/// the real catalog -- these tests are about the launcher's plumbing, not about
+/// any agent's flags. What each agent's arguments really have to be is asserted
+/// against the shipped built-in catalog instead, in
+/// `the_built_in_catalog_*` tests, which run with
+/// `AGENT_SANDBOX_AGENT_SPECS` unset.
 pub const TEST_AGENT_SPECS: &str = concat!(
-    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\n",
-    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\n",
-    "copilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\n",
-    "pi\t[\"pi\",\".\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]",
+    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\n",
+    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--resume\"]\t[\"--resume\",\"{}\",\"--fork-session\"]\t[]\n",
+    "copilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\t[\"--session-id\"]\t[]\t[]\n",
+    "pi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--fork\"]\t[\"--provider\"]",
 );
 
 pub const TEST_IMAGE: &str = "localhost/agent-sandbox:test";
@@ -129,6 +133,10 @@ impl World {
             ("AGENT_SANDBOX_IMAGE".into(), TEST_IMAGE.into()),
             ("AGENT_SANDBOX_AGENT_SPECS".into(), TEST_AGENT_SPECS.into()),
             (
+                "AGENT_SANDBOX_NIX_DAEMON_SOCKET".into(),
+                root.join("run/nonexistent-nix-socket").display().to_string(),
+            ),
+            (
                 "STUB_PODMAN_LOG".into(),
                 root.join("podman.log").display().to_string(),
             ),
@@ -182,6 +190,14 @@ impl World {
         self
     }
 
+    /// Remove an environment variable the `World` sets by default, so the
+    /// launcher falls back to whatever it does without one. `run_bin` clears the
+    /// real environment first, so this really does leave the variable unset.
+    pub fn env_unset(mut self, key: &str) -> Self {
+        self.env.retain(|(k, _)| k != key);
+        self
+    }
+
     /// Write a file into the workspace, creating parent directories.
     pub fn file(self, rel: &str, contents: &str) -> Self {
         let path = self.workspace().join(rel);
@@ -204,6 +220,12 @@ impl World {
 
     /// Teach the stub what to print, and what to exit with, for a subcommand.
     pub fn podman_reply(self, key: &str, stdout: &str, exit_code: i32) -> Self {
+        self.podman_reply_bytes(key, stdout.as_bytes(), exit_code)
+    }
+
+    /// Same, for output that is not valid UTF-8 -- the stub `cat`s the reply
+    /// file, so whatever bytes go in come back out of the container verbatim.
+    pub fn podman_reply_bytes(self, key: &str, stdout: &[u8], exit_code: i32) -> Self {
         let dir = self.root.join("replies");
         fs::write(dir.join(format!("{}.out", key)), stdout).expect("reply stdout");
         fs::write(dir.join(format!("{}.code", key)), exit_code.to_string()).expect("reply code");

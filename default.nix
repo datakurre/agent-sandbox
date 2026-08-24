@@ -128,6 +128,9 @@ let
         (builtins.toJSON (a.programmaticArgs or [ ]))
         (builtins.toJSON (a.modelArg or [ ]))
         (builtins.toJSON (a.creditLimitArg or [ ]))
+        (builtins.toJSON (a.sessionArg or [ ]))
+        (builtins.toJSON (a.forkArg or [ ]))
+        (builtins.toJSON (a.providerArg or [ ]))
       ]
     ) agents
   );
@@ -509,9 +512,32 @@ let
   # `rust` is the whole workspace: buildRustPackage runs `cargo test` in its
   # check phase, so this is what makes `nix flake check` cover the launcher's
   # argument handling, the AGENTS.md parsers and the policy format.
+  # The catalog as data, for the schema check below: every field agents.nix
+  # declares, with `package` reduced to the store path it evaluates to -- the
+  # schema has nothing useful to say about a derivation, and the path is what
+  # actually has to exist.
+  agentsJson = pkgs.writeText "agents.json" (
+    builtins.toJSON (
+      map (a: (builtins.removeAttrs a [ "package" ]) // { package = "${a.package}"; }) agents
+    )
+  );
+
+  # agents.nix is the single place an agent's argv is spelled, and a mistake in it
+  # -- a misnamed key that `or [ ]` then silently defaults away, a flag mapping
+  # with two `{}` placeholders, a state path that escapes $HOME -- otherwise
+  # surfaces only as wrong behaviour inside a container. Validating the rendered
+  # catalog against agents-schema.json makes it a build failure instead.
+  agentsSchemaCheck = pkgs.runCommand "agent-sandbox-agents-schema" {
+    nativeBuildInputs = [ pkgs.check-jsonschema ];
+  } ''
+    check-jsonschema --schemafile ${./agents-schema.json} ${agentsJson}
+    touch $out
+  '';
+
   checks = {
     rust = agentSandboxRust;
     proxy = proxyScript;
+    agents-schema = agentsSchemaCheck;
   };
 
 in

@@ -5,15 +5,16 @@
 `agent-sandbox` is a Nix flake that produces a rootless Podman container image
 ("agent-sandbox") together with a launcher binary (`agent-sandbox`) and a
 management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
-`list`, `status`, `net`, `logs`, `tui`, `proxy`, `mounts`, `attach`, `relay` and
-`purge`).
+`list`, `status`, `net`, `logs`, `tui`, `policy`, `mount`, `attach`, `relay`,
+`browser` and `purge`).
 
 ## Repository map
 
 | Path | What it is |
 | --- | --- |
 | `default.nix` | single Nix module; builds the image and every host script |
-| `agents.nix` | agent catalog (command + persisted state paths per agent) |
+| `agents.nix` | agent catalog (command, per-agent flag spellings, persisted state paths) |
+| `agents-schema.json` | JSON Schema for `agents.nix`, enforced by the `agents-schema` build check |
 | `flake.nix` | flake entry point; exposes `packages.<system>.default` and `apps.<system>.default` |
 | `cli/` | Rust launcher, entrypoint, sidecar, `ctl` subcommands |
 | `proxy/` | Rust egress proxy, TUI, SSH/GPG relay |
