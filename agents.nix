@@ -7,19 +7,37 @@
 # the user's value goes; with no `{}` it is appended, which is the common
 # `--model NAME` shape.
 #
+# `jsonArgs` is the one entry that carries no user value: it is how an agent is
+# told to speak JSON, spliced in when the launcher itself was asked for `--json`,
+# so the agent's own output can go into the result envelope as JSON instead of as
+# a string of escaped JSON. An agent without it is not refused -- its output is
+# just text, and the envelope keeps reporting it as a string.
+#
 # The shape of this file is checked at build time against ./agents-schema.json.
 { pkgs }:
 [
   {
     name = "opencode";
     package = pkgs.opencode;
+    # No ".": the bare command is opencode's TUI, whose `[project]` positional
+    # already defaults to the cwd the sandbox starts it in -- and a positional is
+    # in the way of `run` below.
     command = [
       "opencode"
-      "."
     ];
+    # `opencode run` ("run opencode with a message"), not the TUI's `--prompt`.
+    # The top-level command is the TUI: given `--prompt -` it took "-" as the
+    # prompt *text* and still tried to start the interface, which without a tty
+    # printed the usage banner and exited 1 -- so this agent had no working
+    # programmatic mode at all. `run` takes its message from stdin when no
+    # message positional is given, which is exactly what `--prompt -` asks for,
+    # and it is the only form that has `--format json`.
     programmaticArgs = [
-      "--prompt"
-      "-"
+      "run"
+    ];
+    jsonArgs = [
+      "--format"
+      "json"
     ];
     modelArg = [
       "--model"
@@ -50,6 +68,13 @@
       "-p"
       "-"
     ];
+    # "json (single result)"; the alternative, "stream-json", additionally
+    # requires --verbose and emits the same turn as a line per event. One result
+    # object per run is the closer match to what a buffered --prompt run reports.
+    jsonArgs = [
+      "--output-format"
+      "json"
+    ];
     modelArg = [
       "--model"
     ];
@@ -78,6 +103,11 @@
       "-p"
       "-"
     ];
+    # "'text' (default) or 'json' (JSONL, one JSON object per line)".
+    jsonArgs = [
+      "--output-format"
+      "json"
+    ];
     modelArg = [
       "--model"
     ];
@@ -105,6 +135,11 @@
     programmaticArgs = [
       "--prompt"
       "-"
+    ];
+    # "Output format for print mode (text, json, stream-json)".
+    jsonArgs = [
+      "--output-format"
+      "json"
     ];
     modelArg = [
       "--model"
@@ -142,6 +177,10 @@
       "exec"
       "-"
     ];
+    # `codex exec --json`: "Print events to stdout as JSONL".
+    jsonArgs = [
+      "--json"
+    ];
     modelArg = [
       "--model"
     ];
@@ -174,9 +213,15 @@
     # the prompt automatically whenever one is piped in and no message positional is
     # given -- which is why `command` above must not add one.
     programmaticArgs = [
+      "-p"
+    ];
+    # "Output mode: text (default), json, or rpc". This lived in
+    # programmaticArgs until --json grew per-agent output flags, which meant a
+    # plain `--prompt` run -- one whose output a human reads -- got pi's event
+    # stream too. Here it follows the launcher's own --json instead.
+    jsonArgs = [
       "--mode"
       "json"
-      "-p"
     ];
     modelArg = [
       "--model"

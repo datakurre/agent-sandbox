@@ -154,7 +154,7 @@ agent at all, on a plain `-- COMMAND`.
 | Flag | What it does |
 | --- | --- |
 | `--prompt -` | Feeds the named agent its prompt from stdin instead of running it interactively, appending agent-specific prompt arguments. `-` (stdin) is the only supported value today. Requires an agent to be named. |
-| `--json` | Switches stdout to machine-readable JSON and suppresses human-interactive stderr output. With `--prompt`: the whole run is captured and reported as one closing object once the agent exits — an agent turn is one unit of work, not a log to tail. Without `--prompt` (typically a `-- COMMAND`): one `{"type": "output", "stream": "stdout"\|"stderr", "line": ...}` object is printed per output line as it happens, so a long-running command still tails live, followed by the closing object. |
+| `--json` | Switches stdout to machine-readable JSON and suppresses human-interactive stderr output. With `--prompt`: the whole run is captured and reported as one closing object once the agent exits — an agent turn is one unit of work, not a log to tail — and the agent is asked to speak JSON too (see below). Without `--prompt` (typically a `-- COMMAND`): one `{"type": "output", "stream": "stdout"\|"stderr", "line": ...}` object is printed per output line as it happens, so a long-running command still tails live, followed by the closing object. |
 | `--no-json` | Undoes an earlier `--json` on the same command line. |
 | `--model NAME` | Passes the specified model to the agent (e.g., `sonnet`, `opus`, `gemini-1.5-pro`). Requires `--prompt`. |
 | `--provider NAME` | Selects the agent's inference provider. Requires `--prompt`. |
@@ -178,6 +178,11 @@ it would misread. What is supported today:
 | `codex` | ✅ | — | — | — | — |
 | `pi` | ✅ | ✅ | ✅ | ✅ | — |
 
+`--prompt` itself is mapped the same way, through `programmaticArgs` — and for
+`opencode` that mapping is the `run` subcommand, not the top-level command's
+`--prompt` flag: the top-level command is the TUI, which took `-` as the prompt
+*text* and then tried to start an interface that has no terminal to start in.
+
 Two gaps are worth naming. `codex` resumes through `codex exec resume <id>`, a
 subcommand that has to precede the prompt argument rather than follow it, which
 the append-style mapping cannot express — so `--session` is refused for it
@@ -196,16 +201,50 @@ resume with a qualifier rather than as an id-taking flag of its own.
 (`make -C tests/unit schema`, or the `agents-schema` flake check), which is what
 catches a misspelled key that would otherwise default silently to "unsupported".
 
-The closing object (`"type": "exit"`) carries `status`, `stdout` and `stderr`
-on every `--json` run — `stdout`/`stderr` are the full captured text under
-`--prompt`, and empty under a streamed `-- COMMAND` run, where that text
-already went out as `"type": "output"` lines while the command ran. A run that
-reaches the sandboxed process also carries `network`, an object with `summary`
-(per `host:port` byte counts, connection counts and verdict), `denied` (the
-refused requests) and `proposed_policy` (a pasteable `[network]` block for
-rules added live, or for the denied hosts when there were none) — empty when
-the launch had no `--proxy`. A launch that fails on policy carries
-`policy_error` instead.
+The closing object (`"type": "exit"`) carries `status`, `stdout`,
+`stdout_format` and `stderr` on every `--json` run — `stdout`/`stderr` are the
+full captured output under `--prompt`, and empty under a streamed `-- COMMAND`
+run, where that text already went out as `"type": "output"` lines while the
+command ran. A run that reaches the sandboxed process also carries `network`,
+an object with `summary` (per `host:port` byte counts, connection counts and
+verdict), `denied` (the refused requests) and `proposed_policy` (a pasteable
+`[network]` block for rules added live, or for the denied hosts when there were
+none) — empty when the launch had no `--proxy`. A launch that fails on policy
+carries `policy_error` instead.
+
+### The agent's own JSON: `jsonArgs`
+
+Every agent here can emit machine-readable output of its own, and each spells
+that differently too — `--format json` for `opencode`, `--output-format json`
+for `claude`, `copilot` and `antigravity`, `--json` for `codex`, `--mode json`
+for `pi`. `--json` splices in whichever the agent declares as `jsonArgs`, so one
+flag means one thing all the way down: this run's stdout is for a machine.
+
+That is what keeps the result out of double encoding. An agent asked for JSON
+produces JSON; quoted into the envelope's `stdout` string it would arrive as
+JSON *inside* JSON, every brace escaped and a second parse needed to reach it.
+Instead the launcher parses it and splices the values in:
+
+```json
+{"type": "exit", "status": 0, "stdout_format": "json",
+ "stdout": [{"type": "agent_start"}, {"type": "text", "text": "Hello!"}]}
+```
+
+`stdout` is always an **array** under `"stdout_format": "json"` — one element
+per JSONL event, or a single element for an agent that prints one result object
+— so a consumer can iterate it without knowing which shape its agent emits.
+`jq '.stdout[] | select(.type == "text")'` works the same across all of them.
+
+Two cases fall back to `"stdout_format": "text"`, where `stdout` is the string
+it has always been: an agent with no `jsonArgs` (none today, but a newly added
+agent may have none), and output that does not parse — a crash before the first
+event, or a warning printed onto stdout. The fallback is all-or-nothing on
+purpose: half an event stream reported as a clean array would be worse than the
+text, which at least still contains the warning. `stdout_format` is on every
+closing object, including a streamed `-- COMMAND` run's, where it is `"text"`.
+
+Because the flags follow `--json` rather than `--prompt`, a plain `--prompt`
+run — one whose answer a human reads — gets the agent's ordinary output.
 
 ## Reaching back to the host: `--host-loopback-port`
 

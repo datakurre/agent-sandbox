@@ -985,7 +985,7 @@ fn json_prompt_mode_with_pi_appends_correct_prompt_flags() {
     let out = World::new().run(&["--json", "--prompt", "-", "pi"]);
     let run = out.run_call();
 
-    assert_eq!(run.command(), vec!["pi", "--mode", "json", "-p"]);
+    assert_eq!(run.command(), vec!["pi", "-p", "--mode", "json"]);
 }
 
 #[test]
@@ -1040,7 +1040,7 @@ fn a_mapping_without_a_placeholder_appends_the_value() {
 
     assert_eq!(
         out.run_call().command(),
-        vec!["pi", "--mode", "json", "-p", "--session", "abc123"]
+        vec!["pi", "-p", "--mode", "json", "--session", "abc123"]
     );
 }
 
@@ -1086,7 +1086,7 @@ fn provider_reaches_an_agent_that_does_declare_it() {
 
     assert_eq!(
         out.run_call().command(),
-        vec!["pi", "--mode", "json", "-p", "--provider", "openai"]
+        vec!["pi", "-p", "--mode", "json", "--provider", "openai"]
     );
 }
 
@@ -1106,7 +1106,7 @@ fn the_built_in_catalog_gives_pi_no_message_positional() {
         .env_unset("AGENT_SANDBOX_AGENT_SPECS")
         .run(&["--json", "--prompt", "-", "pi"]);
 
-    assert_eq!(out.run_call().command(), vec!["pi", "--mode", "json", "-p"]);
+    assert_eq!(out.run_call().command(), vec!["pi", "-p", "--mode", "json"]);
 }
 
 #[test]
@@ -1128,15 +1128,38 @@ fn the_built_in_catalog_spells_session_per_agent() {
     // Each of these was read off the agent's own --help, and none of them is the
     // launcher's own `--session`.
     for (agent, expected) in [
-        ("claude", vec!["claude", "-p", "-", "--resume", "s1"]),
-        ("copilot", vec!["copilot", "-p", "-", "--session-id", "s1"]),
+        (
+            "claude",
+            vec!["claude", "-p", "-", "--output-format", "json", "--resume", "s1"],
+        ),
+        (
+            "copilot",
+            vec![
+                "copilot",
+                "-p",
+                "-",
+                "--output-format",
+                "json",
+                "--session-id",
+                "s1",
+            ],
+        ),
         (
             "antigravity",
-            vec!["agy", ".", "--prompt", "-", "--conversation", "s1"],
+            vec![
+                "agy",
+                ".",
+                "--prompt",
+                "-",
+                "--output-format",
+                "json",
+                "--conversation",
+                "s1",
+            ],
         ),
         (
             "opencode",
-            vec!["opencode", ".", "--prompt", "-", "--session", "s1"],
+            vec!["opencode", "run", "--format", "json", "--session", "s1"],
         ),
     ] {
         let out = World::new()
@@ -1201,7 +1224,130 @@ fn the_built_in_catalog_runs_codex_non_interactively_through_exec() {
         .env_unset("AGENT_SANDBOX_AGENT_SPECS")
         .run(&["--json", "--prompt", "-", "codex"]);
 
-    assert_eq!(out.run_call().command(), vec!["codex", "exec", "-"]);
+    assert_eq!(
+        out.run_call().command(),
+        vec!["codex", "exec", "-", "--json"]
+    );
+}
+
+// ── agent-side json output (agents.nix `jsonArgs`) ─────────────────────────
+//
+// `--json` is a statement about the run's stdout, and an agent that can emit
+// JSON itself is part of that: it gets its own output flags, and the closing
+// envelope then carries what it said as JSON rather than as a string of escaped
+// JSON that the caller would have to parse a second time.
+
+#[test]
+fn json_prompt_mode_asks_an_agent_that_can_speak_json_to_do_so() {
+    let out = World::new().run(&["--json", "--prompt", "-", "pi"]);
+
+    assert_eq!(out.run_call().command(), vec!["pi", "-p", "--mode", "json"]);
+}
+
+#[test]
+fn prompt_mode_without_json_leaves_the_agent_in_its_default_output_mode() {
+    // The output flags follow the launcher's --json, not --prompt: a piped
+    // prompt whose answer a human reads back should not arrive as an event
+    // stream.
+    let out = World::new().run(&["--prompt", "-", "pi"]);
+
+    assert_eq!(out.run_call().command(), vec!["pi", "-p"]);
+}
+
+#[test]
+fn an_agent_with_no_json_output_flags_is_still_run() {
+    // Unlike --model or --session, nothing the user spelled is being dropped
+    // here, so there is nothing to refuse: the agent runs in its own default
+    // mode and its output is reported as the text it is.
+    let out = World::new().run(&["--json", "--prompt", "-", "claude"]);
+
+    assert_eq!(out.code, Some(0));
+    assert_eq!(out.run_call().command(), vec!["claude", "-p", "-"]);
+}
+
+#[test]
+fn json_prompt_mode_embeds_an_agents_own_json_output_unquoted() {
+    let events = "{\"type\":\"agent_start\"}\n{\"type\":\"agent_end\",\"cost\":0.5}\n";
+    let world = World::new().podman_reply("run", events, 0);
+    let out = world.run(&["--json", "--prompt", "-", "pi"]);
+
+    let json: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON stdout");
+    assert_eq!(json["stdout_format"], "json");
+    // One array element per JSONL event, reachable directly -- no second parse,
+    // no unescaping.
+    assert_eq!(json["stdout"][0]["type"], "agent_start");
+    assert_eq!(json["stdout"][1]["cost"], 0.5);
+    assert_eq!(json["stdout"].as_array().expect("an array").len(), 2);
+}
+
+#[test]
+fn json_prompt_mode_reports_a_text_only_agents_output_as_a_string() {
+    let world = World::new().podman_reply("run", "plain words\n", 0);
+    let out = world.run(&["--json", "--prompt", "-", "claude"]);
+
+    let json: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON stdout");
+    assert_eq!(json["stdout_format"], "text");
+    assert_eq!(json["stdout"], "plain words\n");
+}
+
+#[test]
+fn output_that_does_not_parse_as_json_falls_back_to_a_string() {
+    // An agent can die before its first event, or print a warning onto stdout.
+    // Reporting that as the text it is beats dropping it.
+    let world = World::new().podman_reply("run", "Killed\n", 0);
+    let out = world.run(&["--json", "--prompt", "-", "pi"]);
+
+    let json: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON stdout");
+    assert_eq!(json["stdout_format"], "text");
+    assert_eq!(json["stdout"], "Killed\n");
+}
+
+#[test]
+fn an_agent_that_printed_nothing_still_reports_an_empty_json_array() {
+    let world = World::new().podman_reply("run", "", 0);
+    let out = world.run(&["--json", "--prompt", "-", "pi"]);
+
+    let json: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON stdout");
+    assert_eq!(json["stdout_format"], "json");
+    assert_eq!(json["stdout"], serde_json::json!([]));
+}
+
+#[test]
+fn the_built_in_catalog_asks_every_agent_for_its_own_json_output() {
+    // Each spelling was read off the agent's own --help. Every agent in the
+    // catalog has one today, so `--json` never has to fall back to quoting an
+    // agent's text.
+    for (agent, expected) in [
+        ("opencode", vec!["--format", "json"]),
+        ("claude", vec!["--output-format", "json"]),
+        ("copilot", vec!["--output-format", "json"]),
+        ("antigravity", vec!["--output-format", "json"]),
+        ("codex", vec!["--json"]),
+        ("pi", vec!["--mode", "json"]),
+    ] {
+        let out = World::new()
+            .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+            .run(&["--json", "--prompt", "-", agent]);
+        let run = out.run_call();
+        let command = run.command();
+        let tail = &command[command.len() - expected.len()..];
+        assert_eq!(tail, expected.as_slice(), "for agent {}", agent);
+    }
+}
+
+#[test]
+fn the_built_in_catalog_runs_opencode_non_interactively_through_run() {
+    // `opencode run`, not the TUI's `--prompt`: the top-level command took "-"
+    // as the prompt *text* and still tried to start the interface, and `run` is
+    // the only form that has `--format json`.
+    let out = World::new()
+        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+        .run(&["--json", "--prompt", "-", "opencode"]);
+
+    assert_eq!(
+        out.run_call().command(),
+        vec!["opencode", "run", "--format", "json"]
+    );
 }
 
 // ── json mode on a plain command (no agent, no --prompt) ───────────────────
@@ -1238,6 +1384,7 @@ fn json_mode_on_a_plain_command_streams_output_lines_and_a_final_exit_summary() 
     // The lines already went out as {type:"output"} objects above; the summary
     // doesn't repeat them.
     assert_eq!(exit["stdout"], "");
+    assert_eq!(exit["stdout_format"], "text");
 }
 
 #[test]

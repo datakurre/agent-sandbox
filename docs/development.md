@@ -37,7 +37,9 @@ Add an entry to `agents.nix`. The entry drives:
   first time the host copy doesn't exist and never touched after),
 - how each launcher flag that reaches the agent is spelled for it
   (`modelArg`, `sessionArg`, `forkArg`, `providerArg`, `creditLimitArg`),
-- the arguments that make it read a prompt from stdin (`programmaticArgs`).
+- the arguments that make it read a prompt from stdin (`programmaticArgs`),
+- the arguments that make it emit JSON instead of prose (`jsonArgs`), spliced
+  in by the launcher's own `--json`.
 
 Two rules for the flag mappings, both there because the alternative is silent
 misbehaviour rather than an error:
@@ -53,6 +55,11 @@ misbehaviour rather than an error:
 The user's value replaces a `{}` token in the mapping, or is appended when
 there is none — `forkArg = [ "--resume" "{}" "--fork-session" ]` is how an
 agent that spells a fork as a qualified resume is expressed.
+
+`jsonArgs` is the exception to the first rule: it carries no user value, so an
+agent that omits it is not refused — it just runs in its default output mode,
+and the `--json` envelope reports its stdout as a string instead of embedding
+it as JSON. Look for the flag anyway; every agent in the catalog has one.
 
 The file's shape is checked at build time against `agents-schema.json`
 (`make -C tests/unit schema`, or the `agents-schema` flake check): required
