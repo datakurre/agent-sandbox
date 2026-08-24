@@ -32,7 +32,32 @@ Add an entry to `agents.nix`. The entry drives:
 - inclusion of the agent package in the image PATH,
 - accepted agent names in the launcher,
 - command dispatch when selecting that agent,
-- persisted home-state mounts (`state` directories, `stateFiles` files).
+- persisted home-state mounts (`state` directories, `stateFiles` files),
+- how each launcher flag that reaches the agent is spelled for it
+  (`modelArg`, `sessionArg`, `forkArg`, `providerArg`, `creditLimitArg`),
+- the arguments that make it read a prompt from stdin (`programmaticArgs`).
+
+Two rules for the flag mappings, both there because the alternative is silent
+misbehaviour rather than an error:
+
+- **Omit the key when the agent has no such flag.** The launcher then refuses
+  `--session`/`--fork`/… for that agent. Do not invent a spelling: several
+  agents accept an unknown-looking argument as a *prompt* rather than
+  rejecting it.
+- **Read the mapping off the agent's own `--help`, for the version pinned in
+  the flake.** These drift. `copilot` dropped `--max-ai-credits`; `codex` has
+  no `-p/--print` at all, and its `-p` means `--profile`.
+
+The user's value replaces a `{}` token in the mapping, or is appended when
+there is none — `forkArg = [ "--resume" "{}" "--fork-session" ]` is how an
+agent that spells a fork as a qualified resume is expressed.
+
+The file's shape is checked at build time against `agents-schema.json`
+(`make -C tests/unit schema`, or the `agents-schema` flake check): required
+keys, no unknown keys (so a typo cannot default silently to "unsupported"),
+non-empty mappings, at most one `{}` per mapping, and `state`/`stateFiles`
+paths that stay under `$HOME`. Update the schema together with the field it
+describes.
 
 Downstream flakes can override the catalog and default agent via:
 

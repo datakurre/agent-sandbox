@@ -26,10 +26,10 @@ use std::process::Command;
 /// `the_built_in_catalog_*` tests, which run with
 /// `AGENT_SANDBOX_AGENT_SPECS` unset.
 pub const TEST_AGENT_SPECS: &str = concat!(
-    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\n",
-    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\n",
-    "copilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\n",
-    "pi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]",
+    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\n",
+    "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--resume\"]\t[\"--resume\",\"{}\",\"--fork-session\"]\t[]\n",
+    "copilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\t[\"--session-id\"]\t[]\t[]\n",
+    "pi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--fork\"]\t[\"--provider\"]",
 );
 
 pub const TEST_IMAGE: &str = "localhost/agent-sandbox:test";

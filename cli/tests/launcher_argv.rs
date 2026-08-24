@@ -970,6 +970,93 @@ fn prompt_value_that_names_a_ctl_subcommand_is_not_dispatched_to_ctl() {
     );
 }
 
+// ── per-agent flag mappings ─────────────────────────────────────────────────
+//
+// --session/--fork/--provider used to be pushed through verbatim, on the
+// assumption every agent spells them the way pi does. They do not: claude
+// resumes with --resume, copilot with --session-id, antigravity with
+// --conversation, and opencode's own --fork is a boolean qualifying a resume
+// rather than an id-taking flag. Each is declared per agent in agents.nix now,
+// and an agent that declares nothing refuses the run.
+
+#[test]
+fn session_uses_the_agents_own_spelling() {
+    let out = World::new().run(&["--json", "--prompt", "-", "--session", "abc123", "claude"]);
+
+    assert_eq!(
+        out.run_call().command(),
+        vec!["claude", "-p", "-", "--resume", "abc123"]
+    );
+}
+
+#[test]
+fn a_mapping_with_a_placeholder_wraps_the_value() {
+    // claude forks by resuming with a new id: `--resume ID --fork-session`. The
+    // value lands where `{}` is, not at the end.
+    let out = World::new().run(&["--json", "--prompt", "-", "--fork", "abc123", "claude"]);
+
+    assert_eq!(
+        out.run_call().command(),
+        vec!["claude", "-p", "-", "--resume", "abc123", "--fork-session"]
+    );
+}
+
+#[test]
+fn a_mapping_without_a_placeholder_appends_the_value() {
+    let out = World::new().run(&["--json", "--prompt", "-", "--session", "abc123", "pi"]);
+
+    assert_eq!(
+        out.run_call().command(),
+        vec!["pi", "--mode", "json", "-p", "--session", "abc123"]
+    );
+}
+
+#[test]
+fn provider_is_refused_for_an_agent_that_declares_no_mapping() {
+    let out = World::new().run(&["--json", "--prompt", "-", "--provider", "anthropic", "claude"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("does not support the --provider flag"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+}
+
+#[test]
+fn fork_is_refused_for_an_agent_that_declares_no_mapping() {
+    let out = World::new().run(&["--json", "--prompt", "-", "--fork", "abc123", "copilot"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("does not support the --fork flag"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+}
+
+#[test]
+fn provider_reaches_an_agent_that_does_declare_it() {
+    let out = World::new().run(&["--json", "--prompt", "-", "--provider", "openai", "pi"]);
+
+    assert_eq!(
+        out.run_call().command(),
+        vec!["pi", "--mode", "json", "-p", "--provider", "openai"]
+    );
+}
+
 // ── the catalog the binary ships with ───────────────────────────────────────
 //
 // Everything above runs against `TEST_AGENT_SPECS`, which is a stand-in. These
@@ -1000,6 +1087,75 @@ fn the_built_in_catalog_gives_pi_no_stdin_marker() {
         !out.run_call().command().contains(&"-"),
         "pi must not be handed a bare '-': {:?}",
         out.run_call().command()
+    );
+}
+
+#[test]
+fn the_built_in_catalog_spells_session_per_agent() {
+    // Each of these was read off the agent's own --help, and none of them is the
+    // launcher's own `--session`.
+    for (agent, expected) in [
+        ("claude", vec!["claude", "-p", "-", "--resume", "s1"]),
+        ("copilot", vec!["copilot", "-p", "-", "--session-id", "s1"]),
+        (
+            "antigravity",
+            vec!["agy", ".", "--prompt", "-", "--conversation", "s1"],
+        ),
+        (
+            "opencode",
+            vec!["opencode", ".", "--prompt", "-", "--session", "s1"],
+        ),
+    ] {
+        let out = World::new()
+            .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+            .run(&["--json", "--prompt", "-", "--session", "s1", agent]);
+        assert_eq!(out.run_call().command(), expected, "for agent {}", agent);
+    }
+}
+
+#[test]
+fn the_built_in_catalog_refuses_session_for_codex() {
+    // Resuming codex is `codex exec resume <id> [PROMPT]`, a subcommand that has
+    // to precede the prompt argument, which an appended mapping cannot express.
+    // Refused rather than mis-spelled.
+    let out = World::new()
+        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+        .run(&["--json", "--prompt", "-", "--session", "s1", "codex"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("does not support the --session flag"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+}
+
+#[test]
+fn the_built_in_catalog_no_longer_claims_copilot_takes_max_ai_credits() {
+    // github-copilot-cli 1.0.61 answers `--max-ai-credits` with "error: unknown
+    // option". The mapping is gone until the flag comes back, so the launcher
+    // refuses instead of building an argv copilot rejects.
+    let out = World::new()
+        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+        .run(&["--json", "--prompt", "-", "--max-ai-credits", "50", "copilot"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("does not support the --max-ai-credits flag"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
     );
 }
 

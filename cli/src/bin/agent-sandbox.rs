@@ -596,7 +596,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option(
         "--provider NAME",
         None,
-        "Specify the provider to use (requires --prompt)",
+        "Specify the inference provider to use (requires --prompt)",
     );
     print_help_option(
         "--session ID",
@@ -606,12 +606,19 @@ forwarding SSH, or exposing Git identity.
     print_help_option(
         "--fork ID",
         None,
-        "Fork from an existing agent session (requires --prompt)",
+        "Resume an existing agent session as a new one (requires --prompt)",
     );
     print_help_option(
         "--max-ai-credits NUMBER",
         None,
-        "Limit the amount of AI credits Copilot can spend in a --prompt run",
+        "Cap the AI credits a --prompt run may spend",
+    );
+    // Deliberately names no agent: the help text's agent list comes from the
+    // catalog, and a second copy of it here would be one more thing to drift.
+    print_help_option(
+        "",
+        None,
+        "The five above are spelled differently by each agent, so each is mapped per agent in agents.nix. An agent that declares no mapping refuses the flag rather than being handed one it would reject -- or silently misread as part of the prompt.",
     );
     print_help_option(
         "--podman-args",
@@ -625,6 +632,60 @@ differently -- --podman in particular is a full sandbox escape; prefer
 https://datakurre.github.io/agent-sandbox/trust-model/
 Full flag reference and examples: https://datakurre.github.io/agent-sandbox/usage/"
     );
+}
+
+/// Splices one launcher flag's value into the arguments the named agent spells it
+/// with, as declared in `agents.nix`.
+///
+/// Every agent-facing flag goes through here, so an agent that declares no mapping
+/// refuses the run instead of being handed a flag invented on its behalf -- the
+/// spellings genuinely differ (`--resume` for claude, `--session-id` for copilot,
+/// `--conversation` for antigravity), and guessing one silently changed what the
+/// agent did rather than failing.
+///
+/// A `{}` token in the mapping is where the value goes, for a flag that wraps its
+/// value rather than following it: forking a session is `--resume ID --fork-session`
+/// for claude and `--session ID --fork` for opencode. Without a `{}` the value is
+/// appended, which is the ordinary `--model NAME` shape.
+fn agent_flag_args(
+    mappings: &HashMap<String, String>,
+    agent: &str,
+    flag: &str,
+    value: &str,
+) -> Vec<String> {
+    let mapping: Vec<String> = match mappings.get(agent) {
+        Some(s) => match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => fail(&format!(
+                "agent-sandbox: invalid {} mapping for agent '{}' in the agent catalog.",
+                flag, agent
+            )),
+        },
+        None => Vec::new(),
+    };
+    if mapping.is_empty() {
+        fail(&format!(
+            "agent-sandbox: agent '{}' does not support the {} flag.",
+            agent, flag
+        ));
+    }
+    let placeholder = "{}";
+    if mapping.iter().any(|a| a == placeholder) {
+        mapping
+            .into_iter()
+            .map(|a| {
+                if a == placeholder {
+                    value.to_string()
+                } else {
+                    a
+                }
+            })
+            .collect()
+    } else {
+        let mut out = mapping;
+        out.push(value.to_string());
+        out
+    }
 }
 
 fn policy_path(home: &str, name: &str) -> Result<PathBuf> {
@@ -1365,7 +1426,7 @@ fn run() -> Result<i32> {
     // AGENT_SANDBOX_AGENT_SPECS -- i.e. someone running the raw binary. It is a hand
     // copy of agents.nix and has drifted from it before; keep the two in step when an
     // agent's command or prompt arguments change.
-    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\ncodex\t[\"codex\"]\t[\".codex\"]\t[]\t[\"exec\",\"-\"]\t[\"--model\"]\t[]\npi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]".to_string();
+    let default_agent_specs = "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\",\".cache/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\nclaude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--resume\"]\t[\"--resume\",\"{}\",\"--fork-session\"]\t[]\ncopilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--session-id\"]\t[]\t[]\nantigravity\t[\"agy\",\".\"]\t[\".local/share/opencode\",\".local/share/antigravity-cli\",\".config/antigravity-cli\",\".cache/antigravity-cli\",\".gemini/antigravity-cli\",\".gemini/config/projects\"]\t[\".gemini/config/config.json\",\".gemini/config/mcp_config.json\"]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--conversation\"]\t[]\t[]\ncodex\t[\"codex\"]\t[\".codex\"]\t[]\t[\"exec\",\"-\"]\t[\"--model\"]\t[]\t[]\t[]\t[]\npi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[]\t[\"--mode\",\"json\",\"-p\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--fork\"]\t[\"--provider\"]".to_string();
     let agent_specs_str = env::var("AGENT_SANDBOX_AGENT_SPECS").unwrap_or(default_agent_specs);
 
     let mut agent_names = Vec::new();
@@ -1375,6 +1436,9 @@ fn run() -> Result<i32> {
     let mut agent_prompt_args_json = HashMap::new();
     let mut agent_model_arg_json = HashMap::new();
     let mut agent_credit_limit_arg_json = HashMap::new();
+    let mut agent_session_arg_json = HashMap::new();
+    let mut agent_fork_arg_json = HashMap::new();
+    let mut agent_provider_arg_json = HashMap::new();
 
     for line in agent_specs_str.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
@@ -1395,6 +1459,15 @@ fn run() -> Result<i32> {
             }
             if parts.len() >= 7 {
                 agent_credit_limit_arg_json.insert(name.clone(), parts[6].to_string());
+            }
+            if parts.len() >= 8 {
+                agent_session_arg_json.insert(name.clone(), parts[7].to_string());
+            }
+            if parts.len() >= 9 {
+                agent_fork_arg_json.insert(name.clone(), parts[8].to_string());
+            }
+            if parts.len() >= 10 {
+                agent_provider_arg_json.insert(name.clone(), parts[9].to_string());
             }
         }
     }
@@ -1997,48 +2070,48 @@ fn run() -> Result<i32> {
         cmd_args.extend(prog_args);
 
         if let Some(model) = want_model {
-            let model_args: Vec<String> = match agent_model_arg_json.get(&agent) {
-                Some(s) => match serde_json::from_str(s) {
-                    Ok(v) => v,
-                    Err(_) => fail(&format!("agent-sandbox: invalid model args for agent '{}'", agent)),
-                },
-                None => Vec::new(),
-            };
-            if model_args.is_empty() {
-                fail(&format!("agent-sandbox: agent '{}' does not support the --model flag.", agent));
-            }
-            cmd_args.extend(model_args);
-            cmd_args.push(model);
+            cmd_args.extend(agent_flag_args(
+                &agent_model_arg_json,
+                &agent,
+                "--model",
+                &model,
+            ));
         }
 
         if let Some(limit) = want_max_ai_credits {
             if limit.parse::<u32>().is_err() {
                 fail("agent-sandbox: --max-ai-credits must be a positive integer.");
             }
-            let limit_args: Vec<String> = match agent_credit_limit_arg_json.get(&agent) {
-                Some(s) => match serde_json::from_str(s) {
-                    Ok(v) => v,
-                    Err(_) => fail(&format!("agent-sandbox: invalid credit limit args for agent '{}'", agent)),
-                },
-                None => Vec::new(),
-            };
-            if limit_args.is_empty() {
-                fail(&format!("agent-sandbox: agent '{}' does not support the --max-ai-credits flag.", agent));
-            }
-            cmd_args.extend(limit_args);
-            cmd_args.push(limit);
+            cmd_args.extend(agent_flag_args(
+                &agent_credit_limit_arg_json,
+                &agent,
+                "--max-ai-credits",
+                &limit,
+            ));
         }
         if let Some(session) = want_session {
-            cmd_args.push("--session".to_string());
-            cmd_args.push(session);
+            cmd_args.extend(agent_flag_args(
+                &agent_session_arg_json,
+                &agent,
+                "--session",
+                &session,
+            ));
         }
         if let Some(fork) = want_fork {
-            cmd_args.push("--fork".to_string());
-            cmd_args.push(fork);
+            cmd_args.extend(agent_flag_args(
+                &agent_fork_arg_json,
+                &agent,
+                "--fork",
+                &fork,
+            ));
         }
         if let Some(provider) = want_provider {
-            cmd_args.push("--provider".to_string());
-            cmd_args.push(provider);
+            cmd_args.extend(agent_flag_args(
+                &agent_provider_arg_json,
+                &agent,
+                "--provider",
+                &provider,
+            ));
         }
     } else {
         if want_model.is_some() {

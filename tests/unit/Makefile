@@ -9,8 +9,9 @@
 # result does not depend on a container existing.  Anything that needs a real
 # container, a real network, or a real relay lives in ../integration.
 #
-#   make -C tests/unit             # rust + docs, the pre-commit set
+#   make -C tests/unit             # rust + docs + schema, the pre-commit set
 #   make -C tests/unit rust        # the Rust workspace only
+#   make -C tests/unit schema      # agents.nix against agents-schema.json
 #   make -C tests/unit nix         # the same suite through `nix flake check`
 #   make -C tests/unit logs        # everything, with logs under tests/unit/logs
 #
@@ -25,9 +26,9 @@ LOGDIR := $(CURDIR)/logs
 CARGO ?= nix shell nixpkgs\#cargo nixpkgs\#rustc nixpkgs\#gcc --command cargo
 NIX ?= nix
 
-.PHONY: all rust docs nix logs clean fmt-check clippy
+.PHONY: all rust docs schema nix logs clean fmt-check clippy
 
-all: rust docs
+all: rust docs schema
 
 ## The whole Rust workspace: the in-crate unit tests plus the integration
 ## tests under cli/tests, which drive the real launcher binary against a stub
@@ -42,6 +43,13 @@ docs:
 	cd $(ROOT) && nix-shell -I nixpkgs=channel:nixos-unstable \
 	  -p 'python3.withPackages (ps: with ps; [ mkdocs mkdocs-material ])' \
 	  --run 'mkdocs build --strict'
+
+## The agent catalog, validated against agents-schema.json.  Cheap enough for
+## the default set: it evaluates agents.nix and runs one JSON Schema validator
+## over the result, with no Rust build involved.
+schema:
+	cd $(ROOT) && $(NIX) build --no-link \
+	  ".#checks.$$($(NIX) eval --raw --impure --expr builtins.currentSystem).agents-schema"
 
 ## The same Rust suite as `rust`, but through the Nix build, which is what CI
 ## and `nix flake check` run.  Slower, and hermetic.
@@ -64,7 +72,7 @@ logs: | $(LOGDIR)
 	@rm -f $(LOGDIR)/*.log
 	@set -o pipefail; \
 	 fail=0; \
-	 for target in rust docs; do \
+	 for target in rust docs schema; do \
 	   echo "=== $$target ==="; \
 	   if $(MAKE) --no-print-directory $$target > $(LOGDIR)/$$target.log 2>&1; then \
 	     echo "PASS $$target"; \

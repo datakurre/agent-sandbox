@@ -157,16 +157,44 @@ agent at all, on a plain `-- COMMAND`.
 | `--json` | Switches stdout to machine-readable JSON and suppresses human-interactive stderr output. With `--prompt`: the whole run is captured and reported as one closing object once the agent exits — an agent turn is one unit of work, not a log to tail. Without `--prompt` (typically a `-- COMMAND`): one `{"type": "output", "stream": "stdout"\|"stderr", "line": ...}` object is printed per output line as it happens, so a long-running command still tails live, followed by the closing object. |
 | `--no-json` | Undoes an earlier `--json` on the same command line. |
 | `--model NAME` | Passes the specified model to the agent (e.g., `sonnet`, `opus`, `gemini-1.5-pro`). Requires `--prompt`. |
-| `--provider NAME` | Passes `--provider NAME` through to the agent. Requires `--prompt`. |
-| `--session ID` | Resumes an existing agent session (`--session ID` to the agent). Requires `--prompt`. |
-| `--fork ID` | Forks from an existing agent session (`--fork ID` to the agent). Requires `--prompt`. |
-| `--max-ai-credits NUMBER` | Limits the amount of AI credits the `copilot` agent can spend in a single run. The run halts if this limit is reached. Requires `--prompt`. |
+| `--provider NAME` | Selects the agent's inference provider. Requires `--prompt`. |
+| `--session ID` | Resumes an existing agent session. Requires `--prompt`. |
+| `--fork ID` | Forks from an existing agent session — resumes it, but records the continuation as a new session. Requires `--prompt`. |
+| `--max-ai-credits NUMBER` | Caps the AI credits a single run may spend. Requires `--prompt`. |
 
-`--model` and `--max-ai-credits` are mapped per agent from `agents.nix`, so an
-agent that declares no equivalent argument refuses the flag rather than
-silently dropping it — `--max-ai-credits` is currently `copilot` only.
-`--provider`, `--session` and `--fork` are passed through verbatim to any agent
-that supports `--prompt`.
+Every one of these is mapped per agent in `agents.nix`, because the agents do
+not agree on how to spell them: a session id is `--resume` to `claude`,
+`--session-id` to `copilot`, `--conversation` to `antigravity` and `--session`
+to `opencode` and `pi`. An agent that declares no mapping for a flag **refuses
+the run** rather than being handed a spelling it would reject — or, worse, one
+it would misread. What is supported today:
+
+| Agent | `--model` | `--session` | `--fork` | `--provider` | `--max-ai-credits` |
+| --- | --- | --- | --- | --- | --- |
+| `opencode` | ✅ | ✅ | ✅ | — | — |
+| `claude` | ✅ | ✅ | ✅ | — | — |
+| `copilot` | ✅ | ✅ | — | — | — |
+| `antigravity` | ✅ | ✅ | — | — | — |
+| `codex` | ✅ | — | — | — | — |
+| `pi` | ✅ | ✅ | ✅ | ✅ | — |
+
+Two gaps are worth naming. `codex` resumes through `codex exec resume <id>`, a
+subcommand that has to precede the prompt argument rather than follow it, which
+the append-style mapping cannot express — so `--session` is refused for it
+instead of mis-spelled. And no agent declares `--max-ai-credits`: `copilot` did
+until github-copilot-cli 1.0.61, which now answers it with `error: unknown
+option '--max-ai-credits'`, so the mapping was removed and the launcher flag
+fails until a release brings the flag back.
+
+A mapping is an argument list, and the user's value replaces a `{}` token in it
+or is appended when there is none. That is what lets an agent whose flag *wraps*
+its value be expressed at all — forking is `--resume ID --fork-session` for
+`claude` and `--session ID --fork` for `opencode`, since both spell a fork as a
+resume with a qualifier rather than as an id-taking flag of its own.
+
+`agents.nix` is validated at build time against `agents-schema.json`
+(`make -C tests/unit schema`, or the `agents-schema` flake check), which is what
+catches a misspelled key that would otherwise default silently to "unsupported".
 
 The closing object (`"type": "exit"`) carries `status`, `stdout` and `stderr`
 on every `--json` run — `stdout`/`stderr` are the full captured text under

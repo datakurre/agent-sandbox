@@ -1,4 +1,13 @@
 # An agent is a CLI command plus the home paths that persist its login state.
+#
+# Every launcher flag that reaches the agent is declared here per agent, as the
+# argument list to splice in. An agent that does not declare a mapping does not
+# support that flag: the launcher refuses the run rather than inventing a spelling
+# the agent would reject or, worse, silently misread. `{}` in a mapping is where
+# the user's value goes; with no `{}` it is appended, which is the common
+# `--model NAME` shape.
+#
+# The shape of this file is checked at build time against ./agents-schema.json.
 { pkgs }:
 [
   {
@@ -15,6 +24,18 @@
     modelArg = [
       "--model"
     ];
+    sessionArg = [
+      "--session"
+    ];
+    # opencode's own `--fork` is a boolean qualifying a resume, not an id-taking
+    # flag: "fork the session when continuing (use with --continue or --session)".
+    forkArg = [
+      "--session"
+      "{}"
+      "--fork"
+    ];
+    # No provider flag: opencode selects a provider through the `provider/model`
+    # form of --model, and `opencode providers` manages credentials.
     state = [
       ".local/share/opencode"
       ".config/opencode"
@@ -32,6 +53,20 @@
     modelArg = [
       "--model"
     ];
+    # `--session-id` exists too, but it *assigns* an id to a new conversation.
+    # Resuming one by id is `--resume`.
+    sessionArg = [
+      "--resume"
+    ];
+    # `--fork-session`: "When resuming, create a new session ID instead of reusing
+    # the original (use with --resume or --continue)".
+    forkArg = [
+      "--resume"
+      "{}"
+      "--fork-session"
+    ];
+    # No provider flag: third-party backends (Bedrock/Vertex/Foundry) are selected
+    # by environment and settings, not on the command line.
     state = [ ".claude" ];
     stateFiles = [ ".claude.json" ];
   }
@@ -46,9 +81,18 @@
     modelArg = [
       "--model"
     ];
-    creditLimitArg = [
-      "--max-ai-credits"
+    # "Resume an existing session or task by ID, or set the UUID for a new session".
+    sessionArg = [
+      "--session-id"
     ];
+    # No fork flag, and no provider flag (BYOK providers are configured, not passed).
+    #
+    # No creditLimitArg either: `--max-ai-credits` was declared here until
+    # github-copilot-cli 1.0.61, which rejects it outright ("error: unknown option
+    # '--max-ai-credits'"). Budget is surfaced in-session (`/usage`, the footer)
+    # rather than capped from the command line. Restore the mapping if a future
+    # release brings the flag back -- the launcher flag stays, it just has no
+    # agent declaring it today.
     state = [ ".copilot" ];
   }
   {
@@ -65,6 +109,11 @@
     modelArg = [
       "--model"
     ];
+    # agy calls a session a conversation: "Resume a previous conversation by ID".
+    sessionArg = [
+      "--conversation"
+    ];
+    # No fork flag, no provider flag.
     state = [
       ".local/share/antigravity-cli"
       ".config/antigravity-cli"
@@ -96,6 +145,12 @@
     modelArg = [
       "--model"
     ];
+    # No sessionArg: resuming is `codex exec resume <SESSION_ID> [PROMPT]`, a
+    # *subcommand* that has to sit between `exec` and the prompt argument. A mapping
+    # here can only splice in after the prompt args, which would put `resume` where
+    # codex expects nothing, so --session is refused instead of mis-spelled. Lifting
+    # this needs the prompt args themselves to become session-aware.
+    # No fork flag; `--oss`/`--local-provider` are not the same thing as --provider.
     state = [
       ".codex"
     ];
@@ -125,6 +180,15 @@
     ];
     modelArg = [
       "--model"
+    ];
+    sessionArg = [
+      "--session"
+    ];
+    forkArg = [
+      "--fork"
+    ];
+    providerArg = [
+      "--provider"
     ];
     state = [
       ".pi"

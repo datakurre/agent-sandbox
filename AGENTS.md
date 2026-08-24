@@ -13,7 +13,8 @@ management multiplexer (`agent-sandbox ctl`, with the subcommands `load`,
 | Path | What it is |
 | --- | --- |
 | `default.nix` | single Nix module; builds the image and every host script |
-| `agents.nix` | agent catalog (command + persisted state paths per agent) |
+| `agents.nix` | agent catalog (command, per-agent flag spellings, persisted state paths) |
+| `agents-schema.json` | JSON Schema for `agents.nix`, enforced by the `agents-schema` build check |
 | `flake.nix` | flake entry point; exposes `packages.<system>.default` and `apps.<system>.default` |
 | `cli/` | Rust launcher, entrypoint, sidecar, `ctl` subcommands |
 | `proxy/` | Rust egress proxy, TUI, SSH/GPG relay |
