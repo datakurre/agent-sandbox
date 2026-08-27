@@ -2676,6 +2676,7 @@ fn run() -> Result<i32> {
 
     let mut merged_policy = agents::ProxyPolicy::default();
     merged_policy.default = vec!["deny".to_string()];
+    let mut policy_sources = HashMap::new();
     let mut startup_info = StartupInfo::new(want_json);
 
     if use_agents_network && agents_md_path.exists() {
@@ -2739,6 +2740,13 @@ fn run() -> Result<i32> {
             let policy = parse_policy_file(&text).map_err(|e| {
                 anyhow::anyhow!("agent-sandbox: invalid policy '{}': {}", policy_name, e)
             })?;
+            for line in format_proxy_policy(&policy, "policy").lines() {
+                if !line.starts_with('#') && !line.starts_with("default ") {
+                    policy_sources
+                        .entry(line.to_string())
+                        .or_insert_with(|| "policy".to_string());
+                }
+            }
             merged_policy.merge(policy);
             startup_info.policy(&format!("loaded {}", policy_file_path.display()));
         }
@@ -2762,6 +2770,13 @@ fn run() -> Result<i32> {
                 let policy = parse_policy_file(&text).map_err(|e| {
                     anyhow::anyhow!("agent-sandbox: invalid policy for agent '{}': {}", agent, e)
                 })?;
+                for line in format_proxy_policy(&policy, "policy").lines() {
+                    if !line.starts_with('#') && !line.starts_with("default ") {
+                        policy_sources
+                            .entry(line.to_string())
+                            .or_insert_with(|| "policy".to_string());
+                    }
+                }
                 merged_policy.merge(policy);
                 startup_info.policy(&format!(
                     "loaded {} (agent '{}')",
@@ -3074,6 +3089,10 @@ fn run() -> Result<i32> {
         }
 
         fs::write(format!("{}/policy", sidecar_policy), &policy_file_content)?;
+        fs::write(
+            format!("{}/policy.sources", sidecar_policy),
+            serde_json::to_string(&policy_sources)?,
+        )?;
         fs::write(
             format!("{}/policy.baseline", sidecar_policy),
             &baseline_content,

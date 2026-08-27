@@ -1,4 +1,4 @@
-use agent_sandbox_proxy::policy_io::{install_policy, load_policy_lines};
+use agent_sandbox_proxy::policy_io::{install_policy, load_policy_lines, load_policy_sources};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -636,6 +636,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             (Vec::new(), HashSet::new())
         };
+        let policy_sources = if view == View::Rules {
+            load_policy_sources(sidecar_policy)
+        } else {
+            HashMap::new()
+        };
 
         terminal.draw(|f| {
             let size = f.size();
@@ -844,6 +849,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let source = if baseline_lines.contains(line) {
                                 "built-in"
+                            } else if let Some(source) = policy_sources.get(line) {
+                                source.as_str()
                             } else if base_lines.contains(line) {
                                 "AGENTS.md"
                             } else {
@@ -870,7 +877,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 View::Requests | View::Connections if show_detail => "↑/↓ scroll   [d]/[Esc] Back   [q] Quit",
                 View::Requests => "↑/↓ select   [d] Details   [a] Allow (domain / SSH host)   [h] Allow HTTP route   [A] Allow IP\n[v] Connections view   [r] Rules view   [c] Clear   [q]/[Esc] Quit",
                 View::Connections => "↑/↓ select   [d] Details   [v] Denied requests   [r] Rules view   [q]/[Esc] Quit",
-                View::Rules => "↑/↓ select   [x] Remove rule (blocked for built-in/AGENTS.md rules)\n[r] Requests view   [q]/[Esc] Quit",
+                View::Rules => "↑/↓ select   [x] Remove rule (blocked for launch-time rules)\n[r] Requests view   [q]/[Esc] Quit",
             };
             let instructions = Paragraph::new(legend_text)
                 .block(Block::default().borders(Borders::ALL).title("Keybindings"));
@@ -1088,14 +1095,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('x') if view == View::Rules => {
                         if let Some(line) = policy_lines.get(rules_selected_idx) {
                             if base_lines.contains(line) {
-                                let label = if baseline_lines.contains(line) {
-                                    "built-in"
+                                let (label, advice) = if baseline_lines.contains(line) {
+                                    ("built-in", "the built-in policy")
+                                } else if policy_sources.get(line).map(String::as_str)
+                                    == Some("policy")
+                                {
+                                    ("policy", "the host-owned policy")
                                 } else {
-                                    "AGENTS.md's baseline"
+                                    ("AGENTS.md", "AGENTS.md")
                                 };
                                 status_msg = format!(
-                                    "'{}' comes from {} policy and can't be removed here — edit AGENTS.md and relaunch, or `agent-sandbox ctl policy reset` first",
-                                    line, label
+                                    "'{}' comes from {} and can't be removed here — edit {} and relaunch, or `agent-sandbox ctl policy reset` first",
+                                    line, label, advice
                                 );
                                 status_kind = StatusKind::Info;
                                 status_until = Some(Instant::now() + Duration::from_secs(5));

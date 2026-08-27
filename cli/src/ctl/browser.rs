@@ -952,6 +952,15 @@ pub fn run(args: BrowserArgs) -> Result<()> {
     let policy_text = policy_file(&allow);
     fs::write(format!("{}/policy", runtime_dir), &policy_text)?;
     fs::write(format!("{}/policy.base", runtime_dir), &policy_text)?;
+    let sources: std::collections::HashMap<_, _> = policy_text
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.starts_with("default "))
+        .map(|line| (line.to_string(), "at start".to_string()))
+        .collect();
+    fs::write(
+        format!("{}/policy.sources", runtime_dir),
+        serde_json::to_string(&sources)?,
+    )?;
     fs::write(format!("{}/policy.baseline", runtime_dir), baseline_file())?;
 
     let extensions = if args.no_extensions {

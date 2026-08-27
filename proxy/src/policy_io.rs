@@ -1,4 +1,5 @@
 use crate::policy;
+use std::collections::HashMap;
 use std::fs;
 
 /// Reads the raw `KEY VALUE` lines of a policy file, or an empty list if it
@@ -10,6 +11,16 @@ pub fn load_policy_lines(policy_dir: &str) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// Reads the launch-time source for each policy line, if the launcher recorded
+/// provenance. Missing or malformed metadata is treated as unavailable so old
+/// sandboxes continue to display their base rules normally.
+pub fn load_policy_sources(policy_dir: &str) -> HashMap<String, String> {
+    fs::read_to_string(format!("{}/policy.sources", policy_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 /// Every `deny_ip` line in a policy, as written.
