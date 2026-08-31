@@ -1,6 +1,6 @@
 # agent-sandbox
 
-**Sandboxed AI coding environment** built on rootless Podman and Nix. Run AI coding agents — `opencode`, `claude`, `copilot`, `codex`, `antigravity`, `pi`, or any bundled tool — in an isolated container. All host integrations are **disabled by default**; you opt in only to what you need.
+**Sandboxed AI coding environment** built on rootless Podman and Nix. Run AI coding agents — `opencode`, `claude`, `copilot`, `codex`, `antigravity`, `pi`, `graph-agent`, or any bundled tool — in an isolated container. All host integrations are **disabled by default**; you opt in only to what you need.
 
 ## What it provides
 
@@ -69,7 +69,7 @@ agent-sandbox --workspace --browser -- claude
 | Goal | Flags to add |
 |------|-------------|
 | Expose current directory at `/workspace/<name>` | `--workspace` |
-| Launch a specific agent | `agent-sandbox <agent>` (`opencode`, `claude`, `copilot`, `codex`, `antigravity`, `pi`) |
+| Launch a specific agent | `agent-sandbox <agent>` (`opencode`, `claude`, `copilot`, `codex`, `antigravity`, `pi`, `graph-agent`) |
 | Reattach to a sandbox already running | `agent-sandbox ctl attach` |
 | Publish a port declared in `AGENTS.md` | `--ports` + `[ports]` in `AGENTS.md` |
 | Mount extra paths, or persist agent state | `--mounts` + `[mounts]` in `AGENTS.md`, or `--agent-mounts` |
