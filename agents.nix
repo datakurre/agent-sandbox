@@ -253,4 +253,34 @@
       ".cache/pi"
     ];
   }
+  {
+    name = "graph-agent";
+    package = pkgs.graph-agent;
+    # Bare `graph-agent` prints the usage banner; interactive launch runs the TUI.
+    command = [
+      "graph-agent"
+      "tui"
+    ];
+    # No programmaticArgs: graph-agent's `run` subcommand takes a positional prompt
+    # and does not read prompts from stdin (`-`), so `--prompt` is not supported.
+    modelArg = [
+      "--model"
+    ];
+    # `tui --resume <session>` reattaches to a parked session.
+    sessionArg = [
+      "--resume"
+    ];
+    # Persistent state: `.config/graph-agent` holds configuration and workflows
+    # ($XDG_CONFIG_HOME), `.local/state/graph-agent` holds sessions and logs
+    # ($XDG_STATE_HOME), and `.pi` holds Pi models and credentials used by Pi's
+    # ModelRuntime.
+    state = [
+      ".config/graph-agent"
+      ".local/state/graph-agent"
+      ".pi"
+      ".local/share/pi"
+      ".config/pi"
+      ".cache/pi"
+    ];
+  }
 ]
