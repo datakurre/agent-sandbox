@@ -14,6 +14,7 @@ agent-sandbox copilot                            # github-copilot-cli (copilot)
 agent-sandbox antigravity                        # antigravity-cli (agy)
 agent-sandbox codex                              # codex
 agent-sandbox pi                                 # pi
+agent-sandbox graph-agent                        # graph-agent (tui)
 echo "prompt" | agent-sandbox --workspace --json --prompt - pi  # headless pi, JSON result
 echo "prompt" | agent-sandbox --workspace --prompt - pi         # headless pi, agent's own output
 agent-sandbox --workspace --json -- make build                  # deterministic command, streamed JSON
@@ -163,11 +164,11 @@ agent at all, on a plain `-- COMMAND`.
 | `--max-ai-credits NUMBER` | Caps the AI credits a single run may spend. Requires `--prompt`. |
 
 Every one of these is mapped per agent in `agents.nix`, because the agents do
-not agree on how to spell them: a session id is `--resume` to `claude`,
-`--session-id` to `copilot`, `--conversation` to `antigravity` and `--session`
-to `opencode` and `pi`. An agent that declares no mapping for a flag **refuses
-the run** rather than being handed a spelling it would reject — or, worse, one
-it would misread. What is supported today:
+not agree on how to spell them: a session id is `--resume` to `claude` and
+`graph-agent`, `--session-id` to `copilot`, `--conversation` to `antigravity`
+and `--session` to `opencode` and `pi`. An agent that declares no mapping for a
+flag **refuses the run** rather than being handed a spelling it would reject —
+or, worse, one it would misread. What is supported today:
 
 | Agent | `--model` | `--session` | `--fork` | `--provider` | `--max-ai-credits` |
 | --- | --- | --- | --- | --- | --- |
@@ -177,11 +178,15 @@ it would misread. What is supported today:
 | `antigravity` | ✅ | ✅ | — | — | — |
 | `codex` | ✅ | — | — | — | — |
 | `pi` | ✅ | ✅ | ✅ | ✅ | — |
+| `graph-agent` | ✅ | ✅ | — | — | — |
 
 `--prompt` itself is mapped the same way, through `programmaticArgs` — and for
 `opencode` that mapping is the `run` subcommand, not the top-level command's
 `--prompt` flag: the top-level command is the TUI, which took `-` as the prompt
 *text* and then tried to start an interface that has no terminal to start in.
+Similarly, `graph-agent` runs interactive TUI by default (`graph-agent tui`) and
+takes its prompt positionally rather than from stdin (`-`), so `--prompt` is not
+mapped for it.
 
 Two gaps are worth naming. `codex` resumes through `codex exec resume <id>`, a
 subcommand that has to precede the prompt argument rather than follow it, which

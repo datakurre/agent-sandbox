@@ -95,6 +95,7 @@ fn is_launcher_bind(destination: &str, workspace_dir: &str) -> bool {
     let prefixes = [
         "/home/user/.local/share/opencode",
         "/home/user/.local/share/antigravity-cli",
+        "/home/user/.local/state/",
         "/home/user/.config/",
         "/home/user/.cache/",
         "/home/user/.claude",

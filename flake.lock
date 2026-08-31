@@ -39,6 +39,26 @@
         "type": "github"
       }
     },
+    "graph-agent": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788116308,
+        "narHash": "sha256-zayuR157/WhKfl949nIo7A+FdiG3HXLZ+HTpioiYanI=",
+        "owner": "datakurre",
+        "repo": "graph-agent",
+        "rev": "13abe629fb74babda22c30ecf90b41b71410abbe",
+        "type": "github"
+      },
+      "original": {
+        "owner": "datakurre",
+        "repo": "graph-agent",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1788179007,
@@ -58,6 +78,7 @@
     "root": {
       "inputs": {
         "antigravity-nix": "antigravity-nix",
+        "graph-agent": "graph-agent",
         "nixpkgs": "nixpkgs"
       }
     },

@@ -6,12 +6,17 @@
     url = "github:jacopone/antigravity-nix";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  inputs.graph-agent = {
+    url = "github:datakurre/graph-agent";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
     {
       self,
       nixpkgs,
       antigravity-nix,
+      graph-agent,
       ...
     }:
     let
@@ -45,7 +50,14 @@
               inherit system;
               # claude-code and google-antigravity-cli are unfree.
               config.allowUnfree = true;
-              overlays = [ antigravity-nix.overlays.default ];
+              overlays = [
+                antigravity-nix.overlays.default
+                (graph-agent.overlays.default or (
+                  final: prev: {
+                    inherit (graph-agent.packages.${prev.stdenv.hostPlatform.system}) graph-agent;
+                  }
+                ))
+              ];
             }
           )
         );
@@ -68,6 +80,7 @@
         # `nix build .#pi-coding-agent` can verify or update it without a full image
         # rebuild.
         pi-coding-agent = pkgs.callPackage ./pi-coding-agent.nix { };
+        graph-agent = pkgs.graph-agent;
       });
 
       apps = lib.genAttrs systems (

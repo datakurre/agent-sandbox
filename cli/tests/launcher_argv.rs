@@ -1349,6 +1349,38 @@ fn the_built_in_catalog_runs_opencode_non_interactively_through_run() {
     );
 }
 
+#[test]
+fn the_built_in_catalog_runs_graph_agent_interactively_as_tui() {
+    let out = World::new()
+        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+        .run(&["graph-agent"]);
+
+    assert_eq!(out.run_call().command(), vec!["graph-agent", "tui"]);
+    assert!(out.run_call().mount_to("/home/user/.config/graph-agent").is_some());
+    assert!(out.run_call().mount_to("/home/user/.local/state/graph-agent").is_some());
+    assert!(out.run_call().mount_to("/home/user/.pi").is_some());
+}
+
+#[test]
+fn the_built_in_catalog_refuses_prompt_for_graph_agent() {
+    let out = World::new()
+        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+        .run(&["--json", "--prompt", "-", "graph-agent"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("does not support --prompt (stdin) execution"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+}
+
 // ── json mode on a plain command (no agent, no --prompt) ───────────────────
 //
 // This is the case `--programmatic` never covered: `--json` on a `-- COMMAND`
