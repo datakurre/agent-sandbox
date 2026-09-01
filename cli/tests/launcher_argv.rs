@@ -279,6 +279,7 @@ fn agent_mounts_all_carries_every_agents_state() {
         run.joined()
     );
     assert!(run.mount_to("/home/user/.config/opencode").is_some());
+    assert!(run.mount_to("/home/user/.local/state/opencode").is_some());
 }
 
 #[test]
@@ -1575,6 +1576,5 @@ fn agent_name_takes_precedence_over_subcommand_shortcut() {
     assert!(!out_ctl.reached_podman_run(), "ctl list reached podman run");
     assert_eq!(out_ctl.code, Some(0));
 }
-
 
 
