@@ -56,6 +56,7 @@
     # form of --model, and `opencode providers` manages credentials.
     state = [
       ".local/share/opencode"
+      ".local/state/opencode"
       ".config/opencode"
       ".cache/opencode"
     ];

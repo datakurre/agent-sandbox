@@ -30,7 +30,7 @@ use std::process::Command;
 /// that can be told to speak JSON and one that cannot -- are both reachable from
 /// this catalog.
 pub const TEST_AGENT_SPECS: &str = concat!(
-    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\t{}\t[]\n",
+    "opencode\t[\"opencode\",\".\"]\t[\".local/share/opencode\",\".local/state/opencode\",\".config/opencode\"]\t[]\t[\"--prompt\",\"-\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--session\",\"{}\",\"--fork\"]\t[]\t{}\t[]\n",
     "claude\t[\"claude\"]\t[\".claude\"]\t[\".claude.json\"]\t[\"-p\",\"-\"]\t[\"--model\"]\t[]\t[\"--resume\"]\t[\"--resume\",\"{}\",\"--fork-session\"]\t[]\t{}\t[]\n",
     "copilot\t[\"copilot\"]\t[\".copilot\"]\t[]\t[\"-p\",\"-\"]\t[\"--model\"]\t[\"--max-ai-credits\"]\t[\"--session-id\"]\t[]\t[]\n",
     "pi\t[\"pi\"]\t[\".pi\",\".local/share/pi\",\".config/pi\",\".cache/pi\"]\t[\".pi/agent/models.json\"]\t[\"-p\"]\t[\"--model\"]\t[]\t[\"--session\"]\t[\"--fork\"]\t[\"--provider\"]\t{\".pi/agent/models.json\":\"SEEDED\"}\t[\"--mode\",\"json\"]",
