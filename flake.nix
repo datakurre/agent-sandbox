@@ -35,7 +35,7 @@
               patches = [
                 (pkgsBootstrap.fetchpatch {
                   url = "https://github.com/NixOS/nixpkgs/pull/534884.patch";
-                  hash = "sha256-QtXHypBSZ7k6LCI18Lld8L8h7V1tDSIZLcB4BYLvRDs=";
+                  hash = "sha256-Za/JptrEFFNOnObk9djXK6EpJzf35fxd7xwcHO8xbAY=";
                 })
               ];
             };
