@@ -46,11 +46,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788116308,
-        "narHash": "sha256-zayuR157/WhKfl949nIo7A+FdiG3HXLZ+HTpioiYanI=",
+        "lastModified": 1788510150,
+        "narHash": "sha256-idGivcqHTyf3ZvxfJNDq/FpztOBFnYCsCyogm1SwrGY=",
         "owner": "datakurre",
         "repo": "graph-agent",
-        "rev": "13abe629fb74babda22c30ecf90b41b71410abbe",
+        "rev": "bd6123a0910adfec23c70776e7f22e4398bbf0ae",
         "type": "github"
       },
       "original": {
