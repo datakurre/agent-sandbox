@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Drive a browser to screenshot a page for visual/image analysis or to interact with it (navigate, click, fill, wait) — either headless inside the sandbox, or a visible browser on the user's host over CDP. Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, automate clicks/form-fills against a page, or work in a real browser the user can watch and click along with.
+description: Drive a browser to screenshot a page for visual/image analysis, record a 25 fps video/screencast, or interact with it (navigate, click, fill, wait) — either headless inside the sandbox, or a visible browser on the user's host over CDP. Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, record a video of a browser interaction, automate clicks/form-fills against a page, or work in a real browser the user can watch and click along with.
 compatibility: opencode
 metadata:
   workflow: headless-browser-automation
@@ -162,6 +162,46 @@ Then read `page.png` with your own image-viewing tool (e.g. Claude Code's
 front of the model. Prefer `aria_snapshot()` or `page.content()` over a
 screenshot when the task is pure text/structure, not appearance — it's cheaper
 and immune to the fonts gotcha.
+
+## Record video: 25 fps screencasts
+
+Playwright records video natively at a constant **25 fps** (`r_frame_rate: 25/1`)
+in WebM format (VP8 codec) using a bundled ffmpeg executable — no external
+system package or host setup required.
+
+```python
+# record.py
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],  # container defaults
+    )
+    context = browser.new_context(
+        record_video_dir="/tmp/playwright-output",
+        record_video_size={"width": 1280, "height": 720},
+    )
+    page = context.new_page()
+
+    page.goto("https://example.com")
+    page.click("text=Learn more")
+    page.wait_for_timeout(2000)
+
+    # Closing context flushes and finalizes the video file
+    context.close()
+    print(f"Video saved to: {page.video.path()}")
+    browser.close()
+```
+
+When the page is idle, Playwright automatically duplicates the previous frame
+to maintain exact wall-clock synchronization at 25 fps. Always call
+`context.close()` or `page.close()` to ensure the video file is completely
+flushed to disk.
+
+For interactive screencasting with chapter titles and live HTML overlays
+(`page.screencast`), headless terminal recording (`ttyd`), browser/terminal
+composition, or transcoding to MP4/GIF, see `reference.md`.
 
 ## Sandbox network
 

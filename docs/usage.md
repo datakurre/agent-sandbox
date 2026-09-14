@@ -454,8 +454,8 @@ advanced patterns. `nix-flake` additionally carries `uv2nix.md` (packaging
 Python projects that have a `uv.lock`) and `images.md` (building OCI container
 images from a flake package); `agent-sandbox` carries `network.md` (proxy policy
 syntax, the `ctl` loop, live-versus-relaunch changes) and `secretspec.md`;
-`browser` carries `reference.md` (form filling, the raw CDP fallback, and a
-debugging checklist).
+`browser` carries `reference.md` (form filling, 25 fps video recording, the raw
+CDP fallback, and a debugging checklist).
 
 They are bundled into the image rather than mounted by the launcher. To use
 user-owned skills instead, mount a replacement tree with

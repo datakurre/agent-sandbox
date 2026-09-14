@@ -99,6 +99,97 @@ Read results back with the agent's own tools (e.g. Claude Code's `Read` for a
 screenshot) before the session ends rather than expecting the directory to
 persist.
 
+## Video and screencasts
+
+See `SKILL.md` for the base recording setup (25 fps, WebM/VP8 via the bundled
+`ffmpeg`). The rest of this section builds on that: chapter titles and HTML
+overlays, transcoding, and compositing in a terminal recording.
+
+### Chapter transitions and HTML overlays (`page.screencast`)
+
+For recorded demos or verification walkthroughs, `page.screencast` provides
+chapter title cards and live annotations overlaid onto the page:
+
+```python
+import os
+from playwright.sync_api import sync_playwright
+
+OUTPUT_DIR = "/tmp/playwright-output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+video_path = os.path.join(OUTPUT_DIR, "screencast.webm")
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+    page = browser.new_page(viewport={"width": 1280, "height": 720})
+
+    # Start 25 fps recording to file
+    page.screencast.start(path=video_path, size={"width": 1280, "height": 720})
+    page.goto("https://example.com")
+
+    # Full-screen chapter card (blurs background, auto-dismisses after duration)
+    page.screencast.show_chapter("Introduction", description="Opening demo page", duration=2000)
+    page.wait_for_timeout(1000)
+
+    # Sticky HTML overlay annotation (pointer-events: none)
+    page.screencast.show_overlay(
+        """
+        <div style="position: absolute; top: 16px; right: 16px;
+                    padding: 8px 16px; background: rgba(0,0,0,0.75);
+                    border-radius: 8px; font-family: sans-serif;
+                    font-size: 14px; color: white;">
+            ⚡ Navigated successfully
+        </div>
+        """,
+        duration=2000,
+    )
+    page.wait_for_timeout(2500)
+
+    # Finalize recording
+    page.screencast.stop()
+    browser.close()
+```
+
+### Transcoding to MP4 or GIF
+
+WebM is the native capture format. If downstream tools or presentation viewers
+require MP4 (H.264) or animated GIF, transcode on demand using Nix:
+
+```sh
+# Convert 25 fps WebM to 25 fps MP4 (H.264, universally compatible)
+nix shell --impure --expr \
+  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; ffmpeg-headless' \
+  --command ffmpeg -i /tmp/playwright-output/screencast.webm -c:v libx264 -pix_fmt yuv420p -r 25 /tmp/playwright-output/screencast.mp4
+
+# Convert 25 fps WebM to optimized 25 fps animated GIF
+nix shell --impure --expr \
+  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; ffmpeg-headless' \
+  --command ffmpeg -i /tmp/playwright-output/screencast.webm -vf "fps=25,scale=800:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" /tmp/playwright-output/screencast.gif
+```
+
+### Recording a headless terminal and compositing with browser
+
+A terminal session running headlessly inside the sandbox can be recorded the
+same way as any other page: run `ttyd` on loopback and drive/record it with
+Playwright.
+
+```sh
+nix shell --impure --expr \
+  'with (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; ttyd' \
+  --command ttyd -p 7681 -i 127.0.0.1 -W bash &
+```
+
+Navigate Playwright to `http://127.0.0.1:7681` and record with
+`page.screencast.start(path="/tmp/playwright-output/terminal.webm")`.
+
+To show it alongside a browser recording, the simplest zero-desync option is
+a single wrapper HTML page with two `<iframe>`s — one for the web app, one for
+`http://127.0.0.1:7681` — recorded as one tab. Compositing two already-recorded
+videos afterward (side-by-side, picture-in-picture) is also possible with
+`ffmpeg`'s `hstack`/`overlay` filters if the wrapper-page approach doesn't fit.
+
 ## Raw CDP fallback
 
 If Playwright itself is undesirable (want the browser process directly, or the
@@ -195,3 +286,5 @@ Attach with `connect_over_cdp` exactly as in `SKILL.md`.
 | `socat` reports it could not bind, or the port answers the wrong service | something in the sandbox already listens on that number | relaunch with `--host-loopback-port 9222:19222` and dial 19222 inside |
 | `connect_over_cdp` times out on an enforcing SELinux host, and the port is listed | SELinux denied the container's `connectto` to the host-loopback socket | inspect `sudo ausearch -m avc -ts recent | grep connectto`, then decide whether `sudo setsebool -P container_connect_any 1` is acceptable on the host |
 | `host.containers.internal` refuses even though the host's service is up | that name is podman's `--map-guest-addr`, which resolves to the host's *LAN* address, not its loopback | bind the host service to `0.0.0.0` to use that name, or map it with `--host-loopback-port` for a loopback-bound one |
+| Video file is 0 bytes or missing | context or screencast was not closed before exit | call `context.close()` or `page.screencast.stop()` to flush ffmpeg to disk |
+| Video does not play in target tool/player | target environment lacks WebM (VP8) decoder | transcode to MP4 (H.264) using the Nix ffmpeg recipe above |
