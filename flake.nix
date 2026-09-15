@@ -25,23 +25,8 @@
         f:
         lib.genAttrs systems (
           system:
-          let
-            # Temporary patch to include PR #534884 for github-copilot-cli (1.0.73+).
-            # Remove this once https://github.com/NixOS/nixpkgs/pull/534884 is merged upstream into nixos-unstable.
-            pkgsBootstrap = import nixpkgs { inherit system; };
-            patchedNixpkgs = pkgsBootstrap.applyPatches {
-              name = "nixpkgs-patched";
-              src = nixpkgs;
-              patches = [
-                (pkgsBootstrap.fetchpatch {
-                  url = "https://github.com/NixOS/nixpkgs/pull/534884.patch";
-                  hash = "sha256-Za/JptrEFFNOnObk9djXK6EpJzf35fxd7xwcHO8xbAY=";
-                })
-              ];
-            };
-          in
           f (
-            import patchedNixpkgs {
+            import nixpkgs {
               inherit system;
               # claude-code and google-antigravity-cli are unfree.
               config.allowUnfree = true;
