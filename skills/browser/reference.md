@@ -71,6 +71,21 @@ popup.wait_for_load_state()
 `"networkidle"` — prefer `"load"` for typical pages; `"networkidle"` is slower
 and unnecessary unless the page keeps polling in the background.
 
+### Downloading a file and displaying it
+
+A download is not a popup. Capture it with `expect_download`, save the file,
+then open it in a fresh page to show its content:
+
+```python
+with page.expect_download() as dl_info:
+    page.get_by_text("Download").click()
+download = dl_info.value
+download.save_as("/tmp/playwright-output/report.html")
+
+viewer = context.new_page()
+viewer.goto("file:///tmp/playwright-output/report.html")
+```
+
 ## PDF export
 
 Only Chromium supports it (`p.chromium`, not `p.firefox`/`p.webkit`), and only
@@ -152,6 +167,51 @@ with sync_playwright() as p:
     browser.close()
 ```
 
+### Simulated cursor and click annotations (`show_actions`)
+
+Headless recordings have no OS mouse pointer, which can make a recorded demo
+hard to follow. `page.screencast.show_actions()` draws a simulated cursor and a
+caption for each interacted element:
+
+```python
+page.screencast.start(path="demo.webm")
+
+with page.screencast.show_actions(cursor="pointer", position="bottom-left"):
+    page.get_by_label("Event Title").fill("Wrobocon Demo Day")
+    page.get_by_role("button", name="Complete").click()
+
+page.screencast.stop()
+```
+
+`show_actions(duration=500, position="bottom|bottom-left|bottom-right|top|top-left|top-right", font_size=None, cursor="pointer"|"none")`
+returns a disposable that can be used as a context manager, or hidden with
+`hide_actions()`. Wrap it around the whole driven sequence rather than each
+action individually.
+
+There is no parameter to resize the cursor or click-point dot, or to suppress
+the caption text; `font_size` only scales the caption. These elements live in
+an `x-pw-glass` element with a closed shadow root and are redrawn internally,
+so treat the cursor, dot, and caption as fixed-size and always-captioned. Raw
+CDP attribute overrides are clobbered by the redraw loop; an event-driven
+override requires the async API, so it is not a practical workaround for a
+sync-API script.
+
+### Multiple concurrent recordings
+
+Each `Page` owns its own screencast, so unrelated pages can record
+independently in the same script:
+
+```python
+page_a.screencast.start(path="a.webm")
+page_b.screencast.start(path="b.webm")
+# Drive page_a while page_b records untouched in the background.
+page_a.screencast.stop()
+page_b.screencast.stop()
+```
+
+This is useful for recording multiple sources separately and combining them
+later with `ffmpeg`.
+
 ### Transcoding to MP4 or GIF
 
 WebM is the native capture format. If downstream tools or presentation viewers
@@ -173,7 +233,9 @@ nix shell --impure --expr \
 
 A terminal session running headlessly inside the sandbox can be recorded the
 same way as any other page: run `ttyd` on loopback and drive/record it with
-Playwright.
+Playwright. The loopback binding below is intentional for sandbox-local
+Playwright. If a host browser must reach ttyd, publish the port and bind ttyd
+to `0.0.0.0` instead; `0.0.0.0` is not required for an in-sandbox recording.
 
 ```sh
 nix shell --impure --expr \
@@ -181,14 +243,77 @@ nix shell --impure --expr \
   --command ttyd -p 7681 -i 127.0.0.1 -W bash &
 ```
 
-Navigate Playwright to `http://127.0.0.1:7681` and record with
-`page.screencast.start(path="/tmp/playwright-output/terminal.webm")`.
+Navigate to it, click the terminal to focus the xterm.js instance, then type
+like a human:
+
+```python
+page.goto("http://127.0.0.1:7681", wait_until="networkidle")
+page.screencast.start(path="/tmp/playwright-output/terminal.webm")
+page.click(".xterm")
+page.keyboard.type("some-command --here", delay=40)
+page.keyboard.press("Enter")
+page.wait_for_timeout(5000)
+page.screencast.stop()
+```
 
 To show it alongside a browser recording, the simplest zero-desync option is
 a single wrapper HTML page with two `<iframe>`s — one for the web app, one for
 `http://127.0.0.1:7681` — recorded as one tab. Compositing two already-recorded
 videos afterward (side-by-side, picture-in-picture) is also possible with
 `ffmpeg`'s `hstack`/`overlay` filters if the wrapper-page approach doesn't fit.
+
+### Compositing recordings with ffmpeg: PiP overlay and concat
+
+Scale an inset recording, overlay it in a corner, and stop when the shorter
+input ends:
+
+```sh
+ffmpeg -y -i main.webm -i inset.webm -filter_complex "\
+  [1:v]scale=380:-1[pip]; \
+  [0:v][pip]overlay=x=W-w-24:y=H-h-24:shortest=1[outv]" \
+  -map "[outv]" -c:v libx264 -pix_fmt yuv420p -r 25 composited.mp4
+```
+
+Join already-encoded, same-resolution and same-fps parts with the concat
+demuxer. Use a plain file list when stream copying is sufficient:
+
+```sh
+printf "file '%s'\nfile '%s'\n" "$(pwd)/part1.mp4" "$(pwd)/part2.mp4" > list.txt
+ffmpeg -y -f concat -safe 0 -i list.txt -c copy final.mp4
+```
+
+### Making a final cut with fades
+
+For a two-clip edit with a one-second dissolve, trim the first clip to six
+seconds and start the transition at five seconds. `acrossfade` keeps the audio
+transition aligned with the video transition:
+
+```sh
+ffmpeg -y -i part1.mp4 -i part2.mp4 -filter_complex "\
+  [0:v]trim=duration=6,setpts=PTS-STARTPTS[v0]; \
+  [1:v]setpts=PTS-STARTPTS[v1]; \
+  [v0][v1]xfade=transition=fade:duration=1:offset=5[v]; \
+  [0:a]atrim=duration=6,asetpts=PTS-STARTPTS[a0]; \
+  [1:a]asetpts=PTS-STARTPTS[a1]; \
+  [a0][a1]acrossfade=d=1:c1=tri[a]" \
+  -map "[v]" -map "[a]" -c:v libx264 -pix_fmt yuv420p -r 25 \
+  -c:a aac -b:a 192k final.mp4
+```
+
+The general rule is `xfade`'s `offset = first-clip-duration - transition-duration`.
+For more clips, chain another `xfade` and `acrossfade`, using the accumulated
+output duration for the next offset. Add a fade at the beginning or end when
+there is no neighboring clip:
+
+```sh
+ffmpeg -y -i final.mp4 -vf \
+  "fade=t=in:st=0:d=0.5,fade=t=out:st=11.5:d=0.5" \
+  -af "afade=t=in:st=0:d=0.5,afade=t=out:st=11.5:d=0.5" \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac faded.mp4
+```
+
+Adjust the final fade's `st` to the actual duration of the edited file. When
+the clips have no audio stream, omit the audio filters and `-map "[a]"`.
 
 ## Raw CDP fallback
 
