@@ -58,7 +58,11 @@ mailpit_log="${TMPDIR:-/tmp}/agent-sandbox-mailpit.log"
 mailpit_url="${MAILPIT_URL:-http://127.0.0.1:8025}"
 
 if ! curl -fsS --max-time 2 "$mailpit_url/api/v1/messages" >/dev/null 2>&1; then
-  if test -r "$mailpit_pid_file" && kill -0 "$(cat "$mailpit_pid_file")" 2>/dev/null; then
+  mailpit_pid=
+  test -r "$mailpit_pid_file" && mailpit_pid="$(sed -n '1p' "$mailpit_pid_file")"
+  if test -n "$mailpit_pid" &&
+    printf '%s\n' "$mailpit_pid" | grep -Eq '^[0-9]+$' &&
+    ps -p "$mailpit_pid" >/dev/null 2>&1; then
     echo "Mailpit is running but not ready: $mailpit_log" >&2
     exit 1
   fi
@@ -105,7 +109,7 @@ from email.message import EmailMessage
 message = EmailMessage()
 message["From"] = "agent.sender@local"
 message["To"] = "agent.receiver@local"
-message["Subject"] = "[agent-request] inspect-build"
+message["Subject"] = "[agent-request] inspect-build-1234"
 message["Message-ID"] = "<inspect-build-1234@agent-sandbox>"
 message["X-Agent-Id"] = "sender"
 message["X-Correlation-Id"] = "inspect-build-1234"
@@ -120,29 +124,77 @@ Use plain text for short coordination messages. Use an attachment or a
 workspace path for large artifacts rather than putting large payloads in the
 mailbox.
 
+Use a stable local mailbox address for each agent and include `X-Agent-Id` on
+every message. For request/response workflows, put the same unique
+`X-Correlation-Id` in the subject and a header, and preserve it in replies.
+Filter by recipient and correlation ID (or an exact subject) so that sent
+messages and unrelated traffic do not match.
+
 ## Read and acknowledge messages
 
 List messages through the API, then fetch the individual message before acting
 on it:
 
 ```sh
-curl -fsS "$MAILPIT_URL/api/v1/messages" | jq .
-curl -fsS "$MAILPIT_URL/api/v1/message/MESSAGE_ID" | jq .
+curl -fsS "${MAILPIT_URL:-http://127.0.0.1:8025}/api/v1/messages" | jq .
+curl -fsS "${MAILPIT_URL:-http://127.0.0.1:8025}/api/v1/message/MESSAGE_ID" | jq .
 ```
 
 Use a recipient, subject prefix, correlation ID, or received-time filter when
 the API supports it. Do not repeatedly download and parse the entire mailbox.
-After successfully processing a message, delete it through the API or record its
-`Message-ID` in a local deduplication file before polling again. Deletion is an
-acknowledgement convention; Mailpit does not provide queue visibility,
-claiming, or exactly-once delivery.
-
-Poll with bounded exponential backoff and a deadline. If a response is required,
-reply to the sender and preserve the original correlation ID:
+After fetching and successfully processing a message, acknowledge it with the
+bulk endpoint:
 
 ```sh
-curl -fsS -X DELETE "$MAILPIT_URL/api/v1/message/MESSAGE_ID"
+curl -fsS -X DELETE \
+  -H "Content-Type: application/json" \
+  --data '{"ids":["MESSAGE_ID"]}' \
+  "${MAILPIT_URL:-http://127.0.0.1:8025}/api/v1/messages"
 ```
+
+Alternatively, record its `Message-ID` in a local deduplication file before
+polling again. Deletion is an acknowledgement convention; Mailpit does not
+provide queue visibility, claiming, or exactly-once delivery. Do not delete a
+message before its individual contents have been fetched and processed.
+
+Poll only while a request is outstanding or on an agreed schedule. Use bounded
+exponential backoff and a hard deadline; fail clearly when the deadline expires.
+For example, this waits for one exact subject without treating the sender's own
+outgoing copy as a response:
+
+```sh
+deadline=$((SECONDS + 30))
+correlation_id=inspect-build-1234
+message_id=
+delay=1
+while test "$SECONDS" -lt "$deadline"; do
+  messages_json="$(curl -fsS \
+    "${MAILPIT_URL:-http://127.0.0.1:8025}/api/v1/messages")" || {
+    echo "Failed to query Mailpit" >&2
+    exit 1
+  }
+  message_id="$(
+    printf '%s' "$messages_json" |
+      jq -r --arg subject "Re: [agent-request] $correlation_id" \
+        '.messages[] |
+        select(.To[]?.Address == "agent.sender@local") |
+        select(.Subject == $subject) |
+        .ID' | sed -n '1p'
+  )"
+  test -n "$message_id" && break
+  sleep "$delay"
+  test "$delay" -ge 8 || delay=$((delay * 2))
+done
+test -n "$message_id" || {
+  echo "Timed out waiting for Mailpit response" >&2
+  exit 1
+}
+curl -fsS \
+  "${MAILPIT_URL:-http://127.0.0.1:8025}/api/v1/message/$message_id" | jq .
+```
+
+If a response is required, reply to the sender and preserve the original
+correlation ID. Process the fetched response before acknowledging it.
 
 ## Safety and reliability
 
