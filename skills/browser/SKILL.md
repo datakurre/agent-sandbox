@@ -195,13 +195,35 @@ with sync_playwright() as p:
 ```
 
 When the page is idle, Playwright automatically duplicates the previous frame
-to maintain exact wall-clock synchronization at 25 fps. Always call
-`context.close()` or `page.close()` to ensure the video file is completely
-flushed to disk.
+to maintain exact wall-clock synchronization at 25 fps. That has a consequence
+worth stating outright:
 
-For interactive screencasting with chapter titles and live HTML overlays
-(`page.screencast`), headless terminal recording (`ttyd`), browser/terminal
-composition, or transcoding to MP4/GIF, see `reference.md`.
+> **A context records in real time, from `new_page()` to `close()`. Every
+> second it is open but not being driven becomes dead air in the video.**
+
+So create each recording context *immediately before* the flow it records, and
+close it *immediately after*. Open one up front — while you log in elsewhere,
+deploy fixtures, or drive a different context — and that wall time lands at the
+head of the clip as a blank white page. Leave one open afterwards and its last
+frame freezes for the rest of the run. Neither *fails*: the script exits 0 and
+the file plays, so both are easy to ship without noticing.
+
+Always call `context.close()` or `page.close()` to ensure the video file is
+completely flushed to disk.
+
+**Playwright's video has no mouse cursor and no click indicator.** A recording
+of a driven page shows things happening with nothing visibly doing them, and
+input lands instantly, which reads as a glitch rather than a demonstration. For
+anything a person will watch, draw a cursor and pace the input for human eyes —
+see *Human-paced cursor and clicks* in `reference.md`.
+
+A finished recording also needs *looking at*: truncation, dead air and blank
+frames all exit 0. See *Verifying a recording* in `reference.md` for the
+contact-sheet and blank-frame checks.
+
+For chapter titles and live HTML overlays (`page.screencast`), composing
+several recordings onto one timeline, headless terminal recording (`ttyd`),
+browser/terminal composition, or transcoding to MP4/GIF, see `reference.md`.
 
 ## Sandbox network
 
