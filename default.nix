@@ -150,6 +150,7 @@ let
       gawk
       which
       curl
+      mailpit
       wget
       ripgrep
       procps

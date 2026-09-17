@@ -10,7 +10,7 @@
 - **SSH / GPG forwarding** — `--ssh` and `--gpg` forward host agent sockets; under `--proxy` they travel through a relay that keeps the firewall intact.
 - **Cooperative browser** — `agent-sandbox browser` starts a throwaway Chromium on your host behind an allow list of its own, defaulting to the ports your sandbox publishes and nothing else, so an agent can drive a visible browser over CDP without that being an unpoliced hole.
 - **Management CLI** — `agent-sandbox ctl` manages running sandboxes: inspect traffic, update policies live, attach a shell, and clean up leftovers.
-- **Built-in skills** — every agent gets `agent-sandbox`, `nix`, `nix-flake`, `devenv`, and `browser` skills baked into the image, so it already knows how the sandbox, proxy policy, and cooperative browser work.
+- **Built-in skills** — every agent gets `agent-sandbox`, `nix`, `nix-flake`, `devenv`, `browser`, and `mailpit` skills baked into the image, so it already knows how the sandbox, proxy policy, cooperative browser, and local agent mailbox work.
 
 ## Prerequisites
 
