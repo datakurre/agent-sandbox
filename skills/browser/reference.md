@@ -463,6 +463,43 @@ across the gaps so the inset is continuous:
 - Pass `-v error -nostats` to the encode. FFmpeg's banner and per-frame
   progress otherwise bury your own script's output.
 
+### Animating PiP focus during page activity
+
+For a demonstration with a main observer view and an active actor view, the
+inset can take focus while the actor is being driven instead of remaining
+small in the corner. Record action intervals for each actor, merge intervals
+whose gaps are short enough to be one interaction, and use those windows as
+the animation timeline:
+
+```python
+FOCUS_SCALE = 0.8       # active inset: 80% of the frame, centered
+FOCUS_FADE = 0.6        # seconds to ease in and out
+FOCUS_MERGE_GAP = 1.5   # coalesce typing/click bursts
+```
+
+Keep the normal inset at 40% in the bottom-right corner. During an activity
+window, interpolate its scale from 40% to 80% and its position from the corner
+to the centered position; interpolate back after the window ends. A cosine
+ease such as `0.5 - 0.5*cos(PI*u)` avoids abrupt starts and stops. Evaluate
+both `scale` and `overlay` per frame so the position follows the changing
+inset dimensions:
+
+```text
+focus = eased_activity_window_factor(t)
+factor = 0.4 + (0.8 - 0.4) * focus
+inset_w = even(1920 * factor)
+inset_h = even(1080 * factor)
+x = corner_x + ((W - w) / 2 - corner_x) * focus
+y = corner_y + ((H - h) / 2 - corner_y) * focus
+```
+
+Use the recorded action timestamps after subtracting the same head trim used
+by the composition. Keep the focus windows independent of the clip padding:
+`tpad` still establishes the actor's wall-clock position, while the activity
+windows only control the visual transition. This keeps Cockpit visible when
+nothing is happening and makes form filling, navigation, and approval readable
+when they are happening.
+
 ### Verifying a recording
 
 Every interesting way a recording goes wrong — truncated tail, blank lead-in,
