@@ -184,6 +184,16 @@ fn request_method(head: &str) -> io::Result<&str> {
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed request line"))
 }
 
+/// The request path as the L7/secret-route matcher must see it.
+///
+/// Rather than normalising `.`/`..`/`//`/percent-encoding the way an origin
+/// might, this rejects any path where that would matter. An origin server is
+/// free to interpret `/admin/..%2Fpublic/x` or `/admin//../public/x`
+/// differently than this proxy would after normalising them, and matching a
+/// normalised copy against `allow_route`/`secret_route` while forwarding the
+/// raw bytes (`rewrite_request_target` copies the target verbatim) would let
+/// a request scoped to one route land on another. Fail closed instead: an
+/// ambiguous path never reaches the matcher or the origin.
 fn request_path(head: &str) -> io::Result<String> {
     let request_line = head
         .lines()
@@ -194,7 +204,7 @@ fn request_path(head: &str) -> io::Result<String> {
     let target = parts
         .next()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request target is missing"))?;
-    
+
     // Target could be absolute URI (http://host/path) or absolute path (/path)
     let path = if let Some(idx) = target.find("://") {
         let after_scheme = &target[idx + 3..];
@@ -206,58 +216,76 @@ fn request_path(head: &str) -> io::Result<String> {
     } else {
         target
     };
-    // Strip query string and fragment
+    // Strip query string and fragment: neither is inspected for ambiguity.
     let path = path.split('?').next().unwrap_or(path);
     let path = path.split('#').next().unwrap_or(path);
-    
-    // Percent decode
-    let decoded = percent_decode(path).map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("invalid percent encoding: {}", e)))?;
-    
-    // Dot segment removal
-    let mut segments = Vec::new();
-    for seg in decoded.split('/') {
-        if seg == "." || (seg.is_empty() && !segments.is_empty()) {
-            continue;
-        } else if seg == ".." {
-            if segments.is_empty() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "invalid path: unresolved '..'"));
+
+    if path.contains('\\') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "path contains a literal backslash",
+        ));
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2f") || lower.contains("%5c") {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "path contains an encoded slash or backslash",
+        ));
+    }
+
+    let decoded_bytes = percent_decode_bytes(path)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("invalid percent encoding: {}", e)))?;
+    if decoded_bytes.iter().any(|&b| b < 0x20) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "path contains a control byte",
+        ));
+    }
+    let decoded = String::from_utf8(decoded_bytes)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "path is not valid UTF-8 after decoding"))?;
+
+    let segments: Vec<&str> = decoded.split('/').collect();
+    let last = segments.len().saturating_sub(1);
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            // A leading or trailing slash produces an empty segment too; only
+            // an empty segment strictly between two others is an actual `//`.
+            if i == 0 || i == last {
+                continue;
             }
-            segments.pop();
-        } else {
-            segments.push(seg);
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "path contains an empty segment",
+            ));
+        }
+        if *seg == "." || *seg == ".." {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "path contains a '.' or '..' segment",
+            ));
         }
     }
-    
-    let mut normalized = segments.join("/");
-    if decoded.starts_with('/') && !normalized.starts_with('/') {
-        normalized.insert(0, '/');
-    }
-    if (decoded.ends_with('/') || decoded.ends_with("/.") || decoded.ends_with("/..")) && !normalized.ends_with('/') {
-        normalized.push('/');
-    }
-    if normalized.is_empty() {
-        normalized.push('/');
-    }
-    
-    Ok(normalized)
+
+    Ok(if decoded.is_empty() { "/".to_string() } else { decoded })
 }
 
-fn percent_decode(s: &str) -> Result<String, &'static str> {
-    let mut out = String::with_capacity(s.len());
+fn percent_decode_bytes(s: &str) -> Result<Vec<u8>, &'static str> {
     let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
             if i + 2 < bytes.len() {
                 let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| "invalid hex")?;
                 let byte = u8::from_str_radix(hex, 16).map_err(|_| "invalid hex")?;
-                out.push(byte as char);
+                out.push(byte);
                 i += 3;
             } else {
                 return Err("truncated percent encoding");
             }
         } else {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
     }
@@ -650,7 +678,13 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             }
 
             let method = request_method(request_text)?.to_string();
-            let path = request_path(request_text)?;
+            let path = match request_path(request_text) {
+                Ok(path) => path,
+                Err(e) => {
+                    let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                    return Err(e);
+                }
+            };
             last_method = Some(method.clone());
             last_path = Some(path.clone());
 
@@ -963,10 +997,11 @@ mod tests {
     }
 
     #[test]
-    fn a_dot_segment_path_cannot_carry_the_secret_off_its_route() {
-        // Matching happens on the normalized path, so /user/repos/../../zen is
-        // /zen and gets nothing -- while the request line goes upstream as the
-        // client wrote it.
+    fn a_dot_segment_path_is_rejected_rather_than_normalized_onto_another_route() {
+        // Normalizing /user/repos/../../zen to /zen and matching that would
+        // still leave the raw target -- which the origin sees -- ambiguous
+        // relative to what the origin does with ".." itself. Fail closed
+        // instead: the request never reaches the matcher or the wire.
         let client_in =
             b"GET /user/repos/../../zen HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
         let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -979,11 +1014,57 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
-            .expect("proxy");
+        let err = proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+            .unwrap_err();
 
-        let rendered = String::from_utf8(upstream.written).expect("utf8");
-        assert!(!rendered.contains("Bearer tok"), "{rendered}");
+        assert!(err.to_string().contains("'.' or '..' segment"), "{err}");
+        assert!(upstream.written.is_empty(), "nothing should reach the origin");
+    }
+
+    #[test]
+    fn ambiguous_paths_are_refused_with_a_400_and_nothing_forwarded() {
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_host x\nallow_route\tx\t*\t/public/**\n",
+            "",
+        ));
+        for target in [
+            "/admin//../public/x",
+            "/admin/..%2Fpublic/x",
+            "/a/%2e%2e/b",
+            "/a/.%2E/b",
+            "/a/%2E/b",
+            "/a\\b",
+        ] {
+            let client_in = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut client = FixtureIo::with_read(client_in.as_bytes());
+            let mut upstream = FixtureIo::with_read(b"");
+            let err = proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared)
+                .unwrap_err();
+            assert!(upstream.written.is_empty(), "{target}: {err}");
+            assert!(
+                String::from_utf8_lossy(&client.written).starts_with("HTTP/1.1 400"),
+                "{target}: {}",
+                String::from_utf8_lossy(&client.written)
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_paths_still_work() {
+        for target in ["/", "/a/b", "/a/b/", "/a%20b"] {
+            let client_in = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut client = FixtureIo::with_read(client_in.as_bytes());
+            let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host x\n", ""));
+            proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared)
+                .unwrap_or_else(|e| panic!("{target} should be allowed: {e}"));
+        }
+        // The query string is never inspected for dot-segments.
+        let client_in = b"GET /a?x=../y HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host x\n", ""));
+        proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared).expect("proxy");
     }
 
     #[test]

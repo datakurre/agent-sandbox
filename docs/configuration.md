@@ -120,9 +120,11 @@ For finer-grained HTTP proxy control and secret injection, you can specify an ar
 
 A host may carry several rules, and `secret` binds to the rule it is written on —
 not to the host. Only requests matching that rule's method and path receive the
-header; every other rule on the same host is proxied without it. Matching uses the
-normalised path, so `..` segments and percent-encoding cannot carry a secret off
-its route.
+header; every other rule on the same host is proxied without it. A request whose
+path is ambiguous — a `.` or `..` segment (literal or percent-encoded), an empty
+`//` segment, an encoded slash or backslash (`%2F`, `%5C`), a literal backslash, or
+a control byte — is refused outright with `400 Bad Request` rather than normalised,
+so it cannot be matched against one route and forwarded to another.
 
 #### Examples
 
