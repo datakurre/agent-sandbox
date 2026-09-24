@@ -800,33 +800,53 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
                 up_bytes += copy_chunked_body(client, upstream)?;
             }
 
-            let response_head = read_head(upstream)?.ok_or_else(|| {
-                io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "upstream closed before sending an HTTP response",
-                )
-            })?;
-            let response_text = std::str::from_utf8(&response_head).map_err(|_| {
-                io::Error::new(ErrorKind::InvalidData, "response head is not valid UTF-8")
-            })?;
-            // Validated before it is relayed: a desynced upstream is not
-            // forwarded to the client as though it were well-formed.
-            validate_head_lines(response_text)?;
+            // Read response heads until the *final* one. A 1xx (other than
+            // 101) is an interim response: RFC 9110 §15.2 says it has no
+            // body and the origin still owes this same request a final
+            // response on the same stream, so looping back to the top to
+            // read the *next request* here would leave that final response
+            // (100 Continue's is the common case: curl sends
+            // `Expect: 100-continue` for larger bodies) sitting unread and
+            // pair it with whatever the client sends next instead.
+            let (status, response_text) = loop {
+                let response_head = read_head(upstream)?.ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "upstream closed before sending an HTTP response",
+                    )
+                })?;
+                let response_text = std::str::from_utf8(&response_head)
+                    .map_err(|_| {
+                        io::Error::new(ErrorKind::InvalidData, "response head is not valid UTF-8")
+                    })?
+                    .to_string();
+                // Validated before it is relayed: a desynced upstream is not
+                // forwarded to the client as though it were well-formed.
+                validate_head_lines(&response_text)?;
 
-            client.write_all(&response_head)?;
-            down_bytes += response_head.len() as u64;
+                client.write_all(&response_head)?;
+                down_bytes += response_head.len() as u64;
 
-            let status = response_status_code(response_text)?;
+                let status = response_status_code(&response_text)?;
+
+                if status == 101 {
+                    // Switching Protocols: the exchange that got us here is
+                    // the last HTTP-shaped thing on this connection. Reading
+                    // another request head out of what comes next (WebSocket
+                    // frames, most commonly) would desync the parser, so
+                    // stop instead of looping.
+                    last_status = Some(status);
+                    return Ok(true);
+                }
+
+                if (100..200).contains(&status) {
+                    continue;
+                }
+
+                break (status, response_text);
+            };
+            let response_text = response_text.as_str();
             last_status = Some(status);
-
-            if status == 101 {
-                // Switching Protocols: the exchange that got us here is the
-                // last HTTP-shaped thing on this connection.  Reading another
-                // request head out of what comes next (WebSocket frames, most
-                // commonly) would desync the parser, so stop instead of
-                // looping.
-                return Ok(true);
-            }
 
             if response_has_no_body(&method, status) {
                 continue;
@@ -1074,6 +1094,70 @@ mod tests {
         let (first, second) = rendered.split_once("GET /zen").expect("both requests forwarded");
         assert!(first.contains("Authorization: Bearer tok"), "{rendered}");
         assert!(!second.contains("Bearer tok"), "the token leaked onto /zen: {rendered}");
+    }
+
+    #[test]
+    fn hundred_continue_relays_final_response() {
+        let client_in = b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\nhi";
+        let upstream_in = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let out = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
+        let got = String::from_utf8_lossy(&client.written);
+        assert!(got.starts_with("HTTP/1.1 100 Continue\r\n\r\n"), "{got}");
+        assert!(got.ends_with("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"), "{got}");
+        assert_eq!(out.status, Some(200));
+    }
+
+    #[test]
+    fn early_hints_relays_final_response() {
+        let client_in = b"GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let out = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
+        let got = String::from_utf8_lossy(&client.written);
+        assert!(got.contains("103 Early Hints"), "{got}");
+        assert!(got.ends_with("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"), "{got}");
+        assert_eq!(out.status, Some(200));
+    }
+
+    #[test]
+    fn interim_responses_do_not_shift_keep_alive_pairing() {
+        let client_in = b"GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n\
+                          GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none\
+                            HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
+        let got = String::from_utf8_lossy(&client.written);
+        assert_eq!(got.matches("HTTP/1.1 200 OK").count(), 2, "{got}");
+        assert!(got.contains("100 Continue"), "{got}");
+        assert!(got.ends_with("two"), "{got}");
+        let upstream_rendered = String::from_utf8_lossy(&upstream.written);
+        assert_eq!(upstream_rendered.matches("GET /").count(), 2, "{upstream_rendered}");
     }
 
     #[test]
