@@ -2434,7 +2434,14 @@ fn run() -> Result<i32> {
                 m.file_type().is_socket()
             })
             .unwrap_or(false);
-        let (m, e) = launch::nix_mounts(is_socket, Path::new("/nix/store").is_dir(), rw_mount_opts);
+        // Test-only override, on the same footing as
+        // AGENT_SANDBOX_NIX_DAEMON_SOCKET above: it lets the stub-podman
+        // integration tests make this existence probe deterministic instead
+        // of depending on whether the host running them happens to have a
+        // Nix store.
+        let store_path =
+            env::var("AGENT_SANDBOX_NIX_STORE").unwrap_or_else(|_| "/nix/store".to_string());
+        let (m, e) = launch::nix_mounts(is_socket, Path::new(&store_path).is_dir(), rw_mount_opts);
         mounts.extend(m);
         env_args.extend(e);
     }
