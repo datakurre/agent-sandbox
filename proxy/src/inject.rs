@@ -68,6 +68,78 @@ fn read_line_crlf<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     }
 }
 
+/// RFC 9110 §5.6.2 `tchar`: the bytes a header field name may contain.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Validate the header block of a request or response head.
+///
+/// RFC 9112 §5.1 requires a server to reject whitespace between a header
+/// field name and its colon, because a lenient recipient that instead
+/// strips it can be made to see a header -- `Transfer-Encoding`, most
+/// dangerously -- that this proxy's own line-oriented lookups
+/// (`content_length`, `is_chunked`, ...) do not, letting a request smuggle a
+/// second one past the L7 check in what this proxy treats as a body. This
+/// walks the header block on the wire's own terms -- strictly `\r\n`
+/// delimited, so a bare CR or LF inside a line (which would let the two
+/// sides disagree about where a line ends) is caught rather than silently
+/// accepted the way `str::lines` would -- and rejects anything RFC 9112
+/// does not allow: an empty or non-`tchar` name (whitespace before the
+/// colon included), obsolete line folding, or a line with no colon.
+fn validate_head_lines(head: &str) -> io::Result<()> {
+    let bad = |msg: &str| io::Error::new(ErrorKind::InvalidData, msg.to_string());
+    let start = head
+        .find("\r\n")
+        .ok_or_else(|| bad("head is missing its request/status line terminator"))?;
+    let mut rest = &head[start + 2..];
+    loop {
+        let idx = rest
+            .find("\r\n")
+            .ok_or_else(|| bad("head is missing the blank line terminating it"))?;
+        let line = &rest[..idx];
+        rest = &rest[idx + 2..];
+        if line.is_empty() {
+            return Ok(());
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err(bad("obsolete header line folding is not allowed"));
+        }
+        if line.contains('\r') || line.contains('\n') {
+            return Err(bad("stray CR or LF inside a header line"));
+        }
+        let Some((name, _value)) = line.split_once(':') else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("header line has no colon: {:?}", line),
+            ));
+        };
+        if name.is_empty() || !name.bytes().all(is_tchar) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid header field name: {:?}", name),
+            ));
+        }
+    }
+}
+
 fn content_length(head: &str) -> io::Result<Option<usize>> {
     let mut found: Option<usize> = None;
     for line in head.lines().skip(1) {
@@ -653,6 +725,10 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             let request_text = std::str::from_utf8(&request_head).map_err(|_| {
                 io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
             })?;
+            if let Err(e) = validate_head_lines(request_text) {
+                let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                return Err(e);
+            }
             validate_request_authority(request_text, expected_host, expected_port)?;
             
             let has_cl = content_length(request_text)?.is_some();
@@ -730,12 +806,16 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
                     "upstream closed before sending an HTTP response",
                 )
             })?;
-            client.write_all(&response_head)?;
-            down_bytes += response_head.len() as u64;
-
             let response_text = std::str::from_utf8(&response_head).map_err(|_| {
                 io::Error::new(ErrorKind::InvalidData, "response head is not valid UTF-8")
             })?;
+            // Validated before it is relayed: a desynced upstream is not
+            // forwarded to the client as though it were well-formed.
+            validate_head_lines(response_text)?;
+
+            client.write_all(&response_head)?;
+            down_bytes += response_head.len() as u64;
+
             let status = response_status_code(response_text)?;
             last_status = Some(status);
 
@@ -994,6 +1074,47 @@ mod tests {
         let (first, second) = rendered.split_once("GET /zen").expect("both requests forwarded");
         assert!(first.contains("Authorization: Bearer tok"), "{rendered}");
         assert!(!second.contains("Bearer tok"), "the token leaked onto /zen: {rendered}");
+    }
+
+    #[test]
+    fn header_lines_with_whitespace_before_the_colon_are_rejected() {
+        let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host example.com\n", ""));
+        let bad_heads: &[&[u8]] = &[
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding : chunked\r\nContent-Length: 5\r\n\r\nhello",
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nContent-Length : 5\r\n\r\nhello",
+            b"GET /ok HTTP/1.1\r\nHost : evil.com\r\n\r\n",
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding\t: chunked\r\n\r\n0\r\n\r\n",
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nX-Multi: a\r\n chunked\r\n\r\n",
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nno-colon-here\r\n\r\n",
+        ];
+        for head in bad_heads {
+            let mut client = FixtureIo::with_read(head);
+            let mut upstream = FixtureIo::with_read(b"");
+            proxy_http1_with_injection(&mut client, &mut upstream, "example.com", 80, &shared)
+                .unwrap_err();
+            assert!(
+                upstream.written.is_empty(),
+                "nothing should reach upstream for {:?}",
+                String::from_utf8_lossy(head)
+            );
+            assert!(
+                String::from_utf8_lossy(&client.written).starts_with("HTTP/1.1 400"),
+                "expected a 400 for {:?}, got {:?}",
+                String::from_utf8_lossy(head),
+                String::from_utf8_lossy(&client.written)
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_header_block_still_passes_validation() {
+        let client_in = b"GET /ok HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host example.com\n", ""));
+        proxy_http1_with_injection(&mut client, &mut upstream, "example.com", 80, &shared)
+            .expect("proxy");
     }
 
     #[test]
