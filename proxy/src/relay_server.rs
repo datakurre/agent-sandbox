@@ -234,12 +234,11 @@ fn validate_gpg_args(args: &[String]) -> bool {
             || lower == "--clearsign"
             || lower == "--verify"
             || lower == "--clear-sign"
+            || (lower.starts_with('-')
+                && !lower.starts_with("--")
+                && (lower.contains('s') || lower.contains('b') || lower.contains('v')))
         {
             has_signing_intent = true;
-        } else if lower.starts_with('-') && !lower.starts_with("--") {
-            if lower.contains('s') || lower.contains('b') || lower.contains('v') {
-                has_signing_intent = true;
-            }
         }
     }
     has_signing_intent
@@ -267,7 +266,7 @@ fn prepare_gpg_home() -> io::Result<()> {
             }
         };
         let target = format!("{RELAY_GPG_HOME}/{name}");
-        if !Path::new(&target).exists() && !Path::new(&target).symlink_metadata().is_ok() {
+        if !Path::new(&target).exists() && Path::new(&target).symlink_metadata().is_err() {
             std::os::unix::fs::symlink(source, target)?;
         }
     }

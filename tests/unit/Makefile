@@ -28,7 +28,7 @@ NIX ?= nix
 
 .PHONY: all rust docs schema nix logs clean fmt-check clippy
 
-all: rust docs schema
+all: rust docs schema clippy
 
 ## The whole Rust workspace: the in-crate unit tests plus the integration
 ## tests under cli/tests, which drive the real launcher binary against a stub
@@ -62,9 +62,11 @@ nix:
 fmt-check:
 	cd $(ROOT) && $(CARGO) fmt --all --check
 
-## Also not part of `all`, for the same reason.
+## The workspace is clippy-clean; this is part of `all` so it stays that way.
+## Warnings that are deliberately kept are `#[allow]`ed at their call site
+## with a comment saying why, rather than silenced here.
 clippy:
-	cd $(ROOT) && $(CARGO) clippy --workspace --all-targets
+	cd $(ROOT) && $(CARGO) clippy --workspace --all-targets -- -D warnings
 
 ## Everything, with output captured.  Use this when handing results to someone
 ## who was not at the terminal.
@@ -72,7 +74,7 @@ logs: | $(LOGDIR)
 	@rm -f $(LOGDIR)/*.log
 	@set -o pipefail; \
 	 fail=0; \
-	 for target in rust docs schema; do \
+	 for target in rust docs schema clippy; do \
 	   echo "=== $$target ==="; \
 	   if $(MAKE) --no-print-directory $$target > $(LOGDIR)/$$target.log 2>&1; then \
 	     echo "PASS $$target"; \

@@ -251,7 +251,7 @@ pub fn try_resolve_sandbox(
             ))));
         }
         let stdout = String::from_utf8(output.stdout)?;
-        let parts: Vec<&str> = stdout.trim().split_whitespace().collect();
+        let parts: Vec<&str> = stdout.split_whitespace().collect();
         if parts.len() < 3 || parts[1] != "sandbox" {
             return Ok(Err(Unresolved::not_found(format!(
                 "container '{}' is not an agent-sandbox",

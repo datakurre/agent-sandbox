@@ -1069,6 +1069,29 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_route_with_no_provider_binding_is_reported_missing_on_success() {
+        // Authorized for injection by policy, but no provider ever bound a
+        // value to the route: the request still goes out (unauthenticated),
+        // and the caller (main.rs) needs to know that happened so it can
+        // surface it, rather than the exchange silently looking like any
+        // other successful one.
+        let client_in = b"GET /user HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_host api.example.com\nsecret_route\tapi.example.com\tGET\t/user\n",
+            "",
+        ));
+
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let outcome =
+            proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+                .expect("proxy");
+
+        assert!(outcome.secret_missing);
+    }
+
+    #[test]
     fn a_second_request_on_one_connection_outside_the_route_gets_no_secret() {
         // The leak, end to end.  Both requests are allowed by L7 -- the repo's
         // AGENTS.md said so -- but only /user/repos is a route the operator

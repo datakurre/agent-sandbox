@@ -326,7 +326,7 @@ pub fn render_summary(records: Vec<ProxyRecord>, style: Style) -> Vec<String> {
         .iter()
         .filter(|r| {
             r.ev.as_deref().unwrap_or("close") == "open"
-                && r.id.as_ref().map_or(false, |id| !closed_ids.contains(id))
+                && r.id.as_ref().is_some_and(|id| !closed_ids.contains(id))
         })
         .collect();
 

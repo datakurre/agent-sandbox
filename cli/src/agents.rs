@@ -287,13 +287,13 @@ pub fn allocate(mapping: Mapping) -> Result<Mapping, ConfigError> {
         .parse()
         .map_err(|e| ConfigError::msg(format!("invalid bind: {}", e)))?;
     let host_port = if mapping.protocol == "udp" {
-        let sock = UdpSocket::bind((bind_addr, 0)).map_err(|e| ConfigError::msg(e))?;
-        sock.local_addr().map_err(|e| ConfigError::msg(e))?.port()
+        let sock = UdpSocket::bind((bind_addr, 0)).map_err(ConfigError::msg)?;
+        sock.local_addr().map_err(ConfigError::msg)?.port()
     } else {
-        let listener = TcpListener::bind((bind_addr, 0)).map_err(|e| ConfigError::msg(e))?;
+        let listener = TcpListener::bind((bind_addr, 0)).map_err(ConfigError::msg)?;
         listener
             .local_addr()
-            .map_err(|e| ConfigError::msg(e))?
+            .map_err(ConfigError::msg)?
             .port()
     };
     let mut m = mapping;
@@ -560,8 +560,10 @@ pub struct ProxyPolicy {
 }
 
 pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
-    let mut policy = ProxyPolicy::default();
-    policy.default = vec!["deny".to_string()];
+    let mut policy = ProxyPolicy {
+        default: vec!["deny".to_string()],
+        ..Default::default()
+    };
 
     let blocks = iter_tagged_blocks(text);
 

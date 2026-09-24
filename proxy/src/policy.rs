@@ -87,6 +87,9 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
+    /// One argument per `ProxyConfig` field; a params struct would only
+    /// rename this same list under a different name.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         allow_host: Vec<TargetRule<String>>,
         secret_routes: Vec<L7Rule>,
@@ -482,7 +485,7 @@ fn union_ports<'a>(
 fn is_port_in_target_ports(port: u16, target_ports: Option<&Vec<PortRange>>, global_ports: Option<&[PortRange]>) -> bool {
     match target_ports {
         Some(ports) => ports.iter().any(|r| r.contains(port)),
-        None => global_ports.map_or(true, |ranges| ranges.iter().any(|r| r.contains(port))),
+        None => global_ports.is_none_or(|ranges| ranges.iter().any(|r| r.contains(port))),
     }
 }
 
@@ -600,7 +603,7 @@ impl ProxyConfig {
     pub fn is_allowed_port(&self, port: u16) -> bool {
         self.allow_port
             .as_ref()
-            .map_or(true, |ranges| ranges.iter().any(|r| r.contains(port)))
+            .is_none_or(|ranges| ranges.iter().any(|r| r.contains(port)))
     }
 
     pub fn is_allowed(&self, host: &str, port: u16) -> bool {

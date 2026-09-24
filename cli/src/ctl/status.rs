@@ -161,7 +161,7 @@ pub fn run(args: StatusArgs) -> Result<()> {
                         .arg(&log_file)
                         .output()?;
                     let awk_out = String::from_utf8(awk_cmd.stdout)?;
-                    let counts: Vec<&str> = awk_out.trim().split_whitespace().collect();
+                    let counts: Vec<&str> = awk_out.split_whitespace().collect();
                     if counts.len() == 4 {
                         let ok: i32 = counts[0].parse().unwrap_or(0);
                         let deny: i32 = counts[1].parse().unwrap_or(0);
@@ -196,7 +196,7 @@ pub fn run(args: StatusArgs) -> Result<()> {
     let published = published.trim();
 
     if !published.is_empty() {
-        row("ports", &published.to_string());
+        row("ports", published);
     } else {
         row("ports", "none published");
     }

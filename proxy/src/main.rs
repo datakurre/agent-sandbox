@@ -21,7 +21,6 @@ mod secret;
 mod tls;
 
 use agent_sandbox_proxy::logfile::rotate_if_needed;
-use ipnet::IpNet;
 use secret::{SecretBinding, SecretBindings};
 use std::collections::HashMap;
 use std::env;
@@ -98,6 +97,12 @@ const HEAD_MAX: usize = 8192;
 const DNS_CACHE_MAX: usize = 512;
 /// How often the policy file is checked for changes.
 const POLICY_POLL: Duration = Duration::from_secs(1);
+
+/// A request matched a route the policy marks secret-bearing, but no provider
+/// binding exists behind it, so it went out unauthenticated -- worth
+/// reporting whether the exchange itself succeeded or failed.
+const SECRET_MISSING_NOTE: &str =
+    "secret missing: domain configured for secret injection in policy, but --secrets was not enabled";
 
 pub mod policy;
 use policy::*;
@@ -361,6 +366,11 @@ impl MetricsLog {
     /// A connection has reached a terminal state.  `id` is `Some` only for
     /// connections that announced themselves with `open_event`; with `None` the
     /// line is byte-for-byte what earlier versions wrote.
+    ///
+    /// One argument per JSON field this writes; a params struct would only
+    /// rename this same list, and `Shared::record` below has to forward every
+    /// one of them regardless.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         id: Option<&str>,
@@ -485,6 +495,9 @@ impl Shared {
         }
     }
 
+    /// Forwards every argument to `Metrics::record` unchanged when metering
+    /// is on; a params struct would only rename this same list.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         id: Option<&str>,
@@ -1109,12 +1122,18 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
                         }
                     }
                 }
+                if outcome.secret_missing {
+                    eprintln!(
+                        "proxy: {}:{} succeeded without secret injection ({})",
+                        host, port, SECRET_MISSING_NOTE
+                    );
+                }
                 shared.record(
                     id.as_deref(),
                     &host,
                     port,
                     "allow",
-                    None,
+                    outcome.secret_missing.then_some(SECRET_MISSING_NOTE),
                     up_bytes,
                     down_bytes,
                     started.elapsed().as_millis(),
@@ -1163,7 +1182,9 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
                 );
                 let mut detail = format!("inject-http: {}", short_err(&error));
                 if secret_missing {
-                    detail.push_str(" (secret missing: domain configured for secret injection in policy, but --secrets was not enabled)");
+                    detail.push_str(" (");
+                    detail.push_str(SECRET_MISSING_NOTE);
+                    detail.push(')');
                 }
                 shared.record(
                     id.as_deref(),
@@ -1181,77 +1202,29 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
             }
         }
         return;
-    } else if port == 443 {
-        if !skip_l7 && shared.session_ca.is_some() {
-            // A transparent client is already sending TLS; only a client that
-            // asked for a tunnel is waiting to be told it has one.
-            if ingress.speaks_http()
-                && client_sock
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .is_err()
-            {
-                return;
-            }
-            let session_ca = shared.session_ca.as_ref().unwrap();
+    } else if port == 443 && !skip_l7 && shared.session_ca.is_some() {
+        // A transparent client is already sending TLS; only a client that
+        // asked for a tunnel is waiting to be told it has one.
+        if ingress.speaks_http()
+            && client_sock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .is_err()
+        {
+            return;
+        }
+        let session_ca = shared.session_ca.as_ref().unwrap();
 
-            let requested_host = normalize_host(&host).unwrap_or_else(|| host.clone());
-            let leaf = match session_ca.issue_leaf(&requested_host) {
-                Ok(leaf) => leaf,
-                Err(e) => {
-                    eprintln!("proxy: cannot issue leaf cert for {}:{}: {}", host, port, e);
-                    shared.record(
-                        None,
-                        &host,
-                        port,
-                        "error",
-                        Some("leaf-cert"),
-                        0,
-                        0,
-                        started.elapsed().as_millis(),
-                        None,
-                        None,
-                        None,
-                    );
-                    return;
-                }
-            };
-
-            let mut client_tls =
-                match tls::terminate(PrefixedStream::new(client_sock, prelude.clone()), &leaf) {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        eprintln!(
-                            "proxy: TLS acceptor setup failed for {}:{}: {}",
-                            host, port, e
-                        );
-                        shared.record(
-                            None,
-                            &host,
-                            port,
-                            "error",
-                            Some("mitm-accept"),
-                            0,
-                            0,
-                            started.elapsed().as_millis(),
-                            None,
-                            None,
-                            None,
-                        );
-                        return;
-                    }
-                };
-
-            if let Err(e) = client_tls.conn.complete_io(&mut client_tls.sock) {
-                eprintln!(
-                    "proxy: TLS client handshake failed for {}:{}: {}",
-                    host, port, e
-                );
+        let requested_host = normalize_host(&host).unwrap_or_else(|| host.clone());
+        let leaf = match session_ca.issue_leaf(&requested_host) {
+            Ok(leaf) => leaf,
+            Err(e) => {
+                eprintln!("proxy: cannot issue leaf cert for {}:{}: {}", host, port, e);
                 shared.record(
                     None,
                     &host,
                     port,
                     "error",
-                    Some("mitm-client-handshake"),
+                    Some("leaf-cert"),
                     0,
                     0,
                     started.elapsed().as_millis(),
@@ -1261,104 +1234,14 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
                 );
                 return;
             }
+        };
 
-            // After complete_io succeeds, check ALPN
-            let negotiated_alpn = client_tls.conn.alpn_protocol();
-            if let Some(proto) = negotiated_alpn {
-                if proto != b"http/1.1" {
-                    eprintln!(
-                        "proxy: deny {}:{} (MITM requires HTTP/1.1 but client negotiated {:?})",
-                        host,
-                        port,
-                        String::from_utf8_lossy(proto)
-                    );
-                    shared.denied_detail(&host, port, "alpn-unsupported", &req_str);
-                    shared.record(
-                        None,
-                        &host,
-                        port,
-                        "deny",
-                        Some("alpn-unsupported"),
-                        0,
-                        0,
-                        started.elapsed().as_millis(),
-                        None,
-                        None,
-                        None,
-                    );
-                    return;
-                }
-            }
-
-            let sni = match client_tls.conn.server_name() {
-                Some(name) => name.to_ascii_lowercase(),
-                None => {
-                    eprintln!("proxy: TLS client sent no SNI for {}:{}", host, port);
-                    shared.denied_detail(&host, port, "sni-missing", &req_str);
-                    shared.record(
-                        None,
-                        &host,
-                        port,
-                        "deny",
-                        Some("sni-missing"),
-                        0,
-                        0,
-                        started.elapsed().as_millis(),
-                        None,
-                        None,
-                        None,
-                    );
-                    return;
-                }
-            };
-            let normalized_sni = match normalize_host(&sni) {
-                Some(name) => name,
-                None => {
-                    eprintln!("proxy: invalid SNI {:?} for {}:{}", sni, host, port);
-                    shared.denied_detail(&host, port, "sni-invalid", &req_str);
-                    shared.record(
-                        None,
-                        &host,
-                        port,
-                        "deny",
-                        Some("sni-invalid"),
-                        0,
-                        0,
-                        started.elapsed().as_millis(),
-                        None,
-                        None,
-                        None,
-                    );
-                    return;
-                }
-            };
-            if normalized_sni != requested_host {
-                eprintln!(
-                    "proxy: deny {}:{} (SNI {:?} does not match CONNECT authority {:?})",
-                    host, port, normalized_sni, requested_host
-                );
-                shared.denied_detail(&host, port, "sni-mismatch", &req_str);
-                shared.record(
-                    None,
-                    &host,
-                    port,
-                    "deny",
-                    Some("sni-mismatch"),
-                    0,
-                    0,
-                    started.elapsed().as_millis(),
-                    None,
-                    None,
-                    None,
-                );
-                return;
-            }
-
-            let mut upstream_tls = match tls::originate(remote_sock, &requested_host) {
+        let mut client_tls =
+            match tls::terminate(PrefixedStream::new(client_sock, prelude.clone()), &leaf) {
                 Ok(stream) => stream,
                 Err(e) => {
                     eprintln!(
-                        "proxy: cannot initialize upstream TLS for {}:{}: {}",
+                        "proxy: TLS acceptor setup failed for {}:{}: {}",
                         host, port, e
                     );
                     shared.record(
@@ -1366,7 +1249,7 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
                         &host,
                         port,
                         "error",
-                        Some("mitm-upstream"),
+                        Some("mitm-accept"),
                         0,
                         0,
                         started.elapsed().as_millis(),
@@ -1378,88 +1261,232 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
                 }
             };
 
-            let id = shared.open_event(&host, port);
-            match inject::proxy_http1_with_injection(
-                &mut client_tls,
-                &mut upstream_tls,
-                &requested_host,
+        if let Err(e) = client_tls.conn.complete_io(&mut client_tls.sock) {
+            eprintln!(
+                "proxy: TLS client handshake failed for {}:{}: {}",
+                host, port, e
+            );
+            shared.record(
+                None,
+                &host,
                 port,
-                &shared,
-            ) {
-                Ok(outcome) => {
-                    shared.record(
-                        id.as_deref(),
-                        &host,
-                        port,
-                        "allow",
-                        None,
-                        outcome.up_bytes,
-                        outcome.down_bytes,
-                        started.elapsed().as_millis(),
-                        outcome.method.as_deref(),
-                        outcome.path.as_deref(),
-                        outcome.status,
-                    );
-                }
-                Err(inject::ProxyHttpError::L7Denied {
-                    method,
-                    path,
-                    reason,
-                }) => {
-                    eprintln!("proxy: deny {}:{} ({})", host, port, reason);
-                    shared.denied_http_detail(
-                        &host,
-                        port,
-                        &format!("L7 denied: {}", reason),
-                        &method,
-                        &path,
-                    );
-                    shared.record(
-                        id.as_deref(),
-                        &host,
-                        port,
-                        "deny",
-                        Some(&format!("L7 denied: {}", reason)),
-                        0,
-                        0,
-                        started.elapsed().as_millis(),
-                        Some(&method),
-                        Some(&path),
-                        Some(403),
-                    );
-                }
-                Err(inject::ProxyHttpError::Io {
-                    method,
-                    path,
-                    status,
-                    secret_missing,
-                    error,
-                }) => {
-                    eprintln!(
-                        "proxy: injected HTTPS proxying failed {}:{}: {}",
-                        host, port, error
-                    );
-                    let mut detail = format!("inject-https: {}", short_err(&error));
-                    if secret_missing {
-                        detail.push_str(" (secret missing: domain configured for secret injection in policy, but --secrets was not enabled)");
-                    }
-                    shared.record(
-                        id.as_deref(),
-                        &host,
-                        port,
-                        "error",
-                        Some(&detail),
-                        0,
-                        0,
-                        started.elapsed().as_millis(),
-                        method.as_deref(),
-                        path.as_deref(),
-                        status,
-                    );
-                }
-            }
+                "error",
+                Some("mitm-client-handshake"),
+                0,
+                0,
+                started.elapsed().as_millis(),
+                None,
+                None,
+                None,
+            );
             return;
         }
+
+        // After complete_io succeeds, check ALPN
+        let negotiated_alpn = client_tls.conn.alpn_protocol();
+        if let Some(proto) = negotiated_alpn {
+            if proto != b"http/1.1" {
+                eprintln!(
+                    "proxy: deny {}:{} (MITM requires HTTP/1.1 but client negotiated {:?})",
+                    host,
+                    port,
+                    String::from_utf8_lossy(proto)
+                );
+                shared.denied_detail(&host, port, "alpn-unsupported", &req_str);
+                shared.record(
+                    None,
+                    &host,
+                    port,
+                    "deny",
+                    Some("alpn-unsupported"),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    None,
+                    None,
+                    None,
+                );
+                return;
+            }
+        }
+
+        let sni = match client_tls.conn.server_name() {
+            Some(name) => name.to_ascii_lowercase(),
+            None => {
+                eprintln!("proxy: TLS client sent no SNI for {}:{}", host, port);
+                shared.denied_detail(&host, port, "sni-missing", &req_str);
+                shared.record(
+                    None,
+                    &host,
+                    port,
+                    "deny",
+                    Some("sni-missing"),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    None,
+                    None,
+                    None,
+                );
+                return;
+            }
+        };
+        let normalized_sni = match normalize_host(&sni) {
+            Some(name) => name,
+            None => {
+                eprintln!("proxy: invalid SNI {:?} for {}:{}", sni, host, port);
+                shared.denied_detail(&host, port, "sni-invalid", &req_str);
+                shared.record(
+                    None,
+                    &host,
+                    port,
+                    "deny",
+                    Some("sni-invalid"),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    None,
+                    None,
+                    None,
+                );
+                return;
+            }
+        };
+        if normalized_sni != requested_host {
+            eprintln!(
+                "proxy: deny {}:{} (SNI {:?} does not match CONNECT authority {:?})",
+                host, port, normalized_sni, requested_host
+            );
+            shared.denied_detail(&host, port, "sni-mismatch", &req_str);
+            shared.record(
+                None,
+                &host,
+                port,
+                "deny",
+                Some("sni-mismatch"),
+                0,
+                0,
+                started.elapsed().as_millis(),
+                None,
+                None,
+                None,
+            );
+            return;
+        }
+
+        let mut upstream_tls = match tls::originate(remote_sock, &requested_host) {
+            Ok(stream) => stream,
+            Err(e) => {
+                eprintln!(
+                    "proxy: cannot initialize upstream TLS for {}:{}: {}",
+                    host, port, e
+                );
+                shared.record(
+                    None,
+                    &host,
+                    port,
+                    "error",
+                    Some("mitm-upstream"),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    None,
+                    None,
+                    None,
+                );
+                return;
+            }
+        };
+
+        let id = shared.open_event(&host, port);
+        match inject::proxy_http1_with_injection(
+            &mut client_tls,
+            &mut upstream_tls,
+            &requested_host,
+            port,
+            &shared,
+        ) {
+            Ok(outcome) => {
+                if outcome.secret_missing {
+                    eprintln!(
+                        "proxy: {}:{} succeeded without secret injection ({})",
+                        host, port, SECRET_MISSING_NOTE
+                    );
+                }
+                shared.record(
+                    id.as_deref(),
+                    &host,
+                    port,
+                    "allow",
+                    outcome.secret_missing.then_some(SECRET_MISSING_NOTE),
+                    outcome.up_bytes,
+                    outcome.down_bytes,
+                    started.elapsed().as_millis(),
+                    outcome.method.as_deref(),
+                    outcome.path.as_deref(),
+                    outcome.status,
+                );
+            }
+            Err(inject::ProxyHttpError::L7Denied {
+                method,
+                path,
+                reason,
+            }) => {
+                eprintln!("proxy: deny {}:{} ({})", host, port, reason);
+                shared.denied_http_detail(
+                    &host,
+                    port,
+                    &format!("L7 denied: {}", reason),
+                    &method,
+                    &path,
+                );
+                shared.record(
+                    id.as_deref(),
+                    &host,
+                    port,
+                    "deny",
+                    Some(&format!("L7 denied: {}", reason)),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    Some(&method),
+                    Some(&path),
+                    Some(403),
+                );
+            }
+            Err(inject::ProxyHttpError::Io {
+                method,
+                path,
+                status,
+                secret_missing,
+                error,
+            }) => {
+                eprintln!(
+                    "proxy: injected HTTPS proxying failed {}:{}: {}",
+                    host, port, error
+                );
+                let mut detail = format!("inject-https: {}", short_err(&error));
+                if secret_missing {
+                    detail.push_str(" (");
+                    detail.push_str(SECRET_MISSING_NOTE);
+                    detail.push(')');
+                }
+                shared.record(
+                    id.as_deref(),
+                    &host,
+                    port,
+                    "error",
+                    Some(&detail),
+                    0,
+                    0,
+                    started.elapsed().as_millis(),
+                    method.as_deref(),
+                    path.as_deref(),
+                    status,
+                );
+            }
+        }
+        return;
     }
 
     // Non-CONNECT traffic always returned above; anything reaching here is a

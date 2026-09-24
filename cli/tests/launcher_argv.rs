@@ -377,10 +377,7 @@ fn selinux_does_not_add_a_relabel_to_the_nix_overlay_mount() {
         run.joined()
     );
     assert!(
-        !run
-            .values_of("-v")
-            .iter()
-            .any(|mount| *mount == "/nix:/nix:O,Z"),
+        !run.values_of("-v").contains(&"/nix:/nix:O,Z"),
         "SELinux relabeling must not be combined with the Nix overlay: {}",
         run.joined()
     );

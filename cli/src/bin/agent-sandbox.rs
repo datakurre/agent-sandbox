@@ -1195,7 +1195,7 @@ impl CleanupGuard {
                 display
             ))
         );
-        println!("");
+        println!();
     }
 }
 
@@ -2681,8 +2681,10 @@ fn run() -> Result<i32> {
     let mut proxy_configured = false;
     let mut secrets_configured = false;
 
-    let mut merged_policy = agents::ProxyPolicy::default();
-    merged_policy.default = vec!["deny".to_string()];
+    let mut merged_policy = agents::ProxyPolicy {
+        default: vec!["deny".to_string()],
+        ..Default::default()
+    };
     let mut policy_sources = HashMap::new();
     let mut startup_info = StartupInfo::new(want_json);
 
