@@ -1,7 +1,6 @@
 ---
 name: mailpit
 description: Use the ephemeral Mailpit SMTP/API mailbox for communication between agents and tools running in the same agent-sandbox container. Trigger when agents need asynchronous handoff, requests, replies, or shared event notifications.
-compatibility: opencode
 metadata:
   workflow: local-agent-mailbox
   audience: developers-and-agents

@@ -43,7 +43,7 @@ Key layers:
 | `/usr/bin/env`        | Symlink to coreutils `env` for generic shebangs        |
 | `/lib64/ld-linux-*`   | ELF interpreter for prebuilt npm binaries              |
 | `/home/user`          | Home directory (uid/gid mapped at runtime)             |
-| `/home/user/.agents/skills` | Bundled `agent-sandbox`, `nix`, `nix-flake`, `devenv` and `browser` skills |
+| `/home/user/.agents/skills` | Bundled `agent-sandbox`, `nix`, `nix-flake`, `devenv`, `browser`, `mailpit` and `commit` skills |
 | `/workspace`          | Default working directory                              |
 
 The skills are image content, not a launcher-managed mount, and the image links

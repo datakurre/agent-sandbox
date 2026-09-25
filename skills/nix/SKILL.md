@@ -1,7 +1,6 @@
 ---
 name: nix
 description: Run any tool from nixpkgs ad hoc, without installing it. Trigger when a CLI tool is missing, when a command fails with "command not found", when a one-off or temporary environment is needed, when looking up a Nix package name, or when asked to avoid global installation.
-compatibility: opencode
 metadata:
   workflow: ephemeral-tooling
   audience: developers-and-agents

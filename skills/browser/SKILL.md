@@ -1,7 +1,6 @@
 ---
 name: browser
 description: Drive a browser to screenshot a page for visual/image analysis, record a 25 fps video/screencast, or interact with it (navigate, click, fill, wait) — either headless inside the sandbox, or a visible browser on the user's host over CDP. Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, record a video of a browser interaction, automate clicks/form-fills against a page, or work in a real browser the user can watch and click along with.
-compatibility: opencode
 metadata:
   workflow: headless-browser-automation
   audience: developers-and-agents

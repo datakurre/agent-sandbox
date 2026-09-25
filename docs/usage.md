@@ -432,7 +432,7 @@ When using Git inside the sandbox, be aware of how the integration flags interac
 
 ### Bundled OpenCode skills
 
-The image includes five OpenCode skills at `/home/user/.agents/skills`:
+The image includes seven OpenCode skills at `/home/user/.agents/skills`:
 
 - `agent-sandbox` for the sandbox itself: recognising that it is running in one,
   what the firewall, the ephemeral home directory and the opt-in flags imply, and
@@ -448,6 +448,10 @@ The image includes five OpenCode skills at `/home/user/.agents/skills`:
   from nixpkgs, and the cooperative host browser `agent-sandbox browser` starts.
   It covers screenshotting a page for visual analysis, driving it via
   Playwright, and which of the two browsers a given task wants.
+- `mailpit` for coordinating agents and tools in the same sandbox through the
+  ephemeral local mailbox.
+- `commit` for ensuring every assistant-created or amended Git commit includes
+  an `Assisted-by: <tool> (<model>)` trailer.
 
 Each skill is a `SKILL.md` with the common path plus reference files with
 advanced patterns. `nix-flake` additionally carries `uv2nix.md` (packaging

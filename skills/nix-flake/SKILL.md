@@ -1,7 +1,6 @@
 ---
 name: nix-flake
 description: Use and write flake.nix — package software as a reproducible build, expose apps and checks, and provide a devShell entered non-interactively with nix develop --command. Trigger when a repository has flake.nix or flake.lock, when packaging or building software with Nix, or when adding a development shell, app, check, or formatter.
-compatibility: opencode
 metadata:
   workflow: project-interface
   audience: developers-and-agents

@@ -1,7 +1,6 @@
 ---
 name: agent-sandbox
 description: Recognize that you are running inside an agent-sandbox container and work with its limits instead of against them. Trigger on network failures that look like policy — a bare 403 Forbidden from a proxy, "Could not resolve host", "denied by allow_signing policy" — on permission errors outside /workspace, on tools or logins that vanished between sessions, and on an AGENTS.md `toml agent-sandbox` block, a secretspec.toml, or any mention of agent-sandbox ctl.
-compatibility: opencode
 metadata:
   workflow: sandbox-awareness
   audience: developers-and-agents

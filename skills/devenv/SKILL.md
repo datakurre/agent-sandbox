@@ -1,7 +1,6 @@
 ---
 name: devenv
 description: Use and write devenv.nix — declarative development environments with pinned packages, language toolchains, scripts, git hooks, and supporting services such as databases, run non-interactively with devenv shell -- <command>. Trigger when a repository has devenv.nix, devenv.yaml, or devenv.lock, when a project command needs its declared environment, or when a service like postgres or redis must run for development or tests.
-compatibility: opencode
 metadata:
   workflow: declared-development-environment
   audience: developers-and-agents
