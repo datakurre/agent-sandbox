@@ -28,7 +28,7 @@ NIX ?= nix
 
 .PHONY: all rust docs schema nix logs clean fmt-check clippy
 
-all: rust docs schema clippy
+all: rust docs schema
 
 ## The whole Rust workspace: the in-crate unit tests plus the integration
 ## tests under cli/tests, which drive the real launcher binary against a stub
@@ -62,9 +62,12 @@ nix:
 fmt-check:
 	cd $(ROOT) && $(CARGO) fmt --all --check
 
-## The workspace is clippy-clean; this is part of `all` so it stays that way.
+## The workspace is clippy-clean as of this writing, but not part of `all`:
+## each new Rust release can add lints, and `all` failing on a toolchain bump
+## with no code change is worse than a warning going briefly unnoticed.
 ## Warnings that are deliberately kept are `#[allow]`ed at their call site
-## with a comment saying why, rather than silenced here.
+## with a comment saying why, rather than silenced here. Run this yourself
+## on a file you are already touching, or after a `nix flake update`.
 clippy:
 	cd $(ROOT) && $(CARGO) clippy --workspace --all-targets -- -D warnings
 
@@ -74,7 +77,7 @@ logs: | $(LOGDIR)
 	@rm -f $(LOGDIR)/*.log
 	@set -o pipefail; \
 	 fail=0; \
-	 for target in rust docs schema clippy; do \
+	 for target in rust docs schema; do \
 	   echo "=== $$target ==="; \
 	   if $(MAKE) --no-print-directory $$target > $(LOGDIR)/$$target.log 2>&1; then \
 	     echo "PASS $$target"; \

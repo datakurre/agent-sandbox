@@ -5,43 +5,63 @@
 /// `**` matches any run of bytes, including `/`, and may match nothing.
 /// Matching is anchored at both ends of `path`.
 ///
-/// This is a textbook two-wildcard glob, matched with a memoized recursion
-/// over `(path_idx, pattern_idx)` rather than the single most-recent-star
+/// This is a textbook two-wildcard glob, matched with a bottom-up DP over
+/// `(path_idx, pattern_idx)` rather than the single most-recent-star
 /// backtrack a hand-rolled version is tempted to use: with only one
 /// remembered backtrack point, a pattern like `/**/b/*` can only ever retry
 /// the `*`, so when matching it requires crossing a `/` (which `*` cannot
 /// do) the whole match fails instead of falling back to let the earlier `**`
-/// absorb more of the path. Memoizing on both indices keeps this polynomial
+/// absorb more of the path. The DP keeps this polynomial
 /// (`O(len(path) * len(pattern))`) rather than backtracking exponentially,
 /// which matters because `path` comes from an untrusted client.
+///
+/// Built bottom-up with two rows rather than as a memoized recursion: a
+/// recursive version makes one call per byte of `path`, and this runs on
+/// connection threads spawned with a small fixed stack
+/// (`stack_size(256 * 1024)` in `main.rs`) -- a path a few KB long, well
+/// under the 64 KiB head limit, is enough to overflow that stack and abort
+/// the whole process, not just the one connection.
 pub fn glob_match(path: &str, pattern: &str) -> bool {
     let p = path.as_bytes();
     let t = pattern.as_bytes();
-    let mut memo = vec![vec![None; t.len() + 1]; p.len() + 1];
-    matches(p, t, 0, 0, &mut memo)
-}
+    let n = p.len();
+    let m = t.len();
 
-fn matches(p: &[u8], t: &[u8], pi: usize, ti: usize, memo: &mut [Vec<Option<bool>>]) -> bool {
-    if let Some(result) = memo[pi][ti] {
-        return result;
+    // `row[j]` is whether `p[i..]` matches `t[j..]`, for the `i` currently
+    // being built. Starts as the row for `i == n` (the empty remainder of
+    // the path), then each iteration below turns it into the row for the
+    // next `i` down, using its own already-computed entries at larger `j`
+    // (same row) and the previous row's entries (`i + 1`).
+    let mut row = vec![false; m + 1];
+    row[m] = true;
+    for j in (0..m).rev() {
+        row[j] = t[j] == b'*' && row[j + 1];
     }
-    let result = if ti == t.len() {
-        pi == p.len()
-    } else if t[ti] == b'*' {
-        if ti + 1 < t.len() && t[ti + 1] == b'*' {
-            // `**`: any run of bytes, including `/`, possibly empty.
-            matches(p, t, pi, ti + 2, memo)
-                || (pi < p.len() && matches(p, t, pi + 1, ti, memo))
-        } else {
-            // `*`: any run of bytes within a segment, possibly empty.
-            matches(p, t, pi, ti + 1, memo)
-                || (pi < p.len() && p[pi] != b'/' && matches(p, t, pi + 1, ti, memo))
+
+    for i in (0..n).rev() {
+        let mut next = vec![false; m + 1];
+        // next[m] stays false: j == m means the pattern is exhausted, which
+        // only matches when i == n, and i < n here.
+        for j in (0..m).rev() {
+            next[j] = if t[j] == b'*' {
+                if j + 1 < m && t[j + 1] == b'*' {
+                    // `**`: skip it (matches zero bytes here), or consume
+                    // p[i] and keep trying to extend it (row[j], the i + 1
+                    // entry for the same `**`).
+                    next[j + 2] || row[j]
+                } else {
+                    // `*`: skip it, or consume p[i] as long as it is not a
+                    // `/` and keep trying to extend it.
+                    next[j + 1] || (p[i] != b'/' && row[j])
+                }
+            } else {
+                p[i] == t[j] && row[j + 1]
+            };
         }
-    } else {
-        pi < p.len() && p[pi] == t[ti] && matches(p, t, pi + 1, ti + 1, memo)
-    };
-    memo[pi][ti] = Some(result);
-    result
+        row = next;
+    }
+
+    row[0]
 }
 
 #[cfg(test)]
@@ -93,5 +113,24 @@ mod tests {
             "glob_match took too long: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn a_long_path_does_not_overflow_a_connection_threads_small_stack() {
+        // Proxy connection threads run with a 256 KiB stack (main.rs). A
+        // recursive matcher makes one call per byte of `path`, which
+        // overflows that stack -- and aborts the whole process, not just
+        // this thread -- well before `path` reaches the 64 KiB head limit a
+        // client is allowed to send.
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let matching = format!("/{}/x", "a".repeat(60_000));
+                assert!(glob_match(&matching, "/**/x"));
+                let non_matching = format!("/{}", "a".repeat(60_000));
+                assert!(!glob_match(&non_matching, "/nope"));
+            })
+            .expect("spawn");
+        handle.join().expect("matcher must not overflow the stack");
     }
 }
