@@ -113,7 +113,7 @@ impl World {
             .tempdir()
             .expect("temp dir");
         let root = tmp.path().to_path_buf();
-        for sub in ["bin", "home", "run", "ws", "replies", "capture"] {
+        for sub in ["bin", "home", "run", "ws", "replies", "capture", "nix-store"] {
             fs::create_dir_all(root.join(sub)).expect("scaffold");
         }
 
@@ -139,6 +139,15 @@ impl World {
             (
                 "AGENT_SANDBOX_NIX_DAEMON_SOCKET".into(),
                 root.join("run/nonexistent-nix-socket").display().to_string(),
+            ),
+            // Deterministic like the socket above: a `World` scaffolds a real
+            // directory of its own, so `--nix`'s "is there a store" probe
+            // does not depend on whether the host running the test happens
+            // to have `/nix/store`. `no_nix_store` points this at a path
+            // that does not exist, for tests that want the other answer.
+            (
+                "AGENT_SANDBOX_NIX_STORE".into(),
+                root.join("nix-store").display().to_string(),
             ),
             (
                 "STUB_PODMAN_LOG".into(),
@@ -200,6 +209,15 @@ impl World {
     pub fn env_unset(mut self, key: &str) -> Self {
         self.env.retain(|(k, _)| k != key);
         self
+    }
+
+    /// Point `AGENT_SANDBOX_NIX_STORE` at a path that does not exist, so
+    /// `--nix` sees no Nix store -- the case a host with no `/nix/store`
+    /// (any Rust toolchain not itself installed through Nix) hits by
+    /// default outside of this harness.
+    pub fn no_nix_store(self) -> Self {
+        let path = self.root.join("no-such-nix-store").display().to_string();
+        self.env("AGENT_SANDBOX_NIX_STORE", &path)
     }
 
     /// Write a file into the workspace, creating parent directories.

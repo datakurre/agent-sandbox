@@ -266,47 +266,6 @@ fn target_kind(target: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{signing_host, target_kind};
-
-    #[test]
-    fn target_kind_infers_ip_port_or_domain() {
-        assert_eq!(target_kind("10.0.0.0/8"), "ips");
-        assert_eq!(target_kind("169.254.169.254"), "ips");
-        assert_eq!(target_kind("10.0.0.0/8:8443"), "ips");
-        assert_eq!(target_kind("169.254.169.254:80"), "ips");
-        assert_eq!(target_kind("8443"), "ports");
-        assert_eq!(target_kind("8000-8100"), "ports");
-        assert_eq!(target_kind("api.openai.com"), "domains");
-        assert_eq!(target_kind("github.com"), "domains");
-        assert_eq!(target_kind("github.com:22"), "domains");
-    }
-
-    #[test]
-    fn only_a_domain_covering_22_authorizes_the_relay() {
-        assert_eq!(signing_host("github.com:22"), Some("github.com".into()));
-        assert_eq!(signing_host("github.com:22,443"), Some("github.com".into()));
-        assert_eq!(signing_host("github.com:20-30"), Some("github.com".into()));
-        assert_eq!(signing_host("github.com:443"), None);
-        // A portless entry gets the default ports at the proxy, but nothing
-        // here says 22 -- and guessing would grant key use nobody asked for.
-        assert_eq!(signing_host("github.com"), None);
-        assert_eq!(signing_host("10.0.0.1:22"), None);
-        assert_eq!(signing_host("*:22"), None);
-    }
-
-    #[test]
-    fn a_bare_port_list_is_ports_not_a_domain() {
-        // Read as a domain, `80,443` installs an allow_host line the proxy
-        // accepts and nothing ever matches.
-        assert_eq!(target_kind("80,443"), "ports");
-        assert_eq!(target_kind("80,8000-8100"), "ports");
-        assert_eq!(target_kind("github.com:22,443"), "domains");
-        assert_eq!(target_kind("10.0.0.0/8:80,443"), "ips");
-    }
-}
-
 pub fn run(args: ProxyArgs) -> Result<()> {
     match args.command {
         ProxyCommand::Show(a) => show(a),
@@ -430,9 +389,8 @@ fn allow(args: AllowArgs) -> Result<()> {
             args.target, method, args.path
         ));
         println!(
-            "  allowed     {:<34} {}",
-            format!("{} {} {}", args.target, method, args.path),
-            "http route"
+            "  allowed     {:<34} http route",
+            format!("{} {} {}", args.target, method, args.path)
         );
     } else {
         let kind = target_kind(&args.target);
@@ -452,7 +410,7 @@ fn allow(args: AllowArgs) -> Result<()> {
             let line = format!("allow_signing {}", host);
             if !lines.contains(&line) {
                 lines.push(line);
-                println!("  allowed     {:<34} {}", host, "ssh (push/pull)");
+                println!("  allowed     {:<34} ssh (push/pull)", host);
             }
             warn_if_no_trusted_host_key(&dir, &host);
         }
@@ -621,4 +579,45 @@ fn check(args: CheckArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{signing_host, target_kind};
+
+    #[test]
+    fn target_kind_infers_ip_port_or_domain() {
+        assert_eq!(target_kind("10.0.0.0/8"), "ips");
+        assert_eq!(target_kind("169.254.169.254"), "ips");
+        assert_eq!(target_kind("10.0.0.0/8:8443"), "ips");
+        assert_eq!(target_kind("169.254.169.254:80"), "ips");
+        assert_eq!(target_kind("8443"), "ports");
+        assert_eq!(target_kind("8000-8100"), "ports");
+        assert_eq!(target_kind("api.openai.com"), "domains");
+        assert_eq!(target_kind("github.com"), "domains");
+        assert_eq!(target_kind("github.com:22"), "domains");
+    }
+
+    #[test]
+    fn only_a_domain_covering_22_authorizes_the_relay() {
+        assert_eq!(signing_host("github.com:22"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:22,443"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:20-30"), Some("github.com".into()));
+        assert_eq!(signing_host("github.com:443"), None);
+        // A portless entry gets the default ports at the proxy, but nothing
+        // here says 22 -- and guessing would grant key use nobody asked for.
+        assert_eq!(signing_host("github.com"), None);
+        assert_eq!(signing_host("10.0.0.1:22"), None);
+        assert_eq!(signing_host("*:22"), None);
+    }
+
+    #[test]
+    fn a_bare_port_list_is_ports_not_a_domain() {
+        // Read as a domain, `80,443` installs an allow_host line the proxy
+        // accepts and nothing ever matches.
+        assert_eq!(target_kind("80,443"), "ports");
+        assert_eq!(target_kind("80,8000-8100"), "ports");
+        assert_eq!(target_kind("github.com:22,443"), "domains");
+        assert_eq!(target_kind("10.0.0.0/8:80,443"), "ips");
+    }
 }

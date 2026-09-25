@@ -62,9 +62,14 @@ nix:
 fmt-check:
 	cd $(ROOT) && $(CARGO) fmt --all --check
 
-## Also not part of `all`, for the same reason.
+## The workspace is clippy-clean as of this writing, but not part of `all`:
+## each new Rust release can add lints, and `all` failing on a toolchain bump
+## with no code change is worse than a warning going briefly unnoticed.
+## Warnings that are deliberately kept are `#[allow]`ed at their call site
+## with a comment saying why, rather than silenced here. Run this yourself
+## on a file you are already touching, or after a `nix flake update`.
 clippy:
-	cd $(ROOT) && $(CARGO) clippy --workspace --all-targets
+	cd $(ROOT) && $(CARGO) clippy --workspace --all-targets -- -D warnings
 
 ## Everything, with output captured.  Use this when handing results to someone
 ## who was not at the terminal.

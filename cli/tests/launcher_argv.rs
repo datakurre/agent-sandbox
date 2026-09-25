@@ -355,6 +355,18 @@ fn without_selinux_no_relabelling_flag_is_added() {
 }
 
 #[test]
+fn with_no_nix_store_and_no_daemon_socket_nix_adds_no_overlay_mount() {
+    let out = World::new().no_nix_store().run(&["--nix", "opencode"]);
+    let run = out.run_call();
+
+    assert!(
+        run.values_of("-v").iter().all(|m| !m.starts_with("/nix:")),
+        "no store and no daemon socket means nothing to mount: {}",
+        run.joined()
+    );
+}
+
+#[test]
 fn selinux_does_not_add_a_relabel_to_the_nix_overlay_mount() {
     let out = World::new().run(&["--nix", "--selinux", "opencode"]);
     let run = out.run_call();
@@ -365,10 +377,7 @@ fn selinux_does_not_add_a_relabel_to_the_nix_overlay_mount() {
         run.joined()
     );
     assert!(
-        !run
-            .values_of("-v")
-            .iter()
-            .any(|mount| *mount == "/nix:/nix:O,Z"),
+        !run.values_of("-v").contains(&"/nix:/nix:O,Z"),
         "SELinux relabeling must not be combined with the Nix overlay: {}",
         run.joined()
     );

@@ -68,6 +68,87 @@ fn read_line_crlf<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     }
 }
 
+/// RFC 9110 §5.6.2 `tchar`: the bytes a header field name may contain.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Validate the header block of a request or response head.
+///
+/// RFC 9112 §5.1 requires a server to reject whitespace between a header
+/// field name and its colon, because a lenient recipient that instead
+/// strips it can be made to see a header -- `Transfer-Encoding`, most
+/// dangerously -- that this proxy's own line-oriented lookups
+/// (`content_length`, `is_chunked`, ...) do not, letting a request smuggle a
+/// second one past the L7 check in what this proxy treats as a body. This
+/// walks the header block on the wire's own terms -- strictly `\r\n`
+/// delimited, so a bare CR or LF inside a line (which would let the two
+/// sides disagree about where a line ends) is caught rather than silently
+/// accepted the way `str::lines` would -- and rejects anything RFC 9112
+/// does not allow: an empty or non-`tchar` name (whitespace before the
+/// colon included), obsolete line folding, or a line with no colon.
+fn validate_head_lines(head: &str) -> io::Result<()> {
+    let bad = |msg: &str| io::Error::new(ErrorKind::InvalidData, msg.to_string());
+    let start = head
+        .find("\r\n")
+        .ok_or_else(|| bad("head is missing its request/status line terminator"))?;
+    // `find` only locates the first true `\r\n`; a bare `\r` or `\n` earlier
+    // in what should be the request/status line would otherwise sit inside
+    // `head[..start]` unchecked, while `content_length`/`is_chunked`
+    // (`str::lines()`-based) would still split on it as a line of its own --
+    // the same disagreement between this validator and the framing logic
+    // that a malformed header name further down is meant to close.
+    if head[..start].contains('\r') || head[..start].contains('\n') {
+        return Err(bad("stray CR or LF inside the request/status line"));
+    }
+    let mut rest = &head[start + 2..];
+    loop {
+        let idx = rest
+            .find("\r\n")
+            .ok_or_else(|| bad("head is missing the blank line terminating it"))?;
+        let line = &rest[..idx];
+        rest = &rest[idx + 2..];
+        if line.is_empty() {
+            return Ok(());
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err(bad("obsolete header line folding is not allowed"));
+        }
+        if line.contains('\r') || line.contains('\n') {
+            return Err(bad("stray CR or LF inside a header line"));
+        }
+        let Some((name, _value)) = line.split_once(':') else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("header line has no colon: {:?}", line),
+            ));
+        };
+        if name.is_empty() || !name.bytes().all(is_tchar) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid header field name: {:?}", name),
+            ));
+        }
+    }
+}
+
 fn content_length(head: &str) -> io::Result<Option<usize>> {
     let mut found: Option<usize> = None;
     for line in head.lines().skip(1) {
@@ -184,6 +265,20 @@ fn request_method(head: &str) -> io::Result<&str> {
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed request line"))
 }
 
+/// The request path as the L7/secret-route matcher must see it.
+///
+/// Percent-encoding is decoded (including `%2F`, since scoped npm package
+/// names and GitLab-style project ids legitimately encode a `/` inside a
+/// path segment), and matching runs against that decoded path. What is
+/// rejected outright, rather than normalised the way an origin might, is any
+/// path where normalising would matter: a `.` or `..` segment, an empty
+/// (`//`) segment, a backslash, or a control byte. An origin server is free
+/// to interpret `/admin//../public/x` differently than this proxy would
+/// after normalising it, and matching a normalised copy against
+/// `allow_route`/`secret_route` while forwarding the raw bytes
+/// (`rewrite_request_target` copies the target verbatim) would let a request
+/// scoped to one route land on another. Fail closed instead: an ambiguous
+/// path never reaches the matcher or the origin.
 fn request_path(head: &str) -> io::Result<String> {
     let request_line = head
         .lines()
@@ -194,7 +289,7 @@ fn request_path(head: &str) -> io::Result<String> {
     let target = parts
         .next()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request target is missing"))?;
-    
+
     // Target could be absolute URI (http://host/path) or absolute path (/path)
     let path = if let Some(idx) = target.find("://") {
         let after_scheme = &target[idx + 3..];
@@ -206,58 +301,71 @@ fn request_path(head: &str) -> io::Result<String> {
     } else {
         target
     };
-    // Strip query string and fragment
+    // Strip query string and fragment: neither is inspected for ambiguity.
     let path = path.split('?').next().unwrap_or(path);
     let path = path.split('#').next().unwrap_or(path);
-    
-    // Percent decode
-    let decoded = percent_decode(path).map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("invalid percent encoding: {}", e)))?;
-    
-    // Dot segment removal
-    let mut segments = Vec::new();
-    for seg in decoded.split('/') {
-        if seg == "." || (seg.is_empty() && !segments.is_empty()) {
-            continue;
-        } else if seg == ".." {
-            if segments.is_empty() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "invalid path: unresolved '..'"));
+
+    // `%2F` is decoded like any other percent-encoding, not refused: origins
+    // that route on the decoded path are common (an npm scoped package name
+    // like `/@scope%2fname`, a GitLab-style project id like
+    // `/api/v4/projects/group%2Fproject`), and the ambiguity that matters --
+    // a path segment that resolves differently depending on whether `.`/`..`
+    // are read before or after decoding -- is caught below regardless, since
+    // the segment check runs on the fully decoded path. A backslash, whether
+    // written literally or as `%5C`, decodes to the same byte either way, so
+    // one check below catches both spellings.
+    let decoded_bytes = percent_decode_bytes(path)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("invalid percent encoding: {}", e)))?;
+    if decoded_bytes.iter().any(|&b| b < 0x20 || b == b'\\') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "path contains a control byte or backslash",
+        ));
+    }
+    let decoded = String::from_utf8(decoded_bytes)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "path is not valid UTF-8 after decoding"))?;
+
+    let segments: Vec<&str> = decoded.split('/').collect();
+    let last = segments.len().saturating_sub(1);
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            // A leading or trailing slash produces an empty segment too; only
+            // an empty segment strictly between two others is an actual `//`.
+            if i == 0 || i == last {
+                continue;
             }
-            segments.pop();
-        } else {
-            segments.push(seg);
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "path contains an empty segment",
+            ));
+        }
+        if *seg == "." || *seg == ".." {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "path contains a '.' or '..' segment",
+            ));
         }
     }
-    
-    let mut normalized = segments.join("/");
-    if decoded.starts_with('/') && !normalized.starts_with('/') {
-        normalized.insert(0, '/');
-    }
-    if (decoded.ends_with('/') || decoded.ends_with("/.") || decoded.ends_with("/..")) && !normalized.ends_with('/') {
-        normalized.push('/');
-    }
-    if normalized.is_empty() {
-        normalized.push('/');
-    }
-    
-    Ok(normalized)
+
+    Ok(if decoded.is_empty() { "/".to_string() } else { decoded })
 }
 
-fn percent_decode(s: &str) -> Result<String, &'static str> {
-    let mut out = String::with_capacity(s.len());
+fn percent_decode_bytes(s: &str) -> Result<Vec<u8>, &'static str> {
     let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
             if i + 2 < bytes.len() {
                 let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| "invalid hex")?;
                 let byte = u8::from_str_radix(hex, 16).map_err(|_| "invalid hex")?;
-                out.push(byte as char);
+                out.push(byte);
                 i += 3;
             } else {
                 return Err("truncated percent encoding");
             }
         } else {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
     }
@@ -625,6 +733,10 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             let request_text = std::str::from_utf8(&request_head).map_err(|_| {
                 io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8")
             })?;
+            if let Err(e) = validate_head_lines(request_text) {
+                let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                return Err(e);
+            }
             validate_request_authority(request_text, expected_host, expected_port)?;
             
             let has_cl = content_length(request_text)?.is_some();
@@ -650,7 +762,13 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             }
 
             let method = request_method(request_text)?.to_string();
-            let path = request_path(request_text)?;
+            let path = match request_path(request_text) {
+                Ok(path) => path,
+                Err(e) => {
+                    let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                    return Err(e);
+                }
+            };
             last_method = Some(method.clone());
             last_path = Some(path.clone());
 
@@ -690,29 +808,53 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
                 up_bytes += copy_chunked_body(client, upstream)?;
             }
 
-            let response_head = read_head(upstream)?.ok_or_else(|| {
-                io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "upstream closed before sending an HTTP response",
-                )
-            })?;
-            client.write_all(&response_head)?;
-            down_bytes += response_head.len() as u64;
+            // Read response heads until the *final* one. A 1xx (other than
+            // 101) is an interim response: RFC 9110 §15.2 says it has no
+            // body and the origin still owes this same request a final
+            // response on the same stream, so looping back to the top to
+            // read the *next request* here would leave that final response
+            // (100 Continue's is the common case: curl sends
+            // `Expect: 100-continue` for larger bodies) sitting unread and
+            // pair it with whatever the client sends next instead.
+            let (status, response_text) = loop {
+                let response_head = read_head(upstream)?.ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "upstream closed before sending an HTTP response",
+                    )
+                })?;
+                let response_text = std::str::from_utf8(&response_head)
+                    .map_err(|_| {
+                        io::Error::new(ErrorKind::InvalidData, "response head is not valid UTF-8")
+                    })?
+                    .to_string();
+                // Validated before it is relayed: a desynced upstream is not
+                // forwarded to the client as though it were well-formed.
+                validate_head_lines(&response_text)?;
 
-            let response_text = std::str::from_utf8(&response_head).map_err(|_| {
-                io::Error::new(ErrorKind::InvalidData, "response head is not valid UTF-8")
-            })?;
-            let status = response_status_code(response_text)?;
+                client.write_all(&response_head)?;
+                down_bytes += response_head.len() as u64;
+
+                let status = response_status_code(&response_text)?;
+
+                if status == 101 {
+                    // Switching Protocols: the exchange that got us here is
+                    // the last HTTP-shaped thing on this connection. Reading
+                    // another request head out of what comes next (WebSocket
+                    // frames, most commonly) would desync the parser, so
+                    // stop instead of looping.
+                    last_status = Some(status);
+                    return Ok(true);
+                }
+
+                if (100..200).contains(&status) {
+                    continue;
+                }
+
+                break (status, response_text);
+            };
+            let response_text = response_text.as_str();
             last_status = Some(status);
-
-            if status == 101 {
-                // Switching Protocols: the exchange that got us here is the
-                // last HTTP-shaped thing on this connection.  Reading another
-                // request head out of what comes next (WebSocket frames, most
-                // commonly) would desync the parser, so stop instead of
-                // looping.
-                return Ok(true);
-            }
 
             if response_has_no_body(&method, status) {
                 continue;
@@ -935,6 +1077,29 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_route_with_no_provider_binding_is_reported_missing_on_success() {
+        // Authorized for injection by policy, but no provider ever bound a
+        // value to the route: the request still goes out (unauthenticated),
+        // and the caller (main.rs) needs to know that happened so it can
+        // surface it, rather than the exchange silently looking like any
+        // other successful one.
+        let client_in = b"GET /user HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_host api.example.com\nsecret_route\tapi.example.com\tGET\t/user\n",
+            "",
+        ));
+
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let outcome =
+            proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+                .expect("proxy");
+
+        assert!(outcome.secret_missing);
+    }
+
+    #[test]
     fn a_second_request_on_one_connection_outside_the_route_gets_no_secret() {
         // The leak, end to end.  Both requests are allowed by L7 -- the repo's
         // AGENTS.md said so -- but only /user/repos is a route the operator
@@ -963,10 +1128,123 @@ mod tests {
     }
 
     #[test]
-    fn a_dot_segment_path_cannot_carry_the_secret_off_its_route() {
-        // Matching happens on the normalized path, so /user/repos/../../zen is
-        // /zen and gets nothing -- while the request line goes upstream as the
-        // client wrote it.
+    fn hundred_continue_relays_final_response() {
+        let client_in = b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\nhi";
+        let upstream_in = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let out = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
+        let got = String::from_utf8_lossy(&client.written);
+        assert!(got.starts_with("HTTP/1.1 100 Continue\r\n\r\n"), "{got}");
+        assert!(got.ends_with("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"), "{got}");
+        assert_eq!(out.status, Some(200));
+    }
+
+    #[test]
+    fn early_hints_relays_final_response() {
+        let client_in = b"GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let out = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
+        let got = String::from_utf8_lossy(&client.written);
+        assert!(got.contains("103 Early Hints"), "{got}");
+        assert!(got.ends_with("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"), "{got}");
+        assert_eq!(out.status, Some(200));
+    }
+
+    #[test]
+    fn interim_responses_do_not_shift_keep_alive_pairing() {
+        let client_in = b"GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n\
+                          GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none\
+                            HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "example.com",
+            80,
+            &crate::dummy_shared(),
+        )
+        .expect("proxy");
+        let got = String::from_utf8_lossy(&client.written);
+        assert_eq!(got.matches("HTTP/1.1 200 OK").count(), 2, "{got}");
+        assert!(got.contains("100 Continue"), "{got}");
+        assert!(got.ends_with("two"), "{got}");
+        let upstream_rendered = String::from_utf8_lossy(&upstream.written);
+        assert_eq!(upstream_rendered.matches("GET /").count(), 2, "{upstream_rendered}");
+    }
+
+    #[test]
+    fn header_lines_with_whitespace_before_the_colon_are_rejected() {
+        let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host example.com\n", ""));
+        let bad_heads: &[&[u8]] = &[
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding : chunked\r\nContent-Length: 5\r\n\r\nhello",
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nContent-Length : 5\r\n\r\nhello",
+            b"GET /ok HTTP/1.1\r\nHost : evil.com\r\n\r\n",
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding\t: chunked\r\n\r\n0\r\n\r\n",
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nX-Multi: a\r\n chunked\r\n\r\n",
+            b"GET /ok HTTP/1.1\r\nHost: example.com\r\nno-colon-here\r\n\r\n",
+            // A bare LF inside what should be the request line: this
+            // validator's own line-splitting (strict on "\r\n") would
+            // otherwise treat "GET /ok HTTP/1.1\nTransfer-Encoding: chunked"
+            // as one unchecked chunk, while content_length/is_chunked
+            // (str::lines()-based) split on the bare "\n" and would see
+            // Transfer-Encoding as a header of its own.
+            b"GET /ok HTTP/1.1\nTransfer-Encoding: chunked\r\nHost: example.com\r\n\r\n",
+        ];
+        for head in bad_heads {
+            let mut client = FixtureIo::with_read(head);
+            let mut upstream = FixtureIo::with_read(b"");
+            proxy_http1_with_injection(&mut client, &mut upstream, "example.com", 80, &shared)
+                .unwrap_err();
+            assert!(
+                upstream.written.is_empty(),
+                "nothing should reach upstream for {:?}",
+                String::from_utf8_lossy(head)
+            );
+            assert!(
+                String::from_utf8_lossy(&client.written).starts_with("HTTP/1.1 400"),
+                "expected a 400 for {:?}, got {:?}",
+                String::from_utf8_lossy(head),
+                String::from_utf8_lossy(&client.written)
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_header_block_still_passes_validation() {
+        let client_in = b"GET /ok HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host example.com\n", ""));
+        proxy_http1_with_injection(&mut client, &mut upstream, "example.com", 80, &shared)
+            .expect("proxy");
+    }
+
+    #[test]
+    fn a_dot_segment_path_is_rejected_rather_than_normalized_onto_another_route() {
+        // Normalizing /user/repos/../../zen to /zen and matching that would
+        // still leave the raw target -- which the origin sees -- ambiguous
+        // relative to what the origin does with ".." itself. Fail closed
+        // instead: the request never reaches the matcher or the wire.
         let client_in =
             b"GET /user/repos/../../zen HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
         let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -979,11 +1257,92 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+        let err = proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("'.' or '..' segment"), "{err}");
+        assert!(upstream.written.is_empty(), "nothing should reach the origin");
+    }
+
+    #[test]
+    fn ambiguous_paths_are_refused_with_a_400_and_nothing_forwarded() {
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_host x\nallow_route\tx\t*\t/public/**\n",
+            "",
+        ));
+        for target in [
+            "/admin//../public/x",
+            "/admin/..%2Fpublic/x",
+            "/a/%2e%2e/b",
+            "/a/.%2E/b",
+            "/a/%2E/b",
+            "/a\\b",
+        ] {
+            let client_in = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut client = FixtureIo::with_read(client_in.as_bytes());
+            let mut upstream = FixtureIo::with_read(b"");
+            let err = proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared)
+                .unwrap_err();
+            assert!(upstream.written.is_empty(), "{target}: {err}");
+            assert!(
+                String::from_utf8_lossy(&client.written).starts_with("HTTP/1.1 400"),
+                "{target}: {}",
+                String::from_utf8_lossy(&client.written)
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_paths_still_work() {
+        for target in [
+            "/",
+            "/a/b",
+            "/a/b/",
+            "/a%20b",
+            // A percent-encoded slash inside a segment is decoded and
+            // matched like a literal one, not refused: both are real paths
+            // origins route on.
+            "/@scope%2fname",
+            "/api/v4/projects/group%2Fproject/issues",
+        ] {
+            let client_in = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut client = FixtureIo::with_read(client_in.as_bytes());
+            let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host x\n", ""));
+            proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared)
+                .unwrap_or_else(|e| panic!("{target} should be allowed: {e}"));
+        }
+        // The query string is never inspected for dot-segments.
+        let client_in = b"GET /a?x=../y HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host x\n", ""));
+        proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared).expect("proxy");
+    }
+
+    #[test]
+    fn a_percent_encoded_slash_decodes_before_route_matching_and_secret_injection() {
+        // The regression: refusing %2F outright broke real traffic (a
+        // private npm registry's scoped package names, a GitLab-style
+        // project id) that legitimately encodes a `/` inside one path
+        // segment. Matching -- and injection -- has to run against the
+        // decoded path, the same one an origin that decodes %2F sees.
+        let client_in =
+            b"GET /@scope%2fname HTTP/1.1\r\nHost: registry.example.com\r\n\r\n";
+        let upstream_in = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_host registry.example.com\n\
+             secret_route\tregistry.example.com\tGET\t/@scope/*\n",
+            "registry.example.com\tGET\t/@scope/*\tAuthorization\tBearer tok\n",
+        ));
+
+        let mut client = FixtureIo::with_read(client_in);
+        let mut upstream = FixtureIo::with_read(upstream_in);
+        proxy_http1_with_injection(&mut client, &mut upstream, "registry.example.com", 80, &shared)
             .expect("proxy");
 
         let rendered = String::from_utf8(upstream.written).expect("utf8");
-        assert!(!rendered.contains("Bearer tok"), "{rendered}");
+        assert!(rendered.contains("Authorization: Bearer tok"), "{rendered}");
     }
 
     #[test]

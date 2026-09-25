@@ -17,8 +17,6 @@ const HTTP1_ALPN: &[u8] = b"http/1.1";
 
 #[derive(Clone, Debug)]
 pub struct IssuedLeaf {
-    pub cert_pem: String,
-    pub key_pem: String,
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
 }
@@ -94,8 +92,6 @@ impl SessionCa {
             .map_err(|e| format!("leaf signing failed for {:?}: {}", host, e))?;
 
         let issued = IssuedLeaf {
-            cert_pem: cert.pem(),
-            key_pem: key_pair.serialize_pem(),
             cert_der: cert.der().to_vec(),
             key_der: key_pair.serialize_der(),
         };
@@ -167,8 +163,6 @@ mod tests {
         let ca = SessionCa::generate().expect("generate");
         let first = ca.issue_leaf("api.example.com").expect("first");
         let second = ca.issue_leaf("api.example.com").expect("second");
-        assert_eq!(first.cert_pem, second.cert_pem);
-        assert_eq!(first.key_pem, second.key_pem);
         assert_eq!(first.cert_der, second.cert_der);
         assert_eq!(first.key_der, second.key_der);
     }
@@ -180,7 +174,7 @@ mod tests {
         for i in 0..(LEAF_CACHE_MAX + 8) {
             let host = format!("{}.example.com", i);
             let leaf = ca.issue_leaf(&host).expect("issue");
-            seen.insert(leaf.cert_pem);
+            seen.insert(leaf.cert_der);
         }
         assert!(seen.len() >= LEAF_CACHE_MAX);
     }

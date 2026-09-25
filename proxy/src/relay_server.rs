@@ -3,8 +3,7 @@ mod relay_protocol;
 
 use relay_protocol::{read_frame, write_frame, CommandType, Frame, RelayHeader};
 use std::env;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -172,20 +171,6 @@ fn refused_ssh_option(args: &[String]) -> Option<&'static str> {
     None
 }
 
-fn domain_match(domain: &str, pattern: &str) -> bool {
-    let domain = domain.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        if suffix.starts_with('.') {
-            domain == &pattern[2..] || domain.ends_with(suffix)
-        } else {
-            domain.ends_with(suffix)
-        }
-    } else {
-        domain == pattern
-    }
-}
-
 const RELAY_LOG: &str = "/sidecar_shared/relay.jsonl";
 const RELAY_GPG_HOME: &str = "/tmp/agent-sandbox-relay-gnupg";
 /// Smaller than the proxy's own logs: one line per relay call, and a
@@ -249,12 +234,11 @@ fn validate_gpg_args(args: &[String]) -> bool {
             || lower == "--clearsign"
             || lower == "--verify"
             || lower == "--clear-sign"
+            || (lower.starts_with('-')
+                && !lower.starts_with("--")
+                && (lower.contains('s') || lower.contains('b') || lower.contains('v')))
         {
             has_signing_intent = true;
-        } else if lower.starts_with('-') && !lower.starts_with("--") {
-            if lower.contains('s') || lower.contains('b') || lower.contains('v') {
-                has_signing_intent = true;
-            }
         }
     }
     has_signing_intent
@@ -282,7 +266,7 @@ fn prepare_gpg_home() -> io::Result<()> {
             }
         };
         let target = format!("{RELAY_GPG_HOME}/{name}");
-        if !Path::new(&target).exists() && !Path::new(&target).symlink_metadata().is_ok() {
+        if !Path::new(&target).exists() && Path::new(&target).symlink_metadata().is_err() {
             std::os::unix::fs::symlink(source, target)?;
         }
     }
@@ -298,30 +282,29 @@ struct SigningPolicy {
     gpg_enabled: bool,
 }
 
+/// Reads the same policy file the proxy does, through the reference parser
+/// (`agent_sandbox_proxy::policy::load_policy`) rather than a second hand-rolled one --
+/// `AGENTS.md` names `policy.rs` as the source of truth for policy syntax,
+/// and `ProxyConfig::allow_signing`/`signing_enabled` exist precisely so the
+/// relay can read the same fields the proxy does, in the same dialect.
+///
+/// Fails closed: a missing, unreadable, or invalid policy file denies both
+/// SSH signing destinations and GPG signing, logged so an operator can see
+/// why. This mirrors how the proxy itself treats its policy file, and is a
+/// stricter version of what the old parser already did for a missing file.
 fn load_signing_policy(policy_path: &str) -> SigningPolicy {
-    let mut ssh_hosts = Vec::new();
-    let mut gpg_enabled = false;
-    if let Ok(file) = File::open(policy_path) {
-        for line in BufReader::new(file).lines().flatten() {
-            let mut parts = line.split_whitespace();
-            if let Some(key) = parts.next() {
-                match key {
-                    "allow_signing" => {
-                        if let Some(val) = parts.next() {
-                            ssh_hosts.push(val.to_string());
-                        }
-                    }
-                    "signing_enabled" => {
-                        gpg_enabled = parts.next() == Some("true");
-                    }
-                    _ => {}
-                }
+    match agent_sandbox_proxy::policy::load_policy(policy_path) {
+        Ok(cfg) => SigningPolicy {
+            ssh_hosts: cfg.allow_signing,
+            gpg_enabled: cfg.signing_enabled,
+        },
+        Err(e) => {
+            eprintln!("relay-server: failed to load policy {:?}: {}", policy_path, e);
+            SigningPolicy {
+                ssh_hosts: Vec::new(),
+                gpg_enabled: false,
             }
         }
-    }
-    SigningPolicy {
-        ssh_hosts,
-        gpg_enabled,
     }
 }
 
@@ -414,9 +397,13 @@ fn handle_client(mut stream: TcpStream, policy_path: &str, known_hosts: Option<&
             }
             match host {
                 Some(dest) => {
+                    // allow_signing entries are lowercased by parse_policy;
+                    // match that here, since policy::domain_match itself is
+                    // case-sensitive.
+                    let dest_lower = dest.to_ascii_lowercase();
                     let mut allowed = false;
                     for rule in &signing_policy.ssh_hosts {
-                        if domain_match(&dest, rule) {
+                        if agent_sandbox_proxy::policy::domain_match(&dest_lower, rule) {
                             allowed = true;
                             break;
                         }
@@ -903,16 +890,37 @@ mod tests {
     }
 
     #[test]
-    fn domain_match_exact() {
-        assert!(domain_match("github.com", "github.com"));
-        assert!(!domain_match("github.com", "gitlab.com"));
+    fn allow_signing_github_com_allows_the_lowercase_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy");
+        std::fs::write(&path, "allow_signing GitHub.com\n").unwrap();
+
+        let policy = load_signing_policy(path.to_str().unwrap());
+        // parse_policy lowercases allow_signing values; the destination is
+        // lowercased the same way at the call site before domain_match, which
+        // is itself case-sensitive.
+        assert!(policy
+            .ssh_hosts
+            .iter()
+            .any(|rule| agent_sandbox_proxy::policy::domain_match("github.com", rule)));
     }
 
     #[test]
-    fn domain_match_wildcard() {
-        assert!(domain_match("api.github.com", "*.github.com"));
-        assert!(domain_match("github.com", "*.github.com"));
-        assert!(!domain_match("github.org", "*.github.com"));
+    fn an_invalid_policy_line_yields_no_ssh_hosts_and_gpg_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy");
+        std::fs::write(&path, "allow_signing github.com\nnot_a_real_key value\n").unwrap();
+
+        let policy = load_signing_policy(path.to_str().unwrap());
+        assert!(policy.ssh_hosts.is_empty(), "a parse error must fail closed");
+        assert!(!policy.gpg_enabled);
+    }
+
+    #[test]
+    fn a_missing_policy_file_fails_closed() {
+        let policy = load_signing_policy("/nonexistent/agent-sandbox-policy-file");
+        assert!(policy.ssh_hosts.is_empty());
+        assert!(!policy.gpg_enabled);
     }
 
     #[test]
