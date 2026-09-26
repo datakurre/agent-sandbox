@@ -20,3 +20,7 @@ Replace both placeholders with the active tool and model identifiers. Keep a
 blank line between the commit message and the trailer. Before committing,
 inspect the full message to confirm the trailer is present and correctly
 formatted.
+
+`Co-Authored-By:` trailers are allowed and must not be excluded or removed.
+Preserve any supplied or requested `Co-Authored-By:` trailers, placing them
+before the required `Assisted-by:` trailer.
