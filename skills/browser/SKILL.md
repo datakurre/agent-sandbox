@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Drive a browser to screenshot a page for visual/image analysis, record a 25 fps video/screencast, or interact with it (navigate, click, fill, wait) — either headless inside the sandbox, or a visible browser on the user's host over CDP. Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, record a video of a browser interaction, automate clicks/form-fills against a page, or work in a real browser the user can watch and click along with.
+description: Drive a browser to screenshot a page for visual/image analysis, record a quick 25 fps video of a page (for a scripted demo or multi-actor walkthrough, use the screencast skill), or interact with it (navigate, click, fill, wait) — either headless inside the sandbox, or a visible browser on the user's host over CDP. Trigger when asked to look at a rendered web page, verify what a UI looks like, screenshot a site, record a video of a browser interaction, automate clicks/form-fills against a page, or work in a real browser the user can watch and click along with.
 metadata:
   workflow: headless-browser-automation
   audience: developers-and-agents
@@ -210,19 +210,18 @@ the file plays, so both are easy to ship without noticing.
 Always call `context.close()` or `page.close()` to ensure the video file is
 completely flushed to disk.
 
-**Playwright's video has no mouse cursor and no click indicator.** A recording
-of a driven page shows things happening with nothing visibly doing them, and
-input lands instantly, which reads as a glitch rather than a demonstration. For
-anything a person will watch, draw a cursor and pace the input for human eyes —
-see *Human-paced cursor and clicks* in `reference.md`.
+**Playwright's video has no mouse cursor and no click indicator**, and input
+lands instantly, so a driven page shows things happening with nothing doing
+them. That is fine for a quick record of what happened. Check the result with
+`ffprobe -v error -show_entries format=duration -of csv=p=0 <file>`: a
+truncated or blank recording still exits 0.
 
-A finished recording also needs *looking at*: truncation, dead air and blank
-frames all exit 0. See *Verifying a recording* in `reference.md` for the
-contact-sheet and blank-frame checks.
-
-For chapter titles and live HTML overlays (`page.screencast`), composing
-several recordings onto one timeline, headless terminal recording (`ttyd`),
-browser/terminal composition, or transcoding to MP4/GIF, see `reference.md`.
+Anything a person will watch — a demo or walkthrough, a visible cursor and
+human-paced input, title cards, several actors on one timeline, MP4/GIF output,
+or a recording that has to be verified — is the **`screencast`** skill's job. Use
+it rather than rebuilding those by hand. Its `reference.md` also covers the raw
+`page.screencast` API, headless terminal recording (`ttyd`) and manual `ffmpeg`
+edits.
 
 ## Sandbox network
 
