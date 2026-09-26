@@ -21,6 +21,5 @@ blank line between the commit message and the trailer. Before committing,
 inspect the full message to confirm the trailer is present and correctly
 formatted.
 
-`Co-Authored-By:` trailers are allowed and must not be excluded or removed.
-Preserve any supplied or requested `Co-Authored-By:` trailers, placing them
-before the required `Assisted-by:` trailer.
+Do not include `Co-Authored-By:` trailers. The required `Assisted-by:` trailer
+must be the commit message's only trailer.
