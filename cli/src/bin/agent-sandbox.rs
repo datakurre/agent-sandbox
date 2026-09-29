@@ -296,11 +296,30 @@ fn is_loopback_bind(bind: &str) -> bool {
     bind.parse::<IpAddr>().map(|a| a.is_loopback()).unwrap_or(false)
 }
 
+/// A bind whose host side is a socket owned by someone other than the
+/// invoking user -- a root-run `nix-daemon`, for one -- can never be
+/// relabeled: rewriting the `security.selinux` xattr needs ownership (or
+/// `CAP_MAC_ADMIN`) that a rootless launch does not have, so podman fails
+/// the whole run with `lsetxattr ... operation not permitted` before the
+/// container starts. Relabeling would not have bought anything anyway --
+/// SELinux gates a socket `connectto` on the two processes' domains, not
+/// the file's label, the same reason `--selinux` alone does not authorize
+/// `--ssh`/`--gpg`/host-loopback sockets either (see docs/browser.md) -- so
+/// these binds are always left exactly as given.
+fn is_foreign_socket(host_path: &str) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    fs::metadata(host_path)
+        .map(|m| m.file_type().is_socket() && m.uid() != nix::unistd::getuid().as_raw())
+        .unwrap_or(false)
+}
+
 fn enforce_selinux_mount_flags(mount_opt: &str, want_selinux: bool) -> String {
     let parts: Vec<&str> = mount_opt.split(':').collect();
     if parts.len() < 2 {
         return mount_opt.to_string();
     }
+
+    let want_selinux = want_selinux && !is_foreign_socket(parts[0]);
 
     let mut new_parts = parts.clone();
 
@@ -3876,6 +3895,31 @@ mod tests {
             enforce_selinux_mount_flags("/nix:/nix:O", true),
             "/nix:/nix:O"
         );
+    }
+
+    #[test]
+    fn selinux_relabeling_skips_sockets_owned_by_someone_else() {
+        // Self-owned sockets (a forwarded SSH/gpg agent, in practice) are
+        // unaffected: they still get relabeled like any other writable bind.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("agent.sock");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        let sock = sock_path.to_str().unwrap();
+        assert!(!is_foreign_socket(sock));
+        assert_eq!(
+            enforce_selinux_mount_flags(&format!("{}:/agent.sock:rw", sock), true),
+            format!("{}:/agent.sock:rw,Z", sock)
+        );
+
+        // A path that is not a socket at all (the common case) is untouched
+        // by the check.
+        let file_path = dir.path().join("plain");
+        fs::write(&file_path, "x").unwrap();
+        assert!(!is_foreign_socket(file_path.to_str().unwrap()));
+
+        // A path that does not exist -- most of this module's own test
+        // fixtures -- is never treated as foreign either.
+        assert!(!is_foreign_socket("/no/such/path"));
     }
 
     #[test]

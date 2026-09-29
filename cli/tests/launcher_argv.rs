@@ -383,6 +383,33 @@ fn selinux_does_not_add_a_relabel_to_the_nix_overlay_mount() {
     );
 }
 
+/// The daemon-socket branch of `--nix` still gets the shared label when the
+/// socket happens to be owned by the same user running the launcher (a
+/// single-user Nix install, say). The case this guards against --
+/// `lsetxattr ... operation not permitted` when the socket belongs to a
+/// root-run daemon, as it does for any multi-user Nix install -- needs a
+/// socket owned by someone else than the test process, which is covered at
+/// the unit level (`is_foreign_socket` in `agent-sandbox.rs`) instead, since
+/// creating one here would need root.
+#[test]
+fn selinux_still_labels_a_self_owned_nix_daemon_socket() {
+    let world = World::new();
+    let socket_path = world.runtime_dir().join("nix-daemon.socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let out = world
+        .env("AGENT_SANDBOX_NIX_DAEMON_SOCKET", socket_path.to_str().unwrap())
+        .run(&["--nix", "--selinux", "opencode"]);
+    let run = out.run_call();
+
+    assert!(
+        run.mount_to("/nix/var/nix/daemon-socket/socket")
+            .unwrap()
+            .ends_with(":rw,z"),
+        "a self-owned daemon socket still takes the shared label: {}",
+        run.joined()
+    );
+}
+
 // ── declared ports ──────────────────────────────────────────────────────────
 
 const PORTS_AGENTS_MD: &str = "\
