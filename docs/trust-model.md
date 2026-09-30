@@ -32,11 +32,13 @@ with no host access. The cache server is limited to the sandbox session and
 stops when that session exits. If the host store or server setup is unavailable,
 the launcher reports that and continues without host-cache sharing.
 
-The cache endpoint uses the same host-loopback socket bridge as an explicit
-`--host-loopback-port`. On an enforcing SELinux host, that socket connection may
-require the host's `container_connect_any` boolean; the launcher prints the
-diagnostic but does not change host policy. Without permission, the sandbox
-still starts, but the host cache may be unavailable. Under `--proxy`, this
+The cache endpoint uses the same host-loopback Unix-socket bridge as an
+explicit `--host-loopback-port`. On an enforcing SELinux host, the policy must
+permit the container process to connect to the host listener's Unix socket.
+Relabeling the socket with `--selinux` does not grant `connectto`, and the
+`container_connect_any` boolean only applies to TCP ports. The launcher does
+not change host SELinux policy. If the socket connection is denied, the
+sandbox still starts but the host cache is unavailable. Under `--proxy`, this
 loopback cache request is outside proxy accounting; the cache server only reads
 and serves existing store paths and does not fetch or build anything itself.
 

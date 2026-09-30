@@ -189,33 +189,42 @@ you wanted is given up with it. Publishing does not need it, and neither does
 `--host-loopback-port`. So the shared network is opt-in and most sandboxes should
 leave it off. `AGENT_SANDBOX_NETWORK` names the network when the flag is on.
 
-### SELinux and the CDP socket
+### SELinux and host-loopback sockets
 
 On an enforcing SELinux host, the sandbox's `socat` must connect to a
 host-owned Unix socket for every `--host-loopback-port` mapping. `--nix` uses
 the same bridge for its automatic cache endpoint. The socket's `:z` relabel
 (enabled by `--selinux`) does not authorize that process-to-process `connectto`
-operation. If an explicit port is listed in
-`$AGENT_SANDBOX_HOST_PORTS` but `connect_over_cdp` still refuses or times out,
+operation. If an explicit port is listed in `$AGENT_SANDBOX_HOST_PORTS` but
+`connect_over_cdp` refuses or times out, or `--nix` cannot reach its cache,
 check for an AVC:
 
 ```sh
 sudo ausearch -m avc -ts recent | grep connectto
 ```
 
-If it names the host-loopback socket, enable the host policy that permits
-containers to connect to host Unix sockets:
+The `container_connect_any` boolean controls access to TCP ports; it does not
+permit a Unix socket `connectto`. Enabling it alone will not fix this failure.
+The host policy must allow the observed container process domain to connect to
+the listening process domain. Read the `scontext` and `tcontext` from the AVC
+before considering a local policy rule; allowing `container_t` to connect to a
+broad host domain can grant access to other host sockets too.
+
+If the audit log is empty, a `dontaudit` rule may be suppressing the denial. An
+administrator can temporarily expose those denials while reproducing, then
+restore the normal policy:
 
 ```sh
-sudo setsebool -P container_connect_any 1
+sudo semodule -DB
+# reproduce the failed socket connection, then:
+sudo semodule -B
+sudo ausearch -m AVC -ts recent | grep connectto
 ```
 
-This is a persistent, host-wide policy change. When SELinux is enforcing and
-the boolean is disabled or cannot be read, `agent-sandbox` reports this
-diagnostic but does not enable the boolean automatically. Without it, an
-explicit mapped service may be unreachable and `--nix` may be unable to use
-the host cache; the sandbox still starts. Keep `--selinux` when you also need
-ordinary writable binds relabeled.
+`agent-sandbox` reports that host-loopback Unix sockets may be denied under
+enforcing SELinux, but does not change host policy. The sandbox continues to
+start if the optional Nix cache bridge is denied. Keep `--selinux` when you
+also need ordinary writable binds relabeled.
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
@@ -230,16 +239,9 @@ typically `unconfined_t` for a user's own `ssh-agent`/`gpg-agent` — and
 default policy denies that regardless of the file's label, to stop containers
 reaching arbitrary host IPC sockets. If `ssh`/`ssh-add` inside the sandbox
 reports `Permission denied` right after finding the socket (as opposed to "no
-such user" or "could not open a connection"), confirm with
-`sudo ausearch -m avc -ts recent | grep connectto` and, if it names your agent
-socket, allow it host-wide with:
-
-```
-sudo setsebool -P container_connect_any 1
-```
-
-This is a persistent, host-wide SELinux policy change, so it is not something
-`agent-sandbox` can or should apply on your behalf.
+such user" or "could not open a connection"), use the AVC procedure above.
+`container_connect_any` is not a Unix-socket permission and does not resolve
+this denial.
 
 The proxy sidecar is treated as infrastructure: it always runs with SELinux
 labeling disabled for `/sidecar_policy` and `/sidecar_shared` so proxy

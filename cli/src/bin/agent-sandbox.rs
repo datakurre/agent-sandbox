@@ -506,21 +506,6 @@ fn selinux_is_enforcing() -> bool {
         .unwrap_or(false)
 }
 
-fn selinux_boolean_enabled(contents: &str) -> Option<bool> {
-    contents
-        .split_whitespace()
-        .next()?
-        .parse::<u8>()
-        .ok()
-        .map(|enabled| enabled != 0)
-}
-
-fn container_connect_any_enabled() -> Option<bool> {
-    fs::read_to_string("/sys/fs/selinux/booleans/container_connect_any")
-        .ok()
-        .and_then(|contents| selinux_boolean_enabled(&contents))
-}
-
 /// Whether a `[ports]` bind address is loopback, which is what decides if a
 /// published port is compatible with `--proxy`.  `parse_ports` has already
 /// reduced the field to an IP literal (`"localhost"` included), so anything
@@ -3292,14 +3277,16 @@ fn run() -> Result<i32> {
                 "agent-sandbox: --nix host-cache requests use a local read-only binary cache outside proxy accounting."
             );
         }
-        if selinux_is_enforcing() && container_connect_any_enabled() != Some(true) {
+        if selinux_is_enforcing() {
             eprintln!(
-                "agent-sandbox: SELinux is enforcing; host-loopback sockets may be denied inside"
+                "agent-sandbox: SELinux is enforcing; container connections to host Unix sockets"
             );
             eprintln!(
-                "               the sandbox. If connections fail, authorize this capability with:"
+                "               (including the --nix cache bridge) may be denied. :z relabeling"
             );
-            eprintln!("               sudo setsebool -P container_connect_any 1");
+            eprintln!(
+                "               does not grant unix_stream_socket connectto; container_connect_any is TCP-only."
+            );
             eprintln!(
                 "               Inspect AVCs with: sudo ausearch -m avc -ts recent"
             );
@@ -4273,13 +4260,6 @@ mod tests {
             enforce_selinux_mount_flags("/nix/store:/nix/store:ro", true),
             "/nix/store:/nix/store:ro"
         );
-    }
-
-    #[test]
-    fn selinux_boolean_parser_reads_current_kernel_value() {
-        assert_eq!(selinux_boolean_enabled("1 1\n"), Some(true));
-        assert_eq!(selinux_boolean_enabled("0 0\n"), Some(false));
-        assert_eq!(selinux_boolean_enabled(""), None);
     }
 
     #[test]
