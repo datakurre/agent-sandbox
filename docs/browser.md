@@ -192,9 +192,10 @@ leave it off. `AGENT_SANDBOX_NETWORK` names the network when the flag is on.
 ### SELinux and the CDP socket
 
 On an enforcing SELinux host, the sandbox's `socat` must connect to a
-host-owned Unix socket for every `--host-loopback-port` mapping. The socket's
-`:z` relabel (enabled by `--selinux`) does not authorize that process-to-process
-`connectto` operation. If the port is listed in
+host-owned Unix socket for every `--host-loopback-port` mapping. `--nix` uses
+the same bridge for its automatic cache endpoint. The socket's `:z` relabel
+(enabled by `--selinux`) does not authorize that process-to-process `connectto`
+operation. If an explicit port is listed in
 `$AGENT_SANDBOX_HOST_PORTS` but `connect_over_cdp` still refuses or times out,
 check for an AVC:
 
@@ -211,8 +212,9 @@ sudo setsebool -P container_connect_any 1
 
 This is a persistent, host-wide policy change. `agent-sandbox` reports the
 same diagnostic when it detects enforcing SELinux, but does not enable the
-boolean automatically. Keep `--selinux` when you also need ordinary writable
-binds relabeled.
+boolean automatically. Without it, an explicit mapped service may be
+unreachable and `--nix` may be unable to use the host cache; the sandbox still
+starts. Keep `--selinux` when you also need ordinary writable binds relabeled.
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared

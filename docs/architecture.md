@@ -52,7 +52,12 @@ the canonical tree from each tool's own discovery path. See
 
 ## Entrypoint (`agent-sandbox-entrypoint`)
 
-1. Loads the Nix store registration on first start (unless `AGENT_SANDBOX_HOST_NIX=1`, in which case the host's `/nix` mount is used, or `AGENT_SANDBOX_SKIP_NIX_INIT=1`, which sidecar launches set because they do not need Nix bootstrap).
+1. Loads the image's Nix store registration on first start, unless
+   `AGENT_SANDBOX_SKIP_NIX_INIT=1` (set on sidecar launches, which do not need
+   Nix bootstrap). `--nix` does not replace the image store or skip this step.
+   When the launcher has started the host cache server, the entrypoint adds its
+   loopback URL and signing key to `NIX_CONFIG`, so in-container Nix can use it
+   as a substituter.
 2. Seeds `~/.ssh/known_hosts`, unconditionally, so a non-interactive `ssh`
    neither prompts nor fails. Under `--proxy` the source is the file the
    launcher bound in from `trusted.toml` (`AGENT_SANDBOX_KNOWN_HOSTS`);
@@ -96,7 +101,12 @@ are unit-tested without a podman.  Call flow:
    selector is the random session word unless `--name NAME` supplies a
    validated, collision-free custom name. The selector is what every `ctl`
    command accepts.
-6. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
+6. For `--nix`, generate or reuse a host signing key and start a per-session
+   `nix-serve` against the host's existing store. The launcher connects it to
+   the container through the same named loopback-port socket bridge used by
+   `--host-loopback-port`; the image gets only the public key and local Nix
+   substituter settings, never the store or daemon socket.
+7. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
    final command (`bash` by default, the selected agent's command when one is
    named positionally, and anything after `--` overrides both).
@@ -221,12 +231,13 @@ Three directories, and which side can see them is the design:
 
 ### Host loopback ports are a mount, not a relay
 
-`--host-loopback-port` is the one capability that reaches the host without going
-through the sidecar.  The launcher binds a unix socket per mapping in a runtime
-directory, splices each connection to `127.0.0.1:PORT` on the host from its own
-process, and mounts the directory at `/run/agent-sandbox-host`; the entrypoint
-puts a `socat TCP-LISTEN` in front of each socket so ordinary TCP clients inside
-can reach it.
+`--host-loopback-port` reaches a named host service without going through the
+sidecar. The launcher binds a unix socket per mapping in a runtime directory,
+splices each connection to `127.0.0.1:PORT` on the host from its own process,
+and mounts the directory at `/run/agent-sandbox-host`; the entrypoint puts a
+`socat TCP-LISTEN` in front of each socket so ordinary TCP clients inside can
+reach it. `--nix` uses the same bridge for its private read-only cache endpoint,
+without adding that endpoint to the user's `AGENT_SANDBOX_HOST_PORTS` list.
 
 It is a mount rather than a route because a route would have to be a network
 mode, and the sandbox's is always already taken -- pasta by default, the
@@ -235,13 +246,13 @@ takes one network mode, which is why the pasta `--map-host-loopback` mapping thi
 replaced could never be had together with `--proxy`.  A bind mount is orthogonal
 to all three.
 
-It is deliberately *not* a sidecar relay, unlike `--ssh` and `--gpg` under
-`--proxy`.  Those are relayed so their egress stays policed; there is no
-equivalent for what a host browser does, since `Page.navigate` to a denied host
-is not an HTTP request the proxy could see or refuse.  Routing it through the
-sidecar would be more machinery for the same hole, and would work only under
-`--proxy`.  So the hole is left visible instead: named ports only, announced at
-launch, and documented in [Trust model](trust-model.md).
+Explicit host-loopback mappings are deliberately *not* sidecar relays, unlike
+`--ssh` and `--gpg` under `--proxy`. Those are relayed so their egress stays
+policed; there is no equivalent for what a host browser does, since
+`Page.navigate` to a denied host is not an HTTP request the proxy could see or
+refuse. The automatic `--nix` mapping is narrower: it exposes only the signed,
+read-only cache server, which serves existing store content and makes no
+outbound requests. Both capabilities are documented in [Trust model](trust-model.md).
 
 ### The cooperative browser is a second proxy, not a relay
 

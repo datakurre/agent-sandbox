@@ -163,29 +163,31 @@ pub fn gnupg_public_mounts(gnupg_home: &Path, want_private: bool) -> Vec<String>
 
 // ── devenv / nix / podman ───────────────────────────────────────────────────
 
-/// Multi-user nix delegates builds to the host daemon over its socket, so the
-/// store can stay read-only.  Single-user nix has no daemon, so the whole tree
-/// is overlaid instead and the container writes into the upper layer.
-pub fn nix_mounts(
-    daemon_socket_is_socket: bool,
-    store_exists: bool,
-    rw: &str,
-) -> (Vec<String>, Vec<String>) {
-    let mut mounts = Vec::new();
-    let mut envs = Vec::new();
-    if daemon_socket_is_socket {
-        mounts.extend(bind("/nix/store", "/nix/store", "ro"));
-        mounts.extend(bind(
-            "/nix/var/nix/daemon-socket/socket",
-            "/nix/var/nix/daemon-socket/socket",
-            rw,
-        ));
-        envs.extend(env("NIX_REMOTE", "daemon"));
-    } else if store_exists {
-        mounts.push("-v".to_string());
-        mounts.push("/nix:/nix:O".to_string());
-    }
-    envs.extend(env("AGENT_SANDBOX_HOST_NIX", "1"));
+/// Where the entrypoint finds the nix-serve public key `--nix` mounted in.
+/// Fixed, like `AGENT_SANDBOX_PROXY_CA_FILE`'s target, so nothing but the env
+/// var pointing at it needs to name it.
+pub const NIX_SERVE_PUBKEY_PATH: &str = "/run/agent-sandbox-nix-serve.pub";
+
+/// The container-side fragment for `--nix`, once the launcher has a live
+/// nix-serve reachable through the ordinary `--host-loopback-port` machinery
+/// (see `serve_host_port`/`HostPort` in `agent-sandbox.rs`) on `internal_port`.
+///
+/// This is deliberately small: unlike the old `nix_mounts`, nothing here
+/// mounts a store or a daemon socket at any canonical path, single- or
+/// multi-user. The container keeps its own local Nix store -- exactly as if
+/// `--nix` were absent -- and only ever adds the host as a substituter it
+/// copies signed, already-built paths in from. See NIX_SERVE.md for why: a
+/// shared canonical-path mount shadows every symlink-into-`/nix/store` the
+/// image ships (including its own entrypoint) with host-labeled files
+/// `container_t` has no policy permission to execute, and a forwarded daemon
+/// socket hands the container root-level build execution on the host.
+pub fn nix_substituter_mounts(pubkey_file: &str, internal_port: u16) -> (Vec<String>, Vec<String>) {
+    let mounts = bind(pubkey_file, NIX_SERVE_PUBKEY_PATH, "ro");
+    let mut envs = env("AGENT_SANDBOX_NIX_SERVE_PORT", &internal_port.to_string());
+    envs.extend(env(
+        "AGENT_SANDBOX_NIX_SERVE_PUBKEY_FILE",
+        NIX_SERVE_PUBKEY_PATH,
+    ));
     (mounts, envs)
 }
 
@@ -550,18 +552,23 @@ mod tests {
     }
 
     #[test]
-    fn multi_user_nix_keeps_the_store_read_only() {
-        let (mounts, envs) = nix_mounts(true, true, "rw");
-        assert!(mounts.contains(&"/nix/store:/nix/store:ro".to_string()));
-        assert!(envs.contains(&"NIX_REMOTE=daemon".to_string()));
-        assert!(envs.contains(&"AGENT_SANDBOX_HOST_NIX=1".to_string()));
-    }
-
-    #[test]
-    fn single_user_nix_overlays_the_whole_tree() {
-        let (mounts, envs) = nix_mounts(false, true, "rw");
-        assert_eq!(mounts, vec!["-v", "/nix:/nix:O"]);
-        assert!(envs.contains(&"AGENT_SANDBOX_HOST_NIX=1".to_string()));
+    fn nix_substituter_mounts_the_key_and_names_the_forwarded_port() {
+        let (mounts, envs) = nix_substituter_mounts("/home/ada/.local/share/agent-sandbox/nix-serve/public_key", 7419);
+        assert_eq!(
+            mounts,
+            vec![
+                "-v",
+                "/home/ada/.local/share/agent-sandbox/nix-serve/public_key:/run/agent-sandbox-nix-serve.pub:ro"
+            ]
+        );
+        assert!(envs.contains(&"AGENT_SANDBOX_NIX_SERVE_PORT=7419".to_string()));
+        assert!(envs.contains(
+            &"AGENT_SANDBOX_NIX_SERVE_PUBKEY_FILE=/run/agent-sandbox-nix-serve.pub".to_string()
+        ));
+        // No store or daemon socket at any canonical path -- the whole point.
+        assert!(!mounts.iter().any(|m| m.contains("/nix/store")));
+        assert!(!mounts.iter().any(|m| m.contains("daemon-socket")));
+        assert!(!envs.iter().any(|e| e.starts_with("NIX_REMOTE=")));
     }
 
     #[test]

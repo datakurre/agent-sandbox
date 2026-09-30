@@ -14,10 +14,11 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, IsTerminal, Write};
-use std::net::{IpAddr, Shutdown, TcpStream};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
@@ -281,6 +282,224 @@ fn serve_host_port(socket: &Path, host_port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `--nix`'s preferred sandbox-side port for the forwarded nix-serve
+/// substituter, reached at `http://127.0.0.1:<port>` from inside the
+/// container. Arbitrary but fixed, so a repeat session's Nix configuration looks the
+/// same; walked upward (like `--browser`'s CDP port picker in `ctl::browser`)
+/// if something else in this session's `--host-loopback-port` list already
+/// claimed it. Outside the common dev-server range (3000/8000/8080/8025) and
+/// `--browser`'s default CDP port (9222), so a default launch of either never
+/// collides with this by chance.
+const NIX_SERVE_PREFERRED_PORT: u16 = 7419;
+
+fn choose_nix_serve_internal_port(host_ports: &[HostPort]) -> Option<u16> {
+    (NIX_SERVE_PREFERRED_PORT..=u16::MAX)
+        .chain(1..NIX_SERVE_PREFERRED_PORT)
+        .find(|port| !host_ports.iter().any(|host_port| host_port.sandbox == *port))
+}
+
+fn public_host_ports(host_ports: &[HostPort], nix_internal_port: Option<u16>) -> String {
+    host_ports
+        .iter()
+        .filter(|port| Some(port.sandbox) != nix_internal_port)
+        .map(|port| port.sandbox.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+struct NixKeyLock(PathBuf);
+
+impl Drop for NixKeyLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A signing keypair for this host's nix-serve, generated once and reused
+/// across sessions -- `agents.nix`'s persisted-state-path convention, applied
+/// to a resource that isn't an agent. Returns the existing pair if both files
+/// are already there, so a session never regenerates (and thereby
+/// invalidates trust in) a key an earlier session's container may still be
+/// relying on having seen in `extra-trusted-public-keys`.
+fn ensure_nix_serve_keypair(home: &str) -> Option<(PathBuf, PathBuf)> {
+    let dir = PathBuf::from(home).join(".local/share/agent-sandbox/nix-serve");
+    let secret_key = dir.join("secret_key");
+    let public_key = dir.join("public_key");
+    fs::create_dir_all(&dir).ok()?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).ok()?;
+
+    // Two sandboxes can start at once. Serialize first-run generation so each
+    // server's private key and the public key mounted into its container are a
+    // matched pair. A stale lock causes a cache-only fallback rather than
+    // racing and serving signatures the container cannot verify.
+    let lock_path = dir.join("keypair.lock");
+    let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let _lock = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => break NixKeyLock(lock_path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::time::Instant::now() >= lock_deadline {
+                    return None;
+                }
+                thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
+    };
+
+    let regular_file = |path: &Path| {
+        fs::symlink_metadata(path)
+            .map(|meta| meta.file_type().is_file())
+            .unwrap_or(false)
+    };
+    for path in [&secret_key, &public_key] {
+        if fs::symlink_metadata(path)
+            .map(|meta| !meta.file_type().is_file())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+    }
+    if regular_file(&secret_key) && regular_file(&public_key) {
+        fs::set_permissions(&secret_key, fs::Permissions::from_mode(0o600)).ok()?;
+        return Some((secret_key, public_key));
+    }
+
+    // The name half of a binary cache key is metadata nix-serve echoes back
+    // in every NAR it signs; it never has to match anything else this
+    // launcher does, so a fixed, self-describing value is fine to reuse
+    // forever.
+    let status = ProcessCommand::new("nix-store")
+        .args([
+            "--generate-binary-cache-key",
+            "agent-sandbox-nix-serve-1",
+            &secret_key.to_string_lossy(),
+            &public_key.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .status();
+    if !matches!(status, Ok(s) if s.success())
+        || !regular_file(&secret_key)
+        || !regular_file(&public_key)
+    {
+        let _ = fs::remove_file(&secret_key);
+        let _ = fs::remove_file(&public_key);
+        return None;
+    }
+    // The secret half signs whatever nix-serve is asked to serve; keep it
+    // from anything reading this session's other files by accident.
+    fs::set_permissions(&secret_key, fs::Permissions::from_mode(0o600)).ok()?;
+    Some((secret_key, public_key))
+}
+
+/// Starts a fresh nix-serve for this session, bound to the host's own
+/// loopback on a port the kernel picks (so two sandboxes launched at once
+/// never race for the same one). Returns the child (for `CleanupGuard` to
+/// kill on exit) and the port it is actually listening on.
+///
+/// nix-serve reads an ordinary local Nix store -- the same `/nix/store` this
+/// host's own `nix` would use -- so no `--store` is passed; it needs no
+/// write access to it, only to read and sign what is already built there.
+fn spawn_nix_serve(secret_key: &Path) -> Result<(std::process::Child, u16), String> {
+    let reserved = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("could not reserve a loopback port: {}", e))?;
+    let port = reserved
+        .local_addr()
+        .map_err(|e| format!("could not read the reserved loopback port: {}", e))?
+        .port();
+    drop(reserved);
+
+    let child = ProcessCommand::new("nix-serve")
+        .args(["--listen", &format!("127.0.0.1:{}", port)])
+        .env("NIX_SECRET_KEY_FILE", secret_key)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Starman forks workers. Isolate the process group so cleanup stops
+        // the master and every worker rather than leaving a cache server behind.
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("could not spawn nix-serve: {}", e))?;
+    Ok((child, port))
+}
+
+fn stop_nix_serve(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let group = nix::unistd::Pid::from_raw(pid);
+        let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGTERM);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The process group can still contain workers after the master exits.
+        let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+    } else {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+/// Wait until nix-serve actually accepts connections. Merely spawning Starman
+/// is not enough: it can exit immediately if its bind fails, and the container
+/// must not receive a substituter URL that cannot answer.
+fn wait_for_nix_serve(child: &mut std::process::Child, port: u16) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!("nix-serve exited during startup ({})", status));
+            }
+            Err(e) => return Err(format!("could not check nix-serve startup: {}", e)),
+            Ok(None) => {}
+        }
+
+        if probe_nix_serve(port) {
+            return Ok(());
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err("nix-serve did not start listening within 5 seconds".to_string());
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn probe_nix_serve(port: u16) -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &address,
+        std::time::Duration::from_millis(100),
+    ) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+    if stream
+        .write_all(b"GET /nix-cache-info HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).is_ok() && nix_cache_info_response_ok(&response)
+}
+
+fn nix_cache_info_response_ok(response: &str) -> bool {
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    headers.lines().next().is_some_and(|line| {
+        line.starts_with("HTTP/1.") && line.split_whitespace().nth(1) == Some("200")
+    }) && body.lines().any(|line| line.trim() == "StoreDir: /nix/store")
+        && body.lines().any(|line| line.trim().starts_with("WantMassQuery:"))
+}
+
 fn selinux_is_enforcing() -> bool {
     fs::read_to_string("/sys/fs/selinux/enforce")
         .map(|value| value.trim() == "1")
@@ -297,7 +516,7 @@ fn is_loopback_bind(bind: &str) -> bool {
 }
 
 /// A bind whose host side is a socket owned by someone other than the
-/// invoking user -- a root-run `nix-daemon`, for one -- can never be
+/// invoking user can never be
 /// relabeled: rewriting the `security.selinux` xattr needs ownership (or
 /// `CAP_MAC_ADMIN`) that a rootless launch does not have, so podman fails
 /// the whole run with `lsetxattr ... operation not permitted` before the
@@ -319,7 +538,11 @@ fn enforce_selinux_mount_flags(mount_opt: &str, want_selinux: bool) -> String {
         return mount_opt.to_string();
     }
 
-    let want_selinux = want_selinux && !is_foreign_socket(parts[0]);
+    // The immutable host Nix store cannot be recursively relabeled by a
+    // rootless launcher. `--nix` no longer mounts it, but an explicit volume
+    // passed through podman args may still name it.
+    let immutable_nix_store = parts[0] == "/nix/store";
+    let want_selinux = want_selinux && !immutable_nix_store && !is_foreign_socket(parts[0]);
 
     let mut new_parts = parts.clone();
 
@@ -547,7 +770,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--gpg", Some(fmt(want_gpg)), "Enables host GnuPG agent forwarding and git commit signing behavior.");
     print_help_option("--gpg-private", Some(fmt(want_gpg_private)), "Exposes ~/.gnupg even if it holds on-disk secret keys.");
     print_help_option("--devenv", Some(fmt(want_devenv)), "Persists ~/.local/share/devenv across sessions.");
-    print_help_option("--nix", Some(fmt(want_nix)), "Mounts the host /nix/store for native Nix execution.");
+    print_help_option("--nix", Some(fmt(want_nix)), "Uses the host's Nix store as a signed substituter; builds stay in the container.");
     print_help_option("--podman", Some(fmt(want_podman)), "Forwards the host rootless Podman socket (sibling containers).");
     print_help_option("--selinux", Some(fmt(want_selinux)), "Applies SELinux shared relabeling (:z) to ordinary writable binds; special volume modes are unchanged.");
     print_help_option("--proxy", Some(fmt(want_proxy)), "Deny-by-default network firewall enforcing AGENTS.md's [network] policy.");
@@ -903,6 +1126,10 @@ struct CleanupGuard {
     /// stay pure JSON output for a machine consumer. Independent of `--prompt`, which
     /// only controls where the agent's own prompt comes from.
     quiet: bool,
+    /// `--nix`'s host-local nix-serve, spawned fresh for this session and
+    /// killed here on exit -- see NIX_SERVE.md. `None` when `--nix` was not
+    /// passed, or its store/key/spawn preconditions were not met.
+    nix_serve_child: Option<std::process::Child>,
 }
 
 impl CleanupGuard {
@@ -1052,6 +1279,7 @@ impl CleanupGuard {
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             ),
             quiet: false,
+            nix_serve_child: None,
         }
     }
 
@@ -1222,6 +1450,14 @@ impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if !self.quiet {
             self.status("closing sandbox");
+        }
+
+        // Fresh per session, killed here: see NIX_SERVE.md. Before anything
+        // else, and unconditionally on either path below, since a nix-serve
+        // process outliving its sandbox would keep the host's store reachable
+        // over a loopback socket nothing is listening in on any more.
+        if let Some(mut child) = self.nix_serve_child.take() {
+            stop_nix_serve(&mut child);
         }
 
         if self.sidecar_id.is_empty() {
@@ -2444,26 +2680,11 @@ fn run() -> Result<i32> {
         ));
     }
 
-    if want_nix {
-        let socket_path = env::var("AGENT_SANDBOX_NIX_DAEMON_SOCKET")
-            .unwrap_or_else(|_| "/nix/var/nix/daemon-socket/socket".to_string());
-        let is_socket = fs::metadata(&socket_path)
-            .map(|m| {
-                use std::os::unix::fs::FileTypeExt;
-                m.file_type().is_socket()
-            })
-            .unwrap_or(false);
-        // Test-only override, on the same footing as
-        // AGENT_SANDBOX_NIX_DAEMON_SOCKET above: it lets the stub-podman
-        // integration tests make this existence probe deterministic instead
-        // of depending on whether the host running them happens to have a
-        // Nix store.
-        let store_path =
-            env::var("AGENT_SANDBOX_NIX_STORE").unwrap_or_else(|_| "/nix/store".to_string());
-        let (m, e) = launch::nix_mounts(is_socket, Path::new(&store_path).is_dir(), rw_mount_opts);
-        mounts.extend(m);
-        env_args.extend(e);
-    }
+    // `--nix` itself is handled further down, alongside `--host-loopback-port`:
+    // it needs the session's `cleanup_guard` (to own the spawned nix-serve
+    // process) and `want_host_ports` (the forwarded socket rides the same
+    // loopback-bridge machinery an explicit `--host-loopback-port` uses),
+    // neither of which exist yet at this point in the function.
 
     if want_podman {
         let host_socket = format!("{}/podman/podman.sock", runtime_dir);
@@ -2910,6 +3131,63 @@ fn run() -> Result<i32> {
     cleanup_guard.status_dir = status_dir.clone();
     let mut proxy_env_vars: Vec<String> = Vec::new();
     let image = env::var("AGENT_SANDBOX_IMAGE").unwrap_or_default();
+    let mut nix_internal_port = None;
+
+    // ── Nix ─────────────────────────────────────────────────────────────────
+    // See NIX_SERVE.md: a per-session nix-serve stands in for the old shared
+    // store/daemon-socket mounts. Its forwarded socket rides the same
+    // --host-loopback-port machinery just below -- pushed into
+    // want_host_ports here, before that section's "anything to serve" check
+    // -- so nix-serve needs no bridging mechanism of its own.
+    if want_nix {
+        let store_path =
+            env::var("AGENT_SANDBOX_NIX_STORE").unwrap_or_else(|_| "/nix/store".to_string());
+        if !Path::new(&store_path).is_dir() {
+            eprintln!(
+                "agent-sandbox: --nix: no host Nix store found at {}; continuing without the host cache.",
+                store_path
+            );
+        } else if let Some(internal_port) = choose_nix_serve_internal_port(&want_host_ports) {
+            match ensure_nix_serve_keypair(&home) {
+                None => eprintln!(
+                    "agent-sandbox: --nix: could not prepare a nix-serve signing key under {}/.local/share/agent-sandbox/nix-serve; continuing without the host Nix cache.",
+                    home
+                ),
+                Some((secret_key, public_key)) => match spawn_nix_serve(&secret_key) {
+                    Err(error) => eprintln!(
+                        "agent-sandbox: --nix: {}; continuing without the host Nix cache.",
+                        error
+                    ),
+                    Ok((mut child, host_port)) => {
+                        if let Err(error) = wait_for_nix_serve(&mut child, host_port) {
+                            stop_nix_serve(&mut child);
+                            eprintln!(
+                                "agent-sandbox: --nix: {}; continuing without the host Nix cache.",
+                                error
+                            );
+                        } else {
+                            want_host_ports.push(HostPort {
+                                host: host_port,
+                                sandbox: internal_port,
+                            });
+                            nix_internal_port = Some(internal_port);
+                            cleanup_guard.nix_serve_child = Some(child);
+                            let (m, e) = launch::nix_substituter_mounts(
+                                &public_key.to_string_lossy(),
+                                internal_port,
+                            );
+                            mounts.extend(m);
+                            env_args.extend(e);
+                        }
+                    }
+                },
+            }
+        } else {
+            eprintln!(
+                "agent-sandbox: --nix: no unused sandbox loopback port is available; continuing without the host Nix cache."
+            );
+        }
+    }
 
     // ── Host loopback ports ─────────────────────────────────────────────────
     // One unix socket per mapping, in a directory mounted into the sandbox,
@@ -2964,27 +3242,39 @@ fn run() -> Result<i32> {
                     hp.sandbox, e
                 ));
             }
-            eprintln!(
-                "agent-sandbox: 127.0.0.1:{} in the sandbox reaches the host's 127.0.0.1:{}",
-                hp.sandbox, hp.host
-            );
+            if Some(hp.sandbox) != nix_internal_port {
+                eprintln!(
+                    "agent-sandbox: 127.0.0.1:{} in the sandbox reaches the host's 127.0.0.1:{}",
+                    hp.sandbox, hp.host
+                );
+            }
             // Probed rather than assumed, and a warning rather than a refusal:
             // the browser flow has the user start Chrome by hand, sometimes
             // after the sandbox.  Saying so now beats a refused connection an
             // agent inside cannot tell from a typo.
-            if TcpStream::connect(("127.0.0.1", hp.host)).is_err() {
+            if Some(hp.sandbox) != nix_internal_port
+                && TcpStream::connect(("127.0.0.1", hp.host)).is_err()
+            {
                 eprintln!(
                     "               (nothing is listening there yet; it will connect when there is)"
                 );
             }
         }
 
-        if want_proxy {
+        let has_user_host_ports = want_host_ports
+            .iter()
+            .any(|port| Some(port.sandbox) != nix_internal_port);
+        if want_proxy && has_user_host_ports {
             eprintln!(
                 "agent-sandbox: warning: a mapped host port is outside the egress policy.  The"
             );
             eprintln!(
                 "               proxy does not see what the service on it fetches on its own."
+            );
+        }
+        if want_proxy && nix_internal_port.is_some() {
+            eprintln!(
+                "agent-sandbox: --nix host-cache requests use a local read-only binary cache outside proxy accounting."
             );
         }
         if selinux_is_enforcing() {
@@ -3008,11 +3298,7 @@ fn run() -> Result<i32> {
         env_args.push("-e".to_string());
         env_args.push(format!(
             "AGENT_SANDBOX_HOST_PORTS={}",
-            want_host_ports
-                .iter()
-                .map(|p| p.sandbox.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
+            public_host_ports(&want_host_ports, nix_internal_port)
         ));
     }
 
@@ -3763,6 +4049,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nix_serve_uses_a_free_sandbox_port_without_overflowing() {
+        assert_eq!(choose_nix_serve_internal_port(&[]), Some(7419));
+        assert_eq!(
+            choose_nix_serve_internal_port(&[
+                HostPort {
+                    host: 9000,
+                    sandbox: 7419
+                },
+                HostPort {
+                    host: 9001,
+                    sandbox: 7420
+                }
+            ]),
+            Some(7421)
+        );
+        assert_eq!(
+            choose_nix_serve_internal_port(&[HostPort {
+                host: 9000,
+                sandbox: u16::MAX
+            }]),
+            Some(7419)
+        );
+    }
+
+    #[test]
+    fn nix_cache_port_is_not_advertised_as_a_user_host_loopback_mapping() {
+        let ports = [
+            HostPort {
+                host: 3000,
+                sandbox: 3000,
+            },
+            HostPort {
+                host: 45001,
+                sandbox: 7419,
+            },
+        ];
+        assert_eq!(public_host_ports(&ports, Some(7419)), "3000");
+        assert_eq!(public_host_ports(&ports, None), "3000,7419");
+    }
+
+    #[test]
+    fn nix_serve_readiness_requires_a_successful_binary_cache_response() {
+        assert!(nix_cache_info_response_ok(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nStoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n"
+        ));
+        assert!(!nix_cache_info_response_ok(
+            "HTTP/1.1 200 OK\r\n\r\nnot a Nix cache\n"
+        ));
+        assert!(!nix_cache_info_response_ok(
+            "HTTP/1.1 503 Service Unavailable\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn nix_serve_probe_requests_the_binary_cache_info_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 256];
+            let n = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).contains("GET /nix-cache-info"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nStoreDir: /nix/store\nWantMassQuery: 1\n",
+                )
+                .unwrap();
+        });
+        assert!(probe_nix_serve(port));
+        server.join().unwrap();
+    }
+
     fn browser(name: &str, cdp_port: u16) -> ctl::browser::Instance {
         ctl::browser::Instance {
             dir: format!("/run/user/1000/agent-sandbox-browser-{name}"),
@@ -3894,6 +4253,10 @@ mod tests {
         assert_eq!(
             enforce_selinux_mount_flags("/nix:/nix:O", true),
             "/nix:/nix:O"
+        );
+        assert_eq!(
+            enforce_selinux_mount_flags("/nix/store:/nix/store:ro", true),
+            "/nix/store:/nix/store:ro"
         );
     }
 

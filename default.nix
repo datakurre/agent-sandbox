@@ -468,6 +468,13 @@ let
     name = "agent-sandbox";
     runtimeInputs = with pkgs; [
       agentSandboxRust podman git coreutils jq gnupg util-linux findutils gnugrep gawk secretspec
+      # `--nix` shells out to both of these directly, as host processes: `nix-store
+      # --generate-binary-cache-key` to make a signing keypair on first use, and
+      # `nix-serve` to serve the host's real store as a binary cache the
+      # container's own local Nix adds as a substituter. Neither ever touches the
+      # container -- see NIX_SERVE.md for why a shared substituter replaced the
+      # old shared store/daemon-socket mounts.
+      nix nix-serve
     ];
     text = launcherPreamble + ''
       exec ${agentSandboxRust}/bin/agent-sandbox "$@"
