@@ -210,11 +210,12 @@ containers to connect to host Unix sockets:
 sudo setsebool -P container_connect_any 1
 ```
 
-This is a persistent, host-wide policy change. `agent-sandbox` reports the
-same diagnostic when it detects enforcing SELinux, but does not enable the
-boolean automatically. Without it, an explicit mapped service may be
-unreachable and `--nix` may be unable to use the host cache; the sandbox still
-starts. Keep `--selinux` when you also need ordinary writable binds relabeled.
+This is a persistent, host-wide policy change. When SELinux is enforcing and
+the boolean is disabled or cannot be read, `agent-sandbox` reports this
+diagnostic but does not enable the boolean automatically. Without it, an
+explicit mapped service may be unreachable and `--nix` may be unable to use
+the host cache; the sandbox still starts. Keep `--selinux` when you also need
+ordinary writable binds relabeled.
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
