@@ -121,6 +121,22 @@ impl World {
         fs::write(&podman, STUB_PODMAN).expect("write stub");
         make_executable(&podman);
 
+        // `--nix` setup is host-side. Keep it deterministic and never let a
+        // test accidentally start the developer's real nix-serve. This key
+        // generator emits a valid-looking public key; the default server stub
+        // exits immediately so tests exercise the launcher's graceful fallback.
+        let nix_store = root.join("bin/nix-store");
+        fs::write(
+            &nix_store,
+            "#!/bin/sh\nif [ \"$1\" = \"--generate-binary-cache-key\" ]; then\n  printf '%s\\n' secret > \"$3\"\n  printf '%s\\n' 'agent-sandbox-nix-serve-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' > \"$4\"\nfi\nexit 0\n",
+        )
+        .expect("write nix-store stub");
+        make_executable(&nix_store);
+
+        let nix_serve = root.join("bin/nix-serve");
+        fs::write(&nix_serve, "#!/bin/sh\nexit 71\n").expect("write nix-serve stub");
+        make_executable(&nix_serve);
+
         let path = format!(
             "{}:{}",
             root.join("bin").display(),
@@ -136,12 +152,8 @@ impl World {
             ),
             ("AGENT_SANDBOX_IMAGE".into(), TEST_IMAGE.into()),
             ("AGENT_SANDBOX_AGENT_SPECS".into(), TEST_AGENT_SPECS.into()),
-            (
-                "AGENT_SANDBOX_NIX_DAEMON_SOCKET".into(),
-                root.join("run/nonexistent-nix-socket").display().to_string(),
-            ),
-            // Deterministic like the socket above: a `World` scaffolds a real
-            // directory of its own, so `--nix`'s "is there a store" probe
+            // Deterministic: a `World` scaffolds a real directory of its own,
+            // so `--nix`'s "is there a store" probe
             // does not depend on whether the host running the test happens
             // to have `/nix/store`. `no_nix_store` points this at a path
             // that does not exist, for tests that want the other answer.

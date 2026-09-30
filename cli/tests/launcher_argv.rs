@@ -9,6 +9,7 @@
 mod common;
 
 use common::{World, TEST_IMAGE};
+use std::fs;
 
 // ── the shape every launch has ──────────────────────────────────────────────
 
@@ -355,59 +356,54 @@ fn without_selinux_no_relabelling_flag_is_added() {
 }
 
 #[test]
-fn with_no_nix_store_and_no_daemon_socket_nix_adds_no_overlay_mount() {
+fn with_no_host_nix_store_nix_adds_no_shared_store_or_daemon_mount() {
     let out = World::new().no_nix_store().run(&["--nix", "opencode"]);
     let run = out.run_call();
 
     assert!(
-        run.values_of("-v").iter().all(|m| !m.starts_with("/nix:")),
-        "no store and no daemon socket means nothing to mount: {}",
+        run.values_of("-v")
+            .iter()
+            .all(|m| !m.starts_with("/nix:") && !m.contains("/nix/store")),
+        "no host store is mounted at a canonical Nix path: {}",
         run.joined()
     );
+    assert!(run.env_value("AGENT_SANDBOX_HOST_NIX").is_none());
 }
 
 #[test]
-fn selinux_does_not_add_a_relabel_to_the_nix_overlay_mount() {
-    let out = World::new().run(&["--nix", "--selinux", "opencode"]);
+fn nix_server_startup_failure_falls_back_without_host_mounts() {
+    let world = World::new();
+    let out = world.run(&["--nix", "opencode"]);
     let run = out.run_call();
 
     assert!(
-        run.values_of("-v").contains(&"/nix:/nix:O"),
-        "the Nix overlay must remain an overlay mount: {}",
-        run.joined()
+        out.stderr.contains("nix-serve exited during startup"),
+        "the failed cache server must be reported: {}",
+        out.stderr
     );
     assert!(
-        !run.values_of("-v").contains(&"/nix:/nix:O,Z"),
-        "SELinux relabeling must not be combined with the Nix overlay: {}",
+        run.values_of("-v")
+            .iter()
+            .all(|m| !m.contains("/nix/store") && !m.contains("daemon-socket")),
+        "failure to start the cache server must not restore shared mounts: {}",
         run.joined()
     );
+    assert!(run.env_value("AGENT_SANDBOX_HOST_NIX").is_none());
+    let secret = world.home().join(".local/share/agent-sandbox/nix-serve/secret_key");
+    assert!(secret.is_file(), "the signing key is generated before serving");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(fs::metadata(secret).unwrap().permissions().mode() & 0o777, 0o600);
 }
 
-/// The daemon-socket branch of `--nix` still gets the shared label when the
-/// socket happens to be owned by the same user running the launcher (a
-/// single-user Nix install, say). The case this guards against --
-/// `lsetxattr ... operation not permitted` when the socket belongs to a
-/// root-run daemon, as it does for any multi-user Nix install -- needs a
-/// socket owned by someone else than the test process, which is covered at
-/// the unit level (`is_foreign_socket` in `agent-sandbox.rs`) instead, since
-/// creating one here would need root.
 #[test]
-fn selinux_still_labels_a_self_owned_nix_daemon_socket() {
-    let world = World::new();
-    let socket_path = world.runtime_dir().join("nix-daemon.socket");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-    let out = world
-        .env("AGENT_SANDBOX_NIX_DAEMON_SOCKET", socket_path.to_str().unwrap())
+fn selinux_nix_without_a_store_does_not_mount_or_relabel_host_nix_paths() {
+    let out = World::new()
+        .no_nix_store()
         .run(&["--nix", "--selinux", "opencode"]);
     let run = out.run_call();
-
-    assert!(
-        run.mount_to("/nix/var/nix/daemon-socket/socket")
-            .unwrap()
-            .ends_with(":rw,z"),
-        "a self-owned daemon socket still takes the shared label: {}",
-        run.joined()
-    );
+    assert!(run.values_of("-v").iter().all(|mount| {
+        !mount.contains("/nix/store") && !mount.contains("daemon-socket")
+    }));
 }
 
 // ── declared ports ──────────────────────────────────────────────────────────
@@ -1579,6 +1575,3 @@ fn agent_name_takes_precedence_over_subcommand_shortcut() {
     assert!(!out_ctl.reached_podman_run(), "ctl list reached podman run");
     assert_eq!(out_ctl.code, Some(0));
 }
-
-
-

@@ -85,11 +85,45 @@ fn runtime_env(sandbox: &str) -> Vec<String> {
 
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|l| {
-            // NAME=VALUE with a non-empty name; anything else would be passed
-            // to podman as a request to *forward* a host variable of that name.
-            l.split_once('=').is_some_and(|(name, _)| !name.is_empty())
-        })
-        .map(|l| l.to_string())
+        .filter_map(attached_env_line)
         .collect()
+}
+
+fn attached_env_line(line: &str) -> Option<String> {
+    if let Some(encoded) = line.strip_prefix("AGENT_SANDBOX_NIX_CONFIG_JSON=") {
+        return serde_json::from_str::<String>(encoded)
+            .ok()
+            .map(|value| format!("NIX_CONFIG={}", value));
+    }
+    // NAME=VALUE with a non-empty name; anything else would be passed to podman
+    // as a request to *forward* a host variable of that name.
+    line.split_once('=')
+        .filter(|(name, _)| !name.is_empty())
+        .map(|_| line.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attached_nix_config_decodes_multiline_json_record() {
+        assert_eq!(
+            attached_env_line("AGENT_SANDBOX_NIX_CONFIG_JSON=\"one\\ntwo\\n\""),
+            Some("NIX_CONFIG=one\ntwo\n".to_string())
+        );
+    }
+
+    #[test]
+    fn attached_environment_keeps_plain_records_and_rejects_malformed_lines() {
+        assert_eq!(
+            attached_env_line("PATH=/bin:/usr/bin"),
+            Some("PATH=/bin:/usr/bin".to_string())
+        );
+        assert_eq!(attached_env_line("not-an-assignment"), None);
+        assert_eq!(
+            attached_env_line("AGENT_SANDBOX_NIX_CONFIG_JSON=not-json"),
+            None
+        );
+    }
 }

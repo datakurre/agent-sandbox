@@ -15,8 +15,10 @@ use std::time::Duration;
 fn main() -> Result<()> {
     // 1. nix-store load db
     let skip_nix_init = env::var("AGENT_SANDBOX_SKIP_NIX_INIT").unwrap_or_else(|_| "0".to_string());
-    let host_nix = env::var("AGENT_SANDBOX_HOST_NIX").unwrap_or_default();
-    if skip_nix_init != "1" && host_nix != "1" {
+    // `--nix` now exposes the host store only as an HTTP substituter. It does
+    // not replace this image's store or registration database, so the image's
+    // registration must still be loaded on the first start.
+    if skip_nix_init != "1" {
         let db_path = Path::new("/nix/var/nix/db/db.sqlite");
         let reg_path = Path::new("/nix/registration");
         if !db_path.exists() && reg_path.exists() {
@@ -25,10 +27,37 @@ fn main() -> Result<()> {
                 .arg("--load-db")
                 .stdin(Stdio::from(file))
                 .status();
-            if let Err(e) = status {
-                eprintln!("Warning: failed to run nix-store --load-db: {}", e);
+            match status {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!(
+                    "Warning: nix-store --load-db exited unsuccessfully: {}",
+                    status
+                ),
+                Err(e) => eprintln!("Warning: failed to run nix-store --load-db: {}", e),
             }
         }
+    }
+
+    // NIX_CONFIG is inherited by every Nix command in this process tree and is
+    // also recorded for `ctl attach` below. The host cache is intentionally an
+    // HTTP binary cache, not a mounted local store or forwarded daemon socket.
+    if let (Ok(port), Ok(pubkey_path)) = (
+        env::var("AGENT_SANDBOX_NIX_SERVE_PORT"),
+        env::var("AGENT_SANDBOX_NIX_SERVE_PUBKEY_FILE"),
+    ) {
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .context("invalid AGENT_SANDBOX_NIX_SERVE_PORT")?;
+        let pubkey = fs::read_to_string(&pubkey_path)
+            .with_context(|| format!("failed to read nix-serve public key at {}", pubkey_path))?;
+        let nix_config = nix_config_with_host_cache(
+            &env::var("NIX_CONFIG").unwrap_or_default(),
+            port,
+            &pubkey,
+        )?;
+        env::set_var("NIX_CONFIG", nix_config);
     }
 
     let home = env::var("HOME").context("HOME not set")?;
@@ -335,16 +364,18 @@ fn main() -> Result<()> {
     // Spawned, not threaded: this process execs below, which would take any
     // thread of ours with it.  socat outlives that as a child of PID 1 and dies
     // with the container.
-    if let Ok(ports) = env::var("AGENT_SANDBOX_HOST_PORTS") {
-        for port in ports.split(',').filter(|p| !p.is_empty()) {
-            let socket = format!("/run/agent-sandbox-host/{}.sock", port);
-            let spawned = Command::new("socat")
-                .arg(format!("TCP-LISTEN:{},bind=127.0.0.1,fork,reuseaddr", port))
-                .arg(format!("UNIX-CONNECT:{}", socket))
-                .spawn();
-            if let Err(e) = spawned {
-                eprintln!("agent-sandbox: could not forward host port {}: {}", port, e);
-            }
+    let ports = host_bridge_ports(
+        &env::var("AGENT_SANDBOX_HOST_PORTS").unwrap_or_default(),
+        env::var("AGENT_SANDBOX_NIX_SERVE_PORT").ok().as_deref(),
+    );
+    for port in ports {
+        let socket = format!("/run/agent-sandbox-host/{}.sock", port);
+        let spawned = Command::new("socat")
+            .arg(format!("TCP-LISTEN:{},bind=127.0.0.1,fork,reuseaddr", port))
+            .arg(format!("UNIX-CONNECT:{}", socket))
+            .spawn();
+        if let Err(e) = spawned {
+            eprintln!("agent-sandbox: could not forward host port {}: {}", port, e);
         }
     }
 
@@ -387,6 +418,43 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn nix_config_with_host_cache(existing: &str, port: u16, public_key: &str) -> Result<String> {
+    if port == 0 {
+        anyhow::bail!("nix-serve port must be in 1-65535");
+    }
+    let public_key = public_key.trim();
+    if public_key.is_empty() || public_key.chars().any(char::is_whitespace) {
+        anyhow::bail!("nix-serve public key must be a single non-empty line");
+    }
+
+    let mut config = existing.to_string();
+    if !config.is_empty() && !config.ends_with('\n') {
+        config.push('\n');
+    }
+    config.push_str(&format!(
+        "extra-substituters = http://127.0.0.1:{}\nextra-trusted-public-keys = {}\n",
+        port, public_key
+    ));
+    Ok(config)
+}
+
+fn host_bridge_ports(host_ports: &str, nix_serve_port: Option<&str>) -> Vec<String> {
+    let mut ports: Vec<String> = host_ports
+        .split(',')
+        .filter(|port| !port.is_empty())
+        .map(str::to_string)
+        .collect();
+    // The private Nix cache bridge uses the same mounted socket directory but
+    // is not a user-requested host-loopback capability, so keep it out of the
+    // public AGENT_SANDBOX_HOST_PORTS list.
+    if let Some(port) = nix_serve_port.filter(|port| !port.is_empty()) {
+        if !ports.iter().any(|existing| existing == port) {
+            ports.push(port.to_string());
+        }
+    }
+    ports
+}
+
 /// Where the entrypoint records the environment it built, for `ctl attach`.
 const ATTACH_ENV: &str = ".config/agent-sandbox/env";
 
@@ -423,6 +491,15 @@ fn write_attach_env(home_path: &Path) {
                 lines.push_str(&format!("{}={}\n", name, value));
             }
         }
+    }
+
+    // NIX_CONFIG is a multiline value. Keep the attach file line-oriented by
+    // storing it as a JSON string; ctl attach decodes this private record back
+    // into the environment variable.
+    if let Ok(value) = env::var("NIX_CONFIG") {
+        lines.push_str("AGENT_SANDBOX_NIX_CONFIG_JSON=");
+        lines.push_str(&serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".to_string()));
+        lines.push('\n');
     }
 
     if let Ok(count) = env::var("GIT_CONFIG_COUNT") {
@@ -528,5 +605,35 @@ mod tests {
 
         let link = home.join(".gemini/config/skills");
         assert!(fs::symlink_metadata(&link).is_err());
+    }
+
+    #[test]
+    fn nix_config_keeps_existing_settings_and_adds_the_host_cache() {
+        let config = nix_config_with_host_cache(
+            "experimental-features = nix-command flakes",
+            7419,
+            "agent-sandbox-nix-serve-1:abc123=\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config,
+            "experimental-features = nix-command flakes\n\
+             extra-substituters = http://127.0.0.1:7419\n\
+             extra-trusted-public-keys = agent-sandbox-nix-serve-1:abc123=\n"
+        );
+    }
+
+    #[test]
+    fn nix_config_rejects_invalid_ports_and_multiline_keys() {
+        assert!(nix_config_with_host_cache("", 0, "key:value").is_err());
+        assert!(nix_config_with_host_cache("", 7419, "").is_err());
+        assert!(nix_config_with_host_cache("", 7419, "first\nsecond").is_err());
+    }
+
+    #[test]
+    fn host_bridge_includes_nix_port_without_changing_public_host_ports() {
+        assert_eq!(host_bridge_ports("3000,8000", Some("7419")), ["3000", "8000", "7419"]);
+        assert_eq!(host_bridge_ports("3000", Some("3000")), ["3000"]);
+        assert_eq!(host_bridge_ports("", None), Vec::<String>::new());
     }
 }

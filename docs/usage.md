@@ -91,9 +91,9 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Workspace & identity | `--gpg` | Enables host GnuPG agent forwarding and git commit signing behavior. |
 | Workspace & identity | `--gpg-private` | Exposes `~/.gnupg` even if it holds on-disk secret keys. |
 | Workspace & identity | `--devenv` | Persists `~/.local/share/devenv` across sessions. |
-| Workspace & identity | `--nix` | Mounts the host `/nix/store` for native Nix execution. |
+| Workspace & identity | `--nix` | Uses the host's existing Nix store as a signed binary-cache substituter. Nix builds and execution stay in the container. See [Trust model](trust-model.md). |
 | Container runtime | `--podman` | Forwards the host rootless Podman socket (sibling containers). See [Trust model](trust-model.md). |
-| Container runtime | `--selinux` | Applies SELinux shared relabeling (`:z`) to ordinary writable binds in the sandbox container; special modes such as the Nix overlay, and a host socket the launcher does not own (the `--nix` daemon socket on a multi-user install), are left unchanged. |
+| Container runtime | `--selinux` | Applies SELinux shared relabeling (`:z`) to ordinary writable binds in the sandbox container; special volume modes and host sockets the launcher does not own are left unchanged. |
 | Container runtime | `--krun` | Runs the sandbox as a KVM microVM with its own kernel, using `podman --runtime krun`. See [Trust model](trust-model.md). |
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
@@ -258,6 +258,10 @@ agent-sandbox --host-loopback-port 9222 -- bash
 The host's `127.0.0.1:9222` is then reachable at the sandbox's own
 `127.0.0.1:9222`. Nothing else on the host's loopback is, which is the point:
 only the ports you name.
+
+With `--nix`, the launcher separately forwards one private, session-only
+loopback endpoint for the host's read-only Nix binary cache. It is not included
+in `$AGENT_SANDBOX_HOST_PORTS` and does not expose other host loopback services.
 
 This is not on by default and there is no way to get it implicitly. Podman
 passes pasta `--no-map-gw`, and the `host.containers.internal` entry it does set

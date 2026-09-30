@@ -1,17 +1,44 @@
 # Trust model
 
 !!! warning "Flags that pierce the sandbox boundary"
-    `--ssh`, `--gpg`, `--podman`, and `--host-loopback-port` each hand the agent a capability that reaches outside the container. Review the section for each flag below before enabling them. For the browser case in particular, prefer `agent-sandbox browser` over mapping a CDP port onto a browser of your own.
+    `--ssh`, `--gpg`, `--podman`, `--host-loopback-port`, and `--nix` each expose a host capability to the agent. Review the section for each flag below before enabling them. For the browser case in particular, prefer `agent-sandbox browser` over mapping a CDP port onto a browser of your own.
 
 By design, `agent-sandbox` includes options that pierce the sandbox boundary. Note that these give any agent running inside the container capabilities on the host:
 
 - `--ssh` (opt-in): The agent can authenticate as you using your forwarded SSH identity (e.g. `git push` to your repos).
 - `--gpg` (opt-in): The agent can sign commits or authenticate with any key held by your host GnuPG agent. Note that `agent-sandbox` protects your private key files by checking for them and gracefully failing the GNUPG directory mount if they are present on disk, but the forwarded GnuPG agent socket is still accessible.
 - `--podman` (opt-in): Forwards the host rootless podman socket. The agent can use this to launch **sibling containers** on the host, which is equivalent to a full sandbox escape (e.g. `podman run -v /:/host ...`).
+- `--nix` (opt-in): Makes the host's existing Nix store readable as a signed binary cache. It does not forward the host daemon or delegate builds, but the agent can request and read store paths already present on the host.
 - `--host-loopback-port PORT` (opt-in): Makes the host's `127.0.0.1:PORT` reachable from inside, so the agent can drive a service you run there. Only the ports you name — but each one is a genuine capability, and what is listening on it decides how large. A database with no password because "it's only local" is now reachable by the agent; a browser's CDP port is the extreme case, because CDP has no authentication and hands the agent a fully-privileged, cookie-bearing browser running as you.
     - **Under `--proxy` it is a channel the sidecar never sees**, and this is the one place where the egress policy stops being a bound. The proxy governs what the *sandbox* connects to; it cannot govern what a program on the host fetches on its own account, so an agent that can say `Page.navigate` can read any page your browser can. Nothing else in the sandbox is loosened — ordinary traffic is still denied by default, and the traffic summary still accounts for it — but a mapped port is deliberately outside that accounting. Map only ports you would be comfortable handing to the agent directly.
     - It is a bind-mounted socket rather than a route, which is why it composes with `--proxy` where the whole-loopback mapping it replaced could not. That is a mechanical fact, not a safety argument: the narrowing to named ports is what makes it defensible.
     - **`agent-sandbox browser` narrows the browser case specifically**, and is what to reach for instead of starting a browser by hand. What it maps is a browser it started itself: an ephemeral profile carrying none of your logins, behind an allow list of its own that defaults to the loopback ports of the app under test and nothing else. The paragraph above still describes a CDP port *you* opened onto *your* browser; it no longer describes the only way to get one. The bounds and their limits are in the section below.
+
+## Host Nix cache: `--nix`
+
+`--nix` starts a short-lived `nix-serve` on the host and configures the
+container's own Nix to use it as an HTTP binary-cache substituter. Nix copies
+matching, already-built paths into the container's local `/nix/store` and
+verifies their content hashes and signatures. Builds and execution remain in
+the container; the host Nix daemon socket and the host's canonical `/nix/store`
+path are never mounted into it. This removes the host-builder capability of the
+old daemon-forwarding behavior and avoids executing host-labeled store files
+under SELinux confinement.
+
+The read capability still matters: the agent can request store paths present on
+the host, and Nix store contents may include source code or other data. Treat
+`--nix` as permission to read the host's Nix cache, not as a build accelerator
+with no host access. The cache server is limited to the sandbox session and
+stops when that session exits. If the host store or server setup is unavailable,
+the launcher reports that and continues without host-cache sharing.
+
+The cache endpoint uses the same host-loopback socket bridge as an explicit
+`--host-loopback-port`. On an enforcing SELinux host, that socket connection may
+require the host's `container_connect_any` boolean; the launcher prints the
+diagnostic but does not change host policy. Without permission, the sandbox
+still starts, but the host cache may be unavailable. Under `--proxy`, this
+loopback cache request is outside proxy accounting; the cache server only reads
+and serves existing store paths and does not fetch or build anything itself.
 
 ## A policed host browser: `agent-sandbox browser`
 
