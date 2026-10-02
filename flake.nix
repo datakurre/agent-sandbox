@@ -6,12 +6,17 @@
     url = "github:jacopone/antigravity-nix";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  inputs.opencode = {
+    url = "github:anomalyco/opencode/v2.0.22";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
     {
       self,
       nixpkgs,
       antigravity-nix,
+      opencode,
       ...
     }:
     let
@@ -30,13 +35,34 @@
               inherit system;
               # claude-code and google-antigravity-cli are unfree.
               config.allowUnfree = true;
-              overlays = [ antigravity-nix.overlays.default ];
+              overlays = [
+                antigravity-nix.overlays.default
+                opencode.overlays.default
+                # The pinned upstream release has a stale x86_64-linux
+                # node_modules hash. Keep its package definition and sources,
+                # correcting only the fixed-output hash for this system. Its
+                # CLI also currently fails while generating shell completions.
+                (final: prev: {
+                  opencode =
+                    (prev.opencode.override {
+                      node_modules =
+                        if final.stdenv.hostPlatform.system == "x86_64-linux" then
+                          prev.opencode.node_modules.override {
+                            hash = "sha256-g3k0cAFGqzmRYlcIkg1NDvlx1WxHYhnYPL0/a8E+qTg=";
+                          }
+                        else
+                          prev.opencode.node_modules;
+                    }).overrideAttrs
+                      (_: {
+                        postInstall = "";
+                      });
+                })
+              ];
             }
           )
         );
 
       packageFor = system: self.packages.${system}.default;
-
 
     in
     {
@@ -53,6 +79,8 @@
         # `nix build .#pi-coding-agent` can verify or update it without a full image
         # rebuild.
         pi-coding-agent = pkgs.callPackage ./pi-coding-agent.nix { };
+        # OpenCode from its upstream flake, also used by the bundled agent.
+        opencode = pkgs.opencode;
       });
 
       apps = lib.genAttrs systems (

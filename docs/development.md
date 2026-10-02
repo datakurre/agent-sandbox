@@ -41,6 +41,11 @@ Add an entry to `agents.nix`. The entry drives:
 - the arguments that make it emit JSON instead of prose (`jsonArgs`), spliced
   in by the launcher's own `--json`.
 
+OpenCode is supplied by the `github:anomalyco/opencode` flake input and its
+upstream overlay, so `pkgs.opencode` in `agents.nix` resolves to that build. Its
+Nixpkgs input follows this flake's Nixpkgs input, keeping both overlays on one
+package set. The standalone package is available as `nix build .#opencode`.
+
 Two rules for the flag mappings, both there because the alternative is silent
 misbehaviour rather than an error:
 
