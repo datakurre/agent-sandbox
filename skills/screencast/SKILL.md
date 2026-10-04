@@ -1,7 +1,6 @@
 ---
 name: screencast
-description: >-
-  Record, compose, and verify a multi-actor screencast of a Robot Framework-driven browser scenario with the robotframework-screencast Python library (https://github.com/datakurre/robotframework-screencast, documentation https://datakurre.github.io/robotframework-screencast/) — several personas taking turns, an observer recording the whole run, title cards, and a picture-in-picture composite. The library is NOT on PyPI: install it from GitHub, as the skill's first section says. Trigger when asked to record a scenario/demo video or product walkthrough of a web application, add a persona turn to an existing recording, re-cut a take without re-recording, debug a broken story or take, or fix dead air, a blank frame or a truncated composite.
+description: Record, compose, and verify a multi-actor screencast of a Robot Framework-driven browser scenario with the robotframework-screencast Python library (https://github.com/datakurre/robotframework-screencast, documentation https://datakurre.github.io/robotframework-screencast/) — several personas taking turns, an observer recording the whole run, title cards, and a picture-in-picture composite. The library is NOT on PyPI: install it from GitHub, as the skill's first section says. Trigger when asked to record a scenario/demo video or product walkthrough of a web application, add a persona turn to an existing recording, re-cut a take without re-recording, debug a broken story or take, or fix dead air, a blank frame or a truncated composite.
 compatibility: Needs Python 3.10+, ffmpeg and ffprobe on the PATH, a Chromium that Playwright can launch, and network access to install the library from GitHub. The application being recorded must be running and reachable from the machine.
 metadata:
   workflow: screencast-recording
@@ -73,10 +72,8 @@ Where to look things up:
   usually supplies one already (follow its own rules — some forbid
   `playwright install`). `SCREENCAST_CHROMIUM_PATH` points the engine at a
   specific Chromium build.
-- If your environment has a `browser` skill, read it for getting a Chromium
-  running (headless or over CDP), fonts and the sandbox's network policy; it
-  also has the basic `record_video_dir` setup. Without it, the recording
-  essentials are these.
+- If your environment has a `browser` skill, read it too: it covers recording
+  fundamentals this skill does not repeat. Without it, the essentials are these.
   Playwright records a context in real time from `new_page()` to `close()`, so
   any time a context is open but not driven is dead air in its video; Playwright
   draws no mouse cursor. The engine handles both — it opens each recorded context
@@ -85,6 +82,11 @@ Where to look things up:
   `Start Observer`/`End Observer` and not open browsers itself. When composing
   video by hand, never use `overlay=...:shortest=1` (it truncates), and freeze a
   frame with `tpad=stop_mode=clone`.
+- **The injected cursor (`screencast/cursor.py`) is plain CSS/JS**, not
+  Playwright's own closed-shadow-root one — fully editable if you need a
+  different look. It already fades to `opacity: 0` after ~3s with no
+  `mousemove` and back to `1` on the next one, so a motionless cursor during a
+  long wait doesn't sit on screen as a distraction.
 - **Never run a story against an environment you do not own.** Stories
   usually start by resetting some state; that is what makes a take
   repeatable, and it is destructive.
@@ -183,14 +185,16 @@ never hard-coded in the story. Keywords, by what they are for:
 
 | Group | Keywords |
 |---|---|
-| Observer | `Start Observer`, `Observe` (bring it to the front; `reload=` only as a deliberate exception), `End Observer` |
+| Observer | `Start Observer`, `Observe` (bring it to the front; `reload=` only as a deliberate exception), `End Observer`, `Get Observer Page` (the raw Playwright page, pinned to the observer even mid-turn -- see below) |
 | Actor turns | `Start Actor Turn`, `End Actor Turn` |
 | Unrecorded setup | `Start Scratch Context`, `End Scratch Context`, `Get Storage State` |
 | Human-paced input | `Human Move`, `Human Click`, `Human Type`, `Paste Text` (for long text), `Press Key`, `Select Option`, `Check`, `Uncheck` |
 | Waiting and reading | `Wait Until Visible`, `Wait For Navigation Away`, `Count Matches`, `Get Attribute`, `Get Url`, `Get Current Page` (the raw Playwright page) |
 | Navigation and shots | `Go To`, `Take Screenshot` |
+| Page chrome | `Hide Cursor` (outright, not just the default ~3s idle fade, and for the rest of that page's context, across navigations -- for a turn with no mouse interaction at all, e.g. a ttyd terminal observer) |
 | Data shared between tasks and runs | `Save State`, `Load State`, `Clear State` |
 | Edit events (no browser time) | `Chapter`, `Focus`, `Hold`, `Caption` |
+| Tracks (an extra always-on screen) | `Start Track`, `End Track` |
 
 `Start Actor Turn` logs the persona in with HTTP Basic auth as `actor` /
 `password` (the password defaults to the actor's name; pass `anonymous=${True}`
@@ -213,6 +217,57 @@ Rules that are easy to get backwards:
 - **Submit through `Wait For Navigation Away`** (or a keyword built on it)
   when a form must go through: a rejected submit leaves the page where it
   was and nothing else says so.
+
+Every input/waiting/reading keyword above routes through the *currently
+open turn's* page by design, so a mid-turn `Observe`-style call can't
+hijack the rest of the turn's own `Human Click`/`Type`/`Wait Until
+Visible` calls. `Get Observer Page` is the one escape hatch: it always
+returns the observer's own Playwright page regardless of whether a turn is
+open, for a project keyword that itself needs to interact with something
+living on the observer's page (a toggle button, say) from *within* an open
+turn (e.g. a "follow this instance live" pattern). `Get Current Page`
+still means whichever page a turn currently has open.
+
+## Tracks: an extra always-on screen
+
+`Start Track name url` (after `Start Observer`) opens a second (third, ...)
+context recorded for the whole take alongside the observer — e.g. an
+ambient terminal showing a background job's own output. `End Track name`
+closes it (before `End Observer`) and writes it onto the timeline, where
+`compose()` always composites it as a corner inset (`bottom-left` by
+default), independent of everything else on screen. A track still open at
+`End Observer` is closed and recorded there, with a warning — but close it
+yourself. The track's `name` must be unique for the whole take — reusing
+one (even from an earlier, already-closed `Start Track`/`End Track` pair)
+raises at `Start Track`, since `Focus view=name` and `compose()` both
+resolve a track by name alone. Four independent opt-in flags, all default
+off (or `bottom-left`):
+
+- `focusable=False` is a structural guarantee that `Focus view=name` can
+  never make this track the main (full-frame) view — for a screen that
+  should always stay a PiP (a shell, say), this is safer than simply never
+  writing such a `Focus` call, which a later edit of the story could still
+  do by mistake. Leave it at the default (`True`) for a track a story
+  *does* mean to cut to full-frame sometimes (`Focus view=name` mid-take).
+- `fade=True` fades that track's own inset past its left third (fully
+  opaque there, a logarithmic fade to transparent across the rest), so the
+  main view shows through behind most of it — independent of `focusable`:
+  it only ever changes how the inset itself renders, never a segment where
+  the track is main.
+- `scale`/`margin`/`border` override this track's own inset's size/spacing
+  (schema defaults 0.4/24/3, same as a focus event's own inset) — e.g.
+  `scale=0.6` for a PiP 1.5x the default size. Like `fade`, only ever
+  affects its inset rendering, never a segment where it is main (main
+  always fills the whole frame).
+- `corner` (schema default `bottom-left`) picks which corner this track's
+  own inset is pinned to, same four values as the external `--track`
+  path's `CORNER` — set it on a second/third simultaneous track so it
+  doesn't land on top of the first one (both default to the same corner
+  otherwise).
+
+A track being "only" a PiP, never main, does not by itself make a wait
+dead air — see the `dead_air` row below. See `reference.md`'s "Engine-
+recorded tracks" section for the full mechanism and worked examples.
 
 ## Selector conventions the input keywords understand
 
@@ -248,7 +303,11 @@ Composer defaults, if you're wondering why a take looks a certain way with no
 view (nothing to inset yet); during a turn its actor is main and the
 observer is the inset; between turns the main view follows the most recent
 `focus` event, default observer. A story only calls `Focus` to override one
-of these defaults for a specific stretch.
+of these defaults for a specific stretch. When the take's first `Chapter`
+fires at or before its first turn starts (a titled first turn), everything
+recorded before that card — `Start Observing`'s own loading, and any
+`Hold` in it — is dropped, and the output opens on the card. Caption times
+and `verify`'s expected duration account for that.
 
 # Sharing data between tasks, and re-running one task
 
@@ -311,8 +370,9 @@ to call them directly:
    call resolves and validates its arguments against what's actually
    imported, with no browser opened. Cheapest first move on anything that
    might be a typo or a missing argument.
-2. **`run story.robot [--task NAME] [--no-record] [--take DIR] [--repl-on-failure]`**
-   — executes in-process. On a failure, prints a compact summary instead of
+2. **`run story.robot [--task NAME] [--no-record] [--take DIR] [--headed] [--repl-on-failure]`**
+   — executes in-process (`--headed` shows the browser window instead of
+   running headless). On a failure, prints a compact summary instead of
    Robot Framework's normal per-keyword trace:
    ```
    FAIL: Story.Broken Turn
@@ -365,6 +425,11 @@ to call them directly:
 4. **`keywords resources/app.resource`** — lists a resource's keywords
    with their arguments and doc, so you know what already exists before
    writing a new one or guessing an argument name.
+5. **`log <take dir>`** — renders `log.html` from that take's
+   `output.json` (Robot Framework's own keyword-by-keyword log, screenshots
+   and all) on demand. `run` never writes it itself, to keep the fast loop
+   fast; reach for this when the compact failure summary above isn't
+   enough and you need the full keyword trace.
 
 Loop: `run --repl-on-failure` → read the summary → try the fix at the paused
 REPL against the still-open page → Ctrl-D/EOF → `run --no-record` again once
@@ -396,10 +461,14 @@ catch what they were written for. Findings, by `check`:
 | `check` | Means |
 |---|---|
 | `stream` | Not exactly one 1920x1080 25fps video stream |
-| `duration` | Composed duration doesn't match the timeline's own prediction (observer length + every chapter/hold duration) |
-| `dead_air` | Judged from the timeline's `wait` events (recorded around `Sleep`, `Wait Until Keyword Succeeds`, the engine's own waits, and any keyword tagged `screencast:wait`): **error** for one wait over 10 s, warning when all waits together pass 30 s |
+| `duration` | Composed duration doesn't match the timeline's own prediction (observer length, less a dropped lead-in before a leading first chapter, plus every chapter and non-`recorded` hold duration) |
+| `dead_air` | Judged from the timeline's `wait` events (recorded around `Sleep`, `Wait Until Keyword Succeeds`, the engine's own waits, and any keyword tagged `screencast:wait`): **error** for one wait over 10 s, warning when all waits together pass 30 s. A wait is not dead air if a track (see "Tracks", above) is either the main view or a genuinely live inset for its entire span — focusable or not; "always a PiP" only concerns eligibility to become main, not whether its own footage still counts. Under a `Focus ... solo=True` no inset is on screen, so only a track that is the main view covers a wait |
 | `blank_frame` | A near-pure-black interval (`blackdetect`, tuned so a dark-navy title card does not count), or an actor's page still one flat colour where the composer enters its clip — also what missing fonts look like |
 | `empty_inset` | A sampled observer frame at some turn's midpoint is a near-uniform colour — that turn's inset would be blank |
+| `captions` | The timeline has `caption` events but no `output.vtt` was composed next to the output, or a cue ends after the output does |
+
+`verify` exits 1 when any finding is an error. It reads `<take>/output.webm`;
+after `compose --output other.webm`, pass the same path to `verify --output`.
 
 **Tag your own polling keywords** so their waiting counts as dead air:
 `[Tags]    screencast:wait` on a user keyword, or
@@ -430,7 +499,14 @@ Mirror an addition with:
   ffmpeg on tiny synthetic clips.
 
 See `reference.md` for the timeline schema's full field reference, the
-composer's segment-boundary algorithm in more depth, and writing a new
-`verify` check. It also covers recording without the engine — the raw
-`page.screencast` API, a headless terminal (`ttyd`), transcoding to MP4/GIF and
-hand-written `ffmpeg` edits — for a one-off that does not need a story.
+composer's segment-boundary algorithm in more depth, writing a new `verify`
+check, pointing `Start Observer` straight at a ttyd terminal (three gotchas:
+the injected cursor and ttyd's own resize-flash both need hiding, and
+there's no DOM text layer to read state or sequence typed commands from),
+engine-recorded tracks in full (`Start Track`/`End Track`, `focusable`,
+`fade`, and exactly how a track covers a wait for `dead_air` purposes), and
+compositing an externally recorded secondary PiP (e.g. a terminal) onto
+the engine's own output — natively, via `compose()`'s own `tracks=`/
+`screencast compose --track` (title cards are hidden behind it for free,
+with no `enable=` expression needed); `chapter_windows()` remains useful for
+the older hand-rolled second-`ffmpeg`-pass fallback.
