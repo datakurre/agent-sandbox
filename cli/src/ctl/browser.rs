@@ -355,6 +355,23 @@ pub fn url_allowlist(allow: &AllowList) -> Vec<String> {
     out
 }
 
+/// `URLBlocklist: ["*"]` covers every scheme, `devtools://` included, and
+/// Chromium refuses to open DevTools on a URL the blocklist denies -- so without
+/// these the operator watching the browser cannot inspect what the agent does.
+/// The DevTools frontend is bundled into the browser; anything it fetches from
+/// the network is still a URL the rest of this list and the proxy decide.
+const INTERNAL_URL_ALLOWLIST: &[&str] = &["devtools://*", "chrome-devtools://*"];
+
+/// The managed `URLAllowlist`: the internal pages that must keep working, then
+/// [`url_allowlist`].
+fn managed_url_allowlist(allow: &AllowList) -> Vec<String> {
+    INTERNAL_URL_ALLOWLIST
+        .iter()
+        .map(|s| s.to_string())
+        .chain(url_allowlist(allow))
+        .collect()
+}
+
 /// Split a policy target into its host part and its optional `:ports` suffix,
 /// keeping IPv6 addresses (which are full of colons) intact.
 fn split_target(target: &str) -> (&str, Option<&str>) {
@@ -410,7 +427,7 @@ pub fn sync_managed_allowlist(dir: &str, lines: &[String]) -> Result<()> {
     let allow = AllowList {
         rules: lines.iter().filter(|l| is_rule_line(l)).cloned().collect(),
     };
-    policy["URLAllowlist"] = json!(url_allowlist(&allow));
+    policy["URLAllowlist"] = json!(managed_url_allowlist(&allow));
 
     // Same temp-file-then-rename as `install_policy`, and inside the same
     // directory, so Chromium's policy watcher never observes a half-written
@@ -442,7 +459,7 @@ pub fn managed_policy_json(
         // layer that still applies inside a CDP-created context with a proxy of
         // its own.
         "URLBlocklist": ["*"],
-        "URLAllowlist": url_allowlist(allow),
+        "URLAllowlist": managed_url_allowlist(allow),
         // Pin the proxy so it cannot be switched off from the settings UI.
         "ProxySettings": {
             "ProxyMode": "fixed_servers",
@@ -1394,7 +1411,12 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&file).expect("read")).expect("json");
         assert_eq!(
             after["URLAllowlist"],
-            json!(["127.0.0.1:8000", "example.com:443"])
+            json!([
+                "devtools://*",
+                "chrome-devtools://*",
+                "127.0.0.1:8000",
+                "example.com:443"
+            ])
         );
         // Everything else is a launch fact and no policy edit implies a change.
         assert_eq!(after["URLBlocklist"], launched["URLBlocklist"]);
@@ -1528,7 +1550,12 @@ mod tests {
         let allow = allow_of(&["allow_ip 127.0.0.1/32:3000"]);
         let policy = managed_policy_json(&allow, 41234, &[]);
         assert_eq!(policy["URLBlocklist"], json!(["*"]));
-        assert_eq!(policy["URLAllowlist"], json!(["127.0.0.1:3000"]));
+        assert_eq!(
+            policy["URLAllowlist"],
+            json!(["devtools://*", "chrome-devtools://*", "127.0.0.1:3000"]),
+            "the blocklist's `*` covers devtools:// too, which would leave the \
+             operator unable to open DevTools"
+        );
         assert_eq!(
             policy["ProxySettings"]["ProxyServer"],
             json!("http://127.0.0.1:41234")
