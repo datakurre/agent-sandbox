@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
+use agent_sandbox_cli::host_bridge;
 use agent_sandbox_proxy::known_hosts::FORGE_KNOWN_HOSTS;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -12,7 +14,18 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+/// Where the launcher mounts the `--host-loopback-port` socket directory.
+const HOST_PORT_DIR: &str = "/run/agent-sandbox-host";
+
+/// Set on the copy of this binary the entrypoint spawns to serve the host
+/// loopback bridge, so it runs that instead of the entrypoint proper.
+const BRIDGE_ROLE_ENV: &str = "AGENT_SANDBOX_HOST_BRIDGE_PORTS";
+
 fn main() -> Result<()> {
+    if let Ok(ports) = env::var(BRIDGE_ROLE_ENV) {
+        run_host_bridge(&ports);
+    }
+
     // 1. nix-store load db
     let skip_nix_init = env::var("AGENT_SANDBOX_SKIP_NIX_INIT").unwrap_or_else(|_| "0".to_string());
     // `--nix` now exposes the host store only as an HTTP substituter. It does
@@ -41,23 +54,23 @@ fn main() -> Result<()> {
     // NIX_CONFIG is inherited by every Nix command in this process tree and is
     // also recorded for `ctl attach` below. The host cache is intentionally an
     // HTTP binary cache, not a mounted local store or forwarded daemon socket.
-    if let (Ok(port), Ok(pubkey_path)) = (
+    // It is applied only once the bridge carrying it is live (step 8).
+    let mut pending_nix_config = None;
+    if let (Ok(port), Ok(pubkey)) = (
         env::var("AGENT_SANDBOX_NIX_SERVE_PORT"),
-        env::var("AGENT_SANDBOX_NIX_SERVE_PUBKEY_FILE"),
+        env::var("AGENT_SANDBOX_NIX_SERVE_PUBKEY"),
     ) {
         let port = port
             .parse::<u16>()
             .ok()
             .filter(|port| *port != 0)
             .context("invalid AGENT_SANDBOX_NIX_SERVE_PORT")?;
-        let pubkey = fs::read_to_string(&pubkey_path)
-            .with_context(|| format!("failed to read nix-serve public key at {}", pubkey_path))?;
         let nix_config = nix_config_with_host_cache(
             &env::var("NIX_CONFIG").unwrap_or_default(),
             port,
             &pubkey,
         )?;
-        env::set_var("NIX_CONFIG", nix_config);
+        pending_nix_config = Some((port, nix_config));
     }
 
     let home = env::var("HOME").context("HOME not set")?;
@@ -354,28 +367,64 @@ fn main() -> Result<()> {
     }
 
     // 8. Host loopback ports
-    // The launcher mounted one socket per mapping and is splicing the far end
-    // to a port on the host's loopback; this puts a TCP listener in front of
-    // each, because the clients that want them -- CDP, a database driver --
-    // speak TCP and not unix sockets.  127.0.0.1 both because NO_PROXY already
-    // exempts it under --proxy and because Chrome's DevTools host check accepts
-    // an IP but not an arbitrary name.
+    // The launcher mounted a directory and dials into it from the host; this
+    // side owns the sockets and the TCP listeners clients inside connect to
+    // (see host_bridge for why that direction).  127.0.0.1 both because
+    // NO_PROXY already exempts it under --proxy and because Chrome's DevTools
+    // host check accepts an IP but not an arbitrary name.
     //
     // Spawned, not threaded: this process execs below, which would take any
-    // thread of ours with it.  socat outlives that as a child of PID 1 and dies
-    // with the container.
+    // thread of ours with it.  The bridge outlives that as a child of PID 1 and
+    // dies with the container.
     let ports = host_bridge_ports(
         &env::var("AGENT_SANDBOX_HOST_PORTS").unwrap_or_default(),
-        env::var("AGENT_SANDBOX_NIX_SERVE_PORT").ok().as_deref(),
+        pending_nix_config
+            .as_ref()
+            .map(|(port, _)| port.to_string())
+            .as_deref(),
     );
-    for port in ports {
-        let socket = format!("/run/agent-sandbox-host/{}.sock", port);
-        let spawned = Command::new("socat")
-            .arg(format!("TCP-LISTEN:{},bind=127.0.0.1,fork,reuseaddr", port))
-            .arg(format!("UNIX-CONNECT:{}", socket))
-            .spawn();
-        if let Err(e) = spawned {
-            eprintln!("agent-sandbox: could not forward host port {}: {}", port, e);
+    let mut ports_up = HashSet::new();
+    if !ports.is_empty() {
+        let spawned = env::current_exe().and_then(|exe| {
+            Command::new(exe)
+                .env(BRIDGE_ROLE_ENV, ports.join(","))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+        });
+        match spawned {
+            Ok(mut bridge) => {
+                if let Some(stdout) = bridge.stdout.take() {
+                    ports_up = read_bridge_reports(stdout, Duration::from_secs(3));
+                }
+            }
+            Err(e) => eprintln!(
+                "agent-sandbox: could not start the host loopback bridge: {}",
+                e
+            ),
+        }
+    }
+
+    // An unreachable substituter is not skipped by Nix: every command retries
+    // it for seconds and logs each attempt.  So the host cache goes into
+    // NIX_CONFIG only once the launcher has parked a connection on its socket
+    // -- and is not waited for at all when the bridge could not serve it.
+    if let Some((port, nix_config)) = pending_nix_config {
+        let marker = host_bridge::ready_marker(Path::new(HOST_PORT_DIR), port);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while ports_up.contains(&port)
+            && !marker.exists()
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if ports_up.contains(&port) && marker.exists() {
+            env::set_var("NIX_CONFIG", nix_config);
+        } else {
+            eprintln!(
+                "agent-sandbox: --nix: the host cache bridge did not come up; continuing without the host Nix cache."
+            );
+            env::remove_var("AGENT_SANDBOX_NIX_SERVE_PORT");
         }
     }
 
@@ -416,6 +465,66 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The bridge role: serve each port in `ports` (comma-separated sandbox
+/// ports) until the container goes away.
+///
+/// Each port's outcome goes to stdout as a `host_bridge::Report` line for the
+/// entrypoint to read, terminated by `done`: the entrypoint prints failures
+/// itself, before it execs the command, where they cannot land inside it.
+fn run_host_bridge(ports: &str) -> ! {
+    let mut out = io::stdout().lock();
+    for port in ports.split(',').filter_map(|p| p.parse::<u16>().ok()) {
+        let outcome = host_bridge::bind_and_serve(Path::new(HOST_PORT_DIR), port);
+        let _ = writeln!(out, "{}", host_bridge::Report::for_port(port, &outcome).to_line());
+    }
+    let _ = writeln!(out, "{}", host_bridge::Report::Done.to_line());
+    let _ = out.flush();
+    drop(out);
+    loop {
+        thread::park();
+    }
+}
+
+/// Read the bridge's per-port reports until `done`, EOF or `timeout`, print
+/// each failure, and return the ports that came up.  On a thread with a
+/// deadline, because a wedged bridge must not hold the command back for good.
+fn read_bridge_reports(stdout: impl Read + Send + 'static, timeout: Duration) -> HashSet<u16> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let Some(report) = host_bridge::Report::parse(&line) else {
+                continue;
+            };
+            let done = report == host_bridge::Report::Done;
+            if tx.send(report).is_err() || done {
+                break;
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut up = HashSet::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(host_bridge::Report::Up(port)) => {
+                up.insert(port);
+            }
+            Ok(host_bridge::Report::Down(port, why)) => {
+                eprintln!("agent-sandbox: could not forward host port {}: {}", port, why);
+            }
+            Ok(host_bridge::Report::Done) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!("agent-sandbox: the host loopback bridge did not report in time.");
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    up
 }
 
 fn nix_config_with_host_cache(existing: &str, port: u16, public_key: &str) -> Result<String> {
@@ -577,6 +686,26 @@ fn ensure_skills_symlinks(home_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_reports_yield_the_ports_that_came_up() {
+        let reports = "ok 9222\nerr 7419 Address already in use (os error 98)\nnoise\ndone\nok 1\n";
+        let up = read_bridge_reports(io::Cursor::new(reports), Duration::from_secs(5));
+        assert_eq!(up, HashSet::from([9222]), "a port after `done` is not read");
+
+        // A bridge that died mid-report: what it said still counts.
+        let up = read_bridge_reports(io::Cursor::new("ok 5\n"), Duration::from_secs(5));
+        assert_eq!(up, HashSet::from([5]));
+    }
+
+    #[test]
+    fn a_silent_bridge_does_not_hold_the_command_back() {
+        let (reader, _writer_kept_open) = std::os::unix::net::UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        let up = read_bridge_reports(reader, Duration::from_millis(200));
+        assert!(up.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn test_ensure_skills_symlinks_creates_symlink() {

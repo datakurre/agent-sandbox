@@ -90,7 +90,8 @@ changes under unrelated churn.
 
 ## The integration and acceptance tiers
 
-These run on the host and write one log per case.
+These run on the host and write one log per case. On an enforcing SELinux
+host, `sandbox_run` adds `--selinux` to every launch, as a user there has to.
 
 ```sh
 make -C tests/integration image        # build and load the image (once)
@@ -235,9 +236,19 @@ Worth knowing when choosing what to test next:
   the stub a canned `podman ps` reply and assert on what gets printed.
 - **The browser** (`ctl/browser.rs`) has its pure parts covered, and
   `90-browser-ports` drives a real instance — its proxy, its policy files and
-  `ctl policy allow --browser` — with a stub in place of Chromium. Launching
-  Chromium itself under bwrap is still untested at any tier, which is where the
-  managed-policy layer lives.
+  `ctl policy allow --browser` — with a stub in place of Chromium.
+  `95-browser-cdp` attaches a sandbox to such a stub with `--browser`, with and
+  without `--proxy`, and fetches its DevTools endpoint through the
+  host-loopback bridge; it also fails if bwrap is on `PATH` but the
+  managed-policy overlay could not be applied. A real Chromium honouring that
+  policy is still untested at any tier.
+- **`--krun` and the host-loopback bridge**: `75-host-loopback-krun` runs
+  `70-host-loopback-port`'s round trip inside a krun guest, where the bridge's
+  sockets sit on virtiofs, and skips on a host without krun. It only reports
+  whether `--nix` reached its cache there; nothing asserts that yet.
+- **SELinux** results depend on the host, so every integration log records the
+  mode it ran under (`### selinux: enforcing`), and `sandbox_run` adds
+  `--selinux` on an enforcing host.
 
 ## Adding a test
 

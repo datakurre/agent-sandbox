@@ -472,9 +472,12 @@ let
       # --generate-binary-cache-key` to make a signing keypair on first use, and
       # `nix-serve` to serve the host's real store as a binary cache the
       # container's own local Nix adds as a substituter. Neither ever touches the
-      # container -- see NIX_SERVE.md for why a shared substituter replaced the
-      # old shared store/daemon-socket mounts.
+      # container -- see docs/architecture.md ("--nix is a binary cache") for
+      # why a substituter replaced the old shared store/daemon-socket mounts.
       nix nix-serve
+      # `agent-sandbox browser` installs its managed Chromium policy with
+      # bwrap; pinned so that layer does not vary with the host's build.
+      bubblewrap
     ];
     text = launcherPreamble + ''
       exec ${agentSandboxRust}/bin/agent-sandbox "$@"
@@ -485,6 +488,7 @@ let
     name = "agent-sandbox-ctl";
     runtimeInputs = with pkgs; [
       agentSandboxRust podman git coreutils jq gnupg util-linux findutils gnugrep gawk secretspec
+      bubblewrap  # for `ctl browser`; see the note in `launcher` above
     ];
     text = launcherPreamble + ''
       exec ${agentSandboxRust}/bin/agent-sandbox ctl "$@"

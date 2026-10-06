@@ -15,7 +15,7 @@ ssh-add -l >/dev/null 2>&1 || skip "the host SSH agent holds no keys"
 require_trusted_host_key github.com
 
 ws="$(make_workspace)"
-cleanup() { kill $launcher 2>/dev/null; cd / || true; rm -rf "$ws"; cleanup_sandboxes; }
+cleanup() { stop_bg "$launcher"; cd / || true; rm -rf "$ws"; cleanup_sandboxes; }
 trap cleanup EXIT
 cd "$ws" || exit 1
 

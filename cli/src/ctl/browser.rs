@@ -525,15 +525,66 @@ pub fn chromium_args(cfg: &BrowserLaunch) -> Vec<String> {
 const CHROMIUM_POLICY_DIR: &str = "/etc/chromium/policies/managed";
 
 /// How the managed policy gets to `CHROMIUM_POLICY_DIR`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayMode {
     /// The directory already exists, so it can simply be bound over.
     Bind,
-    /// It does not.  bwrap can only create a mount point where the namespace's
-    /// root can write, and a real `/etc` is not that -- so `/etc` gets a
-    /// throwaway overlay first, and the directory is created inside it.  Needs
-    /// bubblewrap 0.9+ and unprivileged overlayfs.
-    OverlayEtc,
+    /// It does not, and bwrap cannot create a mount point in the real `/etc`:
+    /// inside its user namespace `/etc` belongs to an unmapped root, so not
+    /// even an overlay over it can be written.  So `/etc` becomes a tmpfs this
+    /// user owns, every real entry is bound back into it, and the missing
+    /// directories are made on the tmpfs.  The ops are [`rebuild_args`]'s.
+    RebuildEtc(Vec<String>),
+}
+
+/// bwrap ops that put a tmpfs at `at` and bind every entry of `real` (the same
+/// directory on the host) back into it, except `rest[0]`: that one is the next
+/// step towards the policy directory, so it is rebuilt the same way if it
+/// exists, and otherwise left for bwrap to create when it binds the policy.
+///
+/// Bind sources resolve against the original root, which the tmpfs does not
+/// cover, so the entries are the host's own.  An entry the host replaces by
+/// rename while the browser runs (`resolv.conf`) stays the old file in here;
+/// the browser's traffic goes through the proxy, which resolves for it.
+pub fn rebuild_args(real: &Path, at: &str, rest: &[&str]) -> Vec<String> {
+    let mut args = vec!["--tmpfs".to_string(), at.to_string()];
+    let Some((next, deeper)) = rest.split_first() else {
+        return args;
+    };
+    let mut names: Vec<String> = fs::read_dir(real)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    for name in names.iter().filter(|name| name != next) {
+        let source = real.join(name);
+        let dest = format!("{}/{}", at, name);
+        match fs::read_link(&source) {
+            Ok(target) => {
+                args.push("--symlink".to_string());
+                args.push(target.to_string_lossy().into_owned());
+            }
+            // -try: an entry that vanishes between listing and binding is
+            // not worth losing the policy layer over.
+            Err(_) => {
+                args.push("--dev-bind-try".to_string());
+                args.push(source.to_string_lossy().into_owned());
+            }
+        }
+        args.push(dest);
+    }
+    if !deeper.is_empty() && real.join(next).is_dir() {
+        args.extend(rebuild_args(
+            &real.join(next),
+            &format!("{}/{}", at, next),
+            deeper,
+        ));
+    }
+    args
 }
 
 /// The bwrap wrapper that puts this instance's managed policy where Chromium
@@ -543,16 +594,15 @@ pub enum OverlayMode {
 /// adds one override, it is not a sandbox and does not pretend to be.
 pub fn bwrap_args(
     managed_dir: &str,
-    mode: OverlayMode,
+    mode: &OverlayMode,
     program: &str,
     program_args: &[String],
 ) -> Vec<String> {
     let mut args = vec!["--dev-bind".to_string(), "/".to_string(), "/".to_string()];
-    if mode == OverlayMode::OverlayEtc {
-        // Writes go to an invisible tmpfs, so the host's /etc is untouched and
-        // nothing survives the process.
-        args.push("--tmp-overlay".to_string());
-        args.push("/etc".to_string());
+    if let OverlayMode::RebuildEtc(ops) = mode {
+        // Only in this process's mount namespace: the host's /etc is untouched
+        // and nothing survives the process.
+        args.extend(ops.iter().cloned());
     }
     args.push("--bind".to_string());
     args.push(managed_dir.to_string());
@@ -583,23 +633,40 @@ fn select_overlay_mode(managed_dir: &str) -> std::result::Result<OverlayMode, St
     if Path::new(CHROMIUM_POLICY_DIR).is_dir() {
         modes.push(OverlayMode::Bind);
     }
-    modes.push(OverlayMode::OverlayEtc);
+    let below_etc: Vec<&str> = CHROMIUM_POLICY_DIR
+        .trim_start_matches("/etc/")
+        .split('/')
+        .collect();
+    modes.push(OverlayMode::RebuildEtc(rebuild_args(
+        Path::new("/etc"),
+        "/etc",
+        &below_etc,
+    )));
 
+    // bwrap's own words for the last failure, so the note names the cause --
+    // an old bwrap, an unsupported flag, a refused mount -- instead of a guess.
+    let mut last_error = String::new();
     for mode in modes {
-        let ok = Command::new("bwrap")
-            .args(bwrap_args(managed_dir, mode, &probe, &[]))
+        match Command::new("bwrap")
+            .args(bwrap_args(managed_dir, &mode, &probe, &[]))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            return Ok(mode);
+            .output()
+        {
+            Ok(out) if out.status.success() => return Ok(mode),
+            Ok(out) => {
+                last_error = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            }
+            Err(e) => last_error = e.to_string(),
         }
     }
     Err(format!(
-        "bwrap cannot bind over {} (no such directory, and no unprivileged overlayfs for /etc)",
-        CHROMIUM_POLICY_DIR
+        "bwrap cannot bind over {} (no such directory, and /etc could not be rebuilt{})",
+        CHROMIUM_POLICY_DIR,
+        if last_error.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", last_error)
+        }
     ))
 }
 
@@ -1031,7 +1098,7 @@ pub fn run(args: BrowserArgs) -> Result<()> {
     let mut browser_cmd = match overlay {
         Ok(mode) => {
             let mut c = Command::new("bwrap");
-            c.args(bwrap_args(&managed_dir, mode, &chromium, &cargs));
+            c.args(bwrap_args(&managed_dir, &mode, &chromium, &cargs));
             c
         }
         Err(reason) => {
@@ -1505,7 +1572,7 @@ mod tests {
     fn bwrap_binds_the_policy_dir_and_then_execs_chromium() {
         let args = bwrap_args(
             "/run/x/policies/managed",
-            OverlayMode::Bind,
+            &OverlayMode::Bind,
             "chromium",
             &["--foo".to_string()],
         );
@@ -1526,23 +1593,62 @@ mod tests {
     }
 
     #[test]
-    fn without_a_policy_dir_etc_gets_a_throwaway_overlay_first() {
+    fn without_a_policy_dir_etc_is_rebuilt_on_a_tmpfs_first() {
         // bwrap cannot create a mount point in a real /etc, which is why most
         // hosts -- where Chromium came from a Nix profile and never wrote to
         // /etc -- need this variant rather than the plain bind.
+        let ops = vec!["--tmpfs".to_string(), "/etc".to_string()];
         let args = bwrap_args(
             "/run/x/policies/managed",
-            OverlayMode::OverlayEtc,
+            &OverlayMode::RebuildEtc(ops),
             "chromium",
             &[],
         );
-        let overlay = args.windows(2).position(|w| w[0] == "--tmp-overlay");
+        let tmpfs = args.windows(2).position(|w| w[0] == "--tmpfs");
         let bind = args.windows(2).position(|w| w[0] == "--bind");
-        assert_eq!(args[overlay.expect("overlay") + 1], "/etc");
         assert!(
-            overlay < bind,
+            args.windows(3).next() == Some(&["--dev-bind".into(), "/".into(), "/".into()]),
+            "the rest of the filesystem first: {args:?}"
+        );
+        assert!(
+            tmpfs.expect("tmpfs") < bind.expect("bind"),
             "/etc has to be writable before the bind can create its mount point: {args:?}"
         );
+    }
+
+    #[test]
+    fn rebuilding_etc_binds_back_everything_but_the_path_to_the_policy() {
+        let etc = tempfile::tempdir().unwrap();
+        let real = etc.path();
+        fs::write(real.join("passwd"), "root").unwrap();
+        fs::create_dir(real.join("ssl")).unwrap();
+        std::os::unix::fs::symlink("../proc/self/mounts", real.join("mtab")).unwrap();
+        let src = |name: &str| real.join(name).to_string_lossy().into_owned();
+
+        let args = rebuild_args(real, "/etc", &["chromium", "policies", "managed"]);
+        let joined = args.join(" ");
+        assert_eq!(&args[..2], ["--tmpfs", "/etc"]);
+        assert!(joined.contains(&format!("--dev-bind-try {} /etc/passwd", src("passwd"))));
+        assert!(joined.contains(&format!("--dev-bind-try {} /etc/ssl", src("ssl"))));
+        assert!(joined.contains("--symlink ../proc/self/mounts /etc/mtab"), "{joined}");
+        assert!(!joined.contains("chromium"), "absent, so bwrap creates it: {joined}");
+
+        // A Chromium directory that exists keeps its contents, but is itself
+        // rebuilt so the missing `managed` can be made inside it.
+        fs::create_dir_all(real.join("chromium/policies/recommended")).unwrap();
+        fs::write(real.join("chromium/master_preferences"), "{}").unwrap();
+        let joined = rebuild_args(real, "/etc", &["chromium", "policies", "managed"]).join(" ");
+        assert!(joined.contains("--tmpfs /etc/chromium "), "{joined}");
+        assert!(joined.contains("--tmpfs /etc/chromium/policies "), "{joined}");
+        assert!(joined.contains(&format!(
+            "--dev-bind-try {} /etc/chromium/master_preferences",
+            src("chromium/master_preferences")
+        )));
+        assert!(joined.contains(&format!(
+            "--dev-bind-try {} /etc/chromium/policies/recommended",
+            src("chromium/policies/recommended")
+        )));
+        assert!(!joined.contains("/etc/chromium/policies/managed"), "{joined}");
     }
 
     #[test]

@@ -138,10 +138,25 @@ pub fn git_identity_env(pairs: &[(String, String)]) -> Vec<String> {
 /// Public keyring material only: the keyring so gpg can name the signing key,
 /// and the trust database so it believes the answer.  Secret keys are a
 /// separate decision made by the caller (see `gpg::scan_gnupg_home`).
-pub fn gnupg_public_mounts(gnupg_home: &Path, want_private: bool) -> Vec<String> {
+///
+/// `exported_pubring` stands in for a keyring file the home does not have: a
+/// keyboxd setup (`use-keyboxd` in `common.conf`, GnuPG 2.4's default on new
+/// installs) keeps public keys in a database behind a socket instead, and a
+/// `gpg --export` of them is an ordinary OpenPGP keyring gpg reads as
+/// `pubring.gpg`.
+pub fn gnupg_public_mounts(
+    gnupg_home: &Path,
+    exported_pubring: Option<&Path>,
+    want_private: bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     for keyring in ["pubring.kbx", "pubring.gpg", "trustdb.gpg"] {
         let path = gnupg_home.join(keyring);
+        // An export replaces the keyring files: under keyboxd one left in the
+        // home is stale or empty, and gpg inside would read it instead.
+        if exported_pubring.is_some() && keyring != "trustdb.gpg" {
+            continue;
+        }
         if path.is_file() {
             out.extend(bind(
                 &path.to_string_lossy(),
@@ -149,6 +164,13 @@ pub fn gnupg_public_mounts(gnupg_home: &Path, want_private: bool) -> Vec<String>
                 "ro",
             ));
         }
+    }
+    if let Some(exported) = exported_pubring {
+        out.extend(bind(
+            &exported.to_string_lossy(),
+            "/run/host-gnupg/pubring.gpg",
+            "ro",
+        ));
     }
     let private = gnupg_home.join("private-keys-v1.d");
     if want_private && private.is_dir() {
@@ -161,34 +183,61 @@ pub fn gnupg_public_mounts(gnupg_home: &Path, want_private: bool) -> Vec<String>
     out
 }
 
-// ── devenv / nix / podman ───────────────────────────────────────────────────
+/// Why `gnupg_home`'s public keys have to be exported rather than mounted,
+/// or None when its keyring file can simply be mounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyExport {
+    /// Configured for keyboxd, whose database sits behind a socket.  The
+    /// configuration decides, not the files, because gpg under keyboxd
+    /// ignores a `pubring.kbx` left in the home -- an empty one of those is
+    /// exactly what hid the keys before.  Signing inside needs the export.
+    Keyboxd,
+    /// No keyring file at all.  Worth an export in case gpg finds keys
+    /// elsewhere, but nothing is lost if it finds none.
+    NoKeyring,
+}
 
-/// Where the entrypoint finds the nix-serve public key `--nix` mounted in.
-/// Fixed, like `AGENT_SANDBOX_PROXY_CA_FILE`'s target, so nothing but the env
-/// var pointing at it needs to name it.
-pub const NIX_SERVE_PUBKEY_PATH: &str = "/run/agent-sandbox-nix-serve.pub";
+pub fn key_export_reason(gnupg_home: &Path) -> Option<KeyExport> {
+    let keyboxd = std::fs::read_to_string(gnupg_home.join("common.conf"))
+        .map(|conf| conf.lines().any(|line| line.trim() == "use-keyboxd"))
+        .unwrap_or(false);
+    if keyboxd {
+        Some(KeyExport::Keyboxd)
+    } else if !["pubring.kbx", "pubring.gpg"]
+        .iter()
+        .any(|keyring| gnupg_home.join(keyring).is_file())
+    {
+        Some(KeyExport::NoKeyring)
+    } else {
+        None
+    }
+}
+
+// ── devenv / nix / podman ───────────────────────────────────────────────────
 
 /// The container-side fragment for `--nix`, once the launcher has a live
 /// nix-serve reachable through the ordinary `--host-loopback-port` machinery
-/// (see `serve_host_port`/`HostPort` in `agent-sandbox.rs`) on `internal_port`.
+/// (see `host_bridge` and `HostPort` in `agent-sandbox.rs`) on `internal_port`.
 ///
 /// This is deliberately small: unlike the old `nix_mounts`, nothing here
 /// mounts a store or a daemon socket at any canonical path, single- or
 /// multi-user. The container keeps its own local Nix store -- exactly as if
 /// `--nix` were absent -- and only ever adds the host as a substituter it
-/// copies signed, already-built paths in from. See NIX_SERVE.md for why: a
-/// shared canonical-path mount shadows every symlink-into-`/nix/store` the
-/// image ships (including its own entrypoint) with host-labeled files
+/// copies signed, already-built paths in from. See docs/architecture.md,
+/// "`--nix` is a binary cache, not a shared store", for why: a shared
+/// canonical-path mount shadows every symlink-into-`/nix/store` the image
+/// ships (including its own entrypoint) with host-labeled files
 /// `container_t` has no policy permission to execute, and a forwarded daemon
 /// socket hands the container root-level build execution on the host.
-pub fn nix_substituter_mounts(pubkey_file: &str, internal_port: u16) -> (Vec<String>, Vec<String>) {
-    let mounts = bind(pubkey_file, NIX_SERVE_PUBKEY_PATH, "ro");
+///
+/// The public key travels by value in the environment rather than as a bind
+/// mount: it is public, one line long, and a file under `~/.local/share`
+/// carries a host label (`data_home_t`) that `container_t` cannot read on an
+/// enforcing SELinux host unless the launch also relabels it.
+pub fn nix_substituter_env(public_key: &str, internal_port: u16) -> Vec<String> {
     let mut envs = env("AGENT_SANDBOX_NIX_SERVE_PORT", &internal_port.to_string());
-    envs.extend(env(
-        "AGENT_SANDBOX_NIX_SERVE_PUBKEY_FILE",
-        NIX_SERVE_PUBKEY_PATH,
-    ));
-    (mounts, envs)
+    envs.extend(env("AGENT_SANDBOX_NIX_SERVE_PUBKEY", public_key.trim()));
+    envs
 }
 
 pub fn podman_socket_mounts(host_socket: &str, rw: &str) -> (Vec<String>, Vec<String>) {
@@ -552,22 +601,46 @@ mod tests {
     }
 
     #[test]
-    fn nix_substituter_mounts_the_key_and_names_the_forwarded_port() {
-        let (mounts, envs) = nix_substituter_mounts("/home/ada/.local/share/agent-sandbox/nix-serve/public_key", 7419);
+    fn a_keyboxd_home_gets_its_exported_keys_as_pubring_gpg() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("trustdb.gpg"), "").unwrap();
+        let exported = Path::new("/tmp/agent-sandbox-pubring-x");
+        let mounts = gnupg_public_mounts(home.path(), Some(exported), false);
+        assert!(mounts.contains(&"/tmp/agent-sandbox-pubring-x:/run/host-gnupg/pubring.gpg:ro".to_string()));
+
+        assert!(mounts.iter().any(|m| m.ends_with(":/run/host-gnupg/trustdb.gpg:ro")));
+
+        // A stale keybox left beside keyboxd is not mounted over the export.
+        std::fs::write(home.path().join("pubring.kbx"), "").unwrap();
+        let mounts = gnupg_public_mounts(home.path(), Some(exported), false);
+        assert!(!mounts.iter().any(|m| m.ends_with(":/run/host-gnupg/pubring.kbx:ro")));
+    }
+
+    #[test]
+    fn keyboxd_configuration_decides_the_export_not_the_files_present() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(key_export_reason(home.path()), Some(KeyExport::NoKeyring));
+
+        std::fs::write(home.path().join("pubring.kbx"), "").unwrap();
+        assert_eq!(key_export_reason(home.path()), None, "a classic keybox home");
+
+        std::fs::write(home.path().join("common.conf"), "use-keyboxd\n").unwrap();
         assert_eq!(
-            mounts,
-            vec![
-                "-v",
-                "/home/ada/.local/share/agent-sandbox/nix-serve/public_key:/run/agent-sandbox-nix-serve.pub:ro"
-            ]
+            key_export_reason(home.path()),
+            Some(KeyExport::Keyboxd),
+            "keyboxd, with a stale keybox beside it"
         );
+    }
+
+    #[test]
+    fn nix_substituter_passes_the_key_by_value_and_names_the_forwarded_port() {
+        let envs = nix_substituter_env("agent-sandbox-nix-serve-1:AAAA\n", 7419);
         assert!(envs.contains(&"AGENT_SANDBOX_NIX_SERVE_PORT=7419".to_string()));
         assert!(envs.contains(
-            &"AGENT_SANDBOX_NIX_SERVE_PUBKEY_FILE=/run/agent-sandbox-nix-serve.pub".to_string()
+            &"AGENT_SANDBOX_NIX_SERVE_PUBKEY=agent-sandbox-nix-serve-1:AAAA".to_string()
         ));
-        // No store or daemon socket at any canonical path -- the whole point.
-        assert!(!mounts.iter().any(|m| m.contains("/nix/store")));
-        assert!(!mounts.iter().any(|m| m.contains("daemon-socket")));
+        // No mount at all -- not the key, and no store or daemon socket.
+        assert!(!envs.iter().any(|e| e == "-v"));
         assert!(!envs.iter().any(|e| e.starts_with("NIX_REMOTE=")));
     }
 

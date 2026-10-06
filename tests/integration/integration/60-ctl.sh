@@ -7,7 +7,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 require_image
 
 ws="$(make_workspace)"
-cleanup() { kill $launcher 2>/dev/null; rm -rf "$ws"; cleanup_sandboxes; }
+cleanup() { stop_bg "$launcher"; rm -rf "$ws"; cleanup_sandboxes; }
 trap cleanup EXIT
 cd "$ws" || exit 1
 

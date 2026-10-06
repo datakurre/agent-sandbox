@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod ctl;
 pub mod gpg;
+pub mod host_bridge;
 pub mod launch;
 pub mod net_summary;
 pub mod secrets;

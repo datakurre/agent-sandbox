@@ -1575,3 +1575,107 @@ fn agent_name_takes_precedence_over_subcommand_shortcut() {
     assert!(!out_ctl.reached_podman_run(), "ctl list reached podman run");
     assert_eq!(out_ctl.code, Some(0));
 }
+
+/// A keyboxd GnuPG home (`use-keyboxd`) has no keyring file to mount, so
+/// gpg inside would have no key to name and refuse to sign with "No secret
+/// key". The launcher exports the public keys and mounts that instead.
+#[test]
+fn a_keyboxd_gnupg_home_gets_its_public_keys_exported() {
+    let world = World::new()
+        .gpg_agent_forwarded()
+        .home_file(".gnupg/common.conf", "use-keyboxd\n")
+        .home_file(".gnupg/trustdb.gpg", "trust")
+        .home_file(".gnupg/public-keys.d/pubring.db", "db")
+        // Stale and empty, as found on a real keyboxd host: must not win.
+        .home_file(".gnupg/pubring.kbx", "")
+        .stub_bin(
+            "gpg",
+            "#!/bin/sh\ncase \" $* \" in *' --export '*) printf 'EXPORTED-KEYS' ;; esac\n",
+        );
+    let out = world.run(&["--workspace", "--gpg", "opencode"]);
+    let run = out.run_call();
+    let source = run
+        .mount_to("/run/host-gnupg/pubring.gpg")
+        .unwrap_or_else(|| panic!("no exported keyring mounted: {}", run.joined()));
+    assert!(
+        source.contains("agent-sandbox-pubring-"),
+        "the export, not a file from the home: {}",
+        source
+    );
+    assert!(
+        run.mount_to("/run/host-gnupg/pubring.kbx").is_none(),
+        "the stale keybox is not mounted beside the export: {}",
+        run.joined()
+    );
+}
+
+/// A launcher stopped with SIGTERM -- by a supervisor, a test harness, `kill` --
+/// used to die without its cleanup and leave `podman run` holding the sandbox
+/// up.  It now removes the container by name and exits 128 + 15.
+#[test]
+fn sigterm_while_the_sandbox_runs_removes_it_and_exits_143() {
+    let world = World::new().env("STUB_PODMAN_RUN_BLOCKS", "1");
+    let out = world.run_signalled(&["opencode"], "running", 15);
+
+    let name = out.run_call().value_of("--name").expect("a named sandbox").to_string();
+    assert!(
+        out.call_starting(&["rm", "-f"]).map_or(false, |rm| rm.has(&name)),
+        "the sandbox {} was not removed: {:?}",
+        name,
+        out.calls
+    );
+    assert_eq!(out.code, Some(143), "stderr: {}", out.stderr);
+}
+
+/// A signal during startup must stop the sandbox from being created at all,
+/// rather than let it start after the launcher has given up on it.
+#[test]
+fn sigterm_before_the_sandbox_starts_means_it_never_does() {
+    let world = World::new().env("STUB_PODMAN_PAUSE_ON", "image-exists");
+    let out = world.run_signalled(&["opencode"], "paused", 15);
+
+    assert!(
+        !out.reached_podman_run(),
+        "the sandbox was started after the signal: {:?}",
+        out.calls
+    );
+    assert_eq!(out.code, Some(143), "stderr: {}", out.stderr);
+}
+
+/// A home with no keyring file and no keyboxd had no keyring mounted before
+/// the export existed, and said nothing about it.  An export that finds no
+/// keys there keeps that silence.
+#[test]
+fn a_home_without_keyboxd_or_keyring_stays_quiet_when_there_is_nothing_to_export() {
+    let world = World::new()
+        .gpg_agent_forwarded()
+        .home_file(".gnupg/trustdb.gpg", "trust")
+        .stub_bin("gpg", "#!/bin/sh\nexit 0\n");
+    let out = world.run(&["--workspace", "--gpg", "opencode"]);
+    assert!(out.reached_podman_run(), "stderr: {}", out.stderr);
+    assert!(
+        !out.stderr.contains("could not export"),
+        "a warning for a home that never had a keyring: {}",
+        out.stderr
+    );
+}
+
+/// A home refused for its on-disk secret keys is not read any further: no
+/// `gpg --export` runs against it on the way to the refusal.
+#[test]
+fn a_refused_gnupg_home_is_not_exported() {
+    let world = World::new()
+        .gpg_agent_forwarded()
+        .home_file(".gnupg/common.conf", "use-keyboxd\n")
+        .home_file(".gnupg/private-keys-v1.d/k.key", "(private-key (rsa))")
+        .stub_bin(
+            "gpg",
+            "#!/bin/sh\ncase \" $* \" in *' --export '*) : > \"$HOME/gpg-export-called\" ;; esac\n",
+        );
+    let out = world.run(&["--workspace", "--gpg", "opencode"]);
+    assert!(out.failed(), "the home holds secret keys: {}", out.stderr);
+    assert!(
+        !world.home().join("gpg-export-called").exists(),
+        "gpg --export ran against a refused home"
+    );
+}

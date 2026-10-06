@@ -23,7 +23,8 @@ verifies their content hashes and signatures. Builds and execution remain in
 the container; the host Nix daemon socket and the host's canonical `/nix/store`
 path are never mounted into it. This removes the host-builder capability of the
 old daemon-forwarding behavior and avoids executing host-labeled store files
-under SELinux confinement.
+under SELinux confinement (see
+[`--nix` is a binary cache, not a shared store](architecture.md#-nix-is-a-binary-cache-not-a-shared-store)).
 
 The read capability still matters: the agent can request store paths present on
 the host, and Nix store contents may include source code or other data. Treat
@@ -33,12 +34,11 @@ stops when that session exits. If the host store or server setup is unavailable,
 the launcher reports that and continues without host-cache sharing.
 
 The cache endpoint uses the same host-loopback Unix-socket bridge as an
-explicit `--host-loopback-port`. On an enforcing SELinux host, the policy must
-permit the container process to connect to the host listener's Unix socket.
-Relabeling the socket with `--selinux` does not grant `connectto`, and the
-`container_connect_any` boolean only applies to TCP ports. The launcher does
-not change host SELinux policy. If the socket connection is denied, the
-sandbox still starts but the host cache is unavailable. Under `--proxy`, this
+explicit `--host-loopback-port`. The sandbox owns that socket and the launcher
+connects into it, which an enforcing SELinux host permits without a policy
+change (see [SELinux and host-loopback sockets](browser.md#selinux-and-host-loopback-sockets)).
+If the bridge does not come up, the sandbox still starts but the host cache is
+unavailable. Under `--proxy`, this
 loopback cache request is outside proxy accounting; the cache server only reads
 and serves existing store paths and does not fetch or build anything itself.
 

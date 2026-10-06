@@ -268,8 +268,9 @@ passes pasta `--no-map-gw`, and the `host.containers.internal` entry it does set
 up points at the host's *LAN* address, not its loopback, so it does not reach a
 loopback-bound service either.
 
-The flag is a bind-mounted unix socket with the launcher splicing each connection
-to the host, **not** a route. That is why it composes with every network mode,
+The flag is a unix socket in a bind-mounted directory, which the sandbox listens
+on and the launcher dials into from the host, splicing each connection to the
+host's loopback. It is **not** a route. That is why it composes with every network mode,
 `--proxy` included — a route would have to be a network mode, and the sandbox's
 is always already spoken for. It is TCP only.
 
@@ -407,7 +408,7 @@ fix it cannot deliver.
 When using Git inside the sandbox, be aware of how the integration flags interact:
 
 - `--git` injects your effective Git configuration into the container using environment variables instead of mounting `.gitconfig`. Host-side `[include]` directives are evaluated and flattened on the host, while host-specific file paths (like `gpg.*.program`, credential helpers, global gitignore, and custom hooks) are automatically blocklisted so they don't break Git inside the container.
-- `--gpg` is required for `--git` to also include commit signing. Without it, the sandbox explicitly disables signing (`commit.gpgsign = false`, `tag.gpgsign = false`) to prevent signing failures when the host's GnuPG agent is not forwarded.
+- `--gpg` is required for `--git` to also include commit signing. Without it, the sandbox explicitly disables signing (`commit.gpgsign = false`, `tag.gpgsign = false`) to prevent signing failures when the host's GnuPG agent is not forwarded. The public keyring goes in alongside the agent socket so gpg can name the signing key; when `common.conf` enables keyboxd (`use-keyboxd`), the public keys live behind a daemon rather than in `pubring.kbx`, so the launcher exports them with `gpg --export` and mounts that instead, ignoring any keyring file left in the home.
 - `--ssh` is required for `git pull` and `git push` to work with SSH remotes. It forwards your host's `SSH_AUTH_SOCK`. Because we avoid excessive host mounts, we do *not* mount your host's `known_hosts` file. An SSH session in a sandbox is non-interactive, so the alternative to knowing a host key in advance is not a prompt but either a hard failure or a silent trust-on-first-use accept of whatever answered — so the key has to come from somewhere explicit. Under `--proxy` that is `[[network.known_hosts]]` in `~/.config/agent-sandbox/trusted.toml`, and a policy that authorizes SSH to a host you have not declared a key for refuses the launch with the block to paste (see [Configuration](configuration.md#ssh-host-keys)). In interactive terminals, if the host is a known forge with published keys, `agent-sandbox` offers an interactive `[y/N/d/?]` prompt to automatically append the keys (with unified diff preview). Without `--proxy` there is no policy to authorize against, and the published keys for GitHub, GitLab and Bitbucket are used.
 - Combined with `--proxy`, neither socket is mounted into the sandbox at all: a
   forwarded socket is a capability that does not pass the firewall. The sockets

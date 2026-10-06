@@ -3,6 +3,7 @@
 use agent_sandbox_cli::agents::{self, format_proxy_policy, parse_policy_file, parse_proxy};
 use agent_sandbox_cli::ctl;
 use agent_sandbox_cli::gpg::{scan_gnupg_home, GpgScanStatus};
+use agent_sandbox_cli::host_bridge;
 use agent_sandbox_cli::launch;
 use agent_sandbox_cli::net_summary;
 use agent_sandbox_cli::secrets::resolve_secrets_with_policies;
@@ -15,9 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -29,6 +29,16 @@ use tempfile::Builder;
 // so only the output-format flag suppresses status/warning chatter and switches `fail`
 // and `refuse` to the JSON envelope.
 static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NIX_SERVE_PROCESS_GROUP: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+/// The first SIGINT/SIGTERM/SIGHUP a launch received, or 0.  Decides the exit
+/// status (128 + signal) once `run` has unwound through its cleanup guard.
+static SHUTDOWN_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// The sandbox container's name, once `podman run` has been spawned for it.
+/// Set under this lock together with a last look at `SHUTDOWN_SIGNAL`, so a
+/// signal either finds the name here or is seen before the spawn -- never
+/// neither, which is how a container used to start after its launcher was gone.
+static SANDBOX_CONTAINER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -237,49 +247,48 @@ fn attach_browsers(
         .collect()
 }
 
-/// Serve one `--host-loopback-port` mapping for the life of the session: every
-/// connection arriving on the unix socket the sandbox has mounted is spliced to
-/// the host's loopback.  A socket rather than a route because a route would have
-/// to be a network mode and the sandbox's is already spoken for -- pasta by
-/// default, the proxy's `--internal` network under `--proxy`, a bridge under
-/// `--shared-network`.  A mount is orthogonal to all three, which is the whole
-/// reason this composes where the pasta mapping it replaced could not.
-fn serve_host_port(socket: &Path, host_port: u16) -> std::io::Result<()> {
-    let listener = UnixListener::bind(socket)?;
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            thread::spawn(move || {
-                let upstream = match TcpStream::connect(("127.0.0.1", host_port)) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!(
-                            "agent-sandbox: host port {} is not answering: {}",
-                            host_port, e
-                        );
-                        return;
-                    }
-                };
-                let (Ok(mut from_sandbox), Ok(mut to_host)) =
-                    (stream.try_clone(), upstream.try_clone())
-                else {
-                    return;
-                };
-                // Two halves, two threads: CDP is long-lived and full duplex, so
-                // neither direction may wait on the other.  Each shuts the far
-                // side's write half when its own end closes, or the peer sits on
-                // a socket that will never carry anything again.
-                let outbound = thread::spawn(move || {
-                    let _ = std::io::copy(&mut from_sandbox, &mut to_host);
-                    let _ = to_host.shutdown(Shutdown::Write);
-                });
-                let (mut from_host, mut to_sandbox) = (upstream, stream);
-                let _ = std::io::copy(&mut from_host, &mut to_sandbox);
-                let _ = to_sandbox.shutdown(Shutdown::Write);
-                let _ = outbound.join();
-            });
+/// The host's public keys as an OpenPGP keyring file, for a GnuPG home that
+/// keeps them in keyboxd.  None when gpg fails or there is nothing to export;
+/// the sandbox then gets no keyring, as before.  Said aloud only for keyboxd,
+/// where that breaks signing; a home with no keyring file at all got none
+/// before this export existed, and stays as quiet as it was.
+fn export_public_keys(gnupg_home: &Path, reason: launch::KeyExport) -> Option<tempfile::NamedTempFile> {
+    let out = match ProcessCommand::new("gpg")
+        .arg("--homedir")
+        .arg(gnupg_home)
+        .args(["--batch", "--export"])
+        .output()
+    {
+        Ok(out) if out.status.success() && !out.stdout.is_empty() => out,
+        // Said rather than swallowed: without the keyring gpg inside fails
+        // with "No secret key", which points everywhere but here.
+        Ok(_) if reason != launch::KeyExport::Keyboxd => return None,
+        Ok(out) => {
+            eprintln!(
+                "agent-sandbox: --gpg: could not export public keys from {} ({}); signing inside will fail.",
+                gnupg_home.display(),
+                if out.status.success() { "no keys".to_string() } else { out.status.to_string() }
+            );
+            for line in String::from_utf8_lossy(&out.stderr).lines() {
+                eprintln!("               {}", line);
+            }
+            return None;
         }
-    });
-    Ok(())
+        Err(_) if reason != launch::KeyExport::Keyboxd => return None,
+        Err(e) => {
+            eprintln!("agent-sandbox: --gpg: could not run gpg to export public keys: {}", e);
+            return None;
+        }
+    };
+    let mut file = Builder::new()
+        .prefix("agent-sandbox-pubring-")
+        .tempfile()
+        .ok()?;
+    file.write_all(&out.stdout).ok()?;
+    // World-readable for the same reason as the passwd file: the container's
+    // mapped uid may not be the owner.  Public keys, so nothing is given away.
+    fs::set_permissions(file.path(), fs::Permissions::from_mode(0o644)).ok()?;
+    Some(file)
 }
 
 /// `--nix`'s preferred sandbox-side port for the forwarded nix-serve
@@ -413,7 +422,7 @@ fn spawn_nix_serve(secret_key: &Path) -> Result<(std::process::Child, u16), Stri
         .port();
     drop(reserved);
 
-    let child = ProcessCommand::new("nix-serve")
+    let mut child = ProcessCommand::new("nix-serve")
         .args(["--listen", &format!("127.0.0.1:{}", port)])
         .env("NIX_SECRET_KEY_FILE", secret_key)
         .stdin(std::process::Stdio::null())
@@ -424,7 +433,113 @@ fn spawn_nix_serve(secret_key: &Path) -> Result<(std::process::Child, u16), Stri
         .process_group(0)
         .spawn()
         .map_err(|e| format!("could not spawn nix-serve: {}", e))?;
+    let process_group = match i32::try_from(child.id()) {
+        Ok(process_group) => process_group,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("invalid nix-serve process id: {}", error));
+        }
+    };
+    NIX_SERVE_PROCESS_GROUP.store(process_group, std::sync::atomic::Ordering::SeqCst);
     Ok((child, port))
+}
+
+fn terminate_nix_serve_process_group() {
+    let process_group =
+        NIX_SERVE_PROCESS_GROUP.load(std::sync::atomic::Ordering::SeqCst);
+    if process_group <= 0 {
+        return;
+    }
+
+    let group = nix::unistd::Pid::from_raw(process_group);
+    let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGTERM);
+    thread::sleep(std::time::Duration::from_millis(200));
+    let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+    let _ = NIX_SERVE_PROCESS_GROUP.compare_exchange(
+        process_group,
+        0,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// SIGINT, SIGTERM and SIGHUP for the whole launch, not just `--nix`.
+///
+/// Left to the default action, any of them ended the launcher on the spot:
+/// no cleanup guard, so the sidecar, its network and the host sockets stayed
+/// behind, and `podman run` -- not killed with it -- kept the sandbox running
+/// or even created it after the launcher had gone.  So the first signal does
+/// not exit.  It stops the sandbox container, which makes `podman run` return,
+/// and `run` then unwinds through the guard exactly as on a normal exit.  A
+/// signal that arrives before the container exists is caught where `podman
+/// run` is spawned instead.  A second signal is the operator no longer willing
+/// to wait, and exits at once.
+fn install_shutdown_handler(quiet: bool) -> Result<(), String> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ])
+    .map_err(|error| format!("could not install the signal handler: {}", error))?;
+    thread::Builder::new()
+        .name("shutdown".to_string())
+        .spawn(move || {
+            for signal in signals.forever() {
+                if SHUTDOWN_SIGNAL
+                    .compare_exchange(
+                        0,
+                        signal,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    terminate_nix_serve_process_group();
+                    std::process::exit(128 + signal);
+                }
+                if !quiet {
+                    eprintln!(
+                        "\nagent-sandbox: stopping the sandbox (signal again to exit without cleanup)"
+                    );
+                }
+                let name = SANDBOX_CONTAINER
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                if let Some(name) = name {
+                    // On its own thread, so this one is free for a second signal.
+                    thread::spawn(move || stop_sandbox_container(&name));
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("could not start the signal handler: {}", error))
+}
+
+/// Remove the sandbox container until the launcher exits.  Repeated because
+/// `podman run` may have been spawned without having created the container
+/// yet; once `run` has cleaned up, the process exits and takes this with it.
+fn stop_sandbox_container(name: &str) {
+    for _ in 0..120 {
+        let _ = ProcessCommand::new("podman")
+            .args(["rm", "-f", "-t", "2", name])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// What `main` exits with: the first signal's conventional status if there was
+/// one, since the sandbox's own exit code is then just how it was stopped.
+fn exit_status(code: i32, signal: i32) -> i32 {
+    if signal != 0 {
+        128 + signal
+    } else {
+        code
+    }
 }
 
 fn stop_nix_serve(child: &mut std::process::Child) {
@@ -444,6 +559,14 @@ fn stop_nix_serve(child: &mut std::process::Child) {
         let _ = child.kill();
     }
     let _ = child.wait();
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = NIX_SERVE_PROCESS_GROUP.compare_exchange(
+            pid,
+            0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
 }
 
 /// Wait until nix-serve actually accepts connections. Merely spawning Starman
@@ -1127,8 +1250,9 @@ struct CleanupGuard {
     /// only controls where the agent's own prompt comes from.
     quiet: bool,
     /// `--nix`'s host-local nix-serve, spawned fresh for this session and
-    /// killed here on exit -- see NIX_SERVE.md. `None` when `--nix` was not
-    /// passed, or its store/key/spawn preconditions were not met.
+    /// killed here on exit (docs/architecture.md, "--nix is a binary cache").
+    /// `None` when `--nix` was not passed, or its store/key/spawn
+    /// preconditions were not met.
     nix_serve_child: Option<std::process::Child>,
 }
 
@@ -1452,10 +1576,11 @@ impl Drop for CleanupGuard {
             self.status("closing sandbox");
         }
 
-        // Fresh per session, killed here: see NIX_SERVE.md. Before anything
-        // else, and unconditionally on either path below, since a nix-serve
-        // process outliving its sandbox would keep the host's store reachable
-        // over a loopback socket nothing is listening in on any more.
+        // Fresh per session, killed here (docs/architecture.md, "--nix is a
+        // binary cache").  Before anything else, and unconditionally on
+        // either path below, since a nix-serve process outliving its sandbox
+        // would keep the host's store reachable over a loopback socket nothing
+        // is listening in on any more.
         if let Some(mut child) = self.nix_serve_child.take() {
             stop_nix_serve(&mut child);
         }
@@ -1636,6 +1761,7 @@ fn fail(message: &str) -> ! {
     } else {
         eprintln!("{}", message);
     }
+    terminate_nix_serve_process_group();
     std::process::exit(1);
 }
 
@@ -1662,7 +1788,11 @@ fn refuse(message: &str) -> Result<i32> {
 fn main() -> Result<()> {
     // `run` owns the cleanup guard; exiting here is safe because it has
     // already been dropped.
-    std::process::exit(run()?)
+    let code = run()?;
+    std::process::exit(exit_status(
+        code,
+        SHUTDOWN_SIGNAL.load(std::sync::atomic::Ordering::SeqCst),
+    ))
 }
 
 fn run() -> Result<i32> {
@@ -2591,6 +2721,8 @@ fn run() -> Result<i32> {
     // overrides.
 
     let mut want_relay_gpg = false;
+    // Lives as long as `run`, like the passwd file: podman reads it at start.
+    let mut exported_pubring: Option<tempfile::NamedTempFile> = None;
     if want_gpg {
         let gpg_socket = ProcessCommand::new("gpgconf")
             .args(["--list-dir", "agent-socket"])
@@ -2603,15 +2735,26 @@ fn run() -> Result<i32> {
 
         let gnupg_home = PathBuf::from(&home).join(".gnupg");
         let mut gnupg_mounts = Vec::new();
+        // Under keyboxd there is no keyring file to mount; export the public
+        // keys instead, or gpg inside has no key to name and refuses to sign
+        // with "No secret key".  `--export` never includes secret material.
+        // Only once the home is going to be mounted: a refused one is not read.
+        let mut public_mounts = |private: bool| {
+            if let Some(reason) = launch::key_export_reason(&gnupg_home) {
+                exported_pubring = export_public_keys(&gnupg_home, reason);
+            }
+            let exported_path = exported_pubring.as_ref().map(|f| f.path());
+            launch::gnupg_public_mounts(&gnupg_home, exported_path, private)
+        };
         if gnupg_home.is_dir() {
             match scan_gnupg_home(&gnupg_home) {
                 Ok(GpgScanStatus::Safe) => {
-                    gnupg_mounts = launch::gnupg_public_mounts(&gnupg_home, want_gpg_private);
+                    gnupg_mounts = public_mounts(want_gpg_private);
                 }
                 Ok(GpgScanStatus::Unsafe(offenders)) => {
                     if want_gpg_private {
                         eprintln!("agent-sandbox: exposing ~/.gnupg with on-disk secret keys (--gpg-private).");
-                        gnupg_mounts = launch::gnupg_public_mounts(&gnupg_home, true);
+                        gnupg_mounts = public_mounts(true);
                     } else {
                         eprintln!(
                             "agent-sandbox: not exposing ~/.gnupg -- it holds secret keys on disk:"
@@ -3106,6 +3249,14 @@ fn run() -> Result<i32> {
         }
     }
 
+    // Without relabeling, container_t can read and write none of the launcher's
+    // binds on an enforcing host -- not /etc/passwd, not the readiness file --
+    // and the launch fails in ways that do not name the cause.
+    if !want_json && !want_selinux && selinux_is_enforcing() {
+        eprintln!("agent-sandbox: warning: SELinux is enforcing, but --selinux is not active; the sandbox");
+        eprintln!("               will not be able to use its mounts. Launch with --selinux.");
+    }
+
     if !want_json && !want_proxy && (proxy_configured || secrets_configured) {
         eprintln!("agent-sandbox: warning: [network] rules or secrets are configured in AGENTS.md, but proxy is not active.");
         eprintln!("               Launch with --proxy to enforce them.");
@@ -3121,6 +3272,14 @@ fn run() -> Result<i32> {
         cleanup_guard.quiet = true;
         cleanup_guard.status_line.enabled = false;
     }
+    // From here on there is something to clean up, so a signal has to unwind
+    // through the guard rather than end the process.
+    if let Err(error) = install_shutdown_handler(want_json) {
+        eprintln!(
+            "agent-sandbox: warning: {}; a signal will skip cleanup.",
+            error
+        );
+    }
     cleanup_guard.status("starting sandbox");
     let status_dir = format!(
         "/tmp/agent-sandbox-status-{}",
@@ -3134,8 +3293,8 @@ fn run() -> Result<i32> {
     let mut nix_internal_port = None;
 
     // ── Nix ─────────────────────────────────────────────────────────────────
-    // See NIX_SERVE.md: a per-session nix-serve stands in for the old shared
-    // store/daemon-socket mounts. Its forwarded socket rides the same
+    // See docs/architecture.md, "--nix is a binary cache": a per-session
+    // nix-serve stands in for the old shared store/daemon-socket mounts. Its forwarded socket rides the same
     // --host-loopback-port machinery just below -- pushed into
     // want_host_ports here, before that section's "anything to serve" check
     // -- so nix-serve needs no bridging mechanism of its own.
@@ -3153,34 +3312,46 @@ fn run() -> Result<i32> {
                     "agent-sandbox: --nix: could not prepare a nix-serve signing key under {}/.local/share/agent-sandbox/nix-serve; continuing without the host Nix cache.",
                     home
                 ),
-                Some((secret_key, public_key)) => match spawn_nix_serve(&secret_key) {
-                    Err(error) => eprintln!(
-                        "agent-sandbox: --nix: {}; continuing without the host Nix cache.",
-                        error
-                    ),
-                    Ok((mut child, host_port)) => {
-                        if let Err(error) = wait_for_nix_serve(&mut child, host_port) {
-                            stop_nix_serve(&mut child);
-                            eprintln!(
-                                "agent-sandbox: --nix: {}; continuing without the host Nix cache.",
-                                error
-                            );
-                        } else {
-                            want_host_ports.push(HostPort {
-                                host: host_port,
-                                sandbox: internal_port,
-                            });
-                            nix_internal_port = Some(internal_port);
-                            cleanup_guard.nix_serve_child = Some(child);
-                            let (m, e) = launch::nix_substituter_mounts(
-                                &public_key.to_string_lossy(),
-                                internal_port,
-                            );
-                            mounts.extend(m);
-                            env_args.extend(e);
+                Some((secret_key, public_key)) => {
+                    match spawn_nix_serve(&secret_key) {
+                        Err(error) => eprintln!(
+                            "agent-sandbox: --nix: {}; continuing without the host Nix cache.",
+                            error
+                        ),
+                        Ok((mut child, host_port)) => {
+                            if let Err(error) = wait_for_nix_serve(&mut child, host_port) {
+                                stop_nix_serve(&mut child);
+                                eprintln!(
+                                    "agent-sandbox: --nix: {}; continuing without the host Nix cache.",
+                                    error
+                                );
+                            } else {
+                                match fs::read_to_string(&public_key) {
+                                    Err(error) => {
+                                        stop_nix_serve(&mut child);
+                                        eprintln!(
+                                            "agent-sandbox: --nix: could not read {}: {}; continuing without the host Nix cache.",
+                                            public_key.display(),
+                                            error
+                                        );
+                                    }
+                                    Ok(key) => {
+                                        want_host_ports.push(HostPort {
+                                            host: host_port,
+                                            sandbox: internal_port,
+                                        });
+                                        nix_internal_port = Some(internal_port);
+                                        cleanup_guard.nix_serve_child = Some(child);
+                                        env_args.extend(launch::nix_substituter_env(
+                                            &key,
+                                            internal_port,
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
-                },
+                }
             }
         } else {
             eprintln!(
@@ -3231,17 +3402,13 @@ fn run() -> Result<i32> {
         cleanup_guard.host_port_dir = dir.clone();
 
         for hp in &want_host_ports {
-            let socket = PathBuf::from(&dir).join(format!("{}.sock", hp.sandbox));
-            if let Err(e) = serve_host_port(&socket, hp.host) {
-                // refuse() rather than fail(): the guard is armed by now, and
-                // returning is what lets it remove the directory.  Leaving that
-                // behind would leave a live-looking path to the host's loopback
-                // in place of one that failed to open.
-                return refuse(&format!(
-                    "agent-sandbox: --host-loopback-port: could not listen for {}: {}",
-                    hp.sandbox, e
-                ));
-            }
+            // The sandbox's entrypoint creates the socket; the host dials it,
+            // which is the direction SELinux allows (see host_bridge).  So
+            // there is nothing to bind here and nothing that can fail yet.
+            host_bridge::serve_host(
+                host_bridge::socket_path(Path::new(&dir), hp.sandbox),
+                hp.host,
+            );
             if Some(hp.sandbox) != nix_internal_port {
                 eprintln!(
                     "agent-sandbox: 127.0.0.1:{} in the sandbox reaches the host's 127.0.0.1:{}",
@@ -3275,20 +3442,6 @@ fn run() -> Result<i32> {
         if want_proxy && nix_internal_port.is_some() {
             eprintln!(
                 "agent-sandbox: --nix host-cache requests use a local read-only binary cache outside proxy accounting."
-            );
-        }
-        if selinux_is_enforcing() {
-            eprintln!(
-                "agent-sandbox: SELinux is enforcing; container connections to host Unix sockets"
-            );
-            eprintln!(
-                "               (including the --nix cache bridge) may be denied. :z relabeling"
-            );
-            eprintln!(
-                "               does not grant unix_stream_socket connectto; container_connect_any is TCP-only."
-            );
-            eprintln!(
-                "               Inspect AVCs with: sudo ausearch -m avc -ts recent"
             );
         }
 
@@ -3835,8 +3988,21 @@ fn run() -> Result<i32> {
     // Not exec'd: returning is what drops the cleanup guard, which stops the
     // sidecar and prints its traffic summary.
     cleanup_guard.status("starting command");
+    // The last point a signal can stop the sandbox from existing at all; see
+    // SANDBOX_CONTAINER for why the check and the spawn share the lock.
+    let mut armed = SANDBOX_CONTAINER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if SHUTDOWN_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        cleanup_guard.clear_status();
+        return Ok(1);
+    }
     let mut child = match podman_cmd.spawn() {
-        Ok(child) => child,
+        Ok(child) => {
+            *armed = Some(container_name.clone());
+            drop(armed);
+            child
+        }
         Err(e) => {
             cleanup_guard.clear_status();
             if !matches!(output_mode, OutputMode::Interactive) {
@@ -4191,35 +4357,6 @@ mod tests {
         }
     }
 
-    /// The channel itself, end to end: a listener standing in for the host's
-    /// service, the socket the sandbox would have mounted, and a full-duplex
-    /// exchange over it.  Worth a real socket rather than a mock, since what is
-    /// being claimed is that a mount reaches the host where a route cannot.
-    #[test]
-    fn a_host_port_socket_carries_traffic_both_ways() {
-        use std::io::{Read, Write};
-
-        let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let host_port = host.local_addr().unwrap().port();
-        thread::spawn(move || {
-            let (mut conn, _) = host.accept().unwrap();
-            let mut buf = [0u8; 5];
-            conn.read_exact(&mut buf).unwrap();
-            assert_eq!(&buf, b"ping\n");
-            conn.write_all(b"pong\n").unwrap();
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("test.sock");
-        serve_host_port(&socket, host_port).unwrap();
-
-        let mut client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-        client.write_all(b"ping\n").unwrap();
-        let mut got = String::new();
-        client.read_to_string(&mut got).unwrap();
-        assert_eq!(got, "pong\n");
-    }
-
     #[test]
     fn expand_v_roots_relative_paths_in_the_workspace() {
         let cwd = Path::new("/home/ada/repo");
@@ -4268,7 +4405,7 @@ mod tests {
         // unaffected: they still get relabeled like any other writable bind.
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("agent.sock");
-        let _listener = UnixListener::bind(&sock_path).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
         let sock = sock_path.to_str().unwrap();
         assert!(!is_foreign_socket(sock));
         assert_eq!(
@@ -4312,5 +4449,24 @@ mod tests {
         assert!(CleanupGuard::new()
             .log_file_name()
             .starts_with("agent-sandbox-connections-session-"));
+    }
+
+    #[test]
+    fn nix_serve_cleanup_terminates_its_process_group() {
+        let mut child = ProcessCommand::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn process group");
+        let process_group = i32::try_from(child.id()).expect("valid process id");
+        NIX_SERVE_PROCESS_GROUP.store(process_group, std::sync::atomic::Ordering::SeqCst);
+
+        terminate_nix_serve_process_group();
+
+        assert!(child.try_wait().expect("wait for group leader").is_some());
+        assert_eq!(
+            NIX_SERVE_PROCESS_GROUP.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }

@@ -14,7 +14,7 @@ pulldown-cmark = "0.9" # For parsing AGENTS.md markdown codeblocks
 tempfile = "3.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-ctrlc = "3.4"
+signal-hook = "0.3"
 nix = { version = "0.27", features = ["process", "signal", "user", "net", "fs", "mount"] }
 chrono = "0.4"
 rand = "0.8"

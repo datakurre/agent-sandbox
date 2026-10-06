@@ -29,7 +29,7 @@ cd "$ws" || exit 1
 sandbox_run --workspace --ports -- \
   bash -c 'python3 -m http.server 8080 --bind 0.0.0.0 >/dev/null 2>&1' &
 launcher=$!
-trap 'kill $launcher 2>/dev/null; rm -rf "$ws"; cleanup_sandboxes' EXIT
+trap 'stop_bg "$launcher"; rm -rf "$ws"; cleanup_sandboxes' EXIT
 
 for _ in $(seq 1 40); do
   curl --silent --max-time 2 -o /dev/null "http://127.0.0.1:$port/" && break
@@ -39,8 +39,7 @@ done
 code="$(curl --silent --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" || true)"
 assert_eq "200" "$code" "the published port answers on the host"
 
-kill $launcher 2>/dev/null
-wait $launcher 2>/dev/null
+stop_bg "$launcher"
 cleanup_sandboxes
 
 # Without --ports the declaration is inert: AGENTS.md alone must never open a
@@ -52,8 +51,7 @@ code="$(curl --silent --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.
 # curl writes its 000 placeholder before the `||` fires, so the reply is
 # "000refused", not "refused" alone. Either half proves nothing answered.
 assert_contains "$code" "refused" "the same port without --ports"
-kill $launcher 2>/dev/null
-wait $launcher 2>/dev/null
+stop_bg "$launcher"
 
 # `wait` on a process we just killed reports 143, and as the last command in
 # the file that would become the case's own exit status -- a green run

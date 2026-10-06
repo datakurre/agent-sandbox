@@ -44,8 +44,8 @@ chmod +x "$ws/fake-chromium"
 cd "$ws" || exit 1
 
 cleanup() {
-  kill "${browser:-}" 2>/dev/null
-  kill "${launcher:-}" 2>/dev/null
+  stop_bg "${launcher:-}"
+  stop_bg "${browser:-}"
   rm -rf "$ws"
   cleanup_sandboxes
 }
@@ -72,6 +72,7 @@ assert_contains "$policy" "allow_host localhost:$port" "the same port under its 
 
 # ── the sandbox it was declared for ─────────────────────────────────────────
 
+require_free_port "$port"
 sandbox_run --workspace --ports -- \
   bash -c "echo hello > index.html; python3 -m http.server 8080 --bind 0.0.0.0 >/dev/null 2>&1" &
 launcher=$!
@@ -112,11 +113,6 @@ managed="$(cat "$rt/policies/managed/agent-sandbox.json")"
 assert_contains "$managed" "127.0.0.1:$widened" "the managed allow list after widening"
 assert_contains "$managed" "\"URLBlocklist\"" "the managed policy is otherwise intact"
 
-kill $launcher 2>/dev/null
-wait $launcher 2>/dev/null
-kill $browser 2>/dev/null
-wait $browser 2>/dev/null
-
-# `wait` on a killed process reports 143, which as the last command would be
-# the case's exit status. Every assertion has already passed by here.
+stop_bg "$launcher"
+stop_bg "$browser"
 exit 0

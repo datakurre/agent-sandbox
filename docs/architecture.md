@@ -73,8 +73,10 @@ the canonical tree from each tool's own discovery path. See
    built-in `fetch` (undici) stop dialing out directly — this also covers
    the bundled Node-based agent CLIs, which share Node's runtime. An
    operator's own explicit `NODE_USE_ENV_PROXY` setting is left alone.
-5. Puts a `socat` TCP listener in front of each `--host-loopback-port` socket,
-   because the clients that want them speak TCP and not unix sockets. This is
+5. Starts the host-loopback bridge: a copy of itself that listens on TCP and
+   on a unix socket for each `--host-loopback-port` mapping, because the
+   clients that want them speak TCP and the launcher reaches in over the
+   socket. This is
    also what makes `AGENT_SANDBOX_BROWSER_CDP_PORT` (set by `--browser`)
    reachable from inside — see [Cooperative Browser](browser.md).
 6. `exec "$@"`.
@@ -105,7 +107,10 @@ are unit-tested without a podman.  Call flow:
    `nix-serve` against the host's existing store. The launcher connects it to
    the container through the same named loopback-port socket bridge used by
    `--host-loopback-port`; the image gets only the public key and local Nix
-   substituter settings, never the store or daemon socket.
+   substituter settings, never the store or daemon socket (see
+   [`--nix` is a binary cache, not a shared store](#-nix-is-a-binary-cache-not-a-shared-store)).
+   The launcher stops the server process group on normal cleanup, launch
+   failures, and termination signals (see the cleanup paragraph below).
 7. Call `podman run` with `--userns=keep-id`, tmpfs for `~/.config`,
    `~/.cache`, `~/.local`, all mounts and env vars, then the image and the
    final command (`bash` by default, the selected agent's command when one is
@@ -126,6 +131,15 @@ When the command exits, `CleanupGuard` renders `closing sandbox`,
 potentially slow cleanup; it finishes with `closed (proxy stopped, resources
 released)` after the sidecar, network, and temporary directories have been
 reclaimed. Non-interactive launches do not receive this status line.
+
+The same cleanup runs when the launcher is stopped by SIGINT, SIGTERM or
+SIGHUP. Once there is anything to clean up, the launcher handles these itself:
+the first signal removes the sandbox container by name (`podman rm -f`), which
+makes `podman run` return, and the launcher then unwinds through
+`CleanupGuard` and exits with 128 + the signal number. A signal that arrives
+during startup is honoured before `podman run` is spawned, so the sandbox is
+never created after its launcher has given up on it. A second signal exits at
+once, without cleanup; `agent-sandbox ctl purge` reclaims what that leaves.
 
 `--git` passes the host's *effective* configuration as `GIT_CONFIG_*`
 environment variables rather than mounting `.gitconfig`: `[include]` directives
@@ -232,12 +246,16 @@ Three directories, and which side can see them is the design:
 ### Host loopback ports are a mount, not a relay
 
 `--host-loopback-port` reaches a named host service without going through the
-sidecar. The launcher binds a unix socket per mapping in a runtime directory,
-splices each connection to `127.0.0.1:PORT` on the host from its own process,
-and mounts the directory at `/run/agent-sandbox-host`; the entrypoint puts a
-`socat TCP-LISTEN` in front of each socket so ordinary TCP clients inside can
-reach it. `--nix` uses the same bridge for its private read-only cache endpoint,
-without adding that endpoint to the user's `AGENT_SANDBOX_HOST_PORTS` list.
+sidecar. The launcher mounts a runtime directory at `/run/agent-sandbox-host`;
+the entrypoint starts a bridge process that listens on `127.0.0.1:PORT` and on
+a unix socket per mapping in that directory. The launcher dials each socket
+from the host and keeps a few connections parked there; when a client connects
+inside, the bridge claims one and signals it, and only then does the launcher
+open `127.0.0.1:PORT` on the host and splice the two. The sandbox listens and
+the host connects because enforcing SELinux denies the opposite direction (see
+[SELinux and host-loopback sockets](browser.md#selinux-and-host-loopback-sockets)).
+`--nix` uses the same bridge for its private read-only cache endpoint, without
+adding that endpoint to the user's `AGENT_SANDBOX_HOST_PORTS` list.
 
 It is a mount rather than a route because a route would have to be a network
 mode, and the sandbox's is always already taken -- pasta by default, the
@@ -253,6 +271,53 @@ policed; there is no equivalent for what a host browser does, since
 refuse. The automatic `--nix` mapping is narrower: it exposes only the signed,
 read-only cache server, which serves existing store content and makes no
 outbound requests. Both capabilities are documented in [Trust model](trust-model.md).
+
+The bridge process reports each port to the entrypoint as it binds it, before
+the command starts. A port that could not be served, for example because
+something inside already holds it, is named at startup, not left for a client
+to discover.
+
+### `--nix` is a binary cache, not a shared store
+
+`--nix` used to mount the host's `/nix/store` at its canonical path and, on a
+multi-user install, forward the host Nix daemon socket. Both are gone.
+
+The store mount broke the sandbox on an enforcing SELinux host. The image's own
+executables, the entrypoint included, resolve through symlinks into
+`/nix/store`, so mounting the host store over the image's made startup execute
+host-labeled files under `container_t`. `execve` returned `EACCES`, crun's
+failed-init path then crashed with status 139, and the same container ran
+under `label=disable`. Relabeling was no way out either, since recursive
+relabeling fails on the immutable store files. The relabel exclusion for
+`/nix/store` stays, for a caller who mounts one explicitly. The daemon socket
+went because it hands the container a root-owned build service on the host.
+
+What is kept is the part worth having: paths already built on the host. Nix's
+`substituters` take a binary-cache store, not a raw store tree, so the launcher
+runs `nix-serve` to expose the host store as a signed HTTP binary cache:
+
+- **Key.** Generated on first use under
+  `~/.local/share/agent-sandbox/nix-serve/`: the directory is `0700`, the
+  secret key `0600`, and a lock file serialises concurrent first launches. The
+  public key goes to the sandbox by value, in `AGENT_SANDBOX_NIX_SERVE_PUBKEY`,
+  because a file under `~/.local/share` carries `data_home_t`, which
+  `container_t` cannot read without relabeling.
+- **Server.** One per session, bound to an ephemeral port on host loopback.
+  The launcher waits for a valid `/nix-cache-info` before it configures the
+  sandbox, and stops the whole process group (Starman's workers included) on
+  exit, on a failed launch and on a signal.
+- **Transport.** The [host-loopback bridge](#host-loopback-ports-are-a-mount-not-a-relay),
+  on a sandbox port that is not added to `AGENT_SANDBOX_HOST_PORTS`.
+- **Configuration.** The entrypoint adds `extra-substituters` and
+  `extra-trusted-public-keys` to `NIX_CONFIG`, and `ctl attach` restores that
+  multi-line value. It does so only once the bridge has reported the port up
+  and the launcher has parked a connection on it. Nix does not skip an
+  unreachable substituter, so a cache added before then would make every Nix
+  command retry it.
+
+Nix copies matching paths into the container's own store and verifies their
+signatures. Builds and execution stay in the container. When the key, the
+server or the bridge is unavailable, the launch continues without the cache.
 
 ### The cooperative browser is a second proxy, not a relay
 

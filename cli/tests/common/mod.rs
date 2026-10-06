@@ -80,6 +80,29 @@ case "$2" in
   *) key="$1-$2" ;;
 esac
 
+# Signal tests. STUB_PODMAN_PAUSE_ON names a call key to hold for a second,
+# after leaving `<log>.paused` for the test to signal on.  STUB_PODMAN_RUN_BLOCKS
+# makes the sandbox's own `podman run` stay up, as a real one does, until a
+# `podman rm` removes it.
+if [ -n "${STUB_PODMAN_PAUSE_ON:-}" ] && [ "$key" = "$STUB_PODMAN_PAUSE_ON" ]; then
+  : > "$STUB_PODMAN_LOG.paused"
+  sleep 1
+fi
+if [ "${STUB_PODMAN_RUN_BLOCKS:-}" = 1 ]; then
+  case "$1 $*" in
+    "run "*/agent-sandbox-status:*)
+      : > "$STUB_PODMAN_LOG.running"
+      i=0
+      while [ ! -e "$STUB_PODMAN_LOG.removed" ] && [ "$i" -lt 100 ]; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      exit 137
+      ;;
+    "rm "*) : > "$STUB_PODMAN_LOG.removed" ;;
+  esac
+fi
+
 for k in "$key" "$1"; do
   if [ -f "$STUB_PODMAN_REPLIES/$k.out" ]; then
     cat "$STUB_PODMAN_REPLIES/$k.out"
@@ -314,6 +337,54 @@ impl World {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             calls: read_calls(&self.root.join("podman.log")),
+        }
+    }
+}
+
+impl World {
+    /// Starts the launcher, waits for the stub to leave `<log>.<marker>`, and
+    /// sends `signal` -- the launcher's own process, as `kill` from a
+    /// supervisor would.
+    pub fn run_signalled(&self, args: &[&str], marker: &str, signal: i32) -> Outcome {
+        let log = self.root.join("podman.log");
+        fs::write(&log, "").expect("reset call log");
+        let marker_path = self.root.join(format!("podman.log.{}", marker));
+        for stale in ["paused", "running", "removed"] {
+            let _ = fs::remove_file(self.root.join(format!("podman.log.{}", stale)));
+        }
+
+        let child = Command::new(bin_path("agent-sandbox"))
+            .args(args)
+            .current_dir(self.workspace())
+            .env_clear()
+            .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("launcher runs");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stub never reached {}",
+                marker
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Past the stub's marker the launcher has its handler installed: it is
+        // installed before anything that has to be cleaned up exists.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::try_from(signal).expect("a signal"),
+        )
+        .expect("signal the launcher");
+
+        let out = child.wait_with_output().expect("launcher exits");
+        Outcome {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            calls: read_calls(&log),
         }
     }
 }

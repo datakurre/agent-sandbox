@@ -134,7 +134,10 @@ nix run github:datakurre/agent-sandbox#browser
     (`URLBlocklist`/`URLAllowlist`) is a second, coarser net over the same allow
     list, and it is best-effort — it needs `bwrap` to bind over Chromium's
     compile-time policy directory, and the command says so on stderr when it
-    cannot. Without it, a CDP client can create a browser context with a proxy
+    cannot. On most hosts that directory does not exist, so `/etc` is rebuilt
+    for the browser alone: a tmpfs with every real entry bound back into it and
+    the policy directory added, leaving the host's `/etc` untouched. Without
+    it, a CDP client can create a browser context with a proxy
     of its own and bypass the first layer. The managed policy binds the agent
     driving CDP, not you: you own the machine and can edit the same directory.
     See [Trust model](trust-model.md).
@@ -191,40 +194,23 @@ leave it off. `AGENT_SANDBOX_NETWORK` names the network when the flag is on.
 
 ### SELinux and host-loopback sockets
 
-On an enforcing SELinux host, the sandbox's `socat` must connect to a
-host-owned Unix socket for every `--host-loopback-port` mapping. `--nix` uses
-the same bridge for its automatic cache endpoint. The socket's `:z` relabel
-(enabled by `--selinux`) does not authorize that process-to-process `connectto`
-operation. If an explicit port is listed in `$AGENT_SANDBOX_HOST_PORTS` but
-`connect_over_cdp` refuses or times out, or `--nix` cannot reach its cache,
-check for an AVC:
+SELinux checks a Unix socket connection between the two processes' domains;
+relabeling the socket file (`--selinux`) does not change that check, and the
+`container_connect_any` boolean only covers TCP ports. A `container_t` process
+connecting to a socket a host process listens on is denied by default.
 
-```sh
-sudo ausearch -m avc -ts recent | grep connectto
-```
+The host-loopback bridge is therefore built the other way round: the sandbox
+owns the socket for every `--host-loopback-port` mapping (and for the `--nix`
+cache endpoint), and the launcher on the host dials *into* it, keeping a few
+idle connections parked for new clients to claim. A host process connecting to
+a container's socket is permitted by the default policy, so the bridge works on
+an enforcing host without a local policy module. It still needs `--selinux`,
+like every other bind on such a host, so the sandbox can create its sockets in
+the mounted directory.
 
-The `container_connect_any` boolean controls access to TCP ports; it does not
-permit a Unix socket `connectto`. Enabling it alone will not fix this failure.
-The host policy must allow the observed container process domain to connect to
-the listening process domain. Read the `scontext` and `tcontext` from the AVC
-before considering a local policy rule; allowing `container_t` to connect to a
-broad host domain can grant access to other host sockets too.
-
-If the audit log is empty, a `dontaudit` rule may be suppressing the denial. An
-administrator can temporarily expose those denials while reproducing, then
-restore the normal policy:
-
-```sh
-sudo semodule -DB
-# reproduce the failed socket connection, then:
-sudo semodule -B
-sudo ausearch -m AVC -ts recent | grep connectto
-```
-
-`agent-sandbox` reports that host-loopback Unix sockets may be denied under
-enforcing SELinux, but does not change host policy. The sandbox continues to
-start if the optional Nix cache bridge is denied. Keep `--selinux` when you
-also need ordinary writable binds relabeled.
+If `--nix`'s bridge does not come up within a few seconds, the entrypoint
+leaves the host cache out of `NIX_CONFIG`, so Nix commands go straight to
+their other substituters instead of retrying an unreachable one.
 
 By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
 no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
@@ -232,16 +218,35 @@ relabeling (`:z`) to built-in writable binds. Podman volume options passed via
 `--podman-args` are preserved exactly as supplied.
 
 `--selinux` relabels the *file* a socket is mounted as, but that alone is not
-enough for `--ssh`: connecting to a forwarded `SSH_AUTH_SOCK` (including a
-gpg-agent SSH socket) is a separate `unix_stream_socket connectto` check
-between the container's process context and the *listening agent's* context —
-typically `unconfined_t` for a user's own `ssh-agent`/`gpg-agent` — and
-default policy denies that regardless of the file's label, to stop containers
-reaching arbitrary host IPC sockets. If `ssh`/`ssh-add` inside the sandbox
-reports `Permission denied` right after finding the socket (as opposed to "no
-such user" or "could not open a connection"), use the AVC procedure above.
-`container_connect_any` is not a Unix-socket permission and does not resolve
-this denial.
+enough for `--ssh`. Unlike the loopback bridge, `--ssh` still connects from
+the sandbox to a host listener. Connecting to a forwarded `SSH_AUTH_SOCK`
+(including a gpg-agent SSH socket) is a separate `unix_stream_socket connectto`
+check between the container's process context and the *listening agent's*
+context, typically `unconfined_t` for a user's own `ssh-agent`/`gpg-agent`.
+Default policy denies that regardless of the file's label, to stop containers
+reaching arbitrary host IPC sockets. `container_connect_any` is not a Unix-socket
+permission and does not resolve this denial.
+
+If `ssh`/`ssh-add` inside the sandbox reports `Permission denied` right after
+finding the socket (as opposed to "no such user" or "could not open a
+connection"), look for the AVC:
+
+```sh
+sudo ausearch -m avc -ts recent | grep connectto
+```
+
+Read its `scontext` and `tcontext` before considering a local policy rule:
+allowing `container_t` to connect to a broad host domain such as
+`unconfined_t` grants access to every other socket that domain listens on. If
+the audit log is empty, a `dontaudit` rule may be hiding the denial; rebuild
+the policy without those rules while you reproduce, then restore it:
+
+```sh
+sudo semodule -DB
+# reproduce the failed ssh-add, then:
+sudo semodule -B
+sudo ausearch -m avc -ts recent | grep connectto
+```
 
 The proxy sidecar is treated as infrastructure: it always runs with SELinux
 labeling disabled for `/sidecar_policy` and `/sidecar_shared` so proxy

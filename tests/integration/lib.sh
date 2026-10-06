@@ -8,9 +8,11 @@
 #   77   skip (the case said so, with a reason)
 #   else fail
 #
-# Cases must clean up after themselves.  `sandbox_run` names every container it
-# starts after the case, and `cleanup_sandboxes` removes anything left over, so
-# a case that dies half way does not poison the next one.
+# Cases must clean up after themselves.  `stop_bg` stops a backgrounded
+# launcher and everything under it, and `cleanup_sandboxes` removes the
+# sandboxes and sidecars that appeared after the case started -- never one
+# that was already running, such as the operator's own session -- so a case
+# that dies half way does not poison the next one.
 
 set -u
 
@@ -182,8 +184,62 @@ require_network() {
 # goes to the launcher.
 #
 #   sandbox_run --workspace -- bash -c 'echo hi'
+#
+# On an enforcing SELinux host every launch gets `--selinux`, the way a user
+# there has to launch: without it the sandbox can use none of its binds and
+# every case fails for that one reason.  Prepended, so a case can still pass
+# `--no-selinux` to test the unlabeled path.
+if [ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = 1 ]; then
+  SANDBOX_SELINUX=(--selinux)
+else
+  SANDBOX_SELINUX=()
+fi
+
 sandbox_run() {
-  "$AS" "$@" 2>&1
+  # The `+` form: an empty array under `set -u` is "unbound" before bash 4.4.
+  "$AS" ${SANDBOX_SELINUX[@]+"${SANDBOX_SELINUX[@]}"} "$@" 2>&1
+}
+
+# Stop a background `sandbox_run ... &` (or any `cmd &`) by its $!.  That PID
+# is the subshell, not the launcher in it: killing only the subshell leaves the
+# launcher running, and a launcher that is still starting goes on to create a
+# container after the case has cleaned up -- one that keeps its published port
+# and fails the next run.  So its children go first.
+stop_bg() {
+  [ -n "${1:-}" ] || return 0
+  local pids
+  pids="$(_descendants "$1") $1"
+  kill -TERM $pids 2>/dev/null
+  # Long enough for the launcher's own cleanup -- stopping a sidecar and
+  # reclaiming its network takes seconds -- before anything is KILLed.
+  for _ in $(seq 1 300); do
+    kill -0 "$1" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL $pids 2>/dev/null
+  wait "$1" 2>/dev/null
+  return 0
+}
+
+# Every process below PID, deepest last.  The launcher cleans up after a
+# SIGTERM, but a case's background job is not always the launcher itself, and
+# a launcher wedged before its handler is installed would leave `podman run`
+# behind -- so the whole tree is stopped, and KILLed if it has not gone.
+_descendants() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    echo "$child"
+    _descendants "$child"
+  done
+}
+
+# Fail if something already answers on a host loopback port the case is about
+# to publish, so a leftover from an earlier run is named rather than tested.
+require_free_port() {
+  local port="$1"
+  if curl --silent --max-time 2 -o /dev/null "http://127.0.0.1:$port/"; then
+    _fail "127.0.0.1:$port already answers before the case starts (a leftover sandbox? see: podman ps; ss -ltnp | grep :$port)"
+  fi
 }
 
 # A scratch workspace with an AGENTS.md, for the cases that need one.
@@ -203,14 +259,30 @@ sidecar_networks() {
     | grep '^agent-sandbox-sidecar-' | sort
 }
 
-cleanup_sandboxes() {
-  local ids
-  ids="$(podman ps -aq --filter "label=agent-sandbox.role=sandbox" 2>/dev/null || true)"
-  [ -n "$ids" ] && podman rm -f $ids >/dev/null 2>&1
-  ids="$(podman ps -aq --filter "label=agent-sandbox.role=proxy" 2>/dev/null || true)"
-  [ -n "$ids" ] && podman rm -f $ids >/dev/null 2>&1
-  return 0
-}
+# Containers that existed before this case started: the operator's own
+# sessions, which a case must never remove.  Taken when lib.sh is sourced.
+CASE_PREEXISTING="$(podman ps -aq --no-trunc 2>/dev/null || true)"
+
+#
+# A subshell from /, because a case's cleanup usually removes its workspace
+# while still standing in it, and podman then refuses every command with
+# "error getting current working directory" -- which left every container in
+# place for as long as this was run from the case's own cwd.
+cleanup_sandboxes() (
+  cd / || exit 0
+  local id role
+  # One query per role: podman ANDs repeated label filters.
+  for id in $(for role in sandbox proxy; do
+      podman ps -aq --no-trunc --filter "label=agent-sandbox.role=$role" 2>/dev/null
+    done); do
+    case "$CASE_PREEXISTING" in
+      *"$id"*) continue ;;
+    esac
+    podman rm -f "$id" >/dev/null 2>&1 \
+      || echo "  note: could not remove container $id" >&2
+  done
+  exit 0
+)
 
 # The image every case needs. Built once by the Makefile's `image` target;
 # checked here so a case says what is missing rather than timing out.

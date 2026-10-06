@@ -25,6 +25,14 @@ CASE_TIMEOUT="${CASE_TIMEOUT:-900}"
 mkdir -p "$logdir"
 rm -f "$logdir"/*.log
 
+# Recorded in every log: a pass on an enforcing host and a pass on a host
+# without SELinux are different results, and the log is the evidence.
+case "$(cat /sys/fs/selinux/enforce 2>/dev/null)" in
+  1) selinux=enforcing ;;
+  0) selinux=permissive ;;
+  *) selinux=disabled ;;
+esac
+
 pass=0; fail=0; skipped=0
 failed_cases=()
 skipped_cases=()
@@ -32,6 +40,7 @@ skipped_cases=()
 echo "== $tier =="
 echo "   binary: ${AGENT_SANDBOX_BIN:-<resolved by lib.sh>}"
 echo "   logs:   $logdir"
+echo "   selinux: $selinux"
 echo
 
 for case_file in "$dir"/*.sh; do
@@ -47,6 +56,7 @@ for case_file in "$dir"/*.sh; do
   {
     echo "### $name"
     echo "### $(date -Is)"
+    echo "### selinux: $selinux"
     echo
   } > "$log"
 
