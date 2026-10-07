@@ -204,17 +204,18 @@ owns the socket for every `--host-loopback-port` mapping (and for the `--nix`
 cache endpoint), and the launcher on the host dials *into* it, keeping a few
 idle connections parked for new clients to claim. A host process connecting to
 a container's socket is permitted by the default policy, so the bridge works on
-an enforcing host without a local policy module. It still needs `--selinux`,
-like every other bind on such a host, so the sandbox can create its sockets in
-the mounted directory.
+an enforcing host without a local policy module. It still needs `--selinux`
+(on by default on such a host), like every other bind there, so the sandbox
+can create its sockets in the mounted directory.
 
 If `--nix`'s bridge does not come up within a few seconds, the entrypoint
 leaves the host cache out of `NIX_CONFIG`, so Nix commands go straight to
 their other substituters instead of retrying an unreachable one.
 
-By default, built-in writable binds stay plain `:rw` so non-SELinux hosts see
-no relabel side-effects. On SELinux hosts, pass `--selinux` to apply shared
-relabeling (`:z`) to built-in writable binds. Podman volume options passed via
+`--selinux` follows the host: when SELinux is enforcing, the launcher applies
+shared relabeling (`:z`) to built-in writable binds; otherwise they stay plain
+`:rw`, so non-SELinux and permissive hosts see no relabel side-effects. Pass
+`--selinux` or `--no-selinux` to override the detected default. Podman volume options passed via
 `--podman-args` are preserved exactly as supplied.
 
 `--selinux` relabels the *file* a socket is mounted as, but that alone is not

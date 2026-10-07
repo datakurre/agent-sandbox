@@ -623,8 +623,13 @@ fn nix_cache_info_response_ok(response: &str) -> bool {
         && body.lines().any(|line| line.trim().starts_with("WantMassQuery:"))
 }
 
+/// The default for `--selinux`: relabel exactly when the host enforces.
+/// `AGENT_SANDBOX_SELINUX_ENFORCE` names a different file to read, so the
+/// stub-podman tests do not depend on the mode of the host running them.
 fn selinux_is_enforcing() -> bool {
-    fs::read_to_string("/sys/fs/selinux/enforce")
+    let path = env::var("AGENT_SANDBOX_SELINUX_ENFORCE")
+        .unwrap_or_else(|_| "/sys/fs/selinux/enforce".to_string());
+    fs::read_to_string(path)
         .map(|value| value.trim() == "1")
         .unwrap_or(false)
 }
@@ -895,7 +900,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--devenv", Some(fmt(want_devenv)), "Persists ~/.local/share/devenv across sessions.");
     print_help_option("--nix", Some(fmt(want_nix)), "Uses the host's Nix store as a signed substituter; builds stay in the container.");
     print_help_option("--podman", Some(fmt(want_podman)), "Forwards the host rootless Podman socket (sibling containers).");
-    print_help_option("--selinux", Some(fmt(want_selinux)), "Applies SELinux shared relabeling (:z) to ordinary writable binds; special volume modes are unchanged.");
+    print_help_option("--selinux", Some(fmt(want_selinux)), "Applies SELinux shared relabeling (:z) to ordinary writable binds; special volume modes are unchanged. Defaults to on when SELinux is enforcing.");
     print_help_option("--proxy", Some(fmt(want_proxy)), "Deny-by-default network firewall enforcing AGENTS.md's [network] policy.");
     print_help_option("--policy NAME", None, "Merge a host-owned reusable network policy for sandbox launches; requires --proxy.");
     print_help_option("--no-policy", None, "Ignore selected and implicit host-owned policies; keep the proxy and AGENTS.md policy.");
@@ -1804,7 +1809,8 @@ fn run() -> Result<i32> {
     let mut want_nix = false;
     let mut want_podman = false;
     let mut want_workspace = false;
-    let mut want_selinux = false;
+    // Auto-detected; an explicit --selinux/--no-selinux wins.
+    let mut want_selinux: Option<bool> = None;
     let mut want_ports = false;
     let mut want_ports_any_interface = false;
     let mut want_shared_network = false;
@@ -2101,8 +2107,8 @@ fn run() -> Result<i32> {
             "--no-podman" => want_podman = false,
             "--workspace" => want_workspace = true,
             "--no-workspace" => want_workspace = false,
-            "--selinux" => want_selinux = true,
-            "--no-selinux" => want_selinux = false,
+            "--selinux" => want_selinux = Some(true),
+            "--no-selinux" => want_selinux = Some(false),
             "--ports" => want_ports = true,
             "--no-ports" => want_ports = false,
             "--ports-any-interface" => want_ports_any_interface = true,
@@ -2290,6 +2296,9 @@ fn run() -> Result<i32> {
         i += 1;
     }
 
+    let explicit_selinux = want_selinux;
+    let want_selinux = want_selinux.unwrap_or_else(selinux_is_enforcing);
+
     if want_help {
         print_usage(
             &agent_list,
@@ -2450,7 +2459,7 @@ fn run() -> Result<i32> {
             eprintln!("agent-sandbox: warning: --privileged is unverified under --krun;");
             eprintln!("               nested podman does not work in the guest out of the box.");
         }
-        if want_selinux {
+        if explicit_selinux == Some(true) {
             eprintln!("agent-sandbox: warning: --selinux under --krun relabels the bind mounts,");
             eprintln!("               but the sandbox process itself runs with label=disable.");
         }
@@ -3253,8 +3262,8 @@ fn run() -> Result<i32> {
     // binds on an enforcing host -- not /etc/passwd, not the readiness file --
     // and the launch fails in ways that do not name the cause.
     if !want_json && !want_selinux && selinux_is_enforcing() {
-        eprintln!("agent-sandbox: warning: SELinux is enforcing, but --selinux is not active; the sandbox");
-        eprintln!("               will not be able to use its mounts. Launch with --selinux.");
+        eprintln!("agent-sandbox: warning: SELinux is enforcing, but --no-selinux turned relabeling off; the");
+        eprintln!("               sandbox will not be able to use its mounts. Drop --no-selinux.");
     }
 
     if !want_json && !want_proxy && (proxy_configured || secrets_configured) {

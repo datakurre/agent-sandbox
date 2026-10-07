@@ -184,6 +184,13 @@ impl World {
                 "AGENT_SANDBOX_NIX_STORE".into(),
                 root.join("nix-store").display().to_string(),
             ),
+            // Likewise for `--selinux`'s default: a path that does not
+            // exist reads as "not enforcing" on any host.
+            // `selinux_enforcing` writes a file that says otherwise.
+            (
+                "AGENT_SANDBOX_SELINUX_ENFORCE".into(),
+                root.join("no-selinux-enforce").display().to_string(),
+            ),
             (
                 "STUB_PODMAN_LOG".into(),
                 root.join("podman.log").display().to_string(),
@@ -253,6 +260,15 @@ impl World {
     pub fn no_nix_store(self) -> Self {
         let path = self.root.join("no-such-nix-store").display().to_string();
         self.env("AGENT_SANDBOX_NIX_STORE", &path)
+    }
+
+    /// Make the launcher see an enforcing SELinux host, which is what turns
+    /// `--selinux` on when neither it nor `--no-selinux` is given.
+    pub fn selinux_enforcing(self) -> Self {
+        let path = self.root.join("selinux-enforce");
+        fs::write(&path, "1\n").expect("write selinux enforce");
+        let path = path.display().to_string();
+        self.env("AGENT_SANDBOX_SELINUX_ENFORCE", &path)
     }
 
     /// Write a file into the workspace, creating parent directories.

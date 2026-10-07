@@ -185,19 +185,10 @@ require_network() {
 #
 #   sandbox_run --workspace -- bash -c 'echo hi'
 #
-# On an enforcing SELinux host every launch gets `--selinux`, the way a user
-# there has to launch: without it the sandbox can use none of its binds and
-# every case fails for that one reason.  Prepended, so a case can still pass
-# `--no-selinux` to test the unlabeled path.
-if [ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = 1 ]; then
-  SANDBOX_SELINUX=(--selinux)
-else
-  SANDBOX_SELINUX=()
-fi
-
+# On an enforcing SELinux host the launcher turns `--selinux` on by itself;
+# a case can still pass `--no-selinux` to test the unlabeled path.
 sandbox_run() {
-  # The `+` form: an empty array under `set -u` is "unbound" before bash 4.4.
-  "$AS" ${SANDBOX_SELINUX[@]+"${SANDBOX_SELINUX[@]}"} "$@" 2>&1
+  "$AS" "$@" 2>&1
 }
 
 # Stop a background `sandbox_run ... &` (or any `cmd &`) by its $!.  That PID

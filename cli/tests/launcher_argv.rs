@@ -356,6 +356,50 @@ fn without_selinux_no_relabelling_flag_is_added() {
 }
 
 #[test]
+fn an_enforcing_host_turns_selinux_on_by_default() {
+    let out = World::new()
+        .selinux_enforcing()
+        .run(&["--workspace", "opencode"]);
+    let run = out.run_call();
+    assert!(
+        run.mount_to("/workspace/ws").unwrap().ends_with(":rw,z"),
+        "relabeling follows the host's mode: {}",
+        run.joined()
+    );
+}
+
+#[test]
+fn no_selinux_overrides_the_detected_default() {
+    let out = World::new()
+        .selinux_enforcing()
+        .run(&["--workspace", "--no-selinux", "opencode"]);
+    assert_eq!(
+        out.run_call()
+            .mount_to("/workspace/ws")
+            .unwrap()
+            .rsplit(':')
+            .next(),
+        Some("rw")
+    );
+}
+
+#[test]
+fn help_shows_the_detected_selinux_default() {
+    let line = |world: World, args: &[&str]| {
+        world
+            .run(args)
+            .stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with("--selinux"))
+            .expect("--selinux in help")
+            .to_string()
+    };
+    assert!(line(World::new(), &["--help"]).contains("[off]"));
+    assert!(line(World::new().selinux_enforcing(), &["--help"]).contains("[on ]"));
+    assert!(line(World::new().selinux_enforcing(), &["--no-selinux", "--help"]).contains("[off]"));
+}
+
+#[test]
 fn with_no_host_nix_store_nix_adds_no_shared_store_or_daemon_mount() {
     let out = World::new().no_nix_store().run(&["--nix", "opencode"]);
     let run = out.run_call();

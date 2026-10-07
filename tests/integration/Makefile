@@ -36,11 +36,6 @@ export CASE_TIMEOUT
 AGENT_SANDBOX_BIN ?= $(ROOT)/result/bin/agent-sandbox
 export AGENT_SANDBOX_BIN
 
-# The warm-up launch needs --selinux on an enforcing host for the same reason
-# every case gets it from lib.sh: without it the sandbox cannot write its
-# readiness file and the launch fails.
-WARM_SELINUX := $(if $(filter 1,$(shell cat /sys/fs/selinux/enforce 2>/dev/null)),--selinux)
-
 .PHONY: all integration acceptance image build warm check bundle clean
 
 all: check integration acceptance
@@ -65,7 +60,7 @@ image: build
 warm:
 	@echo "warming the image (podman shifts ownership under --userns=keep-id;"
 	@echo " the first run after a load takes minutes and is cached afterwards)"
-	@time $(AGENT_SANDBOX_BIN) $(WARM_SELINUX) -- true < /dev/null
+	@time $(AGENT_SANDBOX_BIN) -- true < /dev/null
 	@echo "warm."
 
 ## Refuse to start rather than producing a log full of identical failures.

@@ -91,7 +91,7 @@ changes under unrelated churn.
 ## The integration and acceptance tiers
 
 These run on the host and write one log per case. On an enforcing SELinux
-host, `sandbox_run` adds `--selinux` to every launch, as a user there has to.
+host, the launcher turns `--selinux` on by itself, so cases exercise that default.
 
 ```sh
 make -C tests/integration image        # build and load the image (once)
@@ -247,8 +247,8 @@ Worth knowing when choosing what to test next:
   sockets sit on virtiofs, and skips on a host without krun. It only reports
   whether `--nix` reached its cache there; nothing asserts that yet.
 - **SELinux** results depend on the host, so every integration log records the
-  mode it ran under (`### selinux: enforcing`), and `sandbox_run` adds
-  `--selinux` on an enforcing host.
+  mode it ran under (`### selinux: enforcing`); `--selinux` follows that mode
+  unless a case passes `--no-selinux`.
 
 ## Adding a test
 
