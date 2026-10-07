@@ -1,7 +1,7 @@
 ---
 name: screencast
-description: Record, compose, and verify a multi-actor screencast of a Robot Framework-driven browser scenario with the robotframework-screencast Python library (https://github.com/datakurre/robotframework-screencast, documentation https://datakurre.github.io/robotframework-screencast/) — several personas taking turns, an observer recording the whole run, title cards, and a picture-in-picture composite. The library is NOT on PyPI, so install it from GitHub, as the skill's first section says. Trigger when asked to record a scenario/demo video or product walkthrough of a web application, add a persona turn to an existing recording, re-cut a take without re-recording, debug a broken story or take, or fix dead air, a blank frame or a truncated composite.
-compatibility: Needs Python 3.10+, ffmpeg and ffprobe on the PATH, a Chromium that Playwright can launch, and network access to install the library from GitHub. The application being recorded must be running and reachable from the machine.
+description: Record, compose, and verify a multi-actor screencast of a Robot Framework-driven browser scenario with the robotframework-screencast Python library (https://github.com/datakurre/robotframework-screencast, documentation https://datakurre.github.io/robotframework-screencast/) — several personas taking turns, an observer recording the whole run, title cards, and a picture-in-picture composite. The library is NOT on PyPI: install it from GitHub, as the skill's first section says. Trigger when asked to record a scenario/demo video or product walkthrough of a web application, add a persona turn to an existing recording, re-cut a take without re-recording, debug a broken story or take, or fix dead air, a blank frame or a truncated composite.
+compatibility: Needs Python 3.10+, ffmpeg and ffprobe on the PATH, a Chromium that Playwright can launch (or a running one to attach to over CDP), and network access to install the library from GitHub. The application being recorded must be running and reachable from the machine.
 metadata:
   workflow: screencast-recording
   audience: developers-and-agents
@@ -71,7 +71,9 @@ Where to look things up:
   environment that is `playwright install chromium`; a sandbox or Nix setup
   usually supplies one already (follow its own rules — some forbid
   `playwright install`). `SCREENCAST_CHROMIUM_PATH` points the engine at a
-  specific Chromium build.
+  specific Chromium build. Where nothing can be shown — a container with no
+  display — the engine can attach to a visible browser running elsewhere
+  instead; see *Recording in a browser someone can watch*, below.
 - If your environment has a `browser` skill, read it too: it covers recording
   fundamentals this skill does not repeat. Without it, the essentials are these.
   Playwright records a context in real time from `new_page()` to `close()`, so
@@ -90,6 +92,68 @@ Where to look things up:
 - **Never run a story against an environment you do not own.** Stories
   usually start by resetting some state; that is what makes a take
   repeatable, and it is destructive.
+
+## Recording in a browser someone can watch
+
+By default the engine launches its own Chromium, headless unless you pass
+`--headed`. `--cdp` (or `$SCREENCAST_CDP`, or `cdp=` on the `Library` import)
+attaches it to Chromium that is **already running** instead, over the Chrome
+DevTools Protocol — typically a visible browser on the host of a sandbox that
+has no display of its own, so a person can watch the take as it is recorded.
+
+```sh
+screencast run story.robot --take <dir> --cdp 9222
+screencast run story.robot --take <dir> --cdp "alice=9222,bob=9223"
+```
+
+The value is a comma-separated list of `[NAME=]ENDPOINT`, where an endpoint is
+a bare port on `127.0.0.1` or an `http://`/`ws://` URL. A **named** browser
+plays the actor turn, track, or observer of that name (matched
+case-insensitively), so each persona can act in a window of its own; the
+**first** entry plays everything else: the observer, scratch contexts, and any
+actor without a browser of its own.
+
+What changes, and what does not:
+
+- **Recording is unchanged.** Every observer, track and actor turn is still a
+  fresh context the engine opens just before its flow and closes right after,
+  with the injected cursor; Playwright still writes each clip into the take
+  directory, here, from frames the remote browser streams. Compose and verify
+  do not know the difference.
+- **Each context is fresh, not the browser's own profile.** Cookies or logins
+  kept in the attached browser's profile are not visible to a recorded
+  context. Authenticate the same way as without CDP — HTTP Basic Auth on
+  `Start Actor Turn`, or a scratch-context login carried over as a
+  `storage_state`.
+- **The browser dials the story's URLs, not the engine.** A URL has to be
+  reachable from where that browser runs: an app in a container must be
+  published to the host, and listen on `0.0.0.0` rather than loopback inside
+  the container, or the page loads nothing.
+- **The browser is left running.** At the end of the process the engine closes
+  the contexts it created and disconnects; the browser and its own tabs stay.
+  `--headed` has no effect on an attached browser.
+- **The viewport is emulated.** Each context renders at the take's viewport
+  (1920×1080 unless the story sets another), whatever the window size, and
+  that is the size of the clip.
+- **One endpoint that does not answer fails the run** with its name and
+  address, before anything is recorded. Check that the browser is running and
+  that its port is reachable from where the engine runs.
+
+**In agent-sandbox**, the `browser` skill's host browser is this case exactly.
+Start one per persona on the host (`agent-sandbox browser --name alice`,
+`agent-sandbox browser --name bob`), relaunch the sandbox with `--browser`
+(plus `--ports` for the app under test), and pass its variable through
+unchanged — it already has the `NAME=PORT,...` shape:
+
+```sh
+screencast run story.robot --take <dir> --cdp "$AGENT_SANDBOX_BROWSER_CDP_PORT"
+```
+
+The first name in the variable is the default browser. Each host browser
+reaches only what its own allow list permits (the sandbox's published ports by
+default), so a page that loads in a headless run here and not in the host
+browser is that allow list working as intended — ask the user to widen it,
+as the `browser` skill describes.
 
 # Three layers, one engine
 
@@ -370,9 +434,10 @@ to call them directly:
    call resolves and validates its arguments against what's actually
    imported, with no browser opened. Cheapest first move on anything that
    might be a typo or a missing argument.
-2. **`run story.robot [--task NAME] [--no-record] [--take DIR] [--headed] [--repl-on-failure]`**
+2. **`run story.robot [--task NAME] [--no-record] [--take DIR] [--headed] [--cdp SPEC] [--repl-on-failure]`**
    — executes in-process (`--headed` shows the browser window instead of
-   running headless). On a failure, prints a compact summary instead of
+   running headless; `--cdp` attaches to a running browser instead, see
+   *Recording in a browser someone can watch*). On a failure, prints a compact summary instead of
    Robot Framework's normal per-keyword trace:
    ```
    FAIL: Story.Broken Turn
@@ -411,7 +476,7 @@ to call them directly:
    teardown (and the process) proceeds normally. This is a single `run`
    invocation, one Python process throughout — no separate `probe` call and
    no risk of a dead browser.
-3. **`probe KEYWORD args... [--resource FILE]`** — runs one keyword against
+3. **`probe KEYWORD args... [--resource FILE] [--cdp SPEC]`** — runs one keyword against
    the *live* session a previous `run`/`probe` call left open, **as long as
    it happened in this same Python process**: the session is module-level
    state in `screencast.library`, not per-instance, and it does **not**
