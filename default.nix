@@ -295,8 +295,8 @@ let
     '';
   };
 
-  # All paths baked into the image root, shared between the root env and
-  # closureInfo so they stay in sync.
+  # All paths baked into the image root; rootEnv links them in, and the
+  # store registration follows from rootEnv's closure.
   containerPaths = tools ++ [
     pkgs.cacert
     # Referenced only from the image's FONTCONFIG_FILE, so it has to be named
@@ -313,7 +313,15 @@ let
 
   # Loaded into the nix DB on first container start so nix treats baked-in
   # store paths as valid and won't attempt to re-substitute them.
-  storeRegistration = pkgs.closureInfo { rootPaths = containerPaths; };
+  # Rooted at rootEnv rather than containerPaths: buildEnv installs each
+  # package's meta.outputsToInstall (man pages, vim's xxd) and any propagated
+  # user-env packages, and rootEnv's closure is exactly what the image ships.
+  storeRegistration = pkgs.closureInfo {
+    rootPaths = [
+      rootEnv
+      entrypoint
+    ];
+  };
 
   rootEnv = pkgs.buildEnv {
     name = "agent-sandbox-root";
@@ -429,16 +437,6 @@ let
       ];
     };
   };
-
-  # Under --nix the launcher mounts host /nix over the image store, so image
-  # referenced paths must stay rooted in this package closure as well.
-  imageStorePaths = pkgs.writeTextDir "share/agent-sandbox/image-store-paths" (
-    lib.concatMapStringsSep "\n" toString (
-      lib.concatMap (p: map (o: p.${o}) (p.outputs or [ "out" ])) containerPaths ++ [ entrypoint ]
-    )
-  );
-
-
 
   # Every launcher-adjacent script gets its image/network identifiers from
   # here rather than hard-coding them, and writeShellApplication runs
@@ -560,7 +558,6 @@ pkgs.symlinkJoin {
   paths = [
     launcher
     ctlLauncher
-    imageStorePaths
   ];
   passthru = {
     inherit
