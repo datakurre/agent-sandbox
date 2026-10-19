@@ -80,7 +80,7 @@ agent-sandbox = pkgs.symlinkJoin {
 
 Most flags in the table below have a corresponding `--no-flag` option (e.g., `--no-workspace`) to explicitly disable it. The exceptions are `--name`, `--policy`, `--krun-memory`, `--krun-cpus` and `--ports-any-interface`. Taking a value is not itself the reason: `--host-loopback-port` takes one and does have `--no-host-loopback-port`, which clears every mapping collected so far. For sandbox launches, `--policy` requires `--proxy`; passing it without `--proxy` refuses the launch rather than turning the proxy on implicitly. `--no-policy` is different from `--no-proxy`: it keeps the deny-by-default proxy and the workspace `AGENTS.md` policy, while skipping all host-owned policy files selected before it, including the implicit per-agent policy. A later `--policy NAME` re-enables host-owned policy loading. `agent-sandbox browser --policy NAME` is separate and uses the browser's own proxy. A `--no-proxy` after `--proxy --policy NAME` still turns the sandbox proxy off, dropping the policies with it. Since arguments are evaluated sequentially, passing `--ssh` followed by `--no-ssh` will leave the feature disabled. This is how user-provided command line arguments can override defaults built into the script via `wrapProgram`.
 
-`--gpg-agent` and `--gpg-sign` were merged and removed; use `--gpg` / `--no-gpg`. `--programmatic` was removed; use `'--prompt - --json'` or `'--prompt -'`.
+`--gpg-agent` and `--gpg-sign` were merged and removed; use `--gpg` / `--no-gpg`.
 
 | Group | Flag | What it does |
 | --- | --- | --- |

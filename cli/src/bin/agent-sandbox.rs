@@ -2325,8 +2325,6 @@ fn run() -> Result<i32> {
                     fail("agent-sandbox: '--port' was removed. Declare a [ports] block in AGENTS.md and pass --ports,\n               or publish directly with: --podman-args -p HOST:CONTAINER --");
                 } else if arg == "--proxy-train" || arg.starts_with("--proxy-train=") {
                     fail("agent-sandbox: '--proxy-train' was removed. Run with --proxy and watch denied\n               requests in 'agent-sandbox ctl tui'.");
-                } else if arg == "--programmatic" || arg.starts_with("--programmatic=") {
-                    fail("agent-sandbox: '--programmatic' was removed. Use '--prompt - --json' to reproduce\n               the old behavior, or '--prompt -' alone for unbuffered text.");
                 } else if let Some(v) = arg.strip_prefix("-e") {
                     env_args.push("-e".to_string());
                     env_args.push(v.to_string());

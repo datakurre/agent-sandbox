@@ -1141,27 +1141,6 @@ fn companion_flags_in_separate_syntax_reject_empty_strings() {
 }
 
 #[test]
-fn programmatic_flag_produces_migration_hint() {
-    for flag in &["--programmatic", "--programmatic=true"] {
-        let out = World::new().run(&[flag]);
-        assert_eq!(out.code, Some(1));
-        assert!(!out.reached_podman_run());
-        assert!(
-            out.stderr.contains("'--programmatic' was removed"),
-            "stderr for {}: {}",
-            flag,
-            out.stderr
-        );
-        assert!(
-            out.stderr.contains("Use '--prompt - --json' to reproduce"),
-            "stderr for {}: {}",
-            flag,
-            out.stderr
-        );
-    }
-}
-
-#[test]
 fn no_json_cancels_earlier_json_flag() {
     let out = World::new().run(&["--json", "--no-json", "--prompt", "-", "pi"]);
     assert_eq!(out.code, Some(0));
