@@ -207,10 +207,7 @@ fn main() -> Result<()> {
 
             let ssh_config = ssh_dir.join("config");
             if !ssh_config.exists() && fs::symlink_metadata(&ssh_config).is_err() {
-                let proxy_host_port = http_proxy.split("://").last().unwrap_or(&http_proxy);
-                let mut parts = proxy_host_port.splitn(2, ':');
-                let proxy_host = parts.next().unwrap_or("");
-                let proxy_port = parts.next().unwrap_or("");
+                let (proxy_host, proxy_port) = split_proxy(&http_proxy);
 
                 // ssh takes the first value it sees for a keyword, so the
                 // loopback exemption has to precede the catch-all.  Without it
@@ -237,6 +234,7 @@ fn main() -> Result<()> {
     }
 
     // 5. CA bundle
+    let mut merged_ca_bundle: Option<PathBuf> = None;
     if let Ok(proxy_ca_file) = env::var("AGENT_SANDBOX_PROXY_CA_FILE") {
         if !proxy_ca_file.is_empty() {
             let proxy_ca_path = Path::new(&proxy_ca_file);
@@ -270,6 +268,11 @@ fn main() -> Result<()> {
 
             let mut file = fs::File::create(&merged_bundle)?;
             file.write_all(base_content.as_bytes())?;
+            // Without it a bundle that lacks a final newline runs its last END
+            // line into the proxy CA's BEGIN, and parsers drop the proxy CA.
+            if !base_content.is_empty() && !base_content.ends_with('\n') {
+                file.write_all(b"\n")?;
+            }
             file.write_all(proxy_content.as_bytes())?;
 
             let mut p = fs::metadata(&merged_bundle)?.permissions();
@@ -283,7 +286,26 @@ fn main() -> Result<()> {
             env::set_var("REQUESTS_CA_BUNDLE", &merged_bundle_str);
             env::set_var("CURL_CA_BUNDLE", &merged_bundle_str);
             env::set_var("NODE_EXTRA_CA_CERTS", &merged_bundle_str);
+            merged_ca_bundle = Some(merged_bundle);
         }
+    }
+
+    // 5b. Maven
+    //
+    // Never fatal: a sandbox whose Maven is not proxied is still a sandbox,
+    // and every way this can go wrong is reported instead.
+    let http_proxy = env::var("HTTP_PROXY").ok().filter(|v| !v.is_empty());
+    let (maven_vars, warnings) = setup_maven(
+        &home_path,
+        http_proxy.as_deref(),
+        merged_ca_bundle.as_deref(),
+        &|name| env::var(name).unwrap_or_default(),
+    );
+    for (name, value) in maven_vars {
+        env::set_var(name, value);
+    }
+    for warning in warnings {
+        eprintln!("entrypoint: --proxy and Maven: {warning}");
     }
 
     // 6. Git config
@@ -582,6 +604,10 @@ const ATTACH_ENV_VARS: &[&str] = &[
     "CURL_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
     "GIT_SSH_COMMAND",
+    "MAVEN_ARGS",
+    "MAVEN_CONFIG",
+    "MAVEN_OPTS",
+    "AGENT_SANDBOX_PROXY_HOST",
 ];
 
 fn write_attach_env(home_path: &Path) {
@@ -638,6 +664,421 @@ fn write_attach_env(home_path: &Path) {
             e
         );
     }
+}
+
+/// `http://10.89.7.2:8888` → (`10.89.7.2`, `8888`).  An IPv6 host keeps its
+/// brackets.  A URL without a port means 80, as it does to curl: the ssh
+/// config built from this once got an empty `proxyport=` instead.
+fn split_proxy(http_proxy: &str) -> (&str, &str) {
+    let host_port = http_proxy.split("://").last().unwrap_or(http_proxy);
+    let host_port = host_port.trim_end_matches('/');
+    let port_from = match host_port.find(']') {
+        Some(end) if host_port.starts_with('[') => end + 1,
+        _ => 0,
+    };
+    match host_port[port_from..].rfind(':') {
+        Some(colon) => (&host_port[..port_from + colon], &host_port[port_from + colon + 1..]),
+        None => (host_port, "80"),
+    }
+}
+
+/// Maven's global settings under `--proxy`, relative to home.  Beside the
+/// generated gitconfig, and out of `~/.m2`, which belongs to the operator.
+const MAVEN_GLOBAL_SETTINGS: &str = ".config/agent-sandbox/maven-settings.xml";
+
+fn maven_settings(proxy_host: &str, proxy_port: &str) -> String {
+    // One entry per scheme: Maven picks a proxy by the repository URL's
+    // protocol.  nonProxyHosts repeats the launcher's NO_PROXY literals in
+    // Maven's `|` syntax; XML is the one place that `|` is safe to put.
+    let proxy = |protocol: &str| {
+        format!(
+            "    <proxy>\n\
+             \x20     <id>agent-sandbox-{protocol}</id>\n\
+             \x20     <active>true</active>\n\
+             \x20     <protocol>{protocol}</protocol>\n\
+             \x20     <host>{proxy_host}</host>\n\
+             \x20     <port>{proxy_port}</port>\n\
+             \x20     <nonProxyHosts>localhost|127.0.0.1|::1|[::1]</nonProxyHosts>\n\
+             \x20   </proxy>\n"
+        )
+    };
+    format!(
+        "<settings>\n  <proxies>\n{}{}  </proxies>\n</settings>\n",
+        proxy("https"),
+        proxy("http")
+    )
+}
+
+/// The JVM's own truststore, beside the merged PEM bundle it is made from.
+const MAVEN_TRUSTSTORE: &str = ".cache/agent-sandbox-ca-bundle.jks";
+
+/// The fallback, for when the global settings cannot be handed over: Maven
+/// reads the user settings too, so they carry the proxy instead -- but only in
+/// a file this entrypoint created, which the marker identifies, and only on
+/// the container's own filesystem.
+const MAVEN_USER_SETTINGS: &str = ".m2/settings.xml";
+/// XML forbids `--` inside a comment, so the flag is not named here: a marker
+/// spelling it out made Maven refuse the whole file.
+const MAVEN_USER_SETTINGS_MARKER: &str =
+    "<!-- written by agent-sandbox for its proxy; replaced or removed on every start -->";
+
+/// Exported under `--proxy`, so a settings file the operator keeps can name
+/// the sidecar, whose address changes with every launch, as
+/// `<host>${env.AGENT_SANDBOX_PROXY_HOST}</host>`.  There is no port
+/// counterpart: Maven 3.9 parses `<port>` as a number before it interpolates.
+const PROXY_HOST_ENV: &str = "AGENT_SANDBOX_PROXY_HOST";
+
+/// Points Maven at the proxy -- see "Maven" in docs/architecture.md.  Returns
+/// the variables to set and what went wrong, and never fails: a sandbox whose
+/// Maven is not proxied is still a sandbox.  `existing` is the operator's
+/// value of a variable.  Without a proxy it only removes what this
+/// entrypoint wrote before.
+fn setup_maven(
+    home_path: &Path,
+    http_proxy: Option<&str>,
+    ca_bundle: Option<&Path>,
+    existing: &dyn Fn(&str) -> String,
+) -> (Vec<(&'static str, String)>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let global = home_path.join(MAVEN_GLOBAL_SETTINGS);
+    let truststore = home_path.join(MAVEN_TRUSTSTORE);
+    let user = home_path.join(MAVEN_USER_SETTINGS);
+    let _ = fs::remove_file(&truststore);
+
+    let Some(http_proxy) = http_proxy else {
+        let _ = fs::remove_file(&global);
+        remove_our_user_settings(&user, home_path);
+        return (Vec::new(), warnings);
+    };
+    let (proxy_host, proxy_port) = split_proxy(http_proxy);
+    let proxy_host = proxy_host.trim_start_matches('[').trim_end_matches(']');
+    // The same check keeps the address safe in the XML: no `<`, `&` or `"`.
+    if !shell_word(proxy_host) || !shell_word(proxy_port) {
+        warnings.push(format!(
+            "proxy address {proxy_host}:{proxy_port} is not a plain host and port; Maven is not configured"
+        ));
+        return (Vec::new(), warnings);
+    }
+    let settings_xml = maven_settings(proxy_host, proxy_port);
+
+    // Written whole on every start, like the gitconfig beside it.
+    let global_written = global
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| fs::write(&global, &settings_xml));
+    if let Err(e) = &global_written {
+        warnings.push(format!("could not write {}: {e}", global.display()));
+    }
+
+    // The JVM ignores SSL_CERT_FILE and friends, so a host the proxy
+    // intercepts needs the session CA in a keystore of Java's own.
+    let truststore_path = ca_bundle.and_then(|bundle| {
+        let written = fs::read(bundle)
+            .map_err(anyhow::Error::from)
+            .and_then(|pem| jks_truststore(&pem))
+            .and_then(|(store, skipped)| {
+                fs::write(&truststore, store)?;
+                fs::set_permissions(&truststore, fs::Permissions::from_mode(0o600))?;
+                Ok(skipped)
+            });
+        match written {
+            Ok(skipped) => {
+                if skipped > 0 {
+                    warnings.push(format!(
+                        "left {skipped} unparsable certificate(s) of {} out of Java's truststore",
+                        bundle.display()
+                    ));
+                }
+                Some(truststore.to_string_lossy().to_string())
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "no Java truststore, so hosts the proxy intercepts will fail in Maven: {e:#}"
+                ));
+                None
+            }
+        }
+    });
+
+    let settings_path = global.to_string_lossy().to_string();
+    let plan = maven_env(
+        proxy_host,
+        proxy_port,
+        global_written.is_ok().then_some(settings_path.as_str()),
+        truststore_path.as_deref(),
+        existing,
+    );
+    warnings.extend(plan.warnings);
+    let mut vars = plan.vars;
+    vars.push((PROXY_HOST_ENV, proxy_host.to_string()));
+
+    if plan.unproxied.is_empty() {
+        remove_our_user_settings(&user, home_path);
+        return (vars, warnings);
+    }
+
+    // Some launcher will not read our global settings.  Settings the operator
+    // named, or their own user settings, may carry the proxy already.
+    let why = plan.unproxied.join("; ");
+    let theirs: Vec<String> = ["MAVEN_ARGS", "MAVEN_CONFIG"].iter().map(|n| existing(n)).collect();
+    // Maven resolves a relative settings path against the working directory,
+    // which is the workspace podman starts us in.
+    let cwd = env::current_dir().unwrap_or_default();
+    let mut candidates: Vec<PathBuf> = theirs.iter().flat_map(|v| named_settings(v, &cwd)).collect();
+    candidates.push(user.clone());
+    let wired = candidates.iter().any(|path| {
+        fs::read_to_string(path).is_ok_and(|content| content.contains(PROXY_HOST_ENV))
+    });
+    let advice = format!(
+        "give it a <proxy> with <host>${{env.{PROXY_HOST_ENV}}}</host> and <port>{proxy_port}</port>"
+    );
+    if wired {
+        remove_our_user_settings(&user, home_path);
+    } else if let Some(flag) = theirs.iter().find_map(|v| names_user_settings(v)) {
+        remove_our_user_settings(&user, home_path);
+        warnings.push(format!(
+            "{why}, and {flag} names other user settings, so a fallback in {} would not be read; \
+             {advice}",
+            user.display()
+        ));
+    } else {
+        match write_our_user_settings(&user, home_path, &settings_xml) {
+            Ok(true) => {}
+            Ok(false) => warnings.push(format!(
+                "{why}, and {} is the operator's own or mounted from the host, so it is left \
+                 alone and Maven may connect directly and fail; {advice}",
+                user.display()
+            )),
+            Err(e) => warnings.push(format!(
+                "{why}, and the fallback {} could not be written: {e}",
+                user.display()
+            )),
+        }
+    }
+    (vars, warnings)
+}
+
+/// Whether `path` is the fallback user settings this entrypoint wrote, on the
+/// container's own filesystem.  A file behind a bind mount is the host's even
+/// if it carries the marker -- another sandbox sharing that `~/.m2` may have
+/// written it -- so it is never rewritten or removed from here.
+fn is_our_user_settings(path: &Path, home_path: &Path) -> bool {
+    on_home_device(path, home_path)
+        && fs::read_to_string(path).is_ok_and(|content| content.starts_with(MAVEN_USER_SETTINGS_MARKER))
+}
+
+/// Whether the nearest existing ancestor of `path` is on the same filesystem
+/// as home.  `~/.m2` bound in from the host is not, so nothing written there
+/// outlives the session or leaks a per-session address into host builds.
+fn on_home_device(path: &Path, home_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(home) = fs::metadata(home_path) else {
+        return false;
+    };
+    path.ancestors()
+        .skip(1)
+        .find_map(|dir| fs::metadata(dir).ok())
+        .is_some_and(|dir| dir.dev() == home.dev())
+        && fs::symlink_metadata(path).map_or(true, |file| file.dev() == home.dev())
+}
+
+fn remove_our_user_settings(path: &Path, home_path: &Path) {
+    if is_our_user_settings(path, home_path) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Writes the fallback when there is no settings file, or only ours.  Returns
+/// false, touching nothing, when the file is the operator's or `~/.m2` is a
+/// mount from the host.
+fn write_our_user_settings(path: &Path, home_path: &Path, settings_xml: &str) -> io::Result<bool> {
+    let exists = fs::symlink_metadata(path).is_ok();
+    if (exists && !is_our_user_settings(path, home_path)) || !on_home_device(path, home_path) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{MAVEN_USER_SETTINGS_MARKER}\n{settings_xml}"))?;
+    Ok(true)
+}
+
+/// The settings files `existing` names with `-gs`, `-is` or `-s` and their
+/// long forms, in either `-gs FILE` or `--global-settings=FILE` spelling.  A
+/// relative path is resolved against `cwd`, as Maven resolves it; a leading
+/// `~` is not expanded, because Maven does not expand it either.
+fn named_settings(existing: &str, cwd: &Path) -> Vec<PathBuf> {
+    const FLAGS: [&str; 6] = ["-gs", "-is", "-s", "--global-settings", "--install-settings", "--settings"];
+    let words: Vec<&str> = existing.split_whitespace().collect();
+    let mut paths = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        for flag in FLAGS {
+            if *word == flag {
+                if let Some(next) = words.get(index + 1) {
+                    paths.push(cwd.join(next));
+                }
+            } else if let Some(value) = word.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+                paths.push(cwd.join(value));
+            }
+        }
+    }
+    paths
+}
+
+/// The flag, if `existing` replaces Maven's user settings -- in which case
+/// `~/.m2/settings.xml` is never read and a fallback there would do nothing.
+fn names_user_settings(existing: &str) -> Option<&'static str> {
+    existing.split_whitespace().find_map(|word| {
+        ["-s", "--settings"]
+            .into_iter()
+            .find(|flag| word == *flag || word.starts_with(&format!("{flag}=")))
+    })
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct MavenEnv {
+    /// Final values, each with the operator's own value after ours.
+    vars: Vec<(&'static str, String)>,
+    /// Why some launcher will not get the global settings; non-empty means
+    /// the user-settings fallback is needed.
+    unproxied: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// What to hand Maven, given the operator's current value of each variable.
+///
+/// The settings go out twice because there are two launchers: `bin/mvn` (and
+/// the script-only mvnw, which execs it) reads MAVEN_ARGS, while a jar-based
+/// mvnw starts Maven in its own JVM and reads MAVEN_CONFIG.  Neither reads the
+/// other's, so `-gs` is never passed twice.  Maven 4 calls `-gs` deprecated
+/// but honours it, and Maven 3.9 knows no other spelling.
+///
+/// `proxy_host` and `proxy_port` are already checked with `shell_word` by
+/// `setup_maven`, and the host has lost any IPv6 brackets, which the JVM's
+/// properties do not take.
+fn maven_env(
+    proxy_host: &str,
+    proxy_port: &str,
+    settings: Option<&str>,
+    truststore: Option<&str>,
+    existing: &dyn Fn(&str) -> String,
+) -> MavenEnv {
+    let mut plan = MavenEnv::default();
+
+    // The JVM properties are for what settings do not reach: plugins that
+    // download through java.net themselves, and the wrapper jar fetching Maven.
+    let mut opts = vec![format!(
+        "-Dhttp.proxyHost={proxy_host} -Dhttp.proxyPort={proxy_port} \
+         -Dhttps.proxyHost={proxy_host} -Dhttps.proxyPort={proxy_port}"
+    )];
+    match truststore {
+        Some(path) if shell_word(path) => opts.push(format!(
+            "-Djavax.net.ssl.trustStore={path} -Djavax.net.ssl.trustStoreType=JKS"
+        )),
+        Some(path) => plan
+            .warnings
+            .push(format!("truststore path {path} is not shell-safe; MAVEN_OPTS does not name it")),
+        None => {}
+    }
+    plan.vars
+        .push(("MAVEN_OPTS", prepend_flags(&opts.join(" "), &existing("MAVEN_OPTS"))));
+
+    for name in ["MAVEN_ARGS", "MAVEN_CONFIG"] {
+        let theirs = existing(name);
+        match settings {
+            _ if names_global_settings(&theirs) => plan
+                .unproxied
+                .push(format!("{name} already names global settings")),
+            Some(path) if shell_word(path) => {
+                plan.vars.push((name, prepend_flags(&format!("-gs {path}"), &theirs)))
+            }
+            Some(path) => plan
+                .unproxied
+                .push(format!("settings path {path} is not shell-safe for {name}")),
+            None => plan.unproxied.push(format!("no global settings for {name}")),
+        }
+    }
+    plan
+}
+
+/// Ours first, so an operator's own value -- later on the java command line,
+/// where the last `-D` wins -- still overrides a property it repeats.
+fn prepend_flags(ours: &str, existing: &str) -> String {
+    match existing.trim() {
+        "" => ours.to_string(),
+        existing => format!("{ours} {existing}"),
+    }
+}
+
+/// Whether the operator already chose Maven's global (Maven 4: installation)
+/// settings in this variable.  Theirs wins then: of two `-gs`, Maven keeps
+/// the first, which would be ours.
+fn names_global_settings(existing: &str) -> bool {
+    existing.split_whitespace().any(|word| {
+        ["-gs", "-is", "--global-settings", "--install-settings"]
+            .iter()
+            .any(|flag| word == *flag || word.starts_with(&format!("{flag}=")))
+    })
+}
+
+/// True when `word` stays one word, unchanged, through word splitting and a
+/// shell's `eval` -- Maven 4's `mvn` evals MAVEN_OPTS, where a `|` once made
+/// every invocation fail.  Checked per component, not on the joined value, so
+/// a space inside a path cannot pass as a separator.
+fn shell_word(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.,/:=@+".contains(c))
+}
+
+/// A JKS keystore of trusted-certificate entries, one per certificate in
+/// `pem`, and how many it left out because they would not parse.  JKS rather
+/// than PKCS#12 because it is a few lines of framing and every JDK reads it.
+/// Each certificate is parsed before it goes in: one Java cannot read fails
+/// the whole keystore, and with it every TLS connection Maven makes.  The
+/// integrity digest is keyed with the JDK's stock `changeit`; Java skips the
+/// check anyway when no password is given.
+fn jks_truststore(pem: &[u8]) -> Result<(Vec<u8>, usize)> {
+    use rustls_pki_types::{pem::PemObject, CertificateDer};
+
+    let mut certs = Vec::new();
+    let mut skipped = 0;
+    // A block that does not even decode -- bad base64, no END line -- is
+    // skipped like one that does not parse; the iterator resumes after it.
+    for cert in CertificateDer::pem_slice_iter(pem) {
+        match cert {
+            Ok(cert) if webpki::anchor_from_trusted_cert(&cert).is_ok() => certs.push(cert),
+            _ => skipped += 1,
+        }
+    }
+    anyhow::ensure!(!certs.is_empty(), "the CA bundle holds no usable CERTIFICATE block");
+
+    let utf = |out: &mut Vec<u8>, text: &str| {
+        out.extend_from_slice(&(text.len() as u16).to_be_bytes());
+        out.extend_from_slice(text.as_bytes());
+    };
+    let mut store = Vec::new();
+    store.extend_from_slice(&0xFEED_FEEDu32.to_be_bytes());
+    store.extend_from_slice(&2u32.to_be_bytes());
+    store.extend_from_slice(&(certs.len() as u32).to_be_bytes());
+    for (index, cert) in certs.iter().enumerate() {
+        store.extend_from_slice(&2u32.to_be_bytes()); // trusted certificate
+        utf(&mut store, &format!("ca-{index}"));
+        store.extend_from_slice(&0u64.to_be_bytes()); // creation date
+        utf(&mut store, "X.509");
+        store.extend_from_slice(&(cert.len() as u32).to_be_bytes());
+        store.extend_from_slice(cert);
+    }
+
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    for unit in "changeit".encode_utf16() {
+        digest.update(&unit.to_be_bytes());
+    }
+    digest.update(b"Mighty Aphrodite");
+    digest.update(&store);
+    store.extend_from_slice(digest.finish().as_ref());
+    Ok((store, skipped))
 }
 
 fn which(cmd: &str) -> Result<PathBuf, ()> {
@@ -757,6 +1198,358 @@ mod tests {
         assert!(nix_config_with_host_cache("", 0, "key:value").is_err());
         assert!(nix_config_with_host_cache("", 7419, "").is_err());
         assert!(nix_config_with_host_cache("", 7419, "first\nsecond").is_err());
+    }
+
+    const SETTINGS: &str = "/home/user/.config/agent-sandbox/maven-settings.xml";
+    const TRUSTSTORE: &str = "/home/user/.cache/agent-sandbox-ca-bundle.jks";
+
+    fn operator<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> String + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    fn var<'a>(plan: &'a MavenEnv, name: &str) -> Option<&'a str> {
+        plan.vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn both_launchers_get_the_settings_and_the_jvm_gets_the_proxy() {
+        let plan = maven_env("10.89.7.2", "8888", Some(SETTINGS), None, &operator(&[]));
+        let gs = format!("-gs {SETTINGS}");
+        assert_eq!(var(&plan, "MAVEN_ARGS"), Some(gs.as_str()));
+        assert_eq!(var(&plan, "MAVEN_CONFIG"), Some(gs.as_str()));
+        assert_eq!(
+            var(&plan, "MAVEN_OPTS"),
+            Some(
+                "-Dhttp.proxyHost=10.89.7.2 -Dhttp.proxyPort=8888 \
+                 -Dhttps.proxyHost=10.89.7.2 -Dhttps.proxyPort=8888"
+            )
+        );
+        assert!(plan.unproxied.is_empty() && plan.warnings.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn the_truststore_is_named_only_when_there_is_one() {
+        let plan = maven_env("10.89.7.2", "8888", Some(SETTINGS), Some(TRUSTSTORE), &operator(&[]));
+        let opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(opts.contains("-Djavax.net.ssl.trustStoreType=JKS"));
+    }
+
+    #[test]
+    fn the_operators_values_follow_ours() {
+        let theirs = [("MAVEN_OPTS", " -Xmx1g "), ("MAVEN_ARGS", "-T 4")];
+        let plan = maven_env("10.89.7.2", "8888", Some(SETTINGS), None, &operator(&theirs));
+        assert!(var(&plan, "MAVEN_OPTS").unwrap().ends_with("-Dhttps.proxyPort=8888 -Xmx1g"));
+        assert_eq!(var(&plan, "MAVEN_ARGS").unwrap(), format!("-gs {SETTINGS} -T 4"));
+    }
+
+    #[test]
+    fn an_operators_global_settings_suppress_ours_in_that_variable_only() {
+        let theirs = [("MAVEN_ARGS", "-is /etc/maven.xml")];
+        let plan = maven_env("10.89.7.2", "8888", Some(SETTINGS), None, &operator(&theirs));
+        assert_eq!(var(&plan, "MAVEN_ARGS"), None, "left exactly as the operator set it");
+        assert_eq!(var(&plan, "MAVEN_CONFIG"), Some(format!("-gs {SETTINGS}").as_str()));
+        assert_eq!(plan.unproxied, ["MAVEN_ARGS already names global settings"]);
+    }
+
+    #[test]
+    fn an_operators_global_settings_are_recognised_in_every_spelling() {
+        for existing in [
+            "-gs /etc/m.xml",
+            "-T 4 --global-settings /etc/m.xml",
+            "--global-settings=/etc/m.xml",
+            "-is /etc/m.xml",
+            "--install-settings=/etc/m.xml",
+        ] {
+            assert!(names_global_settings(existing), "{existing}");
+        }
+        for existing in ["", "-T 4", "-s /etc/user.xml", "-gsx", "/root/.m2"] {
+            assert!(!names_global_settings(existing), "{existing}");
+        }
+    }
+
+    #[test]
+    fn nothing_that_would_change_under_eval_is_handed_to_maven() {
+        // A space in a path is the case a check on the joined value missed.
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some("/home/a user/settings.xml"),
+            Some("/home/a user/ca.jks"),
+            &operator(&[]),
+        );
+        assert_eq!(var(&plan, "MAVEN_ARGS"), None);
+        assert_eq!(var(&plan, "MAVEN_CONFIG"), None);
+        assert_eq!(plan.unproxied.len(), 2, "so the fallback takes over: {plan:?}");
+        let opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(!opts.contains("trustStore"), "{opts}");
+        assert_eq!(plan.warnings.len(), 1, "{plan:?}");
+
+        for word in ["a|b", "a;b", "$HOME", "'q'", "a*", "a b", "`x`", "a&b", "[::1]", ""] {
+            assert!(!shell_word(word), "{word:?}");
+        }
+        for word in [SETTINGS, TRUSTSTORE, "10.89.7.2", "fd00::1", "8888"] {
+            assert!(shell_word(word), "{word:?}");
+        }
+    }
+
+    #[test]
+    fn an_ipv6_sidecar_is_named_without_brackets_for_the_jvm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vars, warnings) = setup_maven(tmp.path(), Some("http://[fd00::2]:8888"), None, &operator(&[]));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let opts = &vars.iter().find(|(n, _)| *n == "MAVEN_OPTS").unwrap().1;
+        assert!(opts.contains("-Dhttps.proxyHost=fd00::2 "), "{opts}");
+        assert!(vars.contains(&(PROXY_HOST_ENV, "fd00::2".to_string())));
+        let settings = fs::read_to_string(tmp.path().join(MAVEN_GLOBAL_SETTINGS)).unwrap();
+        assert!(settings.contains("<host>fd00::2</host>"), "{settings}");
+    }
+
+    #[test]
+    fn without_global_settings_every_launcher_needs_the_fallback() {
+        let plan = maven_env("10.89.7.2", "8888", None, None, &operator(&[]));
+        assert_eq!(plan.unproxied.len(), 2);
+        assert!(var(&plan, "MAVEN_OPTS").is_some(), "the JVM properties still go out");
+    }
+
+    #[test]
+    fn maven_settings_point_both_schemes_at_the_proxy() {
+        let settings = maven_settings("10.89.7.2", "8888");
+        assert!(settings.contains("<protocol>https</protocol>"));
+        assert!(settings.contains("<protocol>http</protocol>"));
+        assert_eq!(settings.matches("<host>10.89.7.2</host>").count(), 2);
+        assert_eq!(settings.matches("<port>8888</port>").count(), 2);
+        assert!(settings.contains("<nonProxyHosts>localhost|127.0.0.1|"));
+    }
+
+    #[test]
+    fn the_marker_is_a_well_formed_xml_comment() {
+        let body = MAVEN_USER_SETTINGS_MARKER
+            .strip_prefix("<!--")
+            .and_then(|rest| rest.strip_suffix("-->"))
+            .expect("a comment");
+        assert!(!body.contains("--") && !body.ends_with('-'), "{body}");
+    }
+
+    const PROXY: &str = "http://10.89.7.2:8888";
+
+    fn setup(home: &Path, theirs: &[(&str, &str)]) -> (Vec<(&'static str, String)>, Vec<String>) {
+        setup_maven(home, Some(PROXY), None, &operator(theirs))
+    }
+
+    #[test]
+    fn the_normal_path_writes_global_settings_only_and_is_quiet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vars, warnings) = setup(tmp.path(), &[]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(tmp.path().join(MAVEN_GLOBAL_SETTINGS).exists());
+        assert!(!tmp.path().join(MAVEN_USER_SETTINGS).exists());
+        let names: Vec<_> = vars.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["MAVEN_OPTS", "MAVEN_ARGS", "MAVEN_CONFIG", PROXY_HOST_ENV]);
+        assert!(vars.contains(&(PROXY_HOST_ENV, "10.89.7.2".to_string())));
+    }
+
+    #[test]
+    fn the_fallback_comes_and_goes_with_the_need_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let user = home.join(MAVEN_USER_SETTINGS);
+        let theirs = [("MAVEN_ARGS", "-gs /etc/theirs.xml")];
+
+        let (vars, warnings) = setup(home, &theirs);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!vars.iter().any(|(n, _)| *n == "MAVEN_ARGS"), "theirs is left as it is");
+        let content = fs::read_to_string(&user).unwrap();
+        assert!(content.starts_with(MAVEN_USER_SETTINGS_MARKER), "{content}");
+        assert!(content.contains("<host>10.89.7.2</host>"), "{content}");
+
+        // Not needed any more: ours goes.
+        setup(home, &[]);
+        assert!(!user.exists());
+        // Needed again, then no proxy at all: ours goes, and so do the global settings.
+        setup(home, &theirs);
+        assert!(user.exists());
+        let (vars, warnings) = setup_maven(home, None, None, &operator(&[]));
+        assert!(vars.is_empty() && warnings.is_empty());
+        assert!(!user.exists() && !home.join(MAVEN_GLOBAL_SETTINGS).exists());
+    }
+
+    #[test]
+    fn an_operators_user_settings_are_never_touched_and_the_advice_is_portable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let user = home.join(MAVEN_USER_SETTINGS);
+        fs::create_dir_all(user.parent().unwrap()).unwrap();
+        fs::write(&user, "<settings/>\n").unwrap();
+        let theirs = [("MAVEN_ARGS", "-gs /etc/theirs.xml")];
+
+        let (_, warnings) = setup(home, &theirs);
+        assert_eq!(fs::read_to_string(&user).unwrap(), "<settings/>\n");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("${env.AGENT_SANDBOX_PROXY_HOST}"), "{warnings:?}");
+        assert!(!warnings[0].contains("10.89.7.2"), "that address changes every launch: {warnings:?}");
+
+        // Once the operator follows the advice, the warning stops.
+        fs::write(&user, "<proxy><host>${env.AGENT_SANDBOX_PROXY_HOST}</host></proxy>\n").unwrap();
+        let (_, warnings) = setup(home, &theirs);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn global_settings_the_operator_wired_to_the_proxy_need_no_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theirs_file = tmp.path().join("theirs.xml");
+        fs::write(&theirs_file, "<host>${env.AGENT_SANDBOX_PROXY_HOST}</host>").unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let args = format!("--global-settings={}", theirs_file.display());
+
+        let (_, warnings) = setup(&home, &[("MAVEN_ARGS", &args)]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!home.join(MAVEN_USER_SETTINGS).exists());
+    }
+
+    #[test]
+    fn an_operators_dash_s_means_the_fallback_would_not_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, warnings) = setup(tmp.path(), &[("MAVEN_ARGS", "-gs /etc/g.xml -s /etc/u.xml")]);
+        assert!(!tmp.path().join(MAVEN_USER_SETTINGS).exists());
+        assert!(warnings.iter().any(|w| w.contains("-s names other user settings")), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_settings_directory_on_another_filesystem_is_the_hosts() {
+        // A tmpfs stands in for a bind mount from the host: another device
+        // than a tempdir under /tmp, unless /tmp is a tmpfs too.
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let Ok(elsewhere) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        if fs::metadata(tmp.path()).unwrap().dev() == fs::metadata(elsewhere.path()).unwrap().dev() {
+            return;
+        }
+        std::os::unix::fs::symlink(elsewhere.path(), tmp.path().join(".m2")).unwrap();
+        let path = tmp.path().join(MAVEN_USER_SETTINGS);
+
+        let xml = maven_settings("10.89.7.2", "8888");
+        assert!(!write_our_user_settings(&path, tmp.path(), &xml).unwrap());
+        assert!(fs::read_dir(elsewhere.path()).unwrap().next().is_none(), "nothing written there");
+
+        // Even a file carrying our marker is not removed from there.
+        let marked = elsewhere.path().join("settings.xml");
+        fs::write(&marked, format!("{MAVEN_USER_SETTINGS_MARKER}\n")).unwrap();
+        remove_our_user_settings(&path, tmp.path());
+        assert!(marked.exists());
+    }
+
+    #[test]
+    fn named_settings_are_found_in_every_spelling() {
+        assert_eq!(
+            named_settings("-T 4 -gs /a.xml --settings=/b.xml -is /c.xml", Path::new("/w")),
+            [PathBuf::from("/a.xml"), PathBuf::from("/b.xml"), PathBuf::from("/c.xml")]
+        );
+        // Relative to the working directory, as Maven reads them; no `~`.
+        assert_eq!(
+            named_settings("-gs conf/g.xml --settings=~/u.xml", Path::new("/w")),
+            [PathBuf::from("/w/conf/g.xml"), PathBuf::from("/w/~/u.xml")]
+        );
+        assert_eq!(names_user_settings("-gs /a.xml"), None);
+        assert_eq!(names_user_settings("-s /u.xml"), Some("-s"));
+        assert_eq!(names_user_settings("--settings=/u.xml"), Some("--settings"));
+    }
+
+    #[test]
+    fn an_address_that_is_not_plain_configures_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vars, warnings) = setup_maven(tmp.path(), Some("http://a&b<c:8888"), None, &operator(&[]));
+        assert!(vars.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!tmp.path().join(MAVEN_GLOBAL_SETTINGS).exists(), "no unescaped XML");
+    }
+
+    #[test]
+    fn split_proxy_takes_host_and_port_from_the_url() {
+        assert_eq!(split_proxy("http://10.89.7.2:8888"), ("10.89.7.2", "8888"));
+        assert_eq!(split_proxy("http://10.89.7.2:8888/"), ("10.89.7.2", "8888"));
+        assert_eq!(split_proxy("http://[fd00::2]:8888"), ("[fd00::2]", "8888"));
+        // No port is HTTP's own, for ssh's proxyport= as much as for Maven.
+        assert_eq!(split_proxy("http://10.89.7.2"), ("10.89.7.2", "80"));
+        assert_eq!(split_proxy("http://[fd00::2]/"), ("[fd00::2]", "80"));
+    }
+
+    fn test_ca(name: &str) -> (String, Vec<u8>) {
+        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, name);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), cert.der().to_vec())
+    }
+
+    #[test]
+    fn the_java_truststore_holds_every_certificate_of_the_bundle() {
+        let (pem_a, der_a) = test_ca("base");
+        let (pem_b, der_b) = test_ca("proxy");
+        let (store, skipped) = jks_truststore(format!("{pem_a}{pem_b}").as_bytes()).unwrap();
+        assert_eq!(skipped, 0);
+
+        assert_eq!(&store[..4], &[0xFE, 0xED, 0xFE, 0xED]);
+        assert_eq!(u32::from_be_bytes(store[8..12].try_into().unwrap()), 2);
+        let find = |needle: &[u8]| store.windows(needle.len()).any(|w| w == needle);
+        assert!(find(&der_a) && find(&der_b));
+
+        let (body, digest) = store.split_at(store.len() - 20);
+        let mut expected = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+        for unit in "changeit".encode_utf16() {
+            expected.update(&unit.to_be_bytes());
+        }
+        expected.update(b"Mighty Aphrodite");
+        expected.update(body);
+        assert_eq!(digest, expected.finish().as_ref());
+    }
+
+    #[test]
+    fn a_block_java_could_not_read_is_left_out_rather_than_poisoning_the_store() {
+        let (pem, der) = test_ca("good");
+        // Valid base64, not a certificate: Java would refuse the whole store.
+        let junk = "-----BEGIN CERTIFICATE-----\nAAECAwQFBgcICQ==\n-----END CERTIFICATE-----\n";
+        let other = "-----BEGIN TRUSTED CERTIFICATE-----\nAAEC\n-----END TRUSTED CERTIFICATE-----\n";
+        // Not even base64: the PEM reader errors, and resumes after the block.
+        let undecodable = "-----BEGIN CERTIFICATE-----\n!!not base64!!\n-----END CERTIFICATE-----\n";
+        let bundle = format!("{junk}{undecodable}{other}{pem}");
+        let (store, skipped) = jks_truststore(bundle.as_bytes()).unwrap();
+        assert_eq!(skipped, 2, "the unknown label is not a certificate to count");
+        assert_eq!(u32::from_be_bytes(store[8..12].try_into().unwrap()), 1);
+        assert!(store.windows(der.len()).any(|w| w == der));
+
+        // A block with no END line, at the end of a bundle, costs only itself.
+        let unterminated = "-----BEGIN CERTIFICATE-----\nAAEC\n";
+        let (_, skipped) = jks_truststore(format!("{pem}{unterminated}").as_bytes()).unwrap();
+        assert_eq!(skipped, 1);
+
+        assert!(jks_truststore(other.as_bytes()).is_err(), "nothing usable is an error");
+        assert!(jks_truststore(undecodable.as_bytes()).is_err());
+        assert!(jks_truststore(b"not a certificate").is_err());
+    }
+
+    #[test]
+    fn a_failing_truststore_is_a_warning_not_a_dead_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle.pem");
+        fs::write(&bundle, "-----BEGIN TRUSTED CERTIFICATE-----\nAAEC\n-----END TRUSTED CERTIFICATE-----\n").unwrap();
+        let home = tmp.path().join("home");
+
+        fs::create_dir_all(&home).unwrap();
+        let (_, warnings) = setup_maven(&home, Some(PROXY), Some(&bundle), &operator(&[]));
+        assert!(warnings.iter().any(|w| w.contains("no Java truststore")), "{warnings:?}");
+        assert!(!home.join(MAVEN_TRUSTSTORE).exists());
+        assert!(home.join(MAVEN_GLOBAL_SETTINGS).exists(), "the proxy itself still goes out");
     }
 
     #[test]
