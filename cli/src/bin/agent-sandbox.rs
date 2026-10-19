@@ -946,7 +946,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option(
         "--prompt -",
         None,
-        "Feed the named agent its prompt from stdin instead of running it interactively. '-' (stdin) is the only supported value today. Requires an agent.",
+        "Feed the named agent its prompt from stdin instead of running it interactively. '-' (stdin) is the only supported value today. Requires an agent; cannot be combined with a custom `-- COMMAND`.",
     );
     print_help_option(
         "--json",
@@ -976,12 +976,12 @@ forwarding SSH, or exposing Git identity.
     print_help_option(
         "--fork ID",
         None,
-        "Resume an existing agent session as a new one (requires --prompt)",
+        "Resume an existing agent session as a new one; excludes --session (requires --prompt)",
     );
     print_help_option(
         "--max-ai-credits NUMBER",
         None,
-        "Cap the AI credits a --prompt run may spend (requires --prompt)",
+        "Cap the AI credits a --prompt run may spend; a positive integer (requires --prompt)",
     );
     // Deliberately names no agent: the help text's agent list comes from the
     // catalog, and a second copy of it here would be one more thing to drift.
@@ -2530,6 +2530,11 @@ fn run() -> Result<i32> {
     let has_custom_command = !cmd_args.is_empty();
     if want_prompt_stdin && has_custom_command {
         fail("agent-sandbox: --prompt cannot be combined with a custom command after '--'.");
+    }
+    // `--fork ID` already resumes ID; handing the agent both spellings would
+    // leave it to pick one, and the agents disagree on which.
+    if want_session.is_some() && want_fork.is_some() {
+        fail("agent-sandbox: --session and --fork are mutually exclusive; --fork already resumes the session.");
     }
 
     if cmd_args.is_empty() {

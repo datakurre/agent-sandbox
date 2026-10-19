@@ -145,22 +145,24 @@ sandbox's own `127.0.0.1` answers from inside and refuses from the host.
 ### Programmatic mode
 
 `agent-sandbox` can be run non-interactively for integration with other tools.
-Two independent flags replace the old single `--programmatic`: `--prompt -`
-controls where the agent's input comes from, `--json` controls whether stdout
-is machine-readable. `--json --prompt -` together reproduce the old
-`--programmatic` exactly; each also works alone, and `--json` works with no
-agent at all, on a plain `-- COMMAND`.
+Two independent flags cover it: `--prompt -` controls where the agent's input
+comes from, `--json` controls whether stdout is machine-readable. Combine them
+as `--prompt - --json` for one JSON result per agent run; each also works alone,
+and `--json` works with no agent at all, on a plain `-- COMMAND`.
+
+Every value-taking flag below accepts both `--flag VALUE` and `--flag=VALUE`,
+and an empty value is refused rather than passed on.
 
 | Flag | What it does |
 | --- | --- |
-| `--prompt -` | Feeds the named agent its prompt from stdin instead of running it interactively, appending agent-specific prompt arguments. `-` (stdin) is the only supported value today. Requires an agent to be named. |
+| `--prompt -` | Feeds the named agent its prompt from stdin instead of running it interactively, appending agent-specific prompt arguments. `-` (stdin) is the only supported value today. Requires an agent to be named, and cannot be combined with a custom `-- COMMAND`. |
 | `--json` | Switches stdout to machine-readable JSON and suppresses human-interactive stderr output. With `--prompt`: the whole run is captured and reported as one closing object once the agent exits — an agent turn is one unit of work, not a log to tail — and the agent is asked to speak JSON too (see below). Without `--prompt` (typically a `-- COMMAND`): one `{"type": "output", "stream": "stdout"\|"stderr", "line": ...}` object is printed per output line as it happens, so a long-running command still tails live, followed by the closing object. |
 | `--no-json` | Undoes an earlier `--json` on the same command line. |
 | `--model NAME` | Passes the specified model to the agent (e.g., `sonnet`, `opus`, `gemini-1.5-pro`). Requires `--prompt`. |
 | `--provider NAME` | Selects the agent's inference provider. Requires `--prompt`. |
 | `--session ID` | Resumes an existing agent session. Requires `--prompt`. |
-| `--fork ID` | Forks from an existing agent session — resumes it, but records the continuation as a new session. Requires `--prompt`. |
-| `--max-ai-credits NUMBER` | Caps the AI credits a single run may spend. Requires `--prompt`. |
+| `--fork ID` | Forks from an existing agent session — resumes it, but records the continuation as a new session. Cannot be combined with `--session`. Requires `--prompt`. |
+| `--max-ai-credits NUMBER` | Caps the AI credits a single run may spend. `NUMBER` must be a positive integer. Requires `--prompt`. |
 
 Every one of these is mapped per agent in `agents.nix`, because the agents do
 not agree on how to spell them: a session id is `--resume` to `claude`,

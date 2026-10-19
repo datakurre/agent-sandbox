@@ -1141,6 +1141,21 @@ fn companion_flags_in_separate_syntax_reject_empty_strings() {
 }
 
 #[test]
+fn session_and_fork_together_are_refused() {
+    // `claude` maps both, so this is the launcher refusing, not the catalog.
+    let out = World::new().run(&[
+        "--prompt", "-", "--session", "a", "--fork", "b", "claude",
+    ]);
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr.contains("--session and --fork are mutually exclusive"),
+        "stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn no_json_cancels_earlier_json_flag() {
     let out = World::new().run(&["--json", "--no-json", "--prompt", "-", "pi"]);
     assert_eq!(out.code, Some(0));
