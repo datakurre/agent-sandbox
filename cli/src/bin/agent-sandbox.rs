@@ -981,7 +981,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option(
         "--max-ai-credits NUMBER",
         None,
-        "Cap the AI credits a --prompt run may spend",
+        "Cap the AI credits a --prompt run may spend (requires --prompt)",
     );
     // Deliberately names no agent: the help text's agent list comes from the
     // catalog, and a second copy of it here would be one more thing to drift.
@@ -2053,6 +2053,9 @@ fn run() -> Result<i32> {
             }
             "--model" => {
                 if i + 1 < args.len() {
+                    if args[i + 1].is_empty() {
+                        fail("agent-sandbox: --model requires a value");
+                    }
                     want_model = Some(args[i + 1].clone());
                     i += 1;
                 } else {
@@ -2061,6 +2064,9 @@ fn run() -> Result<i32> {
             }
             "--provider" => {
                 if i + 1 < args.len() {
+                    if args[i + 1].is_empty() {
+                        fail("agent-sandbox: --provider requires a value");
+                    }
                     want_provider = Some(args[i + 1].clone());
                     i += 1;
                 } else {
@@ -2069,6 +2075,9 @@ fn run() -> Result<i32> {
             }
             "--session" => {
                 if i + 1 < args.len() {
+                    if args[i + 1].is_empty() {
+                        fail("agent-sandbox: --session requires a value");
+                    }
                     want_session = Some(args[i + 1].clone());
                     i += 1;
                 } else {
@@ -2077,6 +2086,9 @@ fn run() -> Result<i32> {
             }
             "--fork" => {
                 if i + 1 < args.len() {
+                    if args[i + 1].is_empty() {
+                        fail("agent-sandbox: --fork requires a value");
+                    }
                     want_fork = Some(args[i + 1].clone());
                     i += 1;
                 } else {
@@ -2085,6 +2097,9 @@ fn run() -> Result<i32> {
             }
             "--max-ai-credits" => {
                 if i + 1 < args.len() {
+                    if args[i + 1].is_empty() {
+                        fail("agent-sandbox: --max-ai-credits requires a value");
+                    }
                     want_max_ai_credits = Some(args[i + 1].clone());
                     i += 1;
                 } else {
@@ -2159,7 +2174,37 @@ fn run() -> Result<i32> {
                 break;
             }
             _ => {
-                if let Some(list) = arg.strip_prefix("--agent-mounts=") {
+                if let Some(v) = arg.strip_prefix("--prompt=") {
+                    if v != "-" {
+                        fail("agent-sandbox: --prompt only supports '-' (read the prompt from stdin) today.");
+                    }
+                    want_prompt_stdin = true;
+                } else if let Some(v) = arg.strip_prefix("--model=") {
+                    if v.is_empty() {
+                        fail("agent-sandbox: --model requires a value");
+                    }
+                    want_model = Some(v.to_string());
+                } else if let Some(v) = arg.strip_prefix("--provider=") {
+                    if v.is_empty() {
+                        fail("agent-sandbox: --provider requires a value");
+                    }
+                    want_provider = Some(v.to_string());
+                } else if let Some(v) = arg.strip_prefix("--session=") {
+                    if v.is_empty() {
+                        fail("agent-sandbox: --session requires a value");
+                    }
+                    want_session = Some(v.to_string());
+                } else if let Some(v) = arg.strip_prefix("--fork=") {
+                    if v.is_empty() {
+                        fail("agent-sandbox: --fork requires a value");
+                    }
+                    want_fork = Some(v.to_string());
+                } else if let Some(v) = arg.strip_prefix("--max-ai-credits=") {
+                    if v.is_empty() {
+                        fail("agent-sandbox: --max-ai-credits requires a value");
+                    }
+                    want_max_ai_credits = Some(v.to_string());
+                } else if let Some(list) = arg.strip_prefix("--agent-mounts=") {
                     let list_vec: Vec<String> = list.split(',').map(|s| s.to_string()).collect();
                     for a in &list_vec {
                         if !agent_cmd_json.contains_key(a) {
@@ -2280,6 +2325,8 @@ fn run() -> Result<i32> {
                     fail("agent-sandbox: '--port' was removed. Declare a [ports] block in AGENTS.md and pass --ports,\n               or publish directly with: --podman-args -p HOST:CONTAINER --");
                 } else if arg == "--proxy-train" || arg.starts_with("--proxy-train=") {
                     fail("agent-sandbox: '--proxy-train' was removed. Run with --proxy and watch denied\n               requests in 'agent-sandbox ctl tui'.");
+                } else if arg == "--programmatic" || arg.starts_with("--programmatic=") {
+                    fail("agent-sandbox: '--programmatic' was removed. Use '--prompt - --json' to reproduce\n               the old behavior, or '--prompt -' alone for unbuffered text.");
                 } else if let Some(v) = arg.strip_prefix("-e") {
                     env_args.push("-e".to_string());
                     env_args.push(v.to_string());
@@ -2482,6 +2529,11 @@ fn run() -> Result<i32> {
         }
     }
 
+    let has_custom_command = !cmd_args.is_empty();
+    if want_prompt_stdin && has_custom_command {
+        fail("agent-sandbox: --prompt cannot be combined with a custom command after '--'.");
+    }
+
     if cmd_args.is_empty() {
         if agent.is_empty() {
             cmd_args.push("bash".to_string());
@@ -2547,8 +2599,9 @@ fn run() -> Result<i32> {
         }
 
         if let Some(limit) = want_max_ai_credits {
-            if limit.parse::<u32>().is_err() {
-                fail("agent-sandbox: --max-ai-credits must be a positive integer.");
+            match limit.parse::<u32>() {
+                Ok(n) if n > 0 => {}
+                _ => fail("agent-sandbox: --max-ai-credits must be a positive integer."),
             }
             cmd_args.extend(agent_flag_args(
                 &agent_credit_limit_arg_json,

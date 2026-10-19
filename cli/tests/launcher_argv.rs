@@ -966,6 +966,45 @@ fn max_ai_credits_without_prompt_fails() {
 }
 
 #[test]
+fn session_without_prompt_fails() {
+    let out = World::new().run(&["--session", "s1", "opencode"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr.contains("--session requires --prompt"),
+        "unexpected stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn fork_without_prompt_fails() {
+    let out = World::new().run(&["--fork", "s1", "opencode"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr.contains("--fork requires --prompt"),
+        "unexpected stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn provider_without_prompt_fails() {
+    let out = World::new().run(&["--provider", "anthropic", "pi"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr.contains("--provider requires --prompt"),
+        "unexpected stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn max_ai_credits_rejects_unsupported_agent() {
     let out = World::new().run(&["--json", "--prompt", "-", "--max-ai-credits", "50", "opencode"]);
 
@@ -1000,6 +1039,256 @@ fn max_ai_credits_rejects_non_numeric_value() {
             .contains("--max-ai-credits must be a positive integer"),
         "unexpected stderr in JSON: {:?}",
         json["stderr"]
+    );
+}
+
+#[test]
+fn max_ai_credits_rejects_zero() {
+    let out = World::new().run(&["--json", "--prompt", "-", "--max-ai-credits", "0", "copilot"]);
+
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    let json: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("valid JSON error output");
+    assert_eq!(json["status"], 1);
+    assert!(
+        json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("--max-ai-credits must be a positive integer"),
+        "unexpected stderr in JSON: {:?}",
+        json["stderr"]
+    );
+
+    let out_plain = World::new().run(&["--prompt", "-", "--max-ai-credits", "0", "copilot"]);
+    assert_eq!(out_plain.code, Some(1));
+    assert!(!out_plain.reached_podman_run());
+    assert!(
+        out_plain.stderr.contains("--max-ai-credits must be a positive integer"),
+        "unexpected stderr: {}",
+        out_plain.stderr
+    );
+
+    let out_eq = World::new().run(&["--prompt", "-", "--max-ai-credits=0", "copilot"]);
+    assert_eq!(out_eq.code, Some(1));
+    assert!(!out_eq.reached_podman_run());
+    assert!(
+        out_eq.stderr.contains("--max-ai-credits must be a positive integer"),
+        "unexpected stderr: {}",
+        out_eq.stderr
+    );
+}
+
+#[test]
+fn companion_flags_require_values() {
+    for (flag, expected) in &[
+        ("--prompt", "--prompt requires a value"),
+        ("--model", "--model requires a value"),
+        ("--session", "--session requires a value"),
+        ("--fork", "--fork requires a value"),
+        ("--provider", "--provider requires a value"),
+        ("--max-ai-credits", "--max-ai-credits requires a value"),
+    ] {
+        let out = World::new().run(&[flag]);
+        assert_eq!(out.code, Some(1));
+        assert!(!out.reached_podman_run());
+        assert!(
+            out.stderr.contains(expected),
+            "flag {} did not produce expected error; stderr: {}",
+            flag,
+            out.stderr
+        );
+    }
+
+    for (flag, expected) in &[
+        ("--model=", "--model requires a value"),
+        ("--session=", "--session requires a value"),
+        ("--fork=", "--fork requires a value"),
+        ("--provider=", "--provider requires a value"),
+        ("--max-ai-credits=", "--max-ai-credits requires a value"),
+    ] {
+        let out = World::new().run(&[flag]);
+        assert_eq!(out.code, Some(1));
+        assert!(!out.reached_podman_run());
+        assert!(
+            out.stderr.contains(expected),
+            "flag {} did not produce expected error; stderr: {}",
+            flag,
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn companion_flags_in_separate_syntax_reject_empty_strings() {
+    for (flag, expected) in &[
+        ("--model", "--model requires a value"),
+        ("--session", "--session requires a value"),
+        ("--fork", "--fork requires a value"),
+        ("--provider", "--provider requires a value"),
+        ("--max-ai-credits", "--max-ai-credits requires a value"),
+    ] {
+        let out = World::new().run(&["--prompt", "-", flag, "", "claude"]);
+        assert_eq!(out.code, Some(1), "for flag {}", flag);
+        assert!(!out.reached_podman_run(), "for flag {}", flag);
+        assert!(
+            out.stderr.contains(expected),
+            "flag {} did not produce expected error; stderr: {}",
+            flag,
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn programmatic_flag_produces_migration_hint() {
+    for flag in &["--programmatic", "--programmatic=true"] {
+        let out = World::new().run(&[flag]);
+        assert_eq!(out.code, Some(1));
+        assert!(!out.reached_podman_run());
+        assert!(
+            out.stderr.contains("'--programmatic' was removed"),
+            "stderr for {}: {}",
+            flag,
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("Use '--prompt - --json' to reproduce"),
+            "stderr for {}: {}",
+            flag,
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn no_json_cancels_earlier_json_flag() {
+    let out = World::new().run(&["--json", "--no-json", "--prompt", "-", "pi"]);
+    assert_eq!(out.code, Some(0));
+    let run = out.run_call();
+    assert_eq!(run.command(), vec!["pi", "-p"]);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&out.stdout).is_err(),
+        "stdout should not be JSON envelope: {}",
+        out.stdout
+    );
+}
+
+#[test]
+fn flag_equals_value_syntax_for_companion_flags() {
+    let out = World::new().run(&[
+        "--json",
+        "--prompt=-",
+        "--model=sonnet",
+        "claude",
+    ]);
+    assert_eq!(out.code, Some(0));
+    assert_eq!(
+        out.run_call().command(),
+        vec!["claude", "-p", "-", "--model", "sonnet"]
+    );
+
+    let out_session = World::new().run(&[
+        "--json",
+        "--prompt=-",
+        "--session=s1",
+        "opencode",
+    ]);
+    assert_eq!(out_session.code, Some(0));
+    assert_eq!(
+        out_session.run_call().command(),
+        vec!["opencode", ".", "--prompt", "-", "--session", "s1"]
+    );
+
+    let out_fork = World::new().run(&[
+        "--json",
+        "--prompt=-",
+        "--fork=s1",
+        "opencode",
+    ]);
+    assert_eq!(out_fork.code, Some(0));
+    assert_eq!(
+        out_fork.run_call().command(),
+        vec!["opencode", ".", "--prompt", "-", "--session", "s1", "--fork"]
+    );
+
+    let out_provider = World::new().run(&[
+        "--json",
+        "--prompt=-",
+        "--provider=anthropic",
+        "pi",
+    ]);
+    assert_eq!(out_provider.code, Some(0));
+    assert_eq!(
+        out_provider.run_call().command(),
+        vec!["pi", "-p", "--mode", "json", "--provider", "anthropic"]
+    );
+
+    let out_credits = World::new().run(&[
+        "--json",
+        "--prompt=-",
+        "--max-ai-credits=50",
+        "copilot",
+    ]);
+    assert_eq!(out_credits.code, Some(0));
+    assert_eq!(
+        out_credits.run_call().command(),
+        vec!["copilot", "-p", "-", "--max-ai-credits", "50"]
+    );
+
+    let out_bad_prompt = World::new().run(&["--prompt=text", "claude"]);
+    assert_eq!(out_bad_prompt.code, Some(1));
+    assert!(!out_bad_prompt.reached_podman_run());
+    assert!(
+        out_bad_prompt.stderr.contains("--prompt only supports '-'"),
+        "stderr: {}",
+        out_bad_prompt.stderr
+    );
+}
+
+#[test]
+fn prompt_cannot_be_combined_with_custom_command_after_double_dash() {
+    let out = World::new().run(&["--prompt", "-", "opencode", "--", "echo", "hi"]);
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr
+            .contains("--prompt cannot be combined with a custom command after '--'"),
+        "stderr: {}",
+        out.stderr
+    );
+
+    let out_bare = World::new().run(&["--prompt", "-", "--", "echo", "hi"]);
+    assert_eq!(out_bare.code, Some(1));
+    assert!(!out_bare.reached_podman_run());
+    assert!(
+        out_bare.stderr
+            .contains("--prompt cannot be combined with a custom command after '--'"),
+        "stderr: {}",
+        out_bare.stderr
+    );
+}
+
+#[test]
+fn prompt_bundled_cannot_be_combined_with_custom_command_after_double_dash() {
+    let out = World::new().run(&["--prompt=-", "opencode", "--", "echo", "hi"]);
+    assert_eq!(out.code, Some(1));
+    assert!(!out.reached_podman_run());
+    assert!(
+        out.stderr
+            .contains("--prompt cannot be combined with a custom command after '--'"),
+        "stderr: {}",
+        out.stderr
+    );
+
+    let out_bare = World::new().run(&["--prompt=-", "--", "echo", "hi"]);
+    assert_eq!(out_bare.code, Some(1));
+    assert!(!out_bare.reached_podman_run());
+    assert!(
+        out_bare.stderr
+            .contains("--prompt cannot be combined with a custom command after '--'"),
+        "stderr: {}",
+        out_bare.stderr
     );
 }
 
@@ -1076,6 +1365,25 @@ fn prompt_value_that_names_a_ctl_subcommand_is_not_dispatched_to_ctl() {
         out.stderr.contains("--prompt only supports '-'"),
         "unexpected stderr: {}",
         out.stderr
+    );
+}
+
+#[test]
+fn companion_flags_with_values_matching_ctl_subcommands_run_the_agent() {
+    let out_separate = World::new().run(&["--prompt", "-", "--model", "status", "claude"]);
+    assert_eq!(out_separate.code, Some(0));
+    assert!(out_separate.reached_podman_run());
+    assert_eq!(
+        out_separate.run_call().command(),
+        vec!["claude", "-p", "-", "--model", "status"]
+    );
+
+    let out_bundled = World::new().run(&["--prompt", "-", "--model=status", "claude"]);
+    assert_eq!(out_bundled.code, Some(0));
+    assert!(out_bundled.reached_podman_run());
+    assert_eq!(
+        out_bundled.run_call().command(),
+        vec!["claude", "-p", "-", "--model", "status"]
     );
 }
 
