@@ -21,6 +21,12 @@ rand = "0.8"
 uuid = { version = "1.0", features = ["v4"] }
 libc = "0.2"
 agent-sandbox-proxy = { path = "../proxy" }
+ring = "0.17" # SHA-1 for the integrity digest of the JKS truststore Maven gets
+rustls-pki-types = "1.8.0" # PEM parsing for the JKS truststore
+rustls-webpki = "0.103" # parses each certificate before Java has to
+
+[dev-dependencies]
+rcgen = "0.13.1"
 
 [[bin]]
 name = "agent-sandbox"

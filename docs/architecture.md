@@ -73,6 +73,7 @@ the canonical tree from each tool's own discovery path. See
    built-in `fetch` (undici) stop dialing out directly — this also covers
    the bundled Node-based agent CLIs, which share Node's runtime. An
    operator's own explicit `NODE_USE_ENV_PROXY` setting is left alone.
+   Maven gets its own treatment, described in [Maven](#maven) below.
 5. Starts the host-loopback bridge: a copy of itself that listens on TCP and
    on a unix socket for each `--host-loopback-port` mapping, because the
    clients that want them speak TCP and the launcher reaches in over the
@@ -216,6 +217,109 @@ every client that does use the proxy, since such a client never resolves the
 name.  A transparent client that is denied gets a closed socket rather than a
 `403`, because it is mid-handshake and would read the status line as a TLS
 record.
+
+### Maven
+
+Maven's resolver reads neither the proxy environment nor the JVM's
+`https.proxyHost` property, only `<proxies>` in its settings. So under
+`--proxy` the entrypoint writes `~/.config/agent-sandbox/maven-settings.xml`,
+with an `http` and an `https` proxy entry, and passes it as Maven's *global*
+settings (`-gs`). It leaves `~/.m2/settings.xml` to the operator: Maven merges
+the two files with the user's dominant, so one the operator mounts -- even
+read-only -- keeps its mirrors and servers and still gains the proxy. A proxy
+that file declares itself, active for the same protocol, wins. `-gs` *replaces*
+the Maven installation's own `conf/settings.xml`, which is empty in a stock
+Maven but may hold mirrors in a distribution's or a company's build.
+
+The entrypoint also exports the sidecar's address as
+`AGENT_SANDBOX_PROXY_HOST`, so a settings file the operator keeps can point at
+it although the address changes with every launch. Maven interpolates `${env.*}`
+in settings; the port has to be written out, because Maven 3.9 parses `<port>`
+as a number before it interpolates anything, and the sidecar's is always 8888:
+
+```xml
+<proxy>
+  <id>agent-sandbox</id>
+  <active>true</active>
+  <protocol>https</protocol>
+  <host>${env.AGENT_SANDBOX_PROXY_HOST}</host>
+  <port>8888</port>
+</proxy>
+```
+
+Outside a sandbox that variable is unset and the proxy unresolvable, so such an
+entry belongs in a settings file used only in the sandbox.
+
+The flag is handed over twice, because there are two launchers and each reads
+only its own variable:
+
+| Launcher | Reads | Gets |
+| --- | --- | --- |
+| `mvn` 3.9+ and 4, script-only `mvnw` (which execs `mvn`) | `MAVEN_ARGS` | `-gs <settings>` |
+| jar-based `mvnw` (`.mvn/wrapper/maven-wrapper.jar`) | `MAVEN_CONFIG` | `-gs <settings>` |
+| both, and the wrapper's own download of Maven | `MAVEN_OPTS` | `-Dhttp(s).proxyHost`/`proxyPort`, for plugins that download through `java.net` themselves |
+
+When the policy has an L7 rule, so the proxy terminates TLS, the JVM needs the
+session CA too, and it ignores `SSL_CERT_FILE`. The entrypoint therefore also
+writes the merged CA bundle as a JKS keystore,
+`~/.cache/agent-sandbox-ca-bundle.jks`, and adds `-Djavax.net.ssl.trustStore`
+for it to `MAVEN_OPTS`. Each certificate is parsed before it goes in, because
+a single one Java cannot read would fail the whole keystore and with it every
+TLS connection Maven makes; one that does not parse is left out, with a
+warning.
+
+Ours goes first in each variable, ahead of anything the operator set. In
+`MAVEN_OPTS` that means a property the operator repeats wins, since the JVM keeps
+the last `-D`. Settings are the opposite: of two `-gs`, Maven keeps the
+*first*, so an operator `MAVEN_ARGS` or `MAVEN_CONFIG` that already names global
+settings (`-gs`, `--global-settings`, or Maven 4's `-is`/`--install-settings`) is
+left alone instead.
+
+Maven 4's `mvn` runs `MAVEN_OPTS` through `eval`. So every path and address
+that goes into these variables must stay one word, unchanged, through word
+splitting and `eval` -- no spaces, quotes, `$`, globs or `|`. That is why
+`MAVEN_OPTS` carries no `http.nonProxyHosts`: its `|` list would be read as a
+pipe. It needs none, since the JDK never proxies loopback.
+
+**The fallback.** When some launcher cannot be given the global settings --
+the operator's variable already names their own, a path is not shell-safe, or
+the file could not be written -- the proxy goes into `~/.m2/settings.xml`
+instead, but only if there is no such file yet and `~/.m2` is on the
+container's own filesystem. A `~/.m2` bound in from the host is never written
+to: the file would outlive the session and send the host's own builds to a
+sidecar that no longer exists. The fallback starts with a marker comment, so a
+later run of the entrypoint replaces or removes it, again only on the
+container's own filesystem.
+
+Otherwise the entrypoint prints a warning saying how to wire the operator's
+file to `AGENT_SANDBOX_PROXY_HOST`, as above -- unless one of the settings files
+in play already mentions that variable, or the operator's `-s`/`--settings`
+means Maven would not read `~/.m2/settings.xml` at all, which the warning then
+says instead.
+
+Nothing in this step can stop the sandbox from starting. A failure -- a CA
+bundle with no usable certificate, a file that cannot be written -- is printed
+as an `entrypoint: --proxy and Maven:` warning, and the rest goes ahead.
+
+What is left over:
+
+- A `-gs` typed on the `mvn` command line, or kept in a project's
+  `.mvn/maven.config`, loses to ours. Put it in `MAVEN_ARGS` instead, or, on
+  Maven 4, use `-is`, which takes precedence over `-gs`.
+- Maven 4 prints a deprecation warning for `-gs` on every run. It still honours
+  the flag, and Maven 3.9 knows no other spelling, so the warning is the price
+  of one value that works for both.
+- `mvn` older than 3.9 reads no `MAVEN_ARGS`, and the entrypoint cannot tell
+  which Maven will run. Such a Maven is proxied through a jar-based `mvnw`,
+  which passes `MAVEN_CONFIG` to any Maven, or through user settings the
+  operator wires to `AGENT_SANDBOX_PROXY_HOST`.
+- A Maven that ignores every one of these still reaches a host the policy names
+  exactly, though not one matched only by a wildcard, through the
+  [transparent listeners](#transparent-listeners-for-clients-that-cannot-be-pointed-at-a-proxy).
+- An operator `MAVEN_CONFIG` holding a directory, as the official Maven
+  container images set it (`/root/.m2`), gets `-gs <settings>` in front of it.
+  `mvn` never passes `MAVEN_CONFIG` on as arguments, and a jar-based `mvnw` was
+  already reading that directory as a goal.
 
 ### The proxy
 
