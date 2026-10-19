@@ -666,11 +666,20 @@ fn write_attach_env(home_path: &Path) {
     }
 }
 
-/// `http://10.89.7.2:8888` → (`10.89.7.2`, `8888`).
+/// `http://10.89.7.2:8888` → (`10.89.7.2`, `8888`).  An IPv6 host keeps its
+/// brackets.  A URL without a port means 80, as it does to curl: the ssh
+/// config built from this once got an empty `proxyport=` instead.
 fn split_proxy(http_proxy: &str) -> (&str, &str) {
     let host_port = http_proxy.split("://").last().unwrap_or(http_proxy);
     let host_port = host_port.trim_end_matches('/');
-    host_port.rsplit_once(':').unwrap_or((host_port, "80"))
+    let port_from = match host_port.find(']') {
+        Some(end) if host_port.starts_with('[') => end + 1,
+        _ => 0,
+    };
+    match host_port[port_from..].rfind(':') {
+        Some(colon) => (&host_port[..port_from + colon], &host_port[port_from + colon + 1..]),
+        None => (host_port, "80"),
+    }
 }
 
 /// Maven's global settings under `--proxy`, relative to home.  Beside the
@@ -812,7 +821,10 @@ fn setup_maven(
     // named, or their own user settings, may carry the proxy already.
     let why = plan.unproxied.join("; ");
     let theirs: Vec<String> = ["MAVEN_ARGS", "MAVEN_CONFIG"].iter().map(|n| existing(n)).collect();
-    let mut candidates: Vec<PathBuf> = theirs.iter().flat_map(|v| named_settings(v)).collect();
+    // Maven resolves a relative settings path against the working directory,
+    // which is the workspace podman starts us in.
+    let cwd = env::current_dir().unwrap_or_default();
+    let mut candidates: Vec<PathBuf> = theirs.iter().flat_map(|v| named_settings(v, &cwd)).collect();
     candidates.push(user.clone());
     let wired = candidates.iter().any(|path| {
         fs::read_to_string(path).is_ok_and(|content| content.contains(PROXY_HOST_ENV))
@@ -892,8 +904,10 @@ fn write_our_user_settings(path: &Path, home_path: &Path, settings_xml: &str) ->
 }
 
 /// The settings files `existing` names with `-gs`, `-is` or `-s` and their
-/// long forms, in either `-gs FILE` or `--global-settings=FILE` spelling.
-fn named_settings(existing: &str) -> Vec<PathBuf> {
+/// long forms, in either `-gs FILE` or `--global-settings=FILE` spelling.  A
+/// relative path is resolved against `cwd`, as Maven resolves it; a leading
+/// `~` is not expanded, because Maven does not expand it either.
+fn named_settings(existing: &str, cwd: &Path) -> Vec<PathBuf> {
     const FLAGS: [&str; 6] = ["-gs", "-is", "-s", "--global-settings", "--install-settings", "--settings"];
     let words: Vec<&str> = existing.split_whitespace().collect();
     let mut paths = Vec::new();
@@ -901,10 +915,10 @@ fn named_settings(existing: &str) -> Vec<PathBuf> {
         for flag in FLAGS {
             if *word == flag {
                 if let Some(next) = words.get(index + 1) {
-                    paths.push(PathBuf::from(next));
+                    paths.push(cwd.join(next));
                 }
             } else if let Some(value) = word.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
-                paths.push(PathBuf::from(value));
+                paths.push(cwd.join(value));
             }
         }
     }
@@ -938,6 +952,10 @@ struct MavenEnv {
 /// mvnw starts Maven in its own JVM and reads MAVEN_CONFIG.  Neither reads the
 /// other's, so `-gs` is never passed twice.  Maven 4 calls `-gs` deprecated
 /// but honours it, and Maven 3.9 knows no other spelling.
+///
+/// `proxy_host` and `proxy_port` are already checked with `shell_word` by
+/// `setup_maven`, and the host has lost any IPv6 brackets, which the JVM's
+/// properties do not take.
 fn maven_env(
     proxy_host: &str,
     proxy_port: &str,
@@ -949,18 +967,10 @@ fn maven_env(
 
     // The JVM properties are for what settings do not reach: plugins that
     // download through java.net themselves, and the wrapper jar fetching Maven.
-    let mut opts = Vec::new();
-    let host = proxy_host.trim_start_matches('[').trim_end_matches(']');
-    if shell_word(host) && shell_word(proxy_port) {
-        opts.push(format!(
-            "-Dhttp.proxyHost={host} -Dhttp.proxyPort={proxy_port} \
-             -Dhttps.proxyHost={host} -Dhttps.proxyPort={proxy_port}"
-        ));
-    } else {
-        plan.warnings.push(format!(
-            "proxy address {proxy_host}:{proxy_port} is not shell-safe; MAVEN_OPTS carries no proxy"
-        ));
-    }
+    let mut opts = vec![format!(
+        "-Dhttp.proxyHost={proxy_host} -Dhttp.proxyPort={proxy_port} \
+         -Dhttps.proxyHost={proxy_host} -Dhttps.proxyPort={proxy_port}"
+    )];
     match truststore {
         Some(path) if shell_word(path) => opts.push(format!(
             "-Djavax.net.ssl.trustStore={path} -Djavax.net.ssl.trustStoreType=JKS"
@@ -970,10 +980,8 @@ fn maven_env(
             .push(format!("truststore path {path} is not shell-safe; MAVEN_OPTS does not name it")),
         None => {}
     }
-    if !opts.is_empty() {
-        plan.vars
-            .push(("MAVEN_OPTS", prepend_flags(&opts.join(" "), &existing("MAVEN_OPTS"))));
-    }
+    plan.vars
+        .push(("MAVEN_OPTS", prepend_flags(&opts.join(" "), &existing("MAVEN_OPTS"))));
 
     for name in ["MAVEN_ARGS", "MAVEN_CONFIG"] {
         let theirs = existing(name);
@@ -1036,12 +1044,12 @@ fn jks_truststore(pem: &[u8]) -> Result<(Vec<u8>, usize)> {
 
     let mut certs = Vec::new();
     let mut skipped = 0;
+    // A block that does not even decode -- bad base64, no END line -- is
+    // skipped like one that does not parse; the iterator resumes after it.
     for cert in CertificateDer::pem_slice_iter(pem) {
-        let cert = cert.map_err(|e| anyhow::anyhow!("reading the CA bundle: {e:?}"))?;
-        if webpki::anchor_from_trusted_cert(&cert).is_ok() {
-            certs.push(cert);
-        } else {
-            skipped += 1;
+        match cert {
+            Ok(cert) if webpki::anchor_from_trusted_cert(&cert).is_ok() => certs.push(cert),
+            _ => skipped += 1,
         }
     }
     anyhow::ensure!(!certs.is_empty(), "the CA bundle holds no usable CERTIFICATE block");
@@ -1292,8 +1300,14 @@ mod tests {
 
     #[test]
     fn an_ipv6_sidecar_is_named_without_brackets_for_the_jvm() {
-        let plan = maven_env("[fd00::2]", "8888", Some(SETTINGS), None, &operator(&[]));
-        assert!(var(&plan, "MAVEN_OPTS").unwrap().contains("-Dhttps.proxyHost=fd00::2 "));
+        let tmp = tempfile::tempdir().unwrap();
+        let (vars, warnings) = setup_maven(tmp.path(), Some("http://[fd00::2]:8888"), None, &operator(&[]));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let opts = &vars.iter().find(|(n, _)| *n == "MAVEN_OPTS").unwrap().1;
+        assert!(opts.contains("-Dhttps.proxyHost=fd00::2 "), "{opts}");
+        assert!(vars.contains(&(PROXY_HOST_ENV, "fd00::2".to_string())));
+        let settings = fs::read_to_string(tmp.path().join(MAVEN_GLOBAL_SETTINGS)).unwrap();
+        assert!(settings.contains("<host>fd00::2</host>"), "{settings}");
     }
 
     #[test]
@@ -1437,8 +1451,13 @@ mod tests {
     #[test]
     fn named_settings_are_found_in_every_spelling() {
         assert_eq!(
-            named_settings("-T 4 -gs /a.xml --settings=/b.xml -is /c.xml"),
+            named_settings("-T 4 -gs /a.xml --settings=/b.xml -is /c.xml", Path::new("/w")),
             [PathBuf::from("/a.xml"), PathBuf::from("/b.xml"), PathBuf::from("/c.xml")]
+        );
+        // Relative to the working directory, as Maven reads them; no `~`.
+        assert_eq!(
+            named_settings("-gs conf/g.xml --settings=~/u.xml", Path::new("/w")),
+            [PathBuf::from("/w/conf/g.xml"), PathBuf::from("/w/~/u.xml")]
         );
         assert_eq!(names_user_settings("-gs /a.xml"), None);
         assert_eq!(names_user_settings("-s /u.xml"), Some("-s"));
@@ -1458,6 +1477,10 @@ mod tests {
     fn split_proxy_takes_host_and_port_from_the_url() {
         assert_eq!(split_proxy("http://10.89.7.2:8888"), ("10.89.7.2", "8888"));
         assert_eq!(split_proxy("http://10.89.7.2:8888/"), ("10.89.7.2", "8888"));
+        assert_eq!(split_proxy("http://[fd00::2]:8888"), ("[fd00::2]", "8888"));
+        // No port is HTTP's own, for ssh's proxyport= as much as for Maven.
+        assert_eq!(split_proxy("http://10.89.7.2"), ("10.89.7.2", "80"));
+        assert_eq!(split_proxy("http://[fd00::2]/"), ("[fd00::2]", "80"));
     }
 
     fn test_ca(name: &str) -> (String, Vec<u8>) {
@@ -1497,12 +1520,21 @@ mod tests {
         // Valid base64, not a certificate: Java would refuse the whole store.
         let junk = "-----BEGIN CERTIFICATE-----\nAAECAwQFBgcICQ==\n-----END CERTIFICATE-----\n";
         let other = "-----BEGIN TRUSTED CERTIFICATE-----\nAAEC\n-----END TRUSTED CERTIFICATE-----\n";
-        let (store, skipped) = jks_truststore(format!("{junk}{other}{pem}").as_bytes()).unwrap();
-        assert_eq!(skipped, 1, "the unknown label is not a certificate to count");
+        // Not even base64: the PEM reader errors, and resumes after the block.
+        let undecodable = "-----BEGIN CERTIFICATE-----\n!!not base64!!\n-----END CERTIFICATE-----\n";
+        let bundle = format!("{junk}{undecodable}{other}{pem}");
+        let (store, skipped) = jks_truststore(bundle.as_bytes()).unwrap();
+        assert_eq!(skipped, 2, "the unknown label is not a certificate to count");
         assert_eq!(u32::from_be_bytes(store[8..12].try_into().unwrap()), 1);
         assert!(store.windows(der.len()).any(|w| w == der));
 
+        // A block with no END line, at the end of a bundle, costs only itself.
+        let unterminated = "-----BEGIN CERTIFICATE-----\nAAEC\n";
+        let (_, skipped) = jks_truststore(format!("{pem}{unterminated}").as_bytes()).unwrap();
+        assert_eq!(skipped, 1);
+
         assert!(jks_truststore(other.as_bytes()).is_err(), "nothing usable is an error");
+        assert!(jks_truststore(undecodable.as_bytes()).is_err());
         assert!(jks_truststore(b"not a certificate").is_err());
     }
 
