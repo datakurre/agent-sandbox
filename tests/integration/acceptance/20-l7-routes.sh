@@ -59,3 +59,17 @@ assert_contains "$out" "ABSENT" "the session CA under an L4-only policy"
 # ...and an L4 rule for the same host still passes traffic through untouched.
 out="$(sandbox_run --workspace --proxy -- bash -c "$code https://example.com/ || echo BLOCKED")"
 assert_contains "$out" "200" "an L4-allowed host with no interception"
+
+# The proxy originates its own TLS to the origin, and some origins still stop
+# at TLS 1.2: registry.npmjs.org answers a 1.3-only ClientHello with a
+# protocol_version alert, which the sandbox client sees as a dropped connection.
+cat > AGENTS.md <<'EOF2'
+```toml agent-sandbox
+[[network.allowed_routes]]
+host = "registry.npmjs.org"
+method = "GET"
+path = "/**"
+```
+EOF2
+out="$(sandbox_run --workspace --proxy -- bash -c "$code https://registry.npmjs.org/-/ping || echo BLOCKED")"
+assert_contains "$out" "200" "an intercepted origin that negotiates TLS 1.2"
