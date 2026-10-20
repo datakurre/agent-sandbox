@@ -353,6 +353,39 @@ pub fn resolve_secrets_with_policies(
                     anyhow::bail!("agent-sandbox: 'bindings' must be a list in secrets config");
                 }
             }
+            // Said outright rather than left to serde or dropped: a rule that
+            // leaves `method` out would otherwise fail as a bare "missing
+            // field", or read as unauthorized with a fix that does not name it.
+            let network_routes = val
+                .get("network")
+                .and_then(|n| n.get("allowed_routes"))
+                .map(|r| ("[[network.allowed_routes]]", r));
+            let legacy_routes = ["bindings", "secret", "secrets", "rules"]
+                .into_iter()
+                .filter_map(|key| val.get(key).map(|r| (key, r)));
+            for (label, rules) in network_routes.into_iter().chain(legacy_routes) {
+                for (i, rule) in rules.as_array().into_iter().flatten().enumerate() {
+                    if rule.get("secret").is_none() {
+                        continue;
+                    }
+                    match rule.get("method") {
+                        Some(m) if m.is_str() => {}
+                        Some(_) => anyhow::bail!(
+                            "agent-sandbox: {}: {}[{}].method: must be a string (e.g. method = \"GET\" or method = \"*\").",
+                            config.display(),
+                            label,
+                            i
+                        ),
+                        None => anyhow::bail!(
+                            "agent-sandbox: {}: {}[{}]: missing required field 'method', as in AGENTS.md. Specify an HTTP method (e.g. method = \"GET\" or method = \"*\").",
+                            config.display(),
+                            label,
+                            i
+                        ),
+                    }
+                }
+            }
+
             let mut host_config: HostConfig = match toml::from_str(&c) {
                 Ok(v) => v,
                 Err(e) => {
@@ -367,17 +400,7 @@ pub fn resolve_secrets_with_policies(
             // manually extract [[network.allowed_routes]] and add to bindings
             if let Some(network) = val.get("network").and_then(|v| v.as_table()) {
                 if let Some(rules) = network.get("allowed_routes").and_then(|v| v.as_array()) {
-                    for (i, rule) in rules.iter().enumerate() {
-                        // Said outright rather than dropped with the rest: a
-                        // rule that leaves `method` out would otherwise read as
-                        // unauthorized, and the fix offered would not name it.
-                        if rule.get("secret").is_some() && rule.get("method").is_none() {
-                            anyhow::bail!(
-                                "agent-sandbox: {}: [[network.allowed_routes]][{}]: missing required field 'method', as in AGENTS.md. Specify an HTTP method (e.g. method = \"GET\" or method = \"*\").",
-                                config.display(),
-                                i
-                            );
-                        }
+                    for rule in rules {
                         if let Ok(hb) = rule.clone().try_into::<HostBinding>() {
                             host_config.bindings.push(hb);
                         }
@@ -864,6 +887,36 @@ prefix = "Bearer "
         .to_string();
         assert!(err.contains("missing required field 'method'"), "{err}");
         assert!(err.contains("[[network.allowed_routes]][0]"), "{err}");
+
+        // The legacy `bindings` table and its aliases say it the same way,
+        // and a method that is not a string is named rather than dropped.
+        for (trusted, expected) in [
+            (
+                "[[bindings]]\nhost = \"api.example.com:443\"\npath = \"/user\"\nsecret = \"TOKEN\"\n",
+                "bindings[0]: missing required field 'method'",
+            ),
+            (
+                "[[rules]]\nhost = \"api.example.com:443\"\nmethod = \"GET\"\nsecret = \"A\"\n\
+                 [[rules]]\nhost = \"api.example.com:443\"\nsecret = \"B\"\n",
+                "rules[1]: missing required field 'method'",
+            ),
+            (
+                "[[network.allowed_routes]]\nhost = \"api.example.com:443\"\nmethod = 1\n\
+                 path = \"/user\"\nsecret = \"TOKEN\"\n",
+                "[[network.allowed_routes]][0].method: must be a string",
+            ),
+        ] {
+            std::fs::write(dir.path().join("trusted.toml"), trusted).unwrap();
+            let err = resolve_secrets_logic(
+                &dir.path().join("policy"),
+                &dir.path().join("trusted.toml"),
+                &dir.path().join("secretspec.toml"),
+                &dir.path().join("AGENTS.md"),
+            )
+            .expect_err(trusted)
+            .to_string();
+            assert!(err.contains(expected), "{trusted}\n{err}");
+        }
     }
 
     #[test]
