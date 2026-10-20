@@ -570,6 +570,115 @@ pub fn route_path(path: Option<&str>) -> &str {
     }
 }
 
+/// One HTTP route, validated but not yet compiled into policy lines.
+struct RouteSpec {
+    /// Where the route was written, for error messages:
+    /// `[[network.allowed_routes]][i]`.
+    ctx: String,
+    /// `domain[:ports]`, as written.
+    host: String,
+    method: String,
+    /// Already defaulted: `/**` when the rule names none.
+    path: String,
+    has_secret: bool,
+}
+
+fn parse_route_table(i: usize, rule_val: &Value) -> Result<RouteSpec, ConfigError> {
+    let rule = rule_val.as_table().ok_or_else(|| {
+        ConfigError::msg(format!(
+            "[[network.allowed_routes]][{}]: must be a table",
+            i
+        ))
+    })?;
+
+    let allowed_rule_keys: HashSet<&str> = ["host", "method", "path", "secret", "header", "prefix"]
+        .iter()
+        .cloned()
+        .collect();
+    if let Some(unknown_key) = rule
+        .keys()
+        .find(|k| !allowed_rule_keys.contains(k.as_str()))
+    {
+        return Err(ConfigError::msg(format!("[[network.allowed_routes]][{}]: unknown field '{}'. Valid keys under [[network.allowed_routes]] are 'host', 'method', 'path', 'secret', 'header', and 'prefix'.", i, unknown_key)));
+    }
+
+    let host_val = rule.get("host").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'host'. Example: host = \"registry.npmjs.org:443\".", i)))?;
+    let method = rule.get("method").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'method'. Specify an HTTP method (e.g. method = \"GET\", method = \"POST\", or method = \"*\").", i)))?;
+    let path = match rule.get("path") {
+        None => DEFAULT_ROUTE_PATH,
+        Some(v) => route_path(Some(v.as_str().ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}].path: must be a string. Example: path = \"/api/*\", or omit it to allow every path.", i)))?)),
+    };
+
+    if method != "*" && (!method.chars().all(|c| c.is_ascii_uppercase()) || method.is_empty()) {
+        return Err(ConfigError::msg(format!("[[network.allowed_routes]][{}].method: '{}' must be uppercase (e.g. method = \"GET\" or method = \"*\").", i, method)));
+    }
+    if !path.starts_with('/') {
+        return Err(ConfigError::msg(format!("[[network.allowed_routes]][{}].path: 'path' must start with '/'. Change to path = \"/{}\".", i, path.trim_start_matches('/'))));
+    }
+    if let Some(secret) = rule.get("secret") {
+        if !secret.is_str() {
+            return Err(ConfigError::msg(format!(
+                "[[network.allowed_routes]][{}].secret: must be a string",
+                i
+            )));
+        }
+    }
+
+    Ok(RouteSpec {
+        ctx: format!("[[network.allowed_routes]][{}]", i),
+        host: host_val.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        has_secret: rule.contains_key("secret"),
+    })
+}
+
+/// Compiles one route: its host becomes an allow entry like any other, and
+/// the route itself an `allow_route` line (plus `secret_route` when it
+/// injects).
+fn add_route(policy: &mut ProxyPolicy, route: &RouteSpec) -> Result<(), ConfigError> {
+    let host_ctx = format!("{}.host", route.ctx);
+    let (host_part, port_part) = parse_host_port(&route.host);
+
+    if host_part != "*" {
+        let combined = format_host_port(&host_part, port_part.as_deref());
+        if is_ip_or_cidr(&host_part) {
+            if !policy.allow_ip.contains(&combined) {
+                policy.allow_ip.push(combined);
+            }
+        } else {
+            _proxy_domain(&host_ctx, &host_part)?;
+            if !policy.allow_host.contains(&combined) {
+                policy.allow_host.push(combined);
+            }
+        }
+    }
+
+    if let Some(port) = port_part {
+        _proxy_port(&host_ctx, &port)?;
+        if host_part == "*" {
+            // One line per element, as for allowed_hosts.
+            for element in port.split(',') {
+                let element = element.to_string();
+                if !policy.allow_port.contains(&element) {
+                    policy.allow_port.push(element);
+                }
+            }
+        }
+    }
+
+    let line = format!("{}\t{}\t{}", host_part, route.method, route.path);
+    if route.has_secret {
+        // The route, not just the host: this is what the proxy matches a
+        // request against before injecting.
+        if !policy.secret_route.contains(&line) {
+            policy.secret_route.push(line.clone());
+        }
+    }
+    policy.allow_route.push(line);
+    Ok(())
+}
+
 pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
     let mut policy = ProxyPolicy {
         default: vec!["deny".to_string()],
@@ -615,58 +724,22 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
 
             let mut allow_set = HashSet::new();
             let mut allow_has_wildcard = false;
-            let mut rules_hosts_no_secret = HashSet::new();
-            let mut rules_hosts_with_secret = HashSet::new();
-            let mut has_non_secret_rule = false;
 
+            let mut routes = Vec::new();
             if let Some(rules) = net_table.get("allowed_routes") {
                 let rules_arr = rules.as_array().ok_or_else(|| {
                     ConfigError::msg("[network].allowed_routes must be an array of tables")
                 })?;
                 for (i, rule_val) in rules_arr.iter().enumerate() {
-                    let rule = rule_val.as_table().ok_or_else(|| {
-                        ConfigError::msg(format!(
-                            "[[network.allowed_routes]][{}]: must be a table",
-                            i
-                        ))
-                    })?;
-
-                    let allowed_rule_keys: HashSet<&str> =
-                        ["host", "method", "path", "secret", "header", "prefix"]
-                            .iter()
-                            .cloned()
-                            .collect();
-                    if let Some(unknown_key) = rule
-                        .keys()
-                        .find(|k| !allowed_rule_keys.contains(k.as_str()))
-                    {
-                        return Err(ConfigError::msg(format!("[[network.allowed_routes]][{}]: unknown field '{}'. Valid keys under [[network.allowed_routes]] are 'host', 'method', 'path', 'secret', 'header', and 'prefix'.", i, unknown_key)));
-                    }
-
-                    let host_val = rule.get("host").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'host'. Example: host = \"registry.npmjs.org:443\".", i)))?;
-                    let method = rule.get("method").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'method'. Specify an HTTP method (e.g. method = \"GET\", method = \"POST\", or method = \"*\").", i)))?;
-                    let path = match rule.get("path") {
-                        None => DEFAULT_ROUTE_PATH,
-                        Some(v) => route_path(Some(v.as_str().ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}].path: must be a string. Example: path = \"/api/*\", or omit it to allow every path.", i)))?)),
-                    };
-
-                    if method != "*"
-                        && (!method.chars().all(|c| c.is_ascii_uppercase()) || method.is_empty())
-                    {
-                        return Err(ConfigError::msg(format!("[[network.allowed_routes]][{}].method: '{}' must be uppercase (e.g. method = \"GET\" or method = \"*\").", i, method)));
-                    }
-                    if !path.starts_with('/') {
-                        return Err(ConfigError::msg(format!("[[network.allowed_routes]][{}].path: 'path' must start with '/'. Change to path = \"/{}\".", i, path.trim_start_matches('/'))));
-                    }
-
-                    if rule.contains_key("secret") {
-                        rules_hosts_with_secret.insert(host_val.to_string());
-                    } else {
-                        rules_hosts_no_secret.insert(host_val.to_string());
-                        has_non_secret_rule = true;
-                    }
+                    routes.push(parse_route_table(i, rule_val)?);
                 }
             }
+            let rules_hosts_no_secret: HashSet<&str> = routes
+                .iter()
+                .filter(|r| !r.has_secret)
+                .map(|r| r.host.as_str())
+                .collect();
+            let has_non_secret_rule = !rules_hosts_no_secret.is_empty();
 
             if let Some(allow) = net_table.get("allowed_hosts") {
                 let items = _proxy_list("allowed_hosts", allow, |_, _| Ok(()), "[network].")?;
@@ -680,7 +753,7 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     if item == "*" || item.starts_with("*:") {
                         allow_has_wildcard = true;
                     }
-                    if rules_hosts_no_secret.contains(&item) {
+                    if rules_hosts_no_secret.contains(item.as_str()) {
                         return Err(ConfigError::msg(format!("[network]: host '{}' is allowed broadly, making the non-secret [[network.allowed_routes]] ineffective. Remove the rule or add a secret.", item)));
                     }
                 }
@@ -743,65 +816,8 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 }
             }
 
-            if let Some(rules) = net_table.get("allowed_routes") {
-                let rules_arr = rules.as_array().unwrap();
-                for (i, rule_val) in rules_arr.iter().enumerate() {
-                    let rule = rule_val.as_table().unwrap();
-                    let host_val = rule.get("host").and_then(|v| v.as_str()).unwrap();
-                    let method = rule.get("method").and_then(|v| v.as_str()).unwrap();
-                    let path = route_path(rule.get("path").and_then(|v| v.as_str()));
-
-                    let (host_part, port_part) = parse_host_port(host_val);
-
-                    if host_part != "*" {
-                        let combined = format_host_port(&host_part, port_part.as_deref());
-                        if is_ip_or_cidr(&host_part) {
-                            if !policy.allow_ip.contains(&combined) {
-                                policy.allow_ip.push(combined);
-                            }
-                        } else {
-                            _proxy_domain(
-                                &format!("[[network.allowed_routes]][{}].host", i),
-                                &host_part,
-                            )?;
-                            if !policy.allow_host.contains(&combined) {
-                                policy.allow_host.push(combined);
-                            }
-                        }
-                    }
-
-                    if let Some(port) = port_part {
-                        _proxy_port(&format!("[[network.allowed_routes]][{}].host", i), &port)?;
-                        if host_part == "*" {
-                            // One line per element, as in allowed_hosts above.
-                            for element in port.split(',') {
-                                let element = element.to_string();
-                                if !policy.allow_port.contains(&element) {
-                                    policy.allow_port.push(element);
-                                }
-                            }
-                        }
-                    }
-
-                    policy
-                        .allow_route
-                        .push(format!("{}\t{}\t{}", host_part, method, path));
-
-                    if let Some(secret) = rule.get("secret") {
-                        if !secret.is_str() {
-                            return Err(ConfigError::msg(format!(
-                                "[[network.allowed_routes]][{}].secret: must be a string",
-                                i
-                            )));
-                        }
-                        // The route, not just the host: this is what the proxy
-                        // matches a request against before injecting.
-                        let route = format!("{}\t{}\t{}", host_part, method, path);
-                        if !policy.secret_route.contains(&route) {
-                            policy.secret_route.push(route);
-                        }
-                    }
-                }
+            for route in &routes {
+                add_route(&mut policy, route)?;
             }
         }
     }
@@ -1227,7 +1243,11 @@ mod export_tests {
         // Compiled from a HashSet, so only the set is meaningful.
         assert_eq!(
             sorted(&policy.allow_host),
-            strings(&["api.example.com", "github.com:22,443", "registry.npmjs.org:443"])
+            strings(&[
+                "api.example.com",
+                "github.com:22,443",
+                "registry.npmjs.org:443"
+            ])
         );
         assert_eq!(
             sorted(&policy.allow_ip),
@@ -1246,7 +1266,10 @@ mod export_tests {
                 "192.168.1.5\tGET\t/",
             ])
         );
-        assert_eq!(policy.secret_route, strings(&["api.example.com\tPOST\t/v1/*"]));
+        assert_eq!(
+            policy.secret_route,
+            strings(&["api.example.com\tPOST\t/v1/*"])
+        );
         assert_eq!(policy.default, strings(&["deny"]));
     }
 
@@ -1254,9 +1277,7 @@ mod export_tests {
     fn each_invalid_allowed_routes_rule_is_refused_by_name() {
         let refused = |rule: &str| {
             let agents_md = format!("```agent-sandbox\n[network]\n{rule}```\n");
-            parse_proxy(&agents_md)
-                .expect_err(rule)
-                .to_string()
+            parse_proxy(&agents_md).expect_err(rule).to_string()
         };
         let route = |fields: &str| format!("[[network.allowed_routes]]\n{fields}");
         let cases = [
@@ -1299,7 +1320,10 @@ mod export_tests {
         ];
         for (rule, expected) in cases {
             let err = refused(&rule);
-            assert!(err.contains(expected), "{rule}\n  expected: {expected}\n  got: {err}");
+            assert!(
+                err.contains(expected),
+                "{rule}\n  expected: {expected}\n  got: {err}"
+            );
         }
     }
 
