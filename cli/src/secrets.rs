@@ -421,8 +421,22 @@ pub fn resolve_secrets_with_policies(
         }
 
         let hb = matched_host_binding.unwrap();
-        let (hb_domain, _hb_port) = parse_host_port(&hb.host);
+        let (hb_domain, hb_port) = parse_host_port(&hb.host);
         let hb_domain = hb_domain.to_lowercase();
+
+        // The proxy injects only where it terminates TLS, which is port 443;
+        // the binding line it receives carries no port.  Any other port would
+        // be checked here and then silently mean 443, or never inject at all.
+        if !matches!(hb_port.as_deref(), None | Some("443")) {
+            anyhow::bail!(
+                "agent-sandbox: secret '{}' for host '{}' names port {}, but secrets are \
+                 injected only on HTTPS port 443; use \"{}:443\" or omit the port",
+                hb.secret,
+                hb.host,
+                hb_port.unwrap_or_default(),
+                hb_domain
+            );
+        }
 
         if let Err(e) = validate_domain(&hb_domain) {
             anyhow::bail!(
@@ -778,6 +792,41 @@ prefix = "Bearer "
             "both rules must be authorized: {err}"
         );
         assert!(err.contains("secretspec"), "{err}");
+    }
+
+    #[test]
+    fn a_secret_binding_on_a_port_other_than_443_refuses_the_launch() {
+        // The proxy injects only on 443 and the binding it receives has no
+        // port, so `:8443` would be authorized here and then mean 443.
+        let resolve = |host: &str| {
+            let rule = format!(
+                "[[network.allowed_routes]]\nhost = \"{host}\"\nmethod = \"GET\"\n\
+                 path = \"/user\"\nsecret = \"TOKEN\"\n"
+            );
+            let dir = scratch(&[
+                ("policy", "secret_route\tapi.example.com\tGET\t/user\n"),
+                ("trusted.toml", rule.as_str()),
+                ("AGENTS.md", format!("```agent-sandbox\n{rule}```\n").as_str()),
+                ("secretspec.toml", ""),
+            ]);
+            resolve_secrets_logic(
+                &dir.path().join("policy"),
+                &dir.path().join("trusted.toml"),
+                &dir.path().join("secretspec.toml"),
+                &dir.path().join("AGENTS.md"),
+            )
+            .expect_err("either refused or stopped at the absent secretspec")
+            .to_string()
+        };
+        for host in ["api.example.com:8443", "api.example.com:443,8443", "api.example.com:*"] {
+            let err = resolve(host);
+            assert!(err.contains("only on HTTPS port 443"), "{host}: {err}");
+        }
+        for host in ["api.example.com:443", "api.example.com"] {
+            let err = resolve(host);
+            assert!(!err.contains("port 443"), "{host}: {err}");
+            assert!(err.contains("secretspec"), "{host}: {err}");
+        }
     }
 
     #[test]

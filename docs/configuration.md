@@ -211,6 +211,12 @@ a rule that leaves `path` out. Because the `path` default is every path, a
 secret rule without one is injected into every request with its method on that
 host. An entry without the port authorizes nothing for a rule that has one.
 
+A secret rule's `host` must name port `443` or no port: secrets are injected
+only into HTTPS that the proxy intercepts, which is port 443, and the launcher
+refuses any other port rather than authorize it and inject somewhere else. A
+`*.example.com` host also covers `example.com` itself, for secrets as for every
+other rule.
+
 The authorization is what scopes the injection. The secret reaches the proxy
 bound to that host, method and path, and is injected only into requests matching
 it — so a second `[[network.allowed_routes]]` entry in `AGENTS.md`, on the same host and

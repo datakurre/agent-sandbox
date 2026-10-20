@@ -847,7 +847,15 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             // Resolved here, against the *normalized* path the L7 check just
             // used, so `/user/repos/../../zen` cannot carry the token to
             // `/zen`.
-            let out_head = match shared.secret_for_request(expected_host, &method, &path) {
+            // 443 only: the launcher refuses a binding on any other port, and
+            // this keeps a future change to *where* TLS is terminated from
+            // quietly widening where a secret is injected.
+            let binding = if expected_port == 443 {
+                shared.secret_for_request(expected_host, &method, &path)
+            } else {
+                None
+            };
+            let out_head = match binding {
                 Some(binding) => {
                     rewrite_head(&request_head, &binding.header, binding.value.as_str())?
                 }
@@ -1044,7 +1052,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            443,
             &shared_injecting("example.com\t*\t/**", "Authorization", "Bearer injected-secret"),
         )
         .expect("proxy");
@@ -1112,7 +1120,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            443,
             &shared_injecting("example.com\tPOST\t/submit", "X-Api-Key", "value"),
         )
         .expect("proxy");
@@ -1132,7 +1140,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            443,
             &shared_injecting("example.com\tPOST\t/chunk", "X-Test", "yes"),
         )
         .expect("proxy");
@@ -1183,7 +1191,7 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, &shared)
             .expect("proxy");
 
         let rendered = String::from_utf8(upstream.written).expect("utf8");
@@ -1403,7 +1411,7 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        proxy_http1_with_injection(&mut client, &mut upstream, "registry.example.com", 80, &shared)
+        proxy_http1_with_injection(&mut client, &mut upstream, "registry.example.com", 443, &shared)
             .expect("proxy");
 
         let rendered = String::from_utf8(upstream.written).expect("utf8");
@@ -1424,7 +1432,7 @@ mod tests {
                 &mut client,
                 &mut upstream,
                 "example.com",
-                80,
+                443,
                 &shared_injecting("example.com\t*\t/**", "Authorization", "Bearer v"),
             )
             .expect("proxy");
@@ -1713,6 +1721,27 @@ mod tests {
             let decoded = String::from_utf8(percent_decode_bytes(forwarded_path).unwrap()).unwrap();
             let decoded = if decoded.is_empty() { "/".to_string() } else { decoded };
             assert_eq!(matched, decoded, "{target}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_injected_off_port_443() {
+        for port in [80u16, 8443] {
+            let mut client = FixtureIo::with_read(
+                format!("GET /user/repos HTTP/1.1\r\nHost: api.example.com:{port}\r\n\r\n").as_bytes(),
+            );
+            let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            proxy_http1_with_injection(
+                &mut client,
+                &mut upstream,
+                "api.example.com",
+                port,
+                &shared_scoped_to_user_repos(),
+            )
+            .expect("proxy");
+            let sent = String::from_utf8(upstream.written).expect("utf8");
+            assert!(sent.starts_with("GET /user/repos"), "{port}: {sent}");
+            assert!(!sent.contains("Bearer tok"), "{port}: {sent}");
         }
     }
 
