@@ -572,9 +572,6 @@ pub fn route_path(path: Option<&str>) -> &str {
 
 /// One HTTP route, validated but not yet compiled into policy lines.
 struct RouteSpec {
-    /// Where the route was written, for error messages:
-    /// `[[network.allowed_routes]][i]`.
-    ctx: String,
     /// `domain[:ports]`, as written.
     host: String,
     method: String,
@@ -623,9 +620,10 @@ fn parse_route_table(i: usize, rule_val: &Value) -> Result<RouteSpec, ConfigErro
             )));
         }
     }
+    let ctx = format!("[[network.allowed_routes]][{}]", i);
+    validate_route_host(&ctx, host_val)?;
 
     Ok(RouteSpec {
-        ctx: format!("[[network.allowed_routes]][{}]", i),
         host: host_val.to_string(),
         method: method.to_string(),
         path: path.to_string(),
@@ -633,11 +631,24 @@ fn parse_route_table(i: usize, rule_val: &Value) -> Result<RouteSpec, ConfigErro
     })
 }
 
-/// Compiles one route: its host becomes an allow entry like any other, and
-/// the route itself an `allow_route` line (plus `secret_route` when it
-/// injects).
-fn add_route(policy: &mut ProxyPolicy, route: &RouteSpec) -> Result<(), ConfigError> {
-    let host_ctx = format!("{}.host", route.ctx);
+/// The domain and port checks for a route's `host`, kept with the rest of a
+/// route's validation so every rule is checked before any is compiled.
+fn validate_route_host(ctx: &str, host: &str) -> Result<(), ConfigError> {
+    let host_ctx = format!("{}.host", ctx);
+    let (host_part, port_part) = parse_host_port(host);
+    if host_part != "*" && !is_ip_or_cidr(&host_part) {
+        _proxy_domain(&host_ctx, &host_part)?;
+    }
+    if let Some(port) = port_part {
+        _proxy_port(&host_ctx, &port)?;
+    }
+    Ok(())
+}
+
+/// Compiles one validated route: its host becomes an allow entry like any
+/// other, and the route itself an `allow_route` line (plus `secret_route` when
+/// it injects).
+fn add_route(policy: &mut ProxyPolicy, route: &RouteSpec) {
     let (host_part, port_part) = parse_host_port(&route.host);
 
     if host_part != "*" {
@@ -646,16 +657,12 @@ fn add_route(policy: &mut ProxyPolicy, route: &RouteSpec) -> Result<(), ConfigEr
             if !policy.allow_ip.contains(&combined) {
                 policy.allow_ip.push(combined);
             }
-        } else {
-            _proxy_domain(&host_ctx, &host_part)?;
-            if !policy.allow_host.contains(&combined) {
-                policy.allow_host.push(combined);
-            }
+        } else if !policy.allow_host.contains(&combined) {
+            policy.allow_host.push(combined);
         }
     }
 
     if let Some(port) = port_part {
-        _proxy_port(&host_ctx, &port)?;
         if host_part == "*" {
             // One line per element, as for allowed_hosts.
             for element in port.split(',') {
@@ -676,7 +683,6 @@ fn add_route(policy: &mut ProxyPolicy, route: &RouteSpec) -> Result<(), ConfigEr
         }
     }
     policy.allow_route.push(line);
-    Ok(())
 }
 
 pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
@@ -817,7 +823,7 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
             }
 
             for route in &routes {
-                add_route(&mut policy, route)?;
+                add_route(&mut policy, route);
             }
         }
     }
@@ -1325,6 +1331,27 @@ mod export_tests {
                 "{rule}\n  expected: {expected}\n  got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn the_first_invalid_route_is_the_one_named() {
+        // Every check on a rule, its host included, runs before the next rule
+        // is looked at, so the error points at the earliest mistake.
+        let agents_md = "```agent-sandbox\n\
+             [[network.allowed_routes]]\n\
+             host = \"-bad-.example\"\n\
+             method = \"GET\"\n\
+             [[network.allowed_routes]]\n\
+             host = \"a.example\"\n\
+             method = \"GET\"\n\
+             secret = 1\n\
+             ```\n";
+        let err = parse_proxy(agents_md).expect_err("both rules are invalid");
+        assert!(
+            err.to_string()
+                .contains("[[network.allowed_routes]][0].host"),
+            "{err}"
+        );
     }
 
     #[test]
