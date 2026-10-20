@@ -1186,6 +1186,123 @@ mod export_tests {
         assert!(err.to_string().contains("must be a string"), "{err}");
     }
 
+    /// Pins what `allowed_routes` compiles to, across every host shape a
+    /// route can take, so the parser can be restructured against it.
+    #[test]
+    fn allowed_routes_compile_to_these_policy_lines() {
+        let agents_md = "```agent-sandbox\n\
+             [network]\n\
+             allowed_hosts = [\"github.com:22,443\", \"10.0.0.0/8:80\"]\n\
+             [[network.allowed_routes]]\n\
+             host = \"registry.npmjs.org:443\"\n\
+             method = \"GET\"\n\
+             path = \"/pnpm/**\"\n\
+             [[network.allowed_routes]]\n\
+             host = \"registry.npmjs.org:443\"\n\
+             method = \"PUT\"\n\
+             [[network.allowed_routes]]\n\
+             host = \"api.example.com\"\n\
+             method = \"POST\"\n\
+             path = \"/v1/*\"\n\
+             secret = \"TOKEN\"\n\
+             header = \"X-Token\"\n\
+             prefix = \"Bearer \"\n\
+             [[network.allowed_routes]]\n\
+             host = \"*:8080,8443\"\n\
+             method = \"*\"\n\
+             path = \"/x\"\n\
+             [[network.allowed_routes]]\n\
+             host = \"192.168.1.5:8000\"\n\
+             method = \"GET\"\n\
+             path = \"/\"\n\
+             ```\n";
+        let policy = parse_proxy(agents_md).expect("AGENTS.md must parse");
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Compiled from a HashSet, so only the set is meaningful.
+        assert_eq!(
+            sorted(&policy.allow_host),
+            strings(&["api.example.com", "github.com:22,443", "registry.npmjs.org:443"])
+        );
+        assert_eq!(
+            sorted(&policy.allow_ip),
+            strings(&["10.0.0.0/8:80", "192.168.1.5:8000"])
+        );
+        assert_eq!(sorted(&policy.allow_port), strings(&["8080", "8443"]));
+        assert_eq!(policy.allow_signing, strings(&["github.com"]));
+        // In rule order.
+        assert_eq!(
+            policy.allow_route,
+            strings(&[
+                "registry.npmjs.org\tGET\t/pnpm/**",
+                "registry.npmjs.org\tPUT\t/**",
+                "api.example.com\tPOST\t/v1/*",
+                "*\t*\t/x",
+                "192.168.1.5\tGET\t/",
+            ])
+        );
+        assert_eq!(policy.secret_route, strings(&["api.example.com\tPOST\t/v1/*"]));
+        assert_eq!(policy.default, strings(&["deny"]));
+    }
+
+    #[test]
+    fn each_invalid_allowed_routes_rule_is_refused_by_name() {
+        let refused = |rule: &str| {
+            let agents_md = format!("```agent-sandbox\n[network]\n{rule}```\n");
+            parse_proxy(&agents_md)
+                .expect_err(rule)
+                .to_string()
+        };
+        let route = |fields: &str| format!("[[network.allowed_routes]]\n{fields}");
+        let cases = [
+            (
+                "allowed_routes = [\"x\"]\n".to_string(),
+                "[[network.allowed_routes]][0]: must be a table",
+            ),
+            (
+                route("host = \"a.example\"\nmethod = \"GET\"\nverb = \"GET\"\n"),
+                "[[network.allowed_routes]][0]: unknown field 'verb'.",
+            ),
+            (
+                route("method = \"GET\"\n"),
+                "[[network.allowed_routes]][0]: missing required field 'host'.",
+            ),
+            (
+                route("host = \"a.example\"\n"),
+                "[[network.allowed_routes]][0]: missing required field 'method'.",
+            ),
+            (
+                route("host = \"a.example\"\nmethod = \"get\"\n"),
+                "[[network.allowed_routes]][0].method: 'get' must be uppercase",
+            ),
+            (
+                route("host = \"a.example\"\nmethod = \"GET\"\npath = \"api\"\n"),
+                "[[network.allowed_routes]][0].path: 'path' must start with '/'. Change to path = \"/api\".",
+            ),
+            (
+                route("host = \"a.example\"\nmethod = \"GET\"\nsecret = 1\n"),
+                "[[network.allowed_routes]][0].secret: must be a string",
+            ),
+            (
+                route("host = \"-bad-.example\"\nmethod = \"GET\"\n"),
+                "[[network.allowed_routes]][0].host",
+            ),
+            (
+                route("host = \"a.example:99999\"\nmethod = \"GET\"\n"),
+                "[[network.allowed_routes]][0].host",
+            ),
+        ];
+        for (rule, expected) in cases {
+            let err = refused(&rule);
+            assert!(err.contains(expected), "{rule}\n  expected: {expected}\n  got: {err}");
+        }
+    }
+
     #[test]
     fn csv_ports_compile_to_one_line_and_still_authorize_the_relay() {
         let agents_md = "```agent-sandbox\n\
