@@ -66,6 +66,10 @@ inside the container, or a table with additional options. A relative destination
 is placed under `/workspace` (`"data"` mounts at `/workspace/data`, and `"."` at
 `/workspace` itself); an absolute one is used as written.
 
+A source is not confined to the workspace: `[mounts]` can name any host path
+you can read, which is why the block is honored only with `--mounts`. See
+[Trust model](trust-model.md).
+
 Fields when using a table:
 
 - **`destination`** (required): The path inside the container, absolute or relative to `/workspace` as above.
