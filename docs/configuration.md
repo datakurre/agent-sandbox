@@ -59,11 +59,16 @@ port if a browser needs to reach it.
 
 The `[mounts]` table allows you to bind mount paths from the host into the sandbox container. 
 
-Each key represents the source path (which can be absolute or relative to the workspace directory). The value can be a string representing the destination path inside the container, or a table with additional options.
+Each key represents the source path on the host: absolute, `~`-prefixed (your
+home directory), or relative to the workspace directory, with `.` naming the
+workspace itself. The value can be a string representing the destination path
+inside the container, or a table with additional options. A relative destination
+is placed under `/workspace` (`"data"` mounts at `/workspace/data`, and `"."` at
+`/workspace` itself); an absolute one is used as written.
 
 Fields when using a table:
 
-- **`destination`** (required): The absolute path inside the container.
+- **`destination`** (required): The path inside the container, absolute or relative to `/workspace` as above.
 - **`options`** (optional): A string or list of strings representing mount options (e.g., `"ro"`, `"rw"`, `"Z"`).
 
 #### Examples
