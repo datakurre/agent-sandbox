@@ -235,6 +235,31 @@ pub struct ResolvedSecret {
     pub binding: String,
 }
 
+/// Create `dir` as 0700, failing if anything already sits at that path.
+///
+/// Made private at creation rather than `chmod`ed afterwards, and never
+/// reused: a directory someone else created first under the same name in a
+/// shared `/tmp` is refused instead of being written into.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+/// Write `contents` to a new file at `path`, 0600 from the moment it exists.
+///
+/// `fs::write` followed by `set_permissions` left the secret values readable
+/// under the umask until the second call landed.
+pub fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(contents)
+}
+
 /// Read the `secret_route` routes out of a compiled policy file.
 fn policy_secret_routes(policy: &Path) -> Vec<SecretRoute> {
     let mut routes = Vec::new();
@@ -659,6 +684,25 @@ mod tests {
         // trusted.toml does not authorize the broader rule.
         hb.path = "/".to_string();
         assert!(!requested[0].matches_host_binding(&hb));
+    }
+
+    #[test]
+    fn the_bindings_file_is_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("secrets");
+        create_private_dir(&dir).unwrap();
+        let file = dir.join("bindings");
+        write_private_file(&file, b"api.example.com\tGET\t/\tAuthorization\tv\n").unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&file), 0o600);
+
+        // Neither is reused: something already at the path is an error, not
+        // a place to write secrets into.
+        assert!(create_private_dir(&dir).is_err());
+        assert!(write_private_file(&file, b"x").is_err());
     }
 
     const AGENTS_TWO_RULES: &str = r#"

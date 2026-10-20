@@ -6,7 +6,9 @@ use agent_sandbox_cli::gpg::{scan_gnupg_home, GpgScanStatus};
 use agent_sandbox_cli::host_bridge;
 use agent_sandbox_cli::launch;
 use agent_sandbox_cli::net_summary;
-use agent_sandbox_cli::secrets::resolve_secrets_with_policies;
+use agent_sandbox_cli::secrets::{
+    create_private_dir, resolve_secrets_with_policies, write_private_file,
+};
 use agent_sandbox_cli::trusted;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -3658,7 +3660,7 @@ fn run() -> Result<i32> {
         }
 
         if want_secrets {
-            fs::create_dir_all(&sidecar_secrets)?;
+            create_private_dir(Path::new(&sidecar_secrets))?;
             cleanup_guard.sidecar_secrets = sidecar_secrets.clone();
             let config = trusted::config_path(&home);
             let manifest = Path::new(&pwd).join("secretspec.toml");
@@ -3691,15 +3693,17 @@ fn run() -> Result<i32> {
                 for secret in &resolved_secrets {
                     eprintln!("agent-sandbox: secret: injected {}", secret.name);
                 }
-                // Written 0600 and mounted read-only: the values never reach
-                // the sandbox, only the proxy that injects them.
-                let path = format!("{}/bindings", sidecar_secrets);
+                // Created 0600 inside a 0700 dir and mounted read-only: the
+                // values never reach the sandbox, only the proxy that injects
+                // them, and no other host user can read them in between.
                 let bindings = resolved_secrets
                     .iter()
                     .map(|secret| secret.binding.as_str())
                     .collect::<Vec<_>>();
-                fs::write(&path, format!("{}\n", bindings.join("\n")))?;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                write_private_file(
+                    &Path::new(&sidecar_secrets).join("bindings"),
+                    format!("{}\n", bindings.join("\n")).as_bytes(),
+                )?;
                 sidecar_extra_mounts.push("-v".to_string());
                 sidecar_extra_mounts.push(format!("{}:/sidecar_secrets:ro", sidecar_secrets));
             }

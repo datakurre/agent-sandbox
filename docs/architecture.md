@@ -344,7 +344,7 @@ Three directories, and which side can see them is the design:
 | --- | --- | --- |
 | `/sidecar_policy` | sidecar, **read-only** | `policy`, `policy.base`, `policy.baseline`, `known_hosts` |
 | `/sidecar_shared` | sidecar only | `proxy-ready`, `ready`, `egress-degraded`, `ca.pem`, `connections.jsonl`, `denied-requests.jsonl`, `relay.jsonl` |
-| `/sidecar_secrets` | sidecar, **read-only** | `bindings` |
+| `/sidecar_secrets` | sidecar, **read-only** | `bindings` (host dir created `0700`, file `0600`, neither reused) |
 | (host temp dirs) | — | removed by the launcher's `CleanupGuard` on the way out |
 
 ### Host loopback ports are a mount, not a relay
