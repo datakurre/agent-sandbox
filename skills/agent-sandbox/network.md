@@ -152,11 +152,13 @@ without one stay an opaque `CONNECT` tunnel. That interception is why an L7 rule
 added mid-session produces certificate errors — the session CA is mounted at
 launch, so a live-added route has nothing behind it.
 
-A route restricts the **whole domain**, on every port, not just the port in its
+A route restricts the **whole domain** at the proxy, not just the port in its
 `host`. Once any rule matches a host — `*.example.com` matches `example.com` and
 every subdomain — HTTPS and plain HTTP to it must match some rule, and a
-`CONNECT` to any port other than 443 is denied (`connect-l7-unintercepted`). An
-`allowed_hosts` entry for the same host does not exempt it. So a route on
+`CONNECT` to any port other than 443 is denied (`connect-l7-unintercepted`, also
+what a live-added route gets on 443, having no session CA behind it). An
+`allowed_hosts` entry for the same host does not exempt it. The SSH relay is
+unaffected: it checks only the port-22 entry. So a route on
 `*.example.com` also denies a tunnel to `example.com:8443`; scope the route to
 the subdomain that needs it.
 

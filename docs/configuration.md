@@ -142,13 +142,16 @@ another.
 
 A rule restricts a whole domain, not one port. The proxy matches a route by its
 domain pattern alone — the port in `host` reaches the policy as an ordinary
-allow entry, not as part of the route — so once any rule matches a host, every
-connection to that host is held to its rules, whichever entry let it through:
-HTTPS on port 443 and plain HTTP must match a rule's method and path, and a
-tunnel to any other port (`:8443`, say) is refused outright, because only port
-443 is intercepted. A wildcard rule reaches as far as its pattern: a rule on
-`*.example.com` also restricts `example.com` and `api.example.com`, even where
-`allowed_hosts` lists them on their own.
+allow entry, not as part of the route — so once any rule matches a host, the
+proxy holds all its traffic to that host to its rules, whichever entry let it
+through: HTTPS on port 443 and plain HTTP must match a rule's method and path,
+and a `CONNECT` tunnel to any other port (`:8443`, say) is refused outright,
+because only port 443 is intercepted. Plain HTTP to a host carrying a `secret`
+rule is refused before any matching, since a secret is never sent in cleartext.
+A wildcard rule reaches as far as its pattern: a rule on `*.example.com` also
+restricts `example.com` and `api.example.com`, even where `allowed_hosts` lists
+them on their own. SSH is the exception: the relay that carries `git push` under
+`--proxy` is authorized by the port-22 entry alone and never consults routes.
 
 #### Examples
 
