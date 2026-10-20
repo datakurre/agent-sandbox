@@ -1334,6 +1334,80 @@ mod export_tests {
     }
 
     #[test]
+    fn a_host_allowed_outright_refuses_a_non_secret_route_on_it() {
+        let refused = |network: &str| {
+            parse_proxy(&format!("```agent-sandbox\n[network]\n{network}```\n"))
+                .expect_err(network)
+                .to_string()
+        };
+        let route = "[[network.allowed_routes]]\nhost = \"a.example:443\"\nmethod = \"GET\"\n";
+
+        let err = refused(&format!("allowed_hosts = [\"a.example:443\"]\n{route}"));
+        assert!(
+            err.contains("host 'a.example:443' is allowed broadly"),
+            "{err}"
+        );
+        for wildcard in ["*", "*:443"] {
+            let err = refused(&format!("allowed_hosts = [\"{wildcard}\"]\n{route}"));
+            assert!(err.contains("wildcard allow makes non-secret"), "{err}");
+        }
+
+        // A secret rule is not narrowing anything, so it is not a conflict.
+        let agents_md = format!(
+            "```agent-sandbox\n[network]\nallowed_hosts = [\"a.example:443\"]\n\
+             {route}secret = \"TOKEN\"\n```\n"
+        );
+        parse_proxy(&agents_md).expect("a secret route beside a broad allow");
+    }
+
+    #[test]
+    fn routes_from_several_blocks_compile_in_order_and_dedupe() {
+        let block = |path: &str| {
+            format!(
+                "```agent-sandbox\n[[network.allowed_routes]]\n\
+                 host = \"a.example:443\"\nmethod = \"GET\"\npath = \"{path}\"\n\
+                 secret = \"TOKEN\"\n```\n"
+            )
+        };
+        let agents_md = format!(
+            "{}\nprose\n\n{}\n{}",
+            block("/one"),
+            block("/two"),
+            block("/one")
+        );
+        let policy = parse_proxy(&agents_md).expect("AGENTS.md must parse");
+        assert_eq!(policy.allow_host, vec!["a.example:443".to_string()]);
+        // allow_route keeps one line per rule; secret_route one per route.
+        assert_eq!(
+            policy.allow_route,
+            vec![
+                "a.example\tGET\t/one".to_string(),
+                "a.example\tGET\t/two".to_string(),
+                "a.example\tGET\t/one".to_string(),
+            ]
+        );
+        assert_eq!(
+            policy.secret_route,
+            vec![
+                "a.example\tGET\t/one".to_string(),
+                "a.example\tGET\t/two".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_route_on_the_bare_wildcard_host_adds_no_allow_entry() {
+        let agents_md = "```agent-sandbox\n[[network.allowed_routes]]\n\
+             host = \"*\"\nmethod = \"GET\"\n```\n";
+        let policy = parse_proxy(agents_md).expect("AGENTS.md must parse");
+        assert!(policy.allow_host.is_empty(), "{:?}", policy.allow_host);
+        assert!(policy.allow_ip.is_empty(), "{:?}", policy.allow_ip);
+        assert!(policy.allow_port.is_empty(), "{:?}", policy.allow_port);
+        assert_eq!(policy.allow_route, vec!["*\tGET\t/**".to_string()]);
+        assert_eq!(policy.default, vec!["deny".to_string()]);
+    }
+
+    #[test]
     fn the_first_invalid_route_is_the_one_named() {
         // Every check on a rule, its host included, runs before the next rule
         // is looked at, so the error points at the earliest mistake.
