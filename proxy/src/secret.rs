@@ -144,8 +144,8 @@ impl SecretBindings {
     /// The binding authorized for this exact request, or `None`.
     ///
     /// Most-specific-wins, in the same order the policy resolves a target:
-    /// longest domain pattern first, then longest path pattern, then an exact
-    /// method over `*`.  Two overlapping authorizations are therefore ordered
+    /// longest domain pattern first, then the most specific path pattern (see
+    /// `path_specificity`), then an exact method over `*`.  Two overlapping authorizations are therefore ordered
     /// rather than ambiguous -- `GET /user/repos` beats `GET /user/**` for a
     /// request to `/user/repos`.
     pub fn binding_for_request(
@@ -162,8 +162,23 @@ impl SecretBindings {
                     && (e.method == method || e.method == "*")
                     && crate::l7::glob_match(path, &e.path)
             })
-            .max_by_key(|e| (e.domain.len(), e.path.len(), usize::from(e.method != "*")))
+            .max_by_key(|e| {
+                (
+                    e.domain.len(),
+                    path_specificity(&e.path),
+                    usize::from(e.method != "*"),
+                )
+            })
     }
+}
+
+/// How narrowly a path pattern pins a request: the literal prefix before the
+/// first `*` first, then a pattern without `**` over one with it, then length.
+/// Raw length alone would rank the omitted-path default `/**` above `/*` and
+/// level with `/v1`.
+fn path_specificity(pattern: &str) -> (usize, bool, usize) {
+    let literal = pattern.find('*').unwrap_or(pattern.len());
+    (literal, !pattern.contains("**"), pattern.len())
 }
 
 fn validate_method(method: &str) -> Result<(), &'static str> {
@@ -337,6 +352,29 @@ mod tests {
                 .as_str(),
             "wide"
         );
+    }
+
+    #[test]
+    fn the_every_path_default_ranks_below_any_narrower_route() {
+        // `/**` is what a rule without a path compiles to, so it is the common
+        // case; it must lose to every narrower pattern, however short.
+        let parsed = SecretBindings::parse(
+            "api.example.com\tGET\t/**\tAuthorization\twide\n\
+             api.example.com\tGET\t/*\tAuthorization\tsegment\n\
+             api.example.com\tGET\t/v1\tAuthorization\texact\n",
+        )
+        .expect("parse");
+        let value = |path| {
+            parsed
+                .binding_for_request("api.example.com", "GET", path)
+                .expect("binding")
+                .value
+                .as_str()
+                .to_string()
+        };
+        assert_eq!(value("/v1"), "exact");
+        assert_eq!(value("/foo"), "segment");
+        assert_eq!(value("/foo/bar"), "wide");
     }
 
     #[test]

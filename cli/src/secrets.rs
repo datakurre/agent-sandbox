@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use crate::agents::parse_host_port;
+use crate::agents::{parse_host_port, route_path, DEFAULT_ROUTE_PATH};
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
@@ -22,7 +22,7 @@ impl SecretRule {
         self_domain.to_lowercase() == hb_domain.to_lowercase()
             && self_port == hb_port
             && self.method.to_uppercase() == hb.method.to_uppercase()
-            && self.path == hb.path
+            && self.path == route_path(Some(&hb.path))
             && self.secret == hb.secret
             && self.header.to_lowercase() == hb.header.to_lowercase()
             && self.prefix == hb.prefix.as_deref().unwrap_or("")
@@ -56,7 +56,7 @@ fn default_method() -> String {
     "GET".to_string()
 }
 fn default_path() -> String {
-    "/".to_string()
+    DEFAULT_ROUTE_PATH.to_string()
 }
 fn default_header() -> String {
     "Authorization".to_string()
@@ -144,10 +144,8 @@ fn requested_rules_from_toml(content: &str) -> Vec<SecretRule> {
                                     .get("method")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("GET");
-                                let path = rule_table
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("/");
+                                let path =
+                                    route_path(rule_table.get("path").and_then(|v| v.as_str()));
                                 let header = rule_table
                                     .get("header")
                                     .and_then(|v| v.as_str())
@@ -352,6 +350,12 @@ pub fn resolve_secrets_with_policies(
                         }
                     }
                 }
+            }
+            // An empty path is the default, like an omitted one; resolve it
+            // here so the route compared against the policy and the binding
+            // line the proxy validates both carry the real pattern.
+            for hb in &mut host_config.bindings {
+                hb.path = route_path(Some(&hb.path)).to_string();
             }
 
             (host_config, val)
@@ -624,6 +628,37 @@ mod tests {
             std::fs::write(dir.path().join(name), body).expect("write");
         }
         dir
+    }
+
+    #[test]
+    fn an_omitted_path_defaults_to_every_path_on_both_sides() {
+        // AGENTS.md and trusted.toml must fill in the same default, or a rule
+        // copied verbatim without a path would never be authorized.
+        let block = "[[network.allowed_routes]]\n\
+                     host = \"api.example.com:443\"\n\
+                     method = \"GET\"\n\
+                     secret = \"TOKEN\"\n";
+        let requested = requested_rules_from_toml(block);
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].path, "/**");
+
+        let rule: toml::Value = block.parse().unwrap();
+        let mut hb: HostBinding = rule["network"]["allowed_routes"][0]
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(requested[0].matches_host_binding(&hb));
+
+        hb.path = String::new();
+        assert!(
+            requested[0].matches_host_binding(&hb),
+            "an empty path is the default too"
+        );
+
+        // ...and it is a default, not a wildcard: an explicit narrower path in
+        // trusted.toml does not authorize the broader rule.
+        hb.path = "/".to_string();
+        assert!(!requested[0].matches_host_binding(&hb));
     }
 
     const AGENTS_TWO_RULES: &str = r#"

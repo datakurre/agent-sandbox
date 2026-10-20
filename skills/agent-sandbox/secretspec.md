@@ -179,7 +179,7 @@ prefix = "Bearer "
 ```
 
 Every field is matched exactly, the port included. Omitted fields are not
-wildcards: they take their defaults (`method = "GET"`, `path = "/"`,
+wildcards: they take their defaults (`method = "GET"`, `path = "/**"`,
 `header = "Authorization"`) and are then matched as written. A rule the repo asks
 for but the host has not authorized **refuses the launch** and prints the exact
 block to paste — when a user reports that refusal, the fix is to copy the printed

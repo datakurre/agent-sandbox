@@ -559,6 +559,17 @@ pub struct ProxyPolicy {
     pub default: Vec<String>,
 }
 
+/// The path of an `[[network.allowed_routes]]` rule that names none, or names
+/// `""`: every path, so a rule can narrow a host by method alone.
+pub const DEFAULT_ROUTE_PATH: &str = "/**";
+
+pub fn route_path(path: Option<&str>) -> &str {
+    match path {
+        None | Some("") => DEFAULT_ROUTE_PATH,
+        Some(path) => path,
+    }
+}
+
 pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
     let mut policy = ProxyPolicy {
         default: vec!["deny".to_string()],
@@ -634,7 +645,10 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
 
                     let host_val = rule.get("host").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'host'. Example: host = \"registry.npmjs.org:443\".", i)))?;
                     let method = rule.get("method").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'method'. Specify an HTTP method (e.g. method = \"GET\", method = \"POST\", or method = \"*\").", i)))?;
-                    let path = rule.get("path").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'path'. Example: path = \"/api/*\" or path = \"/\".", i)))?;
+                    let path = match rule.get("path") {
+                        None => DEFAULT_ROUTE_PATH,
+                        Some(v) => route_path(Some(v.as_str().ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}].path: must be a string. Example: path = \"/api/*\", or omit it to allow every path.", i)))?)),
+                    };
 
                     if method != "*"
                         && (!method.chars().all(|c| c.is_ascii_uppercase()) || method.is_empty())
@@ -735,7 +749,7 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     let rule = rule_val.as_table().unwrap();
                     let host_val = rule.get("host").and_then(|v| v.as_str()).unwrap();
                     let method = rule.get("method").and_then(|v| v.as_str()).unwrap();
-                    let path = rule.get("path").and_then(|v| v.as_str()).unwrap();
+                    let path = route_path(rule.get("path").and_then(|v| v.as_str()));
 
                     let (host_part, port_part) = parse_host_port(host_val);
 
@@ -1126,6 +1140,50 @@ mod export_tests {
         assert!(cfg.is_allowed("github.com", 443), "{text}");
         assert!(cfg.is_allowed("github.com", 22), "{text}");
         assert!(cfg.is_allowed("10.1.2.3", 80), "{text}");
+    }
+
+    #[test]
+    fn a_route_without_a_path_allows_every_path_for_its_method() {
+        for path_line in ["", "path = \"\"\n"] {
+            let agents_md = format!(
+                "```agent-sandbox\n\
+                 [[network.allowed_routes]]\n\
+                 host = \"registry.npmjs.org:443\"\n\
+                 method = \"GET\"\n\
+                 {path_line}\
+                 ```\n"
+            );
+            let policy = parse_proxy(&agents_md).expect("AGENTS.md must parse");
+            assert_eq!(
+                policy.allow_route,
+                vec!["registry.npmjs.org\tGET\t/**".to_string()],
+                "{path_line:?}"
+            );
+
+            let text = format_proxy_policy(&policy, "AGENTS.md");
+            let cfg = parse_policy(&text).unwrap_or_else(|e| {
+                panic!("the proxy rejected the launcher's own policy: {e}\n{text}")
+            });
+            for path in ["/", "/pnpm", "/@scope/name/-/name-1.0.0.tgz"] {
+                assert!(
+                    cfg.is_l7_allowed("registry.npmjs.org", "GET", path),
+                    "{path}"
+                );
+            }
+            assert!(!cfg.is_l7_allowed("registry.npmjs.org", "PUT", "/pnpm"));
+        }
+    }
+
+    #[test]
+    fn a_route_path_that_is_not_a_string_is_refused() {
+        let agents_md = "```agent-sandbox\n\
+             [[network.allowed_routes]]\n\
+             host = \"registry.npmjs.org:443\"\n\
+             method = \"GET\"\n\
+             path = 1\n\
+             ```\n";
+        let err = parse_proxy(agents_md).expect_err("path = 1 must not compile");
+        assert!(err.to_string().contains("must be a string"), "{err}");
     }
 
     #[test]

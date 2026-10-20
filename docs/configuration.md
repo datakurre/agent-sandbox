@@ -112,8 +112,9 @@ For finer-grained HTTP proxy control and secret injection, you can specify an ar
 
 - **`host`** (required): The target host and port to match (e.g., `"api.github.com:443"`).
 - **`method`** (required): The HTTP method (e.g., `"GET"`, `"POST"`, or `"*"`) in uppercase.
-- **`path`** (required): The path pattern to match (must start with `/`). `*` matches a single
-  segment, `**` matches several.
+- **`path`** (optional): The path pattern to match (must start with `/`). `*` matches a single
+  segment, `**` matches several. Omitted or empty, it defaults to `"/**"`, every path, so a
+  rule with only `host` and `method` narrows a host by method alone.
 - **`secret`** (optional): The name of a secret to inject into requests matching **this rule**.
 - **`header`** (optional): The HTTP header to inject the secret into (e.g., `"Authorization"`).
 - **`prefix`** (optional): An optional prefix for the secret value (e.g., `"Bearer "` ).
@@ -150,10 +151,10 @@ secret = "GITHUB_TOKEN"
 header = "Authorization"
 prefix = "Bearer "
 
+# Read-only access to the npm registry: any path, GET only
 [[network.allowed_routes]]
 host = "registry.npmjs.org:443"
-method = "*"
-path = "/"
+method = "GET"
 
 # OpenCode Zen: Programmatic agent inference injection
 [[network.allowed_routes]]
@@ -203,17 +204,20 @@ header = "Authorization"
 prefix = "Bearer "
 ```
 
-Omitting a field does not make it a wildcard: `method` defaults to `"GET"`,
-`path` to `"/"` and `header` to `"Authorization"`, and those defaults are then
-matched exactly. An entry without the port authorizes nothing for a rule that
-has one.
+An omitted field takes its default on both sides — `method` defaults to
+`"GET"`, `path` to `"/**"` and `header` to `"Authorization"` — and the results
+are then compared exactly, so `path = "/"` in `trusted.toml` does not authorize
+a rule that leaves `path` out. Because the `path` default is every path, a
+secret rule without one is injected into every request with its method on that
+host. An entry without the port authorizes nothing for a rule that has one.
 
 The authorization is what scopes the injection. The secret reaches the proxy
 bound to that host, method and path, and is injected only into requests matching
 it — so a second `[[network.allowed_routes]]` entry in `AGENTS.md`, on the same host and
 without a `secret`, grants plain access and nothing more. You can authorize
 several routes on one host; where two of them could match the same request, the
-more specific wins (longest domain pattern, then longest path pattern, then an
+more specific wins (longest domain pattern, then the longest literal path prefix
+before any `*` — so the default `"/**"` loses to every narrower path — then an
 exact method over `*`).
 
 With `--secrets`, values are resolved on the host with
