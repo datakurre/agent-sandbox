@@ -1,5 +1,7 @@
 use super::resolve::*;
-use crate::agents::{format_policy_as_network_toml, is_ip_or_cidr, parse_host_port};
+use crate::agents::{
+    format_policy_as_network_toml, is_ip_or_cidr, parse_host_port, DEFAULT_ROUTE_PATH,
+};
 use agent_sandbox_proxy::policy::{parse_csv_ports, parse_policy, ProxyConfig};
 use agent_sandbox_proxy::policy_io::{install_policy, load_policy_lines};
 use anyhow::Result;
@@ -78,7 +80,11 @@ pub struct AllowArgs {
         help = "Allow an HTTP route on TARGET instead of the whole domain (combine with --path)"
     )]
     pub l7: Option<String>,
-    #[arg(long, default_value = "/*", help = "Path pattern for --l7")]
+    #[arg(
+        long,
+        default_value = DEFAULT_ROUTE_PATH,
+        help = "Path pattern for --l7 (default: every path, like an AGENTS.md route without one)"
+    )]
     pub path: String,
     #[arg(help = "Sandbox name (positional)")]
     pub word: Option<String>,
