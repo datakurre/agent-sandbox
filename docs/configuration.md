@@ -106,6 +106,9 @@ The `[network]` table configures the egress proxy's firewall policy. The sandbox
   unions the ports of every rule sharing a pattern — so the list is a
   convenience, not a different semantics.
 
+  An entry can also carry an HTTP method list, a path, or both, which makes it
+  a route rather than a plain allow — see [Short-form routes](#short-form-routes).
+
 An `allowed_hosts` entry covering port `22` is what authorizes the SSH relay for that
 host. Under `--proxy` the host agent sockets are held by the proxy sidecar
 rather than mounted into the sandbox, and the relay refuses every SSH request
@@ -188,6 +191,41 @@ header = "Authorization"
 prefix = "Bearer "
 ```
 ````
+
+#### Short-form routes
+
+A route without a secret can also be written as one `allowed_hosts` entry, with
+a method list before the domain, a path after it, or both:
+
+````markdown
+```toml agent-sandbox
+[network]
+allowed_hosts = [
+    "github.com:443",                         # a plain allow entry
+    "POST *.example.com:443/foo/*",           # one route
+    "GET,POST *.example.com:80,443/foo/**",   # one route per method
+    "GET registry.npmjs.org:443",             # GET only, every path
+    "api.example.net:8443/v2/**",             # every method, under /v2/
+]
+```
+````
+
+The form is `METHODS DOMAIN[:PORTS][/PATH]`: methods separated by commas alone,
+then one space, then the domain. An entry is a route as soon as it has a method
+list or a path; one with neither is a plain allow entry, and so is a CIDR block
+such as `"10.0.0.0/8:80"`, whose `/` is a prefix length. A missing path means
+`"/**"` and a missing method list `"*"`, the defaults of a table, and each entry
+compiles to exactly the `[[network.allowed_routes]]` tables it stands for:
+`"GET,POST *.example.com:80,443/foo/**"` is two tables, one per method, each
+with `host = "*.example.com:80,443"` and `path = "/foo/**"`. Everything above
+about routes holds for them — a route restricts its whole domain.
+
+The short form only narrows. A route that injects a secret needs a table, since
+`secret`, `header` and `prefix` have nowhere to go, and so does a route on an IP
+address: a short-form route names a domain, not an IP, a CIDR block or `*`. Its
+ports must not cover 22 either, since a route is HTTP; write `"host:22"` as an
+entry of its own for SSH. `agent-sandbox ctl policy export` always writes routes
+back as tables.
 
 #### The trusted config
 
@@ -360,11 +398,12 @@ Besides malformed values, these combinations are rejected:
 
 - an unknown key under `[network]` (only `allowed_hosts` and `allowed_routes` exist) or an unknown
   field on a rule;
-- a duplicate entry in `allowed_hosts`;
+- a duplicate entry in `allowed_hosts`, including two
+  [short-form routes](#short-form-routes) that share a method, host and path;
 - a host allowed outright in `allowed_hosts` that also carries a `[[network.allowed_routes]]`
-  entry *without* a secret — the broad allow makes the narrower rule pointless,
-  so one of the two is a mistake. The same applies to a wildcard allow (`"*"`,
-  `"*:port"`);
+  entry *without* a secret, or a short-form route — the broad allow makes the
+  narrower rule pointless, so one of the two is a mistake. The same applies to a
+  wildcard allow (`"*"`, `"*:port"`);
 - an `allowed_hosts` entry covering port 22 for a host with no
   `[[network.known_hosts]]` entry in `trusted.toml` — SSH would be authorized to
   a host whose identity nothing has vouched for.

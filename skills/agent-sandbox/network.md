@@ -165,10 +165,27 @@ A route restricts the **whole domain** at the proxy, not just the port in its
 every subdomain — HTTPS and plain HTTP to it must match some rule, and a
 `CONNECT` to any port other than 443 is denied (`connect-l7-unintercepted`, also
 what a live-added route gets on 443, having no session CA behind it). An
-`allowed_hosts` entry for the same host does not exempt it. The SSH relay is
-unaffected: it checks only the port-22 entry. So a route on
+`allowed_hosts` entry for the same host does not exempt it, so a route on
 `*.example.com` also denies a tunnel to `example.com:8443`; scope the route to
-the subdomain that needs it.
+the subdomain that needs it. The SSH relay is unaffected: it checks only the
+port-22 entry.
+
+A route without a secret can also be written as one `allowed_hosts` entry,
+`METHODS DOMAIN[:PORTS][/PATH]`, which compiles to exactly the tables above, one
+per method:
+
+```toml
+[network]
+allowed_hosts = [
+  "GET,POST api.example.com:443/v1/**",  # two routes, GET and POST
+  "GET registry.npmjs.org:443",          # GET only, every path
+  "api.example.net:8443/v2/**",          # every method, under /v2/
+]
+```
+
+Methods are separated by commas alone, then one space before the domain. No
+path means `/**`; no method list means `*`. A secret route or a route on an IP
+still needs the table form, and a short-form route may not cover port 22.
 
 ### Combinations the launcher refuses
 
@@ -180,7 +197,12 @@ a full relaunch. These are rejected (messages quoted from the parser):
 - duplicate entry: `allowed_hosts: duplicate entry 'github.com:443'`
 - a broadly-allowed host that also carries a secretless route:
   `host 'api.github.com:443' is allowed broadly, making the non-secret
-  [[network.allowed_routes]] ineffective. Remove the rule or add a secret.`
+  [[network.allowed_routes]] ineffective. Remove the rule or add a secret.`, or
+  for a short-form route `… making the route 'GET api.github.com:443/x' in
+  allowed_hosts ineffective. Remove one of the two entries.`
+- a short-form route that is malformed, names an IP or `*`, or covers port 22:
+  `[network].allowed_hosts[1] 'GET a.example:22/x': a route is HTTP, so it
+  cannot cover port 22. …` — the message always names the entry.
 
 There is no `deny` key and no `ctl policy deny` — denying something already denied
 is a no-op.

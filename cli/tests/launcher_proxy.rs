@@ -92,6 +92,32 @@ fn a_host_named_only_by_a_route_is_mapped_too() {
 }
 
 #[test]
+fn a_route_written_into_allowed_hosts_reaches_the_sidecar_policy() {
+    let agents_md = "\
+```toml agent-sandbox
+[network]
+allowed_hosts = [\"GET,POST api.example.com:443/v1/**\"]
+```
+";
+    let world = proxied_world().file("AGENTS.md", agents_md);
+    let out = world.run(&["--workspace", "--proxy", "opencode"]);
+
+    assert!(out.reached_podman_run(), "{}", out.stderr);
+    assert!(out
+        .run_call()
+        .has_pair("--add-host", "api.example.com:10.89.7.2"));
+    let dir = world.captured("sidecar_policy");
+    let policy = fs::read_to_string(dir.join("policy")).expect("the live policy file");
+    for line in [
+        "allow_host api.example.com:443",
+        "allow_route\tapi.example.com\tGET\t/v1/**",
+        "allow_route\tapi.example.com\tPOST\t/v1/**",
+    ] {
+        assert!(policy.lines().any(|l| l == line), "{line:?} in:\n{policy}");
+    }
+}
+
+#[test]
 fn an_unproxied_launch_maps_no_names() {
     // Without --proxy there is no sidecar to point anything at, and the sandbox
     // resolves names for itself.

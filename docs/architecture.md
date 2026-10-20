@@ -480,6 +480,9 @@ policy declares none. A host entry carries its whole port list on one line;
 the standalone `allow_port` key takes a single port or range, so a wildcard
 entry like `"*:80,443"` compiles to one `allow_port` line per element.
 `[[network.allowed_routes]]` configures L7 routes and optional secret injection.
+An `allowed_hosts` entry carrying a method list or a path
+(`"GET,POST api.example.com:443/v1/**"`) is a route in short form, which the
+launcher compiles exactly as the tables it stands for, one per method.
 Those two keys are the whole surface: an unknown key under `[network]` refuses
 the launch rather than being ignored.
 

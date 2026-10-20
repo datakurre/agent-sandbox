@@ -3,7 +3,7 @@
 use agent_sandbox_proxy::policy::ProxyConfig;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, TcpListener, UdpSocket};
 use thiserror::Error;
 use toml::Value;
@@ -572,6 +572,9 @@ pub fn route_path(path: Option<&str>) -> &str {
 
 /// One HTTP route, validated but not yet compiled into policy lines.
 struct RouteSpec {
+    /// The `allowed_hosts` entry a short-form route was written as; `None` for
+    /// a `[[network.allowed_routes]]` table.
+    entry: Option<String>,
     /// `domain[:ports]`, as written.
     host: String,
     method: String,
@@ -624,11 +627,114 @@ fn parse_route_table(i: usize, rule_val: &Value) -> Result<RouteSpec, ConfigErro
     validate_route_host(&ctx, host_val)?;
 
     Ok(RouteSpec {
+        entry: None,
         host: host_val.to_string(),
         method: method.to_string(),
         path: path.to_string(),
         has_secret: rule.contains_key("secret"),
     })
+}
+
+/// The short form of a route, written straight into `allowed_hosts`:
+/// `[METHODS ]DOMAIN[:PORTS][/PATH]`, such as `"GET,POST api.example.com:443/v1/**"`.
+/// A method list without a path means every path, and a path without a method
+/// list every method, as an `[[network.allowed_routes]]` table would have it.
+///
+/// `None` for a plain allow entry: anything without a method list or a path,
+/// a CIDR block's `/` being a prefix length rather than a path.
+fn parse_route_entry(i: usize, entry: &str) -> Option<Result<Vec<RouteSpec>, ConfigError>> {
+    let trimmed = entry.trim();
+    let (methods, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((methods, rest)) => (Some(methods), rest.trim_start()),
+        None => (None, trimmed),
+    };
+    if methods.is_none() {
+        if !rest.contains('/') || is_ip_or_cidr(&parse_host_port(rest).0) {
+            return None;
+        }
+    }
+    Some(route_entry_specs(i, entry, methods, rest))
+}
+
+fn route_entry_specs(
+    i: usize,
+    entry: &str,
+    methods: Option<&str>,
+    rest: &str,
+) -> Result<Vec<RouteSpec>, ConfigError> {
+    let ctx = format!("[network].allowed_hosts[{}] '{}'", i, entry);
+    if rest.contains(char::is_whitespace) {
+        return Err(ConfigError::msg(format!(
+            "{}: unexpected space. A route is written METHODS DOMAIN[:PORTS][/PATH], with one space after the method list (e.g. \"GET,POST api.example.com:443/v1/**\").",
+            ctx
+        )));
+    }
+    let (host, path) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, DEFAULT_ROUTE_PATH),
+    };
+    let (host_part, port_part) = parse_host_port(host);
+    if host_part.is_empty() {
+        return Err(ConfigError::msg(format!(
+            "{}: missing domain. Example: \"GET api.example.com:443/v1/**\".",
+            ctx
+        )));
+    }
+    if host_part == "*" || is_ip_or_cidr(&host_part) {
+        return Err(ConfigError::msg(format!(
+            "{}: a route needs a domain name, not '{}'. Allow it without a method or path instead.",
+            ctx, host_part
+        )));
+    }
+    _proxy_domain(&ctx, &host_part)?;
+    if let Some(port) = &port_part {
+        _proxy_port(&ctx, port)?;
+        if ports_include_ssh(port) {
+            return Err(ConfigError::msg(format!(
+                "{}: a route is HTTP, so it cannot cover port 22. Write \"{}:22\" as an entry of its own for SSH.",
+                ctx, host_part
+            )));
+        }
+    }
+
+    let methods: Vec<&str> = match methods {
+        None => vec!["*"],
+        Some(list) => list.split(',').collect(),
+    };
+    let mut seen = HashSet::new();
+    for method in &methods {
+        let valid = *method == "*"
+            || (!method.is_empty() && method.chars().all(|c| c.is_ascii_uppercase()));
+        if !valid {
+            return Err(ConfigError::msg(format!(
+                "{}: method '{}' must be uppercase (e.g. GET, or * for every method), and methods are separated by commas alone.",
+                ctx, method
+            )));
+        }
+        if !seen.insert(*method) {
+            return Err(ConfigError::msg(format!(
+                "{}: method '{}' is listed twice.",
+                ctx, method
+            )));
+        }
+    }
+    if methods.len() > 1 && methods.contains(&"*") {
+        return Err(ConfigError::msg(format!(
+            "{}: '*' already covers every method; list it alone.",
+            ctx
+        )));
+    }
+
+    Ok(methods
+        .into_iter()
+        .map(|method| RouteSpec {
+            entry: Some(entry.to_string()),
+            host: host.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            has_secret: false,
+        })
+        .collect())
 }
 
 /// The domain and port checks for a route's `host`, kept with the rest of a
@@ -740,33 +846,63 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     routes.push(parse_route_table(i, rule_val)?);
                 }
             }
-            let rules_hosts_no_secret: HashSet<&str> = routes
-                .iter()
-                .filter(|r| !r.has_secret)
-                .map(|r| r.host.as_str())
-                .collect();
-            let has_non_secret_rule = !rules_hosts_no_secret.is_empty();
 
+            // Routes written into allowed_hosts join the tables' routes before
+            // any conflict check, so the order of the entries does not matter.
+            let mut plain_items = Vec::new();
             if let Some(allow) = net_table.get("allowed_hosts") {
                 let items = _proxy_list("allowed_hosts", allow, |_, _| Ok(()), "[network].")?;
-                for item in items {
-                    if !allow_set.insert(item.clone()) {
-                        return Err(ConfigError::msg(format!(
-                            "[network].allowed_hosts: duplicate entry '{}'. Remove the redundant entry.",
-                            item
-                        )));
-                    }
-                    if item == "*" || item.starts_with("*:") {
-                        allow_has_wildcard = true;
-                    }
-                    if rules_hosts_no_secret.contains(item.as_str()) {
-                        return Err(ConfigError::msg(format!("[network]: host '{}' is allowed broadly, making the non-secret [[network.allowed_routes]] ineffective. Remove the rule or add a secret.", item)));
+                let mut seen_routes = HashSet::new();
+                for (i, item) in items.into_iter().enumerate() {
+                    match parse_route_entry(i, &item) {
+                        None => plain_items.push(item),
+                        Some(specs) => {
+                            for spec in specs? {
+                                let key =
+                                    (spec.host.clone(), spec.method.clone(), spec.path.clone());
+                                if !seen_routes.insert(key) {
+                                    return Err(ConfigError::msg(format!(
+                                        "[network].allowed_hosts: duplicate entry '{}': its route {} {}{} is already listed. Remove the redundant entry.",
+                                        item, spec.method, spec.host, spec.path
+                                    )));
+                                }
+                                routes.push(spec);
+                            }
+                        }
                     }
                 }
             }
 
+            let rules_hosts_no_secret: HashMap<&str, &RouteSpec> = routes
+                .iter()
+                .filter(|r| !r.has_secret)
+                .map(|r| (r.host.as_str(), r))
+                .collect();
+            let has_non_secret_rule = !rules_hosts_no_secret.is_empty();
+
+            for item in plain_items {
+                if !allow_set.insert(item.clone()) {
+                    return Err(ConfigError::msg(format!(
+                        "[network].allowed_hosts: duplicate entry '{}'. Remove the redundant entry.",
+                        item
+                    )));
+                }
+                if item == "*" || item.starts_with("*:") {
+                    allow_has_wildcard = true;
+                }
+                if let Some(route) = rules_hosts_no_secret.get(item.as_str()) {
+                    return Err(ConfigError::msg(match &route.entry {
+                        None => format!("[network]: host '{}' is allowed broadly, making the non-secret [[network.allowed_routes]] ineffective. Remove the rule or add a secret.", item),
+                        Some(entry) => format!("[network]: host '{}' is allowed broadly, making the route '{}' in allowed_hosts ineffective. Remove one of the two entries.", item, entry),
+                    }));
+                }
+            }
+
             if allow_has_wildcard && has_non_secret_rule {
-                return Err(ConfigError::msg("[network]: wildcard allow makes non-secret [[network.allowed_routes]] ineffective. Remove the rule or add a secret."));
+                if routes.iter().any(|r| !r.has_secret && r.entry.is_none()) {
+                    return Err(ConfigError::msg("[network]: wildcard allow makes non-secret [[network.allowed_routes]] ineffective. Remove the rule or add a secret."));
+                }
+                return Err(ConfigError::msg("[network]: wildcard allow makes the routes in allowed_hosts ineffective. Remove the wildcard or the routes."));
             }
 
             if allow_has_wildcard {
@@ -1405,6 +1541,166 @@ mod export_tests {
         assert!(policy.allow_port.is_empty(), "{:?}", policy.allow_port);
         assert_eq!(policy.allow_route, vec!["*\tGET\t/**".to_string()]);
         assert_eq!(policy.default, vec!["deny".to_string()]);
+    }
+
+    fn network(body: &str) -> String {
+        format!("```agent-sandbox\n[network]\n{body}```\n")
+    }
+
+    fn compiled(policy: &ProxyPolicy) -> [Vec<String>; 6] {
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        [
+            sorted(&policy.allow_host),
+            sorted(&policy.allow_ip),
+            sorted(&policy.allow_port),
+            sorted(&policy.allow_signing),
+            policy.allow_route.clone(),
+            policy.default.clone(),
+        ]
+    }
+
+    #[test]
+    fn a_route_written_into_allowed_hosts_is_the_table_it_stands_for() {
+        let short = parse_proxy(&network(
+            "allowed_hosts = [\n\
+             \"POST *.example.com:443/foo/*\",\n\
+             \"GET,POST *.example.com:80,443/foo/**\",\n\
+             \"PUT api.example.org\",\n\
+             \"api.example.net:8443/v2/**\",\n\
+             ]\n",
+        ))
+        .expect("the short form must parse");
+        let long = parse_proxy(&network(
+            "[[network.allowed_routes]]\nhost = \"*.example.com:443\"\nmethod = \"POST\"\npath = \"/foo/*\"\n\
+             [[network.allowed_routes]]\nhost = \"*.example.com:80,443\"\nmethod = \"GET\"\npath = \"/foo/**\"\n\
+             [[network.allowed_routes]]\nhost = \"*.example.com:80,443\"\nmethod = \"POST\"\npath = \"/foo/**\"\n\
+             [[network.allowed_routes]]\nhost = \"api.example.org\"\nmethod = \"PUT\"\n\
+             [[network.allowed_routes]]\nhost = \"api.example.net:8443\"\nmethod = \"*\"\npath = \"/v2/**\"\n",
+        ))
+        .expect("the tables must parse");
+        assert_eq!(compiled(&short), compiled(&long));
+        assert_eq!(
+            short.allow_route,
+            vec![
+                "*.example.com\tPOST\t/foo/*".to_string(),
+                "*.example.com\tGET\t/foo/**".to_string(),
+                "*.example.com\tPOST\t/foo/**".to_string(),
+                "api.example.org\tPUT\t/**".to_string(),
+                "api.example.net\t*\t/v2/**".to_string(),
+            ]
+        );
+        assert!(short.secret_route.is_empty());
+    }
+
+    #[test]
+    fn plain_allowed_hosts_entries_are_not_routes() {
+        for entry in [
+            "github.com",
+            "github.com:22,443",
+            "*.example.com:443",
+            "10.0.0.0/8:80",
+            "10.0.0.0/8",
+            "fd00::/8",
+            "[::1]:4000",
+            "*",
+            "*:443",
+        ] {
+            assert!(parse_route_entry(0, entry).is_none(), "{entry}");
+            let policy = parse_proxy(&network(&format!("allowed_hosts = [\"{entry}\"]\n")))
+                .unwrap_or_else(|e| panic!("{entry}: {e}"));
+            assert!(policy.allow_route.is_empty(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_route_in_allowed_hosts_is_refused_by_name() {
+        let cases = [
+            ("get a.example/x", "method 'get' must be uppercase"),
+            ("GET, a.example/x", "methods are separated by commas alone"),
+            ("GET,,POST a.example/x", "method '' must be uppercase"),
+            ("GET,GET a.example/x", "method 'GET' is listed twice"),
+            ("GET,* a.example/x", "'*' already covers every method"),
+            ("GET a.example /x", "unexpected space"),
+            ("GET :443/x", "missing domain"),
+            ("GET /x", "missing domain"),
+            ("GET 10.0.0.1/x", "needs a domain name, not '10.0.0.1'"),
+            ("GET 10.0.0.0/8", "needs a domain name, not '10.0.0.0'"),
+            ("10.0.0.1:80/x", "needs a domain name, not '10.0.0.1'"),
+            ("GET *:443/x", "needs a domain name, not '*'"),
+            ("GET a.example:22/x", "cannot cover port 22"),
+            ("GET a.example:20-30", "cannot cover port 22"),
+            ("GET a.example:99999/x", "is not a port"),
+            ("GET -bad-.example/x", "is not a valid domain name"),
+        ];
+        for (entry, expected) in cases {
+            let err = parse_proxy(&network(&format!(
+                "allowed_hosts = [\"ok.example:443\", \"{entry}\"]\n"
+            )))
+            .expect_err(entry)
+            .to_string();
+            assert!(
+                err.contains(&format!("[network].allowed_hosts[1] '{entry}'")),
+                "{entry}: the entry is named: {err}"
+            );
+            assert!(
+                err.contains(expected),
+                "{entry}\n  expected: {expected}\n  got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_listed_twice_in_allowed_hosts_is_refused() {
+        let err = parse_proxy(&network(
+            "allowed_hosts = [\"GET a.example:443/x\", \"POST,GET a.example:443/x\"]\n",
+        ))
+        .expect_err("GET is listed by both entries")
+        .to_string();
+        assert!(
+            err.contains("duplicate entry 'POST,GET a.example:443/x'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_broad_allow_beside_a_route_in_allowed_hosts_is_refused_either_way_round() {
+        for entries in [
+            "\"a.example:443\", \"GET a.example:443/x\"",
+            "\"GET a.example:443/x\", \"a.example:443\"",
+        ] {
+            let err = parse_proxy(&network(&format!("allowed_hosts = [{entries}]\n")))
+                .expect_err(entries)
+                .to_string();
+            assert!(
+                err.contains(
+                    "host 'a.example:443' is allowed broadly, making the route 'GET a.example:443/x' in allowed_hosts ineffective"
+                ),
+                "{err}"
+            );
+        }
+        let err = parse_proxy(&network("allowed_hosts = [\"*\", \"GET a.example/x\"]\n"))
+            .expect_err("a wildcard beside a route")
+            .to_string();
+        assert!(
+            err.contains("wildcard allow makes the routes in allowed_hosts ineffective"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_policy_file_takes_routes_in_allowed_hosts_too() {
+        let policy =
+            parse_policy_file("[network]\nallowed_hosts = [\"GET api.example.com:443/v1/**\"]\n")
+                .expect("policy files share the parser");
+        assert_eq!(policy.allow_host, vec!["api.example.com:443".to_string()]);
+        assert_eq!(
+            policy.allow_route,
+            vec!["api.example.com\tGET\t/v1/**".to_string()]
+        );
     }
 
     #[test]
