@@ -42,7 +42,8 @@ pub struct HostConfig {
 pub struct HostBinding {
     #[serde(alias = "domain")]
     pub host: String,
-    #[serde(default = "default_method")]
+    /// Required, as it is in AGENTS.md: a default here would let a rule that
+    /// leaves `method` out be authorized by one that does not match it.
     pub method: String,
     #[serde(default = "default_path")]
     pub path: String,
@@ -52,9 +53,6 @@ pub struct HostBinding {
     pub prefix: Option<String>,
 }
 
-fn default_method() -> String {
-    "GET".to_string()
-}
 fn default_path() -> String {
     DEFAULT_ROUTE_PATH.to_string()
 }
@@ -134,16 +132,16 @@ fn requested_rules_from_toml(content: &str) -> Vec<SecretRule> {
             if let Some(rules) = network.get("allowed_routes").and_then(|v| v.as_array()) {
                 for rule in rules {
                     if let Some(rule_table) = rule.as_table() {
-                        if let (Some(secret_val), Some(host_val)) =
-                            (rule_table.get("secret"), rule_table.get("host"))
-                        {
-                            if let (Some(secret), Some(host)) =
-                                (secret_val.as_str(), host_val.as_str())
+                        // `method` is required; `parse_proxy` has already
+                        // refused a rule without one.
+                        if let (Some(secret_val), Some(host_val), Some(method_val)) = (
+                            rule_table.get("secret"),
+                            rule_table.get("host"),
+                            rule_table.get("method"),
+                        ) {
+                            if let (Some(secret), Some(host), Some(method)) =
+                                (secret_val.as_str(), host_val.as_str(), method_val.as_str())
                             {
-                                let method = rule_table
-                                    .get("method")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("GET");
                                 let path =
                                     route_path(rule_table.get("path").and_then(|v| v.as_str()));
                                 let header = rule_table
@@ -369,7 +367,17 @@ pub fn resolve_secrets_with_policies(
             // manually extract [[network.allowed_routes]] and add to bindings
             if let Some(network) = val.get("network").and_then(|v| v.as_table()) {
                 if let Some(rules) = network.get("allowed_routes").and_then(|v| v.as_array()) {
-                    for rule in rules {
+                    for (i, rule) in rules.iter().enumerate() {
+                        // Said outright rather than dropped with the rest: a
+                        // rule that leaves `method` out would otherwise read as
+                        // unauthorized, and the fix offered would not name it.
+                        if rule.get("secret").is_some() && rule.get("method").is_none() {
+                            anyhow::bail!(
+                                "agent-sandbox: {}: [[network.allowed_routes]][{}]: missing required field 'method', as in AGENTS.md. Specify an HTTP method (e.g. method = \"GET\" or method = \"*\").",
+                                config.display(),
+                                i
+                            );
+                        }
                         if let Ok(hb) = rule.clone().try_into::<HostBinding>() {
                             host_config.bindings.push(hb);
                         }
@@ -827,6 +835,35 @@ prefix = "Bearer "
             assert!(!err.contains("port 443"), "{host}: {err}");
             assert!(err.contains("secretspec"), "{host}: {err}");
         }
+    }
+
+    #[test]
+    fn a_trusted_rule_without_a_method_is_refused_not_defaulted() {
+        // AGENTS.md requires `method`, so trusted.toml does too: a "GET"
+        // default here once authorized a rule the AGENTS.md side never wrote.
+        let agents = "```agent-sandbox\n[[network.allowed_routes]]\n\
+                      host = \"api.example.com:443\"\nmethod = \"GET\"\n\
+                      path = \"/user\"\nsecret = \"TOKEN\"\n```\n";
+        let dir = scratch(&[
+            ("policy", "secret_route\tapi.example.com\tGET\t/user\n"),
+            (
+                "trusted.toml",
+                "[[network.allowed_routes]]\nhost = \"api.example.com:443\"\n\
+                 path = \"/user\"\nsecret = \"TOKEN\"\n",
+            ),
+            ("AGENTS.md", agents),
+            ("secretspec.toml", ""),
+        ]);
+        let err = resolve_secrets_logic(
+            &dir.path().join("policy"),
+            &dir.path().join("trusted.toml"),
+            &dir.path().join("secretspec.toml"),
+            &dir.path().join("AGENTS.md"),
+        )
+        .expect_err("a trusted rule without a method must refuse the launch")
+        .to_string();
+        assert!(err.contains("missing required field 'method'"), "{err}");
+        assert!(err.contains("[[network.allowed_routes]][0]"), "{err}");
     }
 
     #[test]

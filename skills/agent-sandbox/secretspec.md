@@ -178,9 +178,10 @@ header = "Authorization"
 prefix = "Bearer "
 ```
 
-Every field is matched exactly, the port included. Omitted fields are not
-wildcards: they take their defaults (`method = "GET"`, `path = "/**"`,
-`header = "Authorization"`) and are then matched as written. A rule the repo asks
+Every field is matched exactly, the port included. `method` is required
+on both sides. Omitted optional fields are not wildcards: they take their
+defaults (`path = "/**"`, `header = "Authorization"`) and are then matched as
+written. A rule the repo asks
 for but the host has not authorized **refuses the launch** and prints the exact
 block to paste — when a user reports that refusal, the fix is to copy the printed
 block unchanged, not to retype it.
