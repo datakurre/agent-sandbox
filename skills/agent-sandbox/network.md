@@ -38,8 +38,12 @@ Two consequences worth internalizing:
 - A tool that ignores `$HTTP_PROXY` and opens its own socket fails, and usually
   reports it as a DNS error. That is the firewall, not a broken resolver.
 - The entrypoint compensates for the common cases: it writes an `~/.ssh/config`
-  that routes SSH through the proxy and sets `NODE_USE_ENV_PROXY=1` for Node.
-  Anything else with its own HTTP stack may need `--proxy`-style flags of its own.
+  that routes SSH through the proxy, sets `NODE_USE_ENV_PROXY=1` for Node, and
+  points Maven (`mvn`, `mvnw`) at the proxy through `MAVEN_ARGS`,
+  `MAVEN_CONFIG` and `MAVEN_OPTS`, plus a Java truststore for the session CA
+  when one is mounted. Don't hand-write `~/.m2/settings.xml` proxy settings
+  over it. Anything else with its own HTTP stack may need `--proxy`-style
+  flags of its own.
 
 The firewall governs *egress*, not the sandbox's own loopback. A server you
 start here stays reachable at `localhost` — `$NO_PROXY` carries
@@ -52,8 +56,10 @@ cause; point it at `127.0.0.1` or set its own no-proxy option.
 
 A proxied session can publish ports: `[ports]` entries bound to loopback work
 under `--proxy`, because publishing is ingress and the firewall governs egress.
-(A bind the wider network can reach is refused, as is a raw `-p` through
-`--podman-args` — the launcher cannot check that one's bind address.)
+(A bind the wider network can reach is refused, as is a raw `-p`, whether
+given directly or through `--podman-args` — the launcher cannot check that
+one's bind address. `--shared-network` is refused too: the shared bridge is a
+route around the proxy.)
 
 **A server behind a `[ports]` mapping must bind `0.0.0.0`, not `127.0.0.1`.**
 Publishing forwards the host's port to the sandbox's *interface* address, so a
@@ -74,8 +80,9 @@ distinguishable from "not running".
 
 If you need one that is not listed, ask the user to relaunch with
 `agent-sandbox --host-loopback-port PORT`; it cannot be turned on in a running
-session. Note that this works under `--proxy` and that what it reaches is *not*
-covered by the egress policy — so it is not a way around a denied host. For that
+session, and it cannot be combined with `--krun` (neither can `--browser`,
+which uses it). Note that this works under `--proxy` and that what it reaches
+is *not* covered by the egress policy — so it is not a way around a denied host. For that
 the answer is still `ctl policy allow`.
 
 ## Where the policy comes from
@@ -84,6 +91,7 @@ the answer is still `ctl policy allow`.
 | --- | --- |
 | `--proxy` | the workspace `AGENTS.md`, plus `~/.config/agent-sandbox/policies/<agent>.toml` if it exists for the launched agent |
 | `--proxy --policy NAME` | the above, plus `~/.config/agent-sandbox/policies/NAME.toml`, merged additively |
+| `--proxy --no-policy` | `AGENTS.md` only — drops the agent-named policy and any `--policy` given before it |
 
 `--policy` requires `--proxy`; using it alone refuses the launch. Policies are
 host-owned; `AGENTS.md` is project-controlled and therefore untrusted. The
@@ -227,9 +235,9 @@ inside — if you need to know what was denied, ask the user to run `ctl logs` o
 | SSH relay authorization (`ctl policy allow <host>:22`) | live — the relay re-reads the policy on every call |
 | `ctl mounts add` / `rm` | live (not under `--krun`) |
 | A new L7 route needing TLS interception | **relaunch** (session CA is mounted at launch) |
-| `[ports]` | **relaunch** |
+| `[ports]`, `[mounts]` | **relaunch** |
 | `--secrets` and any secret binding | **relaunch** |
-| Any flag: `--ssh`, `--gpg`, `--workspace`, `--nix`, `--podman`, `--privileged` | **relaunch** |
+| Any flag: `--ssh`, `--gpg`, `--workspace`, `--nix`, `--podman`, `--privileged`, `--ports`, `--mounts` | **relaunch** |
 | Edits to `AGENTS.md` | **relaunch** |
 
 Say which of the two a request needs. Asking a user to relaunch when

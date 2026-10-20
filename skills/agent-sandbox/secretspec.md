@@ -35,7 +35,7 @@ under `secretspec run` instead of hard-coding anything.
 
 ## Manifest shape
 
-Verified against the bundled `secretspec` (0.19.1):
+Verified against the bundled `secretspec` (0.21.0):
 
 ```toml
 [project]
@@ -43,7 +43,7 @@ name = "demo"
 revision = "1.0"
 
 [defaults]
-provider = "dotenv"
+providers = ["local"]
 
 [providers]
 local = "dotenv://.env"
@@ -66,8 +66,10 @@ secrets = ["API_KEY"]
   cause of "secretspec suddenly stopped working" after someone adds a key.
 - `[profiles.<name>]` — per-environment requirements; `default` is the base.
   A `default` value makes a secret optional in practice.
-- `[providers]` — named aliases for provider URIs; `[defaults] provider` picks
-  one. Users can also set a machine-wide default with
+- `[providers]` — named aliases for provider URIs; `[defaults] providers` lists
+  which of them to use. It is a list: the singular `provider = "..."` that
+  older releases accepted now fails with ``unknown field `provider`, expected
+  `providers` ``. Users can also set a machine-wide default with
   `secretspec config global init` (`~/.config/secretspec/config.toml`).
 - `[scopes.<name>]` — an allowlist of secrets for one service or command;
   `--scope api` injects only those and strips the rest from the child process.
@@ -108,7 +110,8 @@ secretspec.toml — defaults to "agents"; set it to false to disable.)
 
 Supply an honest, specific `--reason` — it is recorded in the audit log
 (`~/.local/state/secretspec/audit.log`, which is on tmpfs in the sandbox and does
-not survive the session). Do not disable the policy to make the message go away.
+not survive the session; the first access prints a note that recording has
+started). Do not disable the policy to make the message go away.
 
 **`keyring://` cannot work inside the sandbox.** There is no session bus or
 display, so it fails with:
@@ -185,6 +188,10 @@ written. A rule the repo asks
 for but the host has not authorized **refuses the launch** and prints the exact
 block to paste — when a user reports that refusal, the fix is to copy the printed
 block unchanged, not to retype it.
+
+A secret route's `host` must name port `443` or no port. Secrets are injected
+only into HTTPS the proxy intercepts, which is port 443, so the launcher refuses
+a rule like `api.example.com:8443` with a `secret` instead of authorizing it.
 
 This asymmetry is the point: `AGENTS.md` is untrusted, so it can name a secret
 but cannot decide where it goes. Note also that secret injection is HTTP/1.1
