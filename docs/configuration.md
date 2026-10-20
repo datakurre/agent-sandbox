@@ -140,6 +140,16 @@ is still ambiguous — a `.` or `..` segment, an empty `//` segment, a backslash
 rather than normalised, so it cannot be matched against one route and forwarded to
 another.
 
+A rule restricts a whole domain, not one port. The proxy matches a route by its
+domain pattern alone — the port in `host` reaches the policy as an ordinary
+allow entry, not as part of the route — so once any rule matches a host, every
+connection to that host is held to its rules, whichever entry let it through:
+HTTPS on port 443 and plain HTTP must match a rule's method and path, and a
+tunnel to any other port (`:8443`, say) is refused outright, because only port
+443 is intercepted. A wildcard rule reaches as far as its pattern: a rule on
+`*.example.com` also restricts `example.com` and `api.example.com`, even where
+`allowed_hosts` lists them on their own.
+
 #### Examples
 
 ````markdown

@@ -152,6 +152,14 @@ without one stay an opaque `CONNECT` tunnel. That interception is why an L7 rule
 added mid-session produces certificate errors — the session CA is mounted at
 launch, so a live-added route has nothing behind it.
 
+A route restricts the **whole domain**, on every port, not just the port in its
+`host`. Once any rule matches a host — `*.example.com` matches `example.com` and
+every subdomain — HTTPS and plain HTTP to it must match some rule, and a
+`CONNECT` to any port other than 443 is denied (`connect-l7-unintercepted`). An
+`allowed_hosts` entry for the same host does not exempt it. So a route on
+`*.example.com` also denies a tunnel to `example.com:8443`; scope the route to
+the subdomain that needs it.
+
 ### Combinations the launcher refuses
 
 An invalid policy refuses the launch outright, so a bad suggestion costs the user
