@@ -424,7 +424,35 @@ fn percent_decode_bytes(s: &str) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
-fn authority_host_port(authority: &str, default_port: u16) -> io::Result<(String, u16)> {
+/// One parsed authority, with a port-less spelling already resolved to the
+/// scheme's default port.
+#[derive(Debug)]
+struct Authority {
+    /// `canonical_host`'s form: lowercase, no trailing dot, IPv6 bracketed
+    /// and folded -- the same spelling the CONNECT authority is held in.
+    host: String,
+    port: u16,
+}
+
+impl Authority {
+    fn same_place(&self, other: &Authority) -> bool {
+        self.host == other.host && self.port == other.port
+    }
+
+    /// The `Host` value an origin is sent: canonical host, and the port in
+    /// decimal whenever it is not the default for `scheme` -- so a port-less
+    /// `Host` always means the default port to the origin, whatever the
+    /// client wrote.
+    fn host_header_value(&self, scheme: Scheme) -> String {
+        if self.port == scheme.default_port() {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+fn authority_host_port(authority: &str, default_port: u16) -> io::Result<Authority> {
     // Refused, not stripped: RFC 9110 §4.2.4 forbids userinfo in an http(s)
     // URI, and checking `h` while forwarding `x@h` leaves the origin -- or a
     // front end routing on Host -- free to read the name differently.
@@ -484,10 +512,33 @@ fn authority_host_port(authority: &str, default_port: u16) -> io::Result<(String
         })?,
         None => default_port,
     };
-    Ok((host.trim_end_matches('.').to_ascii_lowercase(), port))
+    // Bracketed IPv6 comes back out of the split without its brackets;
+    // `normalize_host` wants them, and returns them.
+    let spelled = if authority.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
+    let host = canonical_host(&spelled)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "authority host is invalid"))?;
+    Ok(Authority { host, port })
 }
 
-fn request_target_authority(request_target: &str) -> io::Result<Option<(String, u16)>> {
+/// `normalize_host`, lowercased: the one spelling every host comparison and
+/// every forwarded `Host` in this module uses.
+///
+/// `normalize_host` folds an IPv4-mapped IPv6 literal to IPv4 but keeps the
+/// brackets, and `[127.0.0.1]` is not an IP-literal (RFC 3986 §3.2.2), so a
+/// folded IPv4 loses them here.
+fn canonical_host(host: &str) -> Option<String> {
+    let host = crate::normalize_host(&host.to_ascii_lowercase())?;
+    match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) if inner.parse::<std::net::Ipv4Addr>().is_ok() => Some(inner.to_string()),
+        _ => Some(host),
+    }
+}
+
+fn request_target_authority(request_target: &str) -> io::Result<Option<Authority>> {
     let Some((scheme, authority, _)) = split_absolute(request_target) else {
         return Ok(None);
     };
@@ -504,8 +555,8 @@ fn request_target_authority(request_target: &str) -> io::Result<Option<(String, 
     authority_host_port(authority, scheme_default).map(Some)
 }
 
-fn host_header_authority(head: &str, default_port: u16) -> io::Result<Option<(String, u16)>> {
-    let mut found: Option<(String, u16)> = None;
+fn host_header_authority(head: &str, default_port: u16) -> io::Result<Option<Authority>> {
+    let mut found: Option<Authority> = None;
     for line in head.lines().skip(1) {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
@@ -517,7 +568,7 @@ fn host_header_authority(head: &str, default_port: u16) -> io::Result<Option<(St
         if name.eq_ignore_ascii_case("host") {
             let parsed = authority_host_port(value.trim(), default_port)?;
             if let Some(prev) = &found {
-                if prev != &parsed {
+                if !prev.same_place(&parsed) {
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,
                         "conflicting Host headers",
@@ -530,11 +581,22 @@ fn host_header_authority(head: &str, default_port: u16) -> io::Result<Option<(St
     Ok(found)
 }
 
+/// Check that the request is addressed to the connection's own authority,
+/// and return the `Host` value to forward in place of whatever the client
+/// wrote.
+///
+/// Matching on a normalised host while forwarding the client's spelling
+/// (`API.example.com.:0443`) left a front end that routes on the raw `Host`
+/// string free to read it as somewhere else; forwarding the normalised one
+/// means the origin is told exactly what was checked.  An absolute-form
+/// target's authority is what the forwarded `Host` comes from when there is
+/// one (RFC 9112 §3.2.2), since origin-form drops it from the request line.
 fn validate_request_authority(
     head: &str,
     expected_host: &str,
     expected_port: u16,
-) -> io::Result<()> {
+    scheme: Scheme,
+) -> io::Result<String> {
     let (_, target, _) = request_line(head)?;
 
     // A fragment is never part of a request target (RFC 9112 §3.2), and one
@@ -546,12 +608,16 @@ fn validate_request_authority(
         ));
     }
 
-    let expected = (expected_host.trim_end_matches('.').to_ascii_lowercase(), expected_port);
+    let expected_host = canonical_host(expected_host).ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidData, "connection authority is invalid")
+    })?;
     let target_authority = request_target_authority(target)?;
-    let host_authority = host_header_authority(head, expected_port)?;
+    // A `Host` without a port names the scheme's default, not whatever port
+    // this connection happens to be on: that is how the origin reads it.
+    let host_authority = host_header_authority(head, scheme.default_port())?;
 
     if let (Some(target), Some(host)) = (&target_authority, &host_authority) {
-        if target != host {
+        if !target.same_place(host) {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "request target authority does not match Host",
@@ -566,16 +632,16 @@ fn validate_request_authority(
         )
     })?;
 
-    if effective != expected {
+    if effective.host != expected_host || effective.port != expected_port {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             format!(
                 "request authority {:?}:{} does not match secret target {:?}:{}",
-                effective.0, effective.1, expected.0, expected.1
+                effective.host, effective.port, expected_host, expected_port
             ),
         ));
     }
-    Ok(())
+    Ok(effective.host_header_value(scheme))
 }
 
 fn response_status_code(head: &str) -> io::Result<u16> {
@@ -596,6 +662,25 @@ fn response_status_code(head: &str) -> io::Result<u16> {
             format!("invalid status code: {:?}", status),
         )
     })
+}
+
+/// Replace every `Host` line with one, placed first after the request line
+/// where RFC 9110 §7.2 asks a client to send it.
+fn set_host(head: &[u8], host: &str) -> io::Result<Vec<u8>> {
+    let head_str = std::str::from_utf8(head)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "request head is not valid UTF-8"))?;
+    let mut lines = head_str.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut out = format!("{request_line}\r\nHost: {host}\r\n");
+    for line in lines.take_while(|line| !line.is_empty()) {
+        let name = line.split_once(':').map_or(line, |(name, _)| name);
+        if !name.eq_ignore_ascii_case("host") {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("\r\n");
+    Ok(out.into_bytes())
 }
 
 fn rewrite_head(head: &[u8], header_name: &str, header_value: &str) -> io::Result<Vec<u8>> {
@@ -719,6 +804,23 @@ fn response_has_no_body(request_method: &str, status_code: u16) -> bool {
         || status_code == 304
 }
 
+/// What the client-facing side of the connection speaks: what a port-less
+/// `Host` means, and so when the forwarded `Host` has to spell its port out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheme {
+    Http,
+    Https,
+}
+
+impl Scheme {
+    fn default_port(self) -> u16 {
+        match self {
+            Scheme::Http => 80,
+            Scheme::Https => 443,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpExchangeOutcome {
     pub up_bytes: u64,
@@ -776,6 +878,7 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
     upstream: &mut U,
     expected_host: &str,
     expected_port: u16,
+    scheme: Scheme,
     shared: &std::sync::Arc<crate::Shared>,
 ) -> Result<HttpExchangeOutcome, ProxyHttpError> {
     let mut secret_missing = false;
@@ -797,12 +900,17 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
                 let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
                 return Err(e);
             }
-            if let Err(e) = request_line(request_text)
-                .and_then(|_| validate_request_authority(request_text, expected_host, expected_port))
+            let host_value = match request_line(request_text)
+                .and_then(|_| {
+                    validate_request_authority(request_text, expected_host, expected_port, scheme)
+                })
             {
-                let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
-                return Err(e);
-            }
+                Ok(value) => value,
+                Err(e) => {
+                    let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                    return Err(e);
+                }
+            };
             
             let has_cl = content_length(request_text)?.is_some();
             let has_te = is_chunked(request_text);
@@ -855,6 +963,10 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
             } else {
                 None
             };
+            // Exactly one `Host`, in the form that was checked, on every
+            // request -- injected or not, since `allow_route` scoping rests on
+            // the same check.
+            let request_head = set_host(&request_head, &host_value)?;
             let out_head = match binding {
                 Some(binding) => {
                     rewrite_head(&request_head, &binding.header, binding.value.as_str())?
@@ -1052,7 +1164,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            443,
+            443, Scheme::Https,
             &shared_injecting("example.com\t*\t/**", "Authorization", "Bearer injected-secret"),
         )
         .expect("proxy");
@@ -1082,7 +1194,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            80, Scheme::Http,
             &crate::dummy_shared(),
         )
         .expect("proxy");
@@ -1102,7 +1214,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            80, Scheme::Http,
             &crate::dummy_shared(),
         )
         .expect("proxy");
@@ -1120,7 +1232,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            443,
+            443, Scheme::Https,
             &shared_injecting("example.com\tPOST\t/submit", "X-Api-Key", "value"),
         )
         .expect("proxy");
@@ -1140,7 +1252,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            443,
+            443, Scheme::Https,
             &shared_injecting("example.com\tPOST\t/chunk", "X-Test", "yes"),
         )
         .expect("proxy");
@@ -1166,7 +1278,7 @@ mod tests {
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
         let outcome =
-            proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+            proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, Scheme::Http, &shared)
                 .expect("proxy");
 
         assert!(outcome.secret_missing);
@@ -1191,7 +1303,7 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, &shared)
+        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, Scheme::Https, &shared)
             .expect("proxy");
 
         let rendered = String::from_utf8(upstream.written).expect("utf8");
@@ -1210,7 +1322,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            80, Scheme::Http,
             &crate::dummy_shared(),
         )
         .expect("proxy");
@@ -1230,7 +1342,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            80, Scheme::Http,
             &crate::dummy_shared(),
         )
         .expect("proxy");
@@ -1252,7 +1364,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            80, Scheme::Http,
             &crate::dummy_shared(),
         )
         .expect("proxy");
@@ -1285,7 +1397,7 @@ mod tests {
         for head in bad_heads {
             let mut client = FixtureIo::with_read(head);
             let mut upstream = FixtureIo::with_read(b"");
-            proxy_http1_with_injection(&mut client, &mut upstream, "example.com", 80, &shared)
+            proxy_http1_with_injection(&mut client, &mut upstream, "example.com", 80, Scheme::Http, &shared)
                 .unwrap_err();
             assert!(
                 upstream.written.is_empty(),
@@ -1308,7 +1420,7 @@ mod tests {
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
         let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host example.com\n", ""));
-        proxy_http1_with_injection(&mut client, &mut upstream, "example.com", 80, &shared)
+        proxy_http1_with_injection(&mut client, &mut upstream, "example.com", 80, Scheme::Http, &shared)
             .expect("proxy");
     }
 
@@ -1330,7 +1442,7 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        let err = proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, &shared)
+        let err = proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 80, Scheme::Http, &shared)
             .unwrap_err();
 
         assert!(err.to_string().contains("'.' or '..' segment"), "{err}");
@@ -1354,7 +1466,7 @@ mod tests {
             let client_in = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
             let mut client = FixtureIo::with_read(client_in.as_bytes());
             let mut upstream = FixtureIo::with_read(b"");
-            let err = proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared)
+            let err = proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, Scheme::Http, &shared)
                 .unwrap_err();
             assert!(upstream.written.is_empty(), "{target}: {err}");
             assert!(
@@ -1382,7 +1494,7 @@ mod tests {
             let mut client = FixtureIo::with_read(client_in.as_bytes());
             let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
             let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host x\n", ""));
-            proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared)
+            proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, Scheme::Http, &shared)
                 .unwrap_or_else(|e| panic!("{target} should be allowed: {e}"));
         }
         // The query string is never inspected for dot-segments.
@@ -1390,7 +1502,7 @@ mod tests {
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         let shared = std::sync::Arc::new(crate::shared_with_secrets("allow_host x\n", ""));
-        proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, &shared).expect("proxy");
+        proxy_http1_with_injection(&mut client, &mut upstream, "x", 80, Scheme::Http, &shared).expect("proxy");
     }
 
     #[test]
@@ -1411,7 +1523,7 @@ mod tests {
 
         let mut client = FixtureIo::with_read(client_in);
         let mut upstream = FixtureIo::with_read(upstream_in);
-        proxy_http1_with_injection(&mut client, &mut upstream, "registry.example.com", 443, &shared)
+        proxy_http1_with_injection(&mut client, &mut upstream, "registry.example.com", 443, Scheme::Https, &shared)
             .expect("proxy");
 
         let rendered = String::from_utf8(upstream.written).expect("utf8");
@@ -1432,7 +1544,7 @@ mod tests {
                 &mut client,
                 &mut upstream,
                 "example.com",
-                443,
+                443, Scheme::Https,
                 &shared_injecting("example.com\t*\t/**", "Authorization", "Bearer v"),
             )
             .expect("proxy");
@@ -1460,7 +1572,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "api.example.com",
-            80,
+            80, Scheme::Http,
             &shared_injecting("api.example.com\t*\t/**", "Authorization", "Bearer v"),
         )
         .unwrap_err();
@@ -1484,7 +1596,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "api.example.com",
-            80,
+            80, Scheme::Http,
             &shared_injecting("api.example.com\t*\t/**", "Authorization", "Bearer v"),
         )
         .unwrap_err();
@@ -1539,7 +1651,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            80, Scheme::Http,
             &crate::dummy_shared(),
         )
         .expect("proxy should succeed");
@@ -1599,7 +1711,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "example.com",
-            80,
+            80, Scheme::Http,
             &shared_injecting("example.com\tPOST\t/nothing", "X-Api-Key", "value"),
         )
         .expect("proxy");
@@ -1629,7 +1741,7 @@ mod tests {
             &mut client,
             &mut upstream,
             "api.example.com",
-            443,
+            443, Scheme::Https,
             &shared_scoped_to_user_repos(),
         );
         let sent = String::from_utf8(upstream.written).expect("utf8");
@@ -1736,6 +1848,7 @@ mod tests {
                 &mut upstream,
                 "api.example.com",
                 port,
+                Scheme::Http,
                 &shared_scoped_to_user_repos(),
             )
             .expect("proxy");
@@ -1781,7 +1894,7 @@ mod tests {
             );
             let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
             let outcome =
-                proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, &shared)
+                proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, Scheme::Https, &shared)
                     .expect(query);
             assert_eq!(outcome.path.as_deref(), Some("/login"), "{query}");
             let sent = String::from_utf8(upstream.written).expect("utf8");
@@ -1803,7 +1916,7 @@ mod tests {
             );
             let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
             let result =
-                proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, &shared);
+                proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, Scheme::Https, &shared);
             assert!(result.is_err(), "{path}");
             assert!(upstream.written.is_empty(), "{path} was forwarded");
         }
@@ -1811,7 +1924,127 @@ mod tests {
         let mut client =
             FixtureIo::with_read(b"GET /user/repos;v=1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
         let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, &shared)
+        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, Scheme::Https, &shared)
             .expect("/user/repos;v=1");
+    }
+
+    /// Forward one request through a policy that allows everything on
+    /// `host`, and return the `Host` lines the origin was sent.
+    fn forward_one(
+        request: &str,
+        host: &str,
+        port: u16,
+        scheme: Scheme,
+    ) -> Result<String, ProxyHttpError> {
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(&format!("allow_host {host}\n"), ""));
+        let mut client = FixtureIo::with_read(request.as_bytes());
+        let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        proxy_http1_with_injection(&mut client, &mut upstream, host, port, scheme, &shared)?;
+        Ok(String::from_utf8(upstream.written).expect("utf8"))
+    }
+
+    /// The `Host` lines the origin was sent for one request.
+    fn forwarded_host_lines(request: &str, host: &str, port: u16, scheme: Scheme) -> Vec<String> {
+        forward_one(request, host, port, scheme)
+            .expect(request)
+            .split("\r\n")
+            .filter(|l| l.len() >= 5 && l[..5].eq_ignore_ascii_case("host:"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_host_that_is_forwarded_is_the_host_that_was_checked() {
+        // Matched after normalising, but these used to go out as written --
+        // for a front end routing on the raw string to read its own way.
+        for (request, want) in [
+            ("GET / HTTP/1.1\r\nHost: API.example.com.:0443\r\n\r\n", "Host: api.example.com"),
+            ("GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n", "Host: api.example.com"),
+            ("GET / HTTP/1.1\r\nHost: api.example.com:+443\r\n\r\n", "Host: api.example.com"),
+            (
+                "GET / HTTP/1.1\r\nhost: api.example.com\r\nHOST: API.EXAMPLE.COM.\r\n\r\n",
+                "Host: api.example.com",
+            ),
+            // Absolute-form: the target's authority is the one forwarded,
+            // and supplies a Host the client left out.
+            ("GET https://api.example.com/x HTTP/1.1\r\n\r\n", "Host: api.example.com"),
+            (
+                "GET https://API.example.com/x HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n",
+                "Host: api.example.com",
+            ),
+        ] {
+            assert_eq!(
+                forwarded_host_lines(request, "api.example.com", 443, Scheme::Https),
+                vec![want.to_string()],
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_authority_matches_its_connection() {
+        // The brackets used to be stripped on one side and kept on the
+        // other, so this never matched.
+        for request in [
+            "GET http://[::1]:8000/a HTTP/1.1\r\nHost: [::1]:8000\r\n\r\n",
+            "GET /a HTTP/1.1\r\nHost: [0:0::1]:8000\r\n\r\n",
+        ] {
+            assert_eq!(
+                forwarded_host_lines(request, "[::1]", 8000, Scheme::Http),
+                vec!["Host: [::1]:8000".to_string()],
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_portless_host_means_the_scheme_default_not_the_connection_port() {
+        // On a connection to h:8080, `Host: h` tells the origin h:80.  It used
+        // to pass as h:8080 and go out port-less; now it is refused, and an
+        // origin on a non-default port is always told its port.
+        let err = forward_one("GET / HTTP/1.1\r\nHost: h\r\n\r\n", "h", 8080, Scheme::Http)
+            .expect_err("h means h:80");
+        assert!(err.to_string().contains("does not match"), "{err}");
+        assert_eq!(
+            forwarded_host_lines("GET http://h:8080/ HTTP/1.1\r\nHost: h:8080\r\n\r\n", "h", 8080, Scheme::Http),
+            vec!["Host: h:8080".to_string()]
+        );
+        assert_eq!(
+            forwarded_host_lines("GET http://h/ HTTP/1.1\r\nHost: h:80\r\n\r\n", "h", 80, Scheme::Http),
+            vec!["Host: h".to_string()]
+        );
+        // Plain HTTP on 443 is not HTTPS: 443 is not its default.
+        assert_eq!(
+            forwarded_host_lines("GET http://h:443/ HTTP/1.1\r\nHost: h:443\r\n\r\n", "h", 443, Scheme::Http),
+            vec!["Host: h:443".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_ipv4_mapped_literal_is_forwarded_as_plain_ipv4() {
+        assert_eq!(
+            forwarded_host_lines(
+                "GET / HTTP/1.1\r\nHost: [::FFFF:127.0.0.1]:8000\r\n\r\n",
+                "127.0.0.1",
+                8000,
+                Scheme::Http
+            ),
+            vec!["Host: 127.0.0.1:8000".to_string()]
+        );
+    }
+
+    #[test]
+    fn host_is_the_first_header_and_the_rest_keep_their_order() {
+        let sent = forward_one(
+            "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nHost: H\r\nX-A: 1\r\n\r\n",
+            "h",
+            80,
+            Scheme::Http,
+        )
+        .expect("proxy");
+        assert!(
+            sent.starts_with("GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-A: 1\r\n\r\n"),
+            "{sent:?}"
+        );
     }
 }

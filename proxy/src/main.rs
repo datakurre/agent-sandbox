@@ -1097,6 +1097,7 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
             &mut remote_sock,
             &host,
             port,
+            inject::Scheme::Http,
             &shared,
         ) {
             Ok(outcome) => {
@@ -1404,6 +1405,7 @@ fn serve(mut client_sock: TcpStream, shared: Arc<Shared>, ingress: Ingress) {
             &mut upstream_tls,
             &requested_host,
             port,
+            inject::Scheme::Https,
             &shared,
         ) {
             Ok(outcome) => {
