@@ -213,17 +213,42 @@ pub fn origin_form(target: &str) -> std::borrow::Cow<'_, str> {
     if target == "*" || target.starts_with('/') {
         return Cow::Borrowed(target);
     }
-    let Some(idx) = target.find("://") else {
+    let Some((_, _, rest)) = split_absolute(target) else {
         return Cow::Borrowed(target);
     };
-    let rest = &target[idx + 3..];
-    match rest.find(['/', '?', '#']) {
+    match rest.as_bytes().first() {
         // The common case: the path starts right there, so no copy is needed.
-        Some(i) if rest.as_bytes()[i] == b'/' => Cow::Borrowed(&rest[i..]),
+        Some(b'/') => Cow::Borrowed(rest),
         // `http://h?q` has no path segment; origin-form still needs one.
-        Some(i) => Cow::Owned(format!("/{}", &rest[i..])),
+        Some(_) => Cow::Owned(format!("/{}", rest)),
         None => Cow::Borrowed("/"),
     }
+}
+
+/// Split an absolute-form target into scheme, authority and the rest, which
+/// is empty or starts with `/`, `?` or `#`.  `None` for every other form.
+///
+/// The one place a target is taken apart.  The authority check, the path the
+/// L7/secret-route matcher sees and the origin-form that is forwarded all
+/// read this split, because when they each found the boundary their own way
+/// `https://x?@h/user/repos` was checked as host `h`, path `/user/repos`, and
+/// forwarded as `/?@h/user/repos` -- a token scoped to one route sent to
+/// another.
+///
+/// The part before `://` has to be an RFC 3986 scheme, so an origin-form
+/// target that merely carries a URL in its query
+/// (`/login?next=https://h/user/repos`) stays origin-form instead of being
+/// read as addressed to `h` at `/user/repos`.
+fn split_absolute(target: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, after) = target.split_once("://")?;
+    let mut chars = scheme.chars();
+    let is_scheme = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !is_scheme {
+        return None;
+    }
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    Some((scheme, &after[..end], &after[end..]))
 }
 
 /// Rewrite a request head's target to origin-form, or `None` when it already is
@@ -234,8 +259,8 @@ pub fn origin_form(target: &str) -> std::borrow::Cow<'_, str> {
 /// are copied across verbatim rather than taken from the normalized path the
 /// L7 check uses -- that normalization exists to stop `/a/../b` reaching a rule
 /// it does not match, and forwarding it would change what the origin serves.
-/// A first line that is not exactly three space-separated tokens is left alone:
-/// the request-smuggling checks own that case.
+/// A first line that is not exactly three space-separated tokens is left alone;
+/// `request_line` has already refused it before anything is forwarded.
 pub fn rewrite_request_target(head: &[u8]) -> Option<Vec<u8>> {
     let end = head.windows(2).position(|w| w == b"\r\n")?;
     let line = std::str::from_utf8(&head[..end]).ok()?;
@@ -254,15 +279,46 @@ pub fn rewrite_request_target(head: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The request line as `(method, target, version)`, read strictly.
+///
+/// RFC 9112 §3: `method SP request-target SP HTTP-version`, single spaces and
+/// nothing else.  Matching used to tokenise with `split_whitespace` while the
+/// line went upstream as received, so `GET /user/repos /zen HTTP/1.1` -- or a
+/// vertical tab in place of the second space -- was matched as `/user/repos`
+/// and handed to an origin free to read the target as something longer.  Every
+/// reader of the request line goes through here, so what is matched is what
+/// is forwarded.
+fn request_line(head: &str) -> io::Result<(&str, &str, &str)> {
+    let bad = |msg: &str| io::Error::new(ErrorKind::InvalidData, msg.to_string());
+    let line = head.split("\r\n").next().unwrap_or("");
+    let mut parts = line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad("request line is not `METHOD SP target SP version`"));
+    };
+    if method.is_empty() || !method.bytes().all(is_tchar) {
+        return Err(bad("invalid request method"));
+    }
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
+        return Err(bad("unsupported HTTP version"));
+    }
+    if target.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err(bad("request target contains whitespace or a control byte"));
+    }
+    // Origin-form, absolute-form, or `*` for a server-wide OPTIONS.  Anything
+    // else (authority-form, a bare word) has no path this proxy could match.
+    let shaped = target.starts_with('/')
+        || split_absolute(target).is_some()
+        || (target == "*" && method == "OPTIONS");
+    if !shaped {
+        return Err(bad("request target is not origin-form or absolute-form"));
+    }
+    Ok((method, target, version))
+}
+
 fn request_method(head: &str) -> io::Result<&str> {
-    let request_line = head
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
-    request_line
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed request line"))
+    request_line(head).map(|(method, _, _)| method)
 }
 
 /// The request path as the L7/secret-route matcher must see it.
@@ -280,26 +336,12 @@ fn request_method(head: &str) -> io::Result<&str> {
 /// scoped to one route land on another. Fail closed instead: an ambiguous
 /// path never reaches the matcher or the origin.
 fn request_path(head: &str) -> io::Result<String> {
-    let request_line = head
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
-    let mut parts = request_line.split_whitespace();
-    parts.next(); // skip method
-    let target = parts
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request target is missing"))?;
+    let (_, target, _) = request_line(head)?;
 
     // Target could be absolute URI (http://host/path) or absolute path (/path)
-    let path = if let Some(idx) = target.find("://") {
-        let after_scheme = &target[idx + 3..];
-        if let Some(path_idx) = after_scheme.find('/') {
-            &after_scheme[path_idx..]
-        } else {
-            "/"
-        }
-    } else {
-        target
+    let path = match split_absolute(target) {
+        Some((_, _, rest)) => rest,
+        None => target,
     };
     // Strip query string and fragment: neither is inspected for ambiguity.
     let path = path.split('?').next().unwrap_or(path);
@@ -339,10 +381,20 @@ fn request_path(head: &str) -> io::Result<String> {
                 "path contains an empty segment",
             ));
         }
-        if *seg == "." || *seg == ".." {
+        // Servlet-style origins drop a `;param` suffix before resolving dot
+        // segments, so `/user/..;/admin` reaches `/admin` there while it
+        // matched `/user/**` here.  Judge the segment by what precedes `;`.
+        let bare = seg.split(';').next().unwrap_or(seg);
+        if bare == "." || bare == ".." {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "path contains a '.' or '..' segment",
+            ));
+        }
+        if bare.is_empty() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "path contains an empty segment",
             ));
         }
     }
@@ -373,9 +425,15 @@ fn percent_decode_bytes(s: &str) -> Result<Vec<u8>, &'static str> {
 }
 
 fn authority_host_port(authority: &str, default_port: u16) -> io::Result<(String, u16)> {
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host_port)| host_port);
+    // Refused, not stripped: RFC 9110 §4.2.4 forbids userinfo in an http(s)
+    // URI, and checking `h` while forwarding `x@h` leaves the origin -- or a
+    // front end routing on Host -- free to read the name differently.
+    if authority.contains('@') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "authority must not contain userinfo",
+        ));
+    }
     if authority.is_empty() {
         return Err(io::Error::new(ErrorKind::InvalidData, "authority is empty"));
     }
@@ -429,17 +487,20 @@ fn authority_host_port(authority: &str, default_port: u16) -> io::Result<(String
     Ok((host.trim_end_matches('.').to_ascii_lowercase(), port))
 }
 
-fn request_target_authority(request_target: &str, default_port: u16) -> io::Result<Option<(String, u16)>> {
-    let Some((scheme, rest)) = request_target.split_once("://") else {
+fn request_target_authority(request_target: &str) -> io::Result<Option<(String, u16)>> {
+    let Some((scheme, authority, _)) = split_absolute(request_target) else {
         return Ok(None);
     };
-    let scheme = scheme.to_ascii_lowercase();
-    let scheme_default = match scheme.as_str() {
+    let scheme_default = match scheme.to_ascii_lowercase().as_str() {
         "http" => 80,
         "https" => 443,
-        _ => default_port,
+        _ => {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "request target scheme is not http or https",
+            ))
+        }
     };
-    let authority = rest.split('/').next().unwrap_or("");
     authority_host_port(authority, scheme_default).map(Some)
 }
 
@@ -474,20 +535,19 @@ fn validate_request_authority(
     expected_host: &str,
     expected_port: u16,
 ) -> io::Result<()> {
-    let request_line = head
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request head is missing request line"))?;
-    let mut parts = request_line.split_whitespace();
-    let _method = parts
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed request line"))?;
-    let target = parts
-        .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request target is missing"))?;
+    let (_, target, _) = request_line(head)?;
+
+    // A fragment is never part of a request target (RFC 9112 §3.2), and one
+    // ahead of the path would hide the path from `split_absolute`.
+    if target.contains('#') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "request target contains a fragment",
+        ));
+    }
 
     let expected = (expected_host.trim_end_matches('.').to_ascii_lowercase(), expected_port);
-    let target_authority = request_target_authority(target, expected_port)?;
+    let target_authority = request_target_authority(target)?;
     let host_authority = host_header_authority(head, expected_port)?;
 
     if let (Some(target), Some(host)) = (&target_authority, &host_authority) {
@@ -737,7 +797,12 @@ pub fn proxy_http1_with_injection<C: Read + Write, U: Read + Write>(
                 let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
                 return Err(e);
             }
-            validate_request_authority(request_text, expected_host, expected_port)?;
+            if let Err(e) = request_line(request_text)
+                .and_then(|_| validate_request_authority(request_text, expected_host, expected_port))
+            {
+                let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                return Err(e);
+            }
             
             let has_cl = content_length(request_text)?.is_some();
             let has_te = is_chunked(request_text);
@@ -1536,5 +1601,188 @@ mod tests {
             "forwarded head was {:?}",
             rendered
         );
+    }
+
+    /// Policy and binding that authorize exactly `GET /user/repos` on
+    /// `api.example.com`, and nothing else on that host.
+    fn shared_scoped_to_user_repos() -> std::sync::Arc<crate::Shared> {
+        std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_host api.example.com\n\
+             allow_route\tapi.example.com\tGET\t/user/repos\n\
+             secret_route\tapi.example.com\tGET\t/user/repos\n",
+            "api.example.com\tGET\t/user/repos\tAuthorization\tBearer tok\n",
+        ))
+    }
+
+    fn proxy_once(request: &str) -> (Result<HttpExchangeOutcome, ProxyHttpError>, String, String) {
+        let mut client = FixtureIo::with_read(request.as_bytes());
+        let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let result = proxy_http1_with_injection(
+            &mut client,
+            &mut upstream,
+            "api.example.com",
+            443,
+            &shared_scoped_to_user_repos(),
+        );
+        let sent = String::from_utf8(upstream.written).expect("utf8");
+        let replied = String::from_utf8(client.written).expect("utf8");
+        (result, sent, replied)
+    }
+
+    #[test]
+    fn a_query_ahead_of_the_path_cannot_carry_a_scoped_token_to_another_route() {
+        // The leak: matched as `/user/repos`, forwarded as `/?@.../user/repos`,
+        // with the token the operator scoped to `/user/repos` on it.
+        let (result, sent, replied) = proxy_once(
+            "GET https://x?@api.example.com/user/repos HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+        );
+        assert!(result.is_err());
+        assert!(sent.is_empty(), "forwarded: {sent}");
+        assert!(replied.starts_with("HTTP/1.1 400"), "{replied}");
+    }
+
+    #[test]
+    fn a_query_right_after_the_authority_is_matched_as_the_root_path() {
+        // `/user/repos` here is query text, so neither the route nor the
+        // token applies; the L7 rule for `/user/repos` denies it.
+        let (result, sent, _) = proxy_once(
+            "GET https://api.example.com?x/user/repos HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+        );
+        assert!(
+            matches!(result, Err(ProxyHttpError::L7Denied { ref path, .. }) if path == "/"),
+            "{result:?}"
+        );
+        assert!(sent.is_empty(), "forwarded: {sent}");
+    }
+
+    #[test]
+    fn a_fragment_in_the_target_is_refused() {
+        for target in ["https://api.example.com#/user/repos", "/user/repos#x"] {
+            let (result, sent, replied) = proxy_once(&format!(
+                "GET {target} HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+            ));
+            assert!(result.is_err(), "{target}");
+            assert!(sent.is_empty(), "{target} forwarded: {sent}");
+            assert!(replied.starts_with("HTTP/1.1 400"), "{target}: {replied}");
+        }
+    }
+
+    #[test]
+    fn userinfo_is_refused_rather_than_stripped() {
+        for request in [
+            "GET /user/repos HTTP/1.1\r\nHost: evil@api.example.com\r\n\r\n",
+            "GET https://evil@api.example.com/user/repos HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+        ] {
+            let (result, sent, _) = proxy_once(request);
+            let err = result.expect_err(request);
+            assert!(err.to_string().contains("userinfo"), "{err}");
+            assert!(sent.is_empty(), "forwarded: {sent}");
+        }
+    }
+
+    #[test]
+    fn a_non_http_scheme_is_refused() {
+        let (result, sent, _) = proxy_once(
+            "GET ftp://api.example.com/user/repos HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+        );
+        assert!(result.is_err());
+        assert!(sent.is_empty(), "forwarded: {sent}");
+    }
+
+    #[test]
+    fn the_matched_path_is_the_path_that_is_forwarded() {
+        // The invariant behind the leak above: whatever the matcher saw is
+        // what the origin is sent, for every shape of target that passes.
+        for target in [
+            "/user/repos",
+            "/user/repos?per_page=1",
+            "/",
+            "/?q",
+            "https://api.example.com/user/repos",
+            "https://api.example.com/user/repos?x=/zen",
+            "https://api.example.com",
+            "https://api.example.com?x/user/repos",
+            "HTTPS://api.example.com:443/user",
+            "http://[::1]:8000/a/b",
+            "https://api.example.com/@scope%2fname",
+        ] {
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let matched = request_path(&head).expect(target);
+            let forwarded = origin_form(target);
+            let forwarded_path = forwarded.split('?').next().unwrap();
+            let decoded = String::from_utf8(percent_decode_bytes(forwarded_path).unwrap()).unwrap();
+            let decoded = if decoded.is_empty() { "/".to_string() } else { decoded };
+            assert_eq!(matched, decoded, "{target}");
+        }
+    }
+
+    #[test]
+    fn a_request_line_that_is_not_three_single_space_tokens_is_refused() {
+        // Each was matched as `/user/repos` and got the token, then went out
+        // verbatim for the origin to read its own way.
+        for line in [
+            "GET /user/repos /zen HTTP/1.1",
+            "GET /user/repos\x0b/zen HTTP/1.1",
+            "GET\t/user/repos\tHTTP/1.1",
+            "GET  https://api.example.com/user/repos HTTP/1.1",
+            "GET /user/repos HTTP/1.1 ",
+            "GET /user/repos HTTP/2.0",
+            "GET api.example.com:443 HTTP/1.1",
+        ] {
+            let (result, sent, replied) =
+                proxy_once(&format!("{line}\r\nHost: api.example.com\r\n\r\n"));
+            assert!(result.is_err(), "{line:?}");
+            assert!(sent.is_empty(), "{line:?} forwarded: {sent}");
+            assert!(replied.starts_with("HTTP/1.1 400"), "{line:?}: {replied}");
+        }
+    }
+
+    #[test]
+    fn a_url_in_an_origin_form_query_is_not_read_as_the_target() {
+        // Origin-form with a redirect URL in its query is ordinary traffic,
+        // and must be matched as `/login`, never as the URL's `/user/repos`.
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_host api.example.com\n\
+             secret_route\tapi.example.com\tGET\t/user/repos\n",
+            "api.example.com\tGET\t/user/repos\tAuthorization\tBearer tok\n",
+        ));
+        for query in ["next=https://other.example/x", "next=https://api.example.com/user/repos"] {
+            let mut client = FixtureIo::with_read(
+                format!("GET /login?{query} HTTP/1.1\r\nHost: api.example.com\r\n\r\n").as_bytes(),
+            );
+            let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let outcome =
+                proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, &shared)
+                    .expect(query);
+            assert_eq!(outcome.path.as_deref(), Some("/login"), "{query}");
+            let sent = String::from_utf8(upstream.written).expect("utf8");
+            assert!(sent.starts_with(&format!("GET /login?{query} HTTP/1.1")), "{sent}");
+            assert!(!sent.contains("Bearer tok"), "{query}: {sent}");
+        }
+    }
+
+    #[test]
+    fn a_dot_segment_hidden_behind_path_parameters_is_refused() {
+        let shared = std::sync::Arc::new(crate::shared_with_secrets(
+            "allow_host api.example.com\n\
+             secret_route\tapi.example.com\tGET\t/user/**\n",
+            "api.example.com\tGET\t/user/**\tAuthorization\tBearer tok\n",
+        ));
+        for path in ["/user/..;/admin", "/user/.;x/repos", "/user/..%3Bjsessionid=1/admin", "/user/;/x"] {
+            let mut client = FixtureIo::with_read(
+                format!("GET {path} HTTP/1.1\r\nHost: api.example.com\r\n\r\n").as_bytes(),
+            );
+            let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let result =
+                proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, &shared);
+            assert!(result.is_err(), "{path}");
+            assert!(upstream.written.is_empty(), "{path} was forwarded");
+        }
+        // A parameter on an ordinary segment is still an ordinary path.
+        let mut client =
+            FixtureIo::with_read(b"GET /user/repos;v=1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        let mut upstream = FixtureIo::with_read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        proxy_http1_with_injection(&mut client, &mut upstream, "api.example.com", 443, &shared)
+            .expect("/user/repos;v=1");
     }
 }
