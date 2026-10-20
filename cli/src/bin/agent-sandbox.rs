@@ -140,7 +140,12 @@ enum AgentMountsMode {
 /// destination lands under `/workspace`.
 fn expand_v(spec: &str, current_dir: &Path, home_dir: &str) -> String {
     let parts: Vec<&str> = spec.split(':').collect();
-    let mut src = parts[0].replace('~', home_dir);
+    // Only a leading `~` is the home directory, as in a shell: `backup~1`
+    // names a file, not one with the home spliced into it.
+    let mut src = match parts[0].strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{}{}", home_dir, rest),
+        _ => parts[0].to_string(),
+    };
     if src == "." {
         src = current_dir.to_string_lossy().into_owned();
     }
@@ -4450,6 +4455,16 @@ mod tests {
         assert_eq!(
             expand_v("/etc/hosts", cwd, "/home/ada"),
             "/etc/hosts:/etc/hosts"
+        );
+        assert_eq!(expand_v("~:/h", cwd, "/home/ada"), "/home/ada:/h");
+        // Only a leading `~` is the home directory.
+        assert_eq!(
+            expand_v("backup~1:/b", cwd, "/home/ada"),
+            "/home/ada/repo/backup~1:/b"
+        );
+        assert_eq!(
+            expand_v("~other/x:/o", cwd, "/home/ada"),
+            "/home/ada/repo/~other/x:/o"
         );
     }
 
