@@ -693,6 +693,15 @@ fn krun_and_podman_are_refused_together() {
 }
 
 #[test]
+fn krun_and_host_loopback_port_are_refused_together() {
+    let out = World::new().run(&["--krun", "--host-loopback-port", "18124", "opencode"]);
+
+    assert!(!out.reached_podman_run());
+    assert!(out.stderr.contains("--host-loopback-port"), "{}", out.stderr);
+    assert!(out.stderr.contains("--krun"), "{}", out.stderr);
+}
+
+#[test]
 fn an_unknown_flag_stops_the_launch_rather_than_reaching_podman() {
     let out = World::new().run(&["--definitely-not-a-flag", "opencode"]);
 

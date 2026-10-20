@@ -79,8 +79,8 @@ assert_contains "$out" "ARGS=-gs" "MAVEN_ARGS under an L4-only policy"
 assert_not_contains "$out" "trustStore" "no truststore without an L7 rule"
 
 # Without --proxy nothing is set at all.
-out="$(sandbox_run --workspace -- bash -c "$show; ls $settings ~/.m2/settings.xml 2>&1 || true")"
+out="$(sandbox_run --workspace -- bash -c "$show; for f in $settings ~/.m2/settings.xml; do [ -e \"\$f\" ] && echo \"present: \$f\"; done; true")"
 for var in ARGS CONFIG OPTS HOST; do
   assert_contains "$out" "$var=;" "$var without --proxy"
 done
-assert_not_contains "$out" "maven-settings.xml" "no global settings without --proxy"
+assert_not_contains "$out" "present:" "no global settings without --proxy"

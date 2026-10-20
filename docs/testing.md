@@ -242,10 +242,11 @@ Worth knowing when choosing what to test next:
   host-loopback bridge; it also fails if bwrap is on `PATH` but the
   managed-policy overlay could not be applied. A real Chromium honouring that
   policy is still untested at any tier.
-- **`--krun` and the host-loopback bridge**: `75-host-loopback-krun` runs
-  `70-host-loopback-port`'s round trip inside a krun guest, where the bridge's
-  sockets sit on virtiofs, and skips on a host without krun. It only reports
-  whether `--nix` reached its cache there; nothing asserts that yet.
+- **`--krun` and the host-loopback bridge**: the bridge's sockets sit on
+  virtiofs, where a unix socket the guest listens on is not reachable from the
+  host, so `--krun --host-loopback-port` is refused. `75-host-loopback-krun`
+  asserts the refusal (it needs no krun); the unit tier covers it too. It only
+  reports whether `--nix` reached its cache under krun; nothing asserts that.
 - **SELinux** results depend on the host, so every integration log records the
   mode it ran under (`### selinux: enforcing`); `--selinux` follows that mode
   unless a case passes `--no-selinux`.

@@ -914,7 +914,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--ports-any-interface", None, "Permits port binds outside of loopback interfaces.");
     print_help_option("--shared-network", Some(fmt(want_shared_network)), "Joins the shared bridge network so sibling containers can reach this one by name.");
     print_help_option("--browser", Some(fmt(want_browser)), "Attaches every running 'agent-sandbox browser' session, mapping its CDP port in automatically.");
-    print_help_option("--host-loopback-port PORT", Some(fmt(want_host_ports)), "Makes a host 127.0.0.1:PORT reachable at the sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP port). Repeatable; takes HOST:SANDBOX to remap.");
+    print_help_option("--host-loopback-port PORT", Some(fmt(want_host_ports)), "Makes a host 127.0.0.1:PORT reachable at the sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP port). Repeatable; takes HOST:SANDBOX to remap. Not with --krun.");
 
     println!("\nMounts:");
     print_help_option("--mounts / --no-mounts", Some(fmt(want_mounts)), "Honors [mounts] declarations from AGENTS.md.");
@@ -2496,6 +2496,12 @@ fn run() -> Result<i32> {
     if want_krun {
         if want_podman {
             fail("agent-sandbox: --krun cannot be combined with --podman.");
+        }
+        // The bridge needs the host to dial a unix socket the guest listens on
+        // over virtiofs, and a krun guest's never reaches the host (measured:
+        // the guest accepts a client and no host connection ever arrives).
+        if !want_host_ports.is_empty() {
+            fail("agent-sandbox: --host-loopback-port (and --browser) cannot be used with --krun: the bridge's sockets do not cross virtiofs.");
         }
         // Accepted rather than refused, but neither is verified against a
         // guest: --krun already runs the sandbox with SELinux labeling
