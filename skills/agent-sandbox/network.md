@@ -183,7 +183,7 @@ allowed_hosts = [
 ]
 ```
 
-Methods are separated by commas alone, then one space before the domain. No
+Methods are separated by commas alone, then whitespace before the domain. No
 path means `/**`; no method list means `*`. A secret route or a route on an IP
 still needs the table form, and a short-form route may not cover port 22.
 

@@ -211,7 +211,7 @@ allowed_hosts = [
 ````
 
 The form is `METHODS DOMAIN[:PORTS][/PATH]`: methods separated by commas alone,
-then one space, then the domain. An entry is a route as soon as it has a method
+then whitespace, then the domain. An entry is a route as soon as it has a method
 list or a path; one with neither is a plain allow entry, and so is a CIDR block
 such as `"10.0.0.0/8:80"`, whose `/` is a prefix length. A missing path means
 `"/**"` and a missing method list `"*"`, the defaults of a table, and each entry
@@ -398,8 +398,9 @@ Besides malformed values, these combinations are rejected:
 
 - an unknown key under `[network]` (only `allowed_hosts` and `allowed_routes` exist) or an unknown
   field on a rule;
-- a duplicate entry in `allowed_hosts`, including two
-  [short-form routes](#short-form-routes) that share a method, host and path;
+- a duplicate entry in `allowed_hosts`, including a
+  [short-form route](#short-form-routes) that repeats the method, host and path
+  of another one or of a `[[network.allowed_routes]]` table;
 - a host allowed outright in `allowed_hosts` that also carries a `[[network.allowed_routes]]`
   entry *without* a secret, or a short-form route — the broad allow makes the
   narrower rule pointless, so one of the two is a mistake. The same applies to a

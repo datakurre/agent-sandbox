@@ -649,7 +649,13 @@ fn parse_route_entry(i: usize, entry: &str) -> Option<Result<Vec<RouteSpec>, Con
         None => (None, trimmed),
     };
     if methods.is_none() {
-        if !rest.contains('/') || is_ip_or_cidr(&parse_host_port(rest).0) {
+        // An address before the first `/` makes it a CIDR block, well-formed
+        // or not; a malformed one is the plain path's to refuse, as before.
+        let before_slash = rest.split('/').next().unwrap_or_default();
+        let address = parse_host_port(before_slash).0;
+        let address = address.trim_start_matches('[').trim_end_matches(']');
+        if !rest.contains('/') || is_ip_or_cidr(&parse_host_port(rest).0) || is_ip_or_cidr(address)
+        {
             return None;
         }
     }
@@ -665,7 +671,7 @@ fn route_entry_specs(
     let ctx = format!("[network].allowed_hosts[{}] '{}'", i, entry);
     if rest.contains(char::is_whitespace) {
         return Err(ConfigError::msg(format!(
-            "{}: unexpected space. A route is written METHODS DOMAIN[:PORTS][/PATH], with one space after the method list (e.g. \"GET,POST api.example.com:443/v1/**\").",
+            "{}: unexpected space. A route is written METHODS DOMAIN[:PORTS][/PATH], with whitespace after the method list and none elsewhere (e.g. \"GET,POST api.example.com:443/v1/**\").",
             ctx
         )));
     }
@@ -735,6 +741,29 @@ fn route_entry_specs(
             has_secret: false,
         })
         .collect())
+}
+
+/// The refusal for a host allowed outright beside secret-less routes on it,
+/// naming every one of them so a single edit can resolve it.
+fn broad_allow_conflict(item: &str, routes: &[&RouteSpec]) -> String {
+    let has_table = routes.iter().any(|r| r.entry.is_none());
+    let mut entries: Vec<String> = Vec::new();
+    for entry in routes.iter().filter_map(|r| r.entry.as_deref()) {
+        let quoted = format!("'{}'", entry);
+        if !entries.contains(&quoted) {
+            entries.push(quoted);
+        }
+    }
+    let short = match entries.len() {
+        0 => String::new(),
+        1 => format!("the route {} in allowed_hosts", entries[0]),
+        _ => format!("the routes {} in allowed_hosts", entries.join(", ")),
+    };
+    match (has_table, short.is_empty()) {
+        (true, true) => format!("[network]: host '{}' is allowed broadly, making the non-secret [[network.allowed_routes]] ineffective. Remove the rule or add a secret.", item),
+        (false, _) => format!("[network]: host '{}' is allowed broadly, making {} ineffective. Remove one of the two entries.", item, short),
+        (true, false) => format!("[network]: host '{}' is allowed broadly, making the non-secret [[network.allowed_routes]] and {} ineffective. Remove the broad allow, or the rules.", item, short),
+    }
 }
 
 /// The domain and port checks for a route's `host`, kept with the rest of a
@@ -852,7 +881,12 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
             let mut plain_items = Vec::new();
             if let Some(allow) = net_table.get("allowed_hosts") {
                 let items = _proxy_list("allowed_hosts", allow, |_, _| Ok(()), "[network].")?;
-                let mut seen_routes = HashSet::new();
+                // Seeded with the tables, so a short-form route repeating one
+                // is refused too.
+                let mut seen_routes: HashSet<(String, String, String)> = routes
+                    .iter()
+                    .map(|r: &RouteSpec| (r.host.clone(), r.method.clone(), r.path.clone()))
+                    .collect();
                 for (i, item) in items.into_iter().enumerate() {
                     match parse_route_entry(i, &item) {
                         None => plain_items.push(item),
@@ -862,7 +896,7 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                                     (spec.host.clone(), spec.method.clone(), spec.path.clone());
                                 if !seen_routes.insert(key) {
                                     return Err(ConfigError::msg(format!(
-                                        "[network].allowed_hosts: duplicate entry '{}': its route {} {}{} is already listed. Remove the redundant entry.",
+                                        "[network].allowed_hosts: duplicate entry '{}': its route {} {}{} is already listed, in allowed_hosts or as a [[network.allowed_routes]] table. Remove the redundant entry.",
                                         item, spec.method, spec.host, spec.path
                                     )));
                                 }
@@ -873,11 +907,13 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 }
             }
 
-            let rules_hosts_no_secret: HashMap<&str, &RouteSpec> = routes
-                .iter()
-                .filter(|r| !r.has_secret)
-                .map(|r| (r.host.as_str(), r))
-                .collect();
+            let mut rules_hosts_no_secret: HashMap<&str, Vec<&RouteSpec>> = HashMap::new();
+            for r in routes.iter().filter(|r| !r.has_secret) {
+                rules_hosts_no_secret
+                    .entry(r.host.as_str())
+                    .or_default()
+                    .push(r);
+            }
             let has_non_secret_rule = !rules_hosts_no_secret.is_empty();
 
             for item in plain_items {
@@ -890,11 +926,8 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 if item == "*" || item.starts_with("*:") {
                     allow_has_wildcard = true;
                 }
-                if let Some(route) = rules_hosts_no_secret.get(item.as_str()) {
-                    return Err(ConfigError::msg(match &route.entry {
-                        None => format!("[network]: host '{}' is allowed broadly, making the non-secret [[network.allowed_routes]] ineffective. Remove the rule or add a secret.", item),
-                        Some(entry) => format!("[network]: host '{}' is allowed broadly, making the route '{}' in allowed_hosts ineffective. Remove one of the two entries.", item, entry),
-                    }));
+                if let Some(conflicting) = rules_hosts_no_secret.get(item.as_str()) {
+                    return Err(ConfigError::msg(broad_allow_conflict(&item, conflicting)));
                 }
             }
 
@@ -1629,7 +1662,6 @@ mod export_tests {
             ("GET /x", "missing domain"),
             ("GET 10.0.0.1/x", "needs a domain name, not '10.0.0.1'"),
             ("GET 10.0.0.0/8", "needs a domain name, not '10.0.0.0'"),
-            ("10.0.0.1:80/x", "needs a domain name, not '10.0.0.1'"),
             ("GET *:443/x", "needs a domain name, not '*'"),
             ("GET a.example:22/x", "cannot cover port 22"),
             ("GET a.example:20-30", "cannot cover port 22"),
@@ -1651,6 +1683,72 @@ mod export_tests {
                 "{entry}\n  expected: {expected}\n  got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_malformed_address_keeps_the_plain_entry_error() {
+        // No method list, so these were never routes: a bad address is
+        // refused as before, not told to drop a method it does not have.
+        for entry in ["10.0.0.0/33", "fd00::/8:80", "10.0.0.1:80/x"] {
+            assert!(parse_route_entry(0, entry).is_none(), "{entry}");
+            let err = parse_proxy(&network(&format!("allowed_hosts = [\"{entry}\"]\n")))
+                .expect_err(entry)
+                .to_string();
+            assert!(err.contains("is not a valid domain name"), "{entry}: {err}");
+        }
+    }
+
+    #[test]
+    fn whitespace_after_the_method_list_is_any_run_of_it() {
+        for entry in [
+            "GET a.example/x",
+            "GET\ta.example/x",
+            "GET   a.example/x",
+            " GET a.example/x ",
+        ] {
+            let policy = parse_proxy(&network(&format!("allowed_hosts = [\"{entry}\"]\n")))
+                .unwrap_or_else(|e| panic!("{entry:?}: {e}"));
+            assert_eq!(
+                policy.allow_route,
+                vec!["a.example\tGET\t/x".to_string()],
+                "{entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_form_route_repeating_a_table_is_refused() {
+        let err = parse_proxy(&network(
+            "allowed_hosts = [\"GET a.example:443/x\"]\n\
+             [[network.allowed_routes]]\nhost = \"a.example:443\"\nmethod = \"GET\"\npath = \"/x\"\n",
+        ))
+        .expect_err("the same route twice")
+        .to_string();
+        assert!(
+            err.contains("duplicate entry 'GET a.example:443/x'"),
+            "{err}"
+        );
+        assert!(
+            err.contains("as a [[network.allowed_routes]] table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_broad_allow_conflict_names_every_route_it_defeats() {
+        let err = parse_proxy(&network(
+            "allowed_hosts = [\"a.example:443\", \"GET a.example:443/x\", \"PUT a.example:443/y\"]\n\
+             [[network.allowed_routes]]\nhost = \"a.example:443\"\nmethod = \"POST\"\n",
+        ))
+        .expect_err("a broad allow beside routes")
+        .to_string();
+        assert!(
+            err.contains(
+                "making the non-secret [[network.allowed_routes]] and the routes \
+                 'GET a.example:443/x', 'PUT a.example:443/y' in allowed_hosts ineffective"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
