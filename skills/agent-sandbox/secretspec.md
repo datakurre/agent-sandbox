@@ -182,7 +182,8 @@ prefix = "Bearer "
 ```
 
 Every field is matched exactly, the port included. `method` is required
-on both sides. Omitted optional fields are not wildcards: they take their
+on both sides; a `trusted.toml` entry without one, which older versions read as
+`GET`, now refuses the launch until `method = "GET"` is added. Omitted optional fields are not wildcards: they take their
 defaults (`path = "/**"`, `header = "Authorization"`) and are then matched as
 written. A rule the repo asks
 for but the host has not authorized **refuses the launch** and prints the exact

@@ -284,8 +284,10 @@ header = "Authorization"
 prefix = "Bearer "
 ```
 
-`method` is required on both sides, as it is everywhere a route is written. An
-omitted optional field takes its default on both sides — `path` defaults to
+`method` is required on both sides, as it is everywhere a route is written.
+Earlier versions read a `trusted.toml` route without one as `method = "GET"`;
+such an entry now refuses the launch, naming it, and adding `method = "GET"`
+keeps its old meaning. An omitted optional field takes its default on both sides — `path` defaults to
 `"/**"` and `header` to `"Authorization"` — and the results are then compared
 exactly, so `path = "/"` in `trusted.toml` does not authorize
 a rule that leaves `path` out. Because the `path` default is every path, a

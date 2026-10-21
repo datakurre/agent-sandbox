@@ -363,6 +363,10 @@ pub fn resolve_secrets_with_policies(
             let legacy_routes = ["bindings", "secret", "secrets", "rules"]
                 .into_iter()
                 .filter_map(|key| val.get(key).map(|r| (key, r)));
+            // Every such entry at once: a trusted.toml kept across many
+            // projects may carry several written before `method` was required.
+            let mut problems = Vec::new();
+            let mut missing = false;
             for (label, rules) in network_routes.into_iter().chain(legacy_routes) {
                 for (i, rule) in rules.as_array().into_iter().flatten().enumerate() {
                     if rule.get("secret").is_none() {
@@ -370,20 +374,32 @@ pub fn resolve_secrets_with_policies(
                     }
                     match rule.get("method") {
                         Some(m) if m.is_str() => {}
-                        Some(_) => anyhow::bail!(
+                        Some(_) => problems.push(format!(
                             "agent-sandbox: {}: {}[{}].method: must be a string (e.g. method = \"GET\" or method = \"*\").",
                             config.display(),
                             label,
                             i
-                        ),
-                        None => anyhow::bail!(
-                            "agent-sandbox: {}: {}[{}]: missing required field 'method', as in AGENTS.md. Specify an HTTP method (e.g. method = \"GET\" or method = \"*\").",
-                            config.display(),
-                            label,
-                            i
-                        ),
+                        )),
+                        None => {
+                            missing = true;
+                            problems.push(format!(
+                                "agent-sandbox: {}: {}[{}]: missing required field 'method', as in AGENTS.md.",
+                                config.display(),
+                                label,
+                                i
+                            ));
+                        }
                     }
                 }
+            }
+            if missing {
+                problems.push(
+                    "               Earlier versions read a missing method as GET: add method = \"GET\" to keep that meaning, or, to authorize a different rule, its method."
+                        .to_string(),
+                );
+            }
+            if !problems.is_empty() {
+                anyhow::bail!("{}", problems.join("\n"));
             }
 
             let mut host_config: HostConfig = match toml::from_str(&c) {
@@ -887,6 +903,11 @@ prefix = "Bearer "
         .to_string();
         assert!(err.contains("missing required field 'method'"), "{err}");
         assert!(err.contains("[[network.allowed_routes]][0]"), "{err}");
+        // The migration: what the field used to mean when it was left out.
+        assert!(
+            err.contains("Earlier versions read a missing method as GET: add method = \"GET\""),
+            "{err}"
+        );
 
         // The legacy `bindings` table and its aliases say it the same way,
         // and a method that is not a string is named rather than dropped.
@@ -899,6 +920,13 @@ prefix = "Bearer "
                 "[[rules]]\nhost = \"api.example.com:443\"\nmethod = \"GET\"\nsecret = \"A\"\n\
                  [[rules]]\nhost = \"api.example.com:443\"\nsecret = \"B\"\n",
                 "rules[1]: missing required field 'method'",
+            ),
+            // Every stale entry in one refusal, not one per launch.
+            (
+                "[[rules]]\nhost = \"a.example:443\"\nsecret = \"A\"\n\
+                 [[rules]]\nhost = \"b.example:443\"\nsecret = \"B\"\n",
+                "rules[0]: missing required field 'method', as in AGENTS.md.\n\
+                 agent-sandbox: ",
             ),
             (
                 "[[network.allowed_routes]]\nhost = \"api.example.com:443\"\nmethod = 1\n\
