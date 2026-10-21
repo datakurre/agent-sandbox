@@ -1480,7 +1480,7 @@ impl CleanupGuard {
             let baseline: HashSet<String> = read_lines("policy.baseline").into_iter().collect();
             let delta = agents::policy_delta_lines(&active, &base, &baseline);
             if !delta.is_empty() {
-                if let Some(toml) = agents::format_policy_lines_as_network_toml(&delta) {
+                if let Some(toml) = agents::format_policy_delta_as_network_toml(&active, &delta) {
                     proposed = Some(toml);
                 }
             }
@@ -1626,7 +1626,7 @@ impl CleanupGuard {
         if delta.is_empty() {
             return;
         }
-        let Some(toml) = agents::format_policy_lines_as_network_toml(&delta) else {
+        let Some(toml) = agents::format_policy_delta_as_network_toml(&active, &delta) else {
             return;
         };
 
@@ -3181,7 +3181,12 @@ fn run() -> Result<i32> {
                 (d, e)
             })
             .collect();
-        let check = match trusted::check_mounts(&declared, &trusted_mounts, Path::new(&pwd)) {
+        let check = match trusted::check_mounts(
+            &declared,
+            &trusted_mounts,
+            Path::new(&pwd),
+            want_workspace,
+        ) {
             Ok(check) => check,
             Err(e) => fail(&e.to_string()),
         };

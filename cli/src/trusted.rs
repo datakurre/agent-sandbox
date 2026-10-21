@@ -419,10 +419,15 @@ pub struct MountCheck {
 /// A trusted source has to be absolute (or `~`-relative), and one that lies in
 /// this workspace authorizes nothing: resolving it would follow the very
 /// symlinks the repository controls, so it could be repointed after the fact.
+///
+/// `workspace_mounted` is whether the sandbox gets the workspace at all
+/// (`--workspace`). Without it the tree was withheld on purpose, so a mount
+/// from it needs authorizing like any other host path.
 pub fn check_mounts(
     declared: &[(MountDecl, String)],
     trusted: &[(MountDecl, String)],
     workspace: &Path,
+    workspace_mounted: bool,
 ) -> Result<MountCheck> {
     let workspace_canonical = std::fs::canonicalize(workspace)?;
     let in_workspace =
@@ -430,10 +435,10 @@ pub fn check_mounts(
 
     let mut grants = Vec::new();
     for (decl, expanded) in trusted {
-        if !(decl.source.starts_with('/') || decl.source.starts_with('~')) {
+        if !(decl.source.starts_with('/') || decl.source == "~" || decl.source.starts_with("~/")) {
             bail!(
                 "agent-sandbox: trusted.toml [mounts] {}: a source must be an absolute path \
-                 (or start with ~), not one relative to whichever workspace is launching.",
+                 (or start with ~/), not one relative to whichever workspace is launching.",
                 toml::Value::String(decl.source.clone())
             );
         }
@@ -451,9 +456,8 @@ pub fn check_mounts(
     for (decl, expanded) in declared {
         let mount = resolve(expanded)
             .map_err(|e| anyhow::anyhow!("agent-sandbox: [mounts] \"{}\": {}", decl.source, e))?;
-        if !mount.source.starts_with(&workspace_canonical)
-            && !grants.iter().any(|g| g.same_grant(&mount))
-        {
+        let inside = workspace_mounted && mount.source.starts_with(&workspace_canonical);
+        if !inside && !grants.iter().any(|g| g.same_grant(&mount)) {
             check.unauthorized.push(MountDecl {
                 source: mount.source.display().to_string(),
                 destination: mount.destination.clone(),
@@ -475,8 +479,8 @@ pub fn check_mounts(
 pub fn mounts_refusal(unauthorized: &[MountDecl], path: &Path) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "agent-sandbox: AGENTS.md [mounts] names host paths outside the workspace,\n\
-         \x20              which only {} can authorize:\n\n",
+        "agent-sandbox: AGENTS.md [mounts] names host paths outside the workspace (or in\n\
+         \x20              it, launched without --workspace), which only {} can authorize:\n\n",
         path.display()
     ));
     for decl in unauthorized {
@@ -706,7 +710,9 @@ mod tests {
             trusted: &[(MountDecl, String)],
             ws: &Path,
         ) -> Vec<MountDecl> {
-            check_mounts(declared, trusted, ws).unwrap().unauthorized
+            check_mounts(declared, trusted, ws, true)
+                .unwrap()
+                .unauthorized
         }
 
         #[test]
@@ -763,11 +769,44 @@ mod tests {
         }
 
         #[test]
+        fn without_the_workspace_mounted_its_tree_needs_authorizing_too() {
+            let (_root, ws, _) = scratch();
+            let inside = || {
+                pair(decl(
+                    ws.join("data").to_str().unwrap(),
+                    "/workspace/data",
+                    "",
+                ))
+            };
+            let check = check_mounts(&[inside()], &[], &ws, false).unwrap();
+            assert_eq!(check.unauthorized.len(), 1);
+        }
+
+        #[test]
+        fn a_trusted_source_naming_another_users_home_is_refused() {
+            let (_root, ws, _) = scratch();
+            let err = check_mounts(
+                &[],
+                &[(decl("~other/x", "/mnt/x", ""), "x".into())],
+                &ws,
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("must be an absolute path"), "{err}");
+        }
+
+        #[test]
         fn a_relative_trusted_source_is_refused() {
             let (_root, ws, _) = scratch();
-            let err = check_mounts(&[], &[(decl("escape", "/mnt/x", ""), "x".into())], &ws)
-                .unwrap_err()
-                .to_string();
+            let err = check_mounts(
+                &[],
+                &[(decl("escape", "/mnt/x", ""), "x".into())],
+                &ws,
+                true,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("must be an absolute path"), "{err}");
         }
 
@@ -784,6 +823,7 @@ mod tests {
                 ))],
                 &[pair(decl(real.to_str().unwrap(), "/mnt/x", "ro"))],
                 &ws,
+                true,
             )
             .unwrap();
             assert_eq!(check.specs, vec![format!("{}:/mnt/x:ro", real.display())]);
@@ -793,7 +833,7 @@ mod tests {
         fn a_missing_source_is_refused_by_name() {
             let (_root, ws, _) = scratch();
             let gone = decl(ws.join("gone").to_str().unwrap(), "/mnt/x", "");
-            let err = check_mounts(&[pair(gone)], &[], &ws)
+            let err = check_mounts(&[pair(gone)], &[], &ws, true)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("cannot mount"), "{err}");

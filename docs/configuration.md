@@ -67,7 +67,9 @@ is placed under `/workspace` (`"data"` mounts at `/workspace/data`, and `"."` at
 `/workspace` itself); an absolute one is used as written.
 
 The block is honored only with `--mounts`. A source inside the workspace — the
-repository's own tree — is mounted as declared. A source anywhere else —
+repository's own tree — is mounted as declared when `--workspace` mounts that
+tree too; without it, the tree was withheld on purpose, so a source in it needs
+authorizing like any other. A source anywhere else —
 `~/.cache/pip`, `/etc`, or a workspace path that only leads outside through a
 symlink — is the repository reaching into your host, so it is mounted only once
 `~/.config/agent-sandbox/trusted.toml` carries the same entry, with the same
@@ -181,7 +183,7 @@ them on their own. SSH is the exception: the relay that carries `git push` under
 `--proxy` is authorized by the port-22 entry alone and never consults routes.
 
 A route's `host` may be a single IPv4 address, but such a route filters plain
-HTTP only. A CIDR block or an IPv6 address is refused: the proxy matches a route
+HTTP only. A CIDR block, an IPv6 address or `*` is refused: the proxy matches a route
 against the one host a request names, so on those it would never apply, and the
 address would be allowed unfiltered while looking narrowed.
 HTTPS to an address carries no server name (clients send none for an IP), and
@@ -254,11 +256,10 @@ with `host = "*.example.com:80,443"` and `path = "/foo/**"`. Everything above
 about routes holds for them — a route restricts its whole domain.
 
 The short form only narrows. A route that injects a secret needs a table, since
-`secret`, `header` and `prefix` have nowhere to go, and so does a route on an IP
+`secret`, `header` and `prefix` have nowhere to go, and so does a route on a
 single IPv4 address (plain HTTP only, see above): a short-form route names a
-domain, not an IP, a CIDR block or `*`. Its
-ports must not cover 22 either, since a route is HTTP; write `"host:22"` as an
-entry of its own for SSH. `agent-sandbox ctl policy export` always writes routes
+domain, not an IP, a CIDR block or `*`. Its ports must not cover 22 either,
+since a route is HTTP; write `"host:22"` as an entry of its own for SSH. `agent-sandbox ctl policy export` always writes routes
 back as tables.
 
 #### The trusted config
@@ -438,7 +439,9 @@ without regard to case, as the proxy does:
   field on a rule;
 - two `[[network.allowed_routes]]` tables in one block with the same domain,
   method and path, with or without a secret — whatever ports their hosts name,
-  since a route holds its domain on every port; list every port on one table;
+  since a route holds its domain on every port; list every port on one table.
+  Across blocks the same route may repeat, but not with a secret on only one
+  copy;
 - a duplicate entry in `allowed_hosts`, including a
   [short-form route](#short-form-routes) that repeats the method, domain and
   path of another one or of a `[[network.allowed_routes]]` table, ports aside;
@@ -449,7 +452,8 @@ without regard to case, as the proxy does:
   names: `"a.example:8443"` conflicts with a route on `a.example:443`, while
   `"*.a.example:443"` does not conflict with a route on `a.example`. A plain entry
   on port 22 alone is the exception, since SSH goes through the relay and never
-  meets the route. The same applies to a wildcard allow (`"*"`, `"*:port"`).
+  meets the route. The same applies to a wildcard allow (`"*"`, `"*:port"`),
+  except `"*:22"`.
   This is checked across every `agent-sandbox` block in the file, not only
   within one;
 - an `allowed_hosts` entry covering port 22 for a host with no

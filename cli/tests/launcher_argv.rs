@@ -578,6 +578,26 @@ fn a_declared_mount_keeps_the_options_it_declared() {
 }
 
 #[test]
+fn without_the_workspace_a_mount_from_it_needs_trusted_toml_too() {
+    let world = World::new()
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[mounts]\n\".\" = \"/workspace\"\n```\n",
+        )
+        .file(".env", "SECRET=1\n");
+    let out = world.run(&["--mounts", "opencode"]);
+    assert!(!out.reached_podman_run(), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("outside the workspace"),
+        "{}",
+        out.stderr
+    );
+
+    let out = world.run(&["--workspace", "--mounts", "opencode"]);
+    assert!(out.reached_podman_run(), "{}", out.stderr);
+}
+
+#[test]
 fn a_declared_mount_outside_the_workspace_needs_trusted_toml() {
     let agents_md =
         "```toml agent-sandbox\n[mounts]\n\"~/shared\" = { destination = \"/mnt/shared\", options = \"ro\" }\n```\n";
