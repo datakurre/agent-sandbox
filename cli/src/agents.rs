@@ -310,6 +310,19 @@ pub struct MountDecl {
     pub options: String,
 }
 
+impl RouteSpec {
+    /// What makes two routes the same route: the domain pattern, whatever
+    /// ports its host names (a route holds its domain on every port), the
+    /// method and the path.
+    fn identity(&self) -> (String, String, String) {
+        (
+            parse_host_port(&self.host).0.to_ascii_lowercase(),
+            self.method.clone(),
+            self.path.clone(),
+        )
+    }
+}
+
 impl MountDecl {
     /// The `src:dest[:opts]` form podman's `-v` takes, before expansion.
     pub fn spec(&self) -> String {
@@ -985,7 +998,19 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                     ConfigError::msg("[network].allowed_routes must be an array of tables")
                 })?;
                 for (i, rule_val) in rules_arr.iter().enumerate() {
-                    routes.push(parse_route_table(i, rule_val)?);
+                    let route = parse_route_table(i, rule_val)?;
+                    // The same route twice compiles to two identical lines;
+                    // with a secret on only one of them, one is a mistake.
+                    if let Some(j) = routes
+                        .iter()
+                        .position(|r: &RouteSpec| r.identity() == route.identity())
+                    {
+                        return Err(ConfigError::msg(format!(
+                            "[[network.allowed_routes]][{}] repeats the domain, method and path of [[network.allowed_routes]][{}]; remove one (keep the one with the secret, if either has one), and list every port on the one that stays.",
+                            i, j
+                        )));
+                    }
+                    routes.push(route);
                 }
             }
 
@@ -998,21 +1023,14 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 // is refused too.
                 // Host names compare case-insensitively, as the proxy matches
                 // them.
-                let mut seen_routes: HashSet<(String, String, String)> = routes
-                    .iter()
-                    .map(|r: &RouteSpec| (r.host.to_lowercase(), r.method.clone(), r.path.clone()))
-                    .collect();
+                let mut seen_routes: HashSet<(String, String, String)> =
+                    routes.iter().map(RouteSpec::identity).collect();
                 for (i, item) in items.into_iter().enumerate() {
                     match parse_route_entry(i, &item) {
                         None => plain_items.push(item),
                         Some(specs) => {
                             for spec in specs? {
-                                let key = (
-                                    spec.host.to_lowercase(),
-                                    spec.method.clone(),
-                                    spec.path.clone(),
-                                );
-                                if !seen_routes.insert(key) {
+                                if !seen_routes.insert(spec.identity()) {
                                     return Err(ConfigError::msg(format!(
                                         "[network].allowed_hosts: duplicate entry '{}': its route {} {}{} is already listed, in allowed_hosts or as a [[network.allowed_routes]] table. Remove the redundant entry.",
                                         item, spec.method, spec.host, spec.path
@@ -2423,6 +2441,39 @@ mod export_tests {
         )
         .expect("a list of options");
         assert_eq!(ok[0].spec(), "data:/mnt/x:ro,Z");
+    }
+
+    #[test]
+    fn a_route_table_repeated_in_one_block_is_refused() {
+        let table = |host: &str, extra: &str| {
+            format!("[[network.allowed_routes]]\nhost = \"{host}\"\nmethod = \"GET\"\npath = \"/x\"\n{extra}")
+        };
+        for second in [
+            table("a.example:443", ""),
+            table("A.example:443", ""),
+            table("a.example:443", "secret = \"TOKEN\"\n"),
+            // A route holds its domain on every port, so another port is the
+            // same route.
+            table("a.example", ""),
+            table("a.example:80", ""),
+        ] {
+            let agents_md = network(&format!("{}{}", table("a.example:443", ""), second));
+            let err = parse_proxy(&agents_md).expect_err(&second).to_string();
+            assert!(
+                err.contains(
+                    "[[network.allowed_routes]][1] repeats the domain, method and path of \
+                     [[network.allowed_routes]][0]"
+                ),
+                "{second}\n{err}"
+            );
+        }
+        // Another method or path is another route.
+        let agents_md = network(&format!(
+            "{}{}",
+            table("a.example:443", ""),
+            table("a.example:443", "").replace("/x", "/y")
+        ));
+        parse_proxy(&agents_md).expect("two routes on one host");
     }
 
     #[test]

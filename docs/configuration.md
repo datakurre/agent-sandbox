@@ -426,9 +426,12 @@ without regard to case, as the proxy does:
 
 - an unknown key under `[network]` (only `allowed_hosts` and `allowed_routes` exist) or an unknown
   field on a rule;
+- two `[[network.allowed_routes]]` tables in one block with the same domain,
+  method and path, with or without a secret — whatever ports their hosts name,
+  since a route holds its domain on every port; list every port on one table;
 - a duplicate entry in `allowed_hosts`, including a
-  [short-form route](#short-form-routes) that repeats the method, host and path
-  of another one or of a `[[network.allowed_routes]]` table;
+  [short-form route](#short-form-routes) that repeats the method, domain and
+  path of another one or of a `[[network.allowed_routes]]` table, ports aside;
 - a host allowed outright in `allowed_hosts` that also carries a `[[network.allowed_routes]]`
   entry *without* a secret, or a short-form route — the route holds the host to
   its rules on every port, so the plain entry grants nothing beside it and one of
