@@ -180,6 +180,15 @@ restricts `example.com` and `api.example.com`, even where `allowed_hosts` lists
 them on their own. SSH is the exception: the relay that carries `git push` under
 `--proxy` is authorized by the port-22 entry alone and never consults routes.
 
+A route's `host` may be a single IPv4 address, but such a route filters plain
+HTTP only. A CIDR block or an IPv6 address is refused: the proxy matches a route
+against the one host a request names, so on those it would never apply, and the
+address would be allowed unfiltered while looking narrowed.
+HTTPS to an address carries no server name (clients send none for an IP), and
+the proxy pins every intercepted tunnel to the name it authorized, so once a
+route covers an address, HTTPS to it is refused (`sni-missing`). The short form
+and `ctl policy allow --l7` take domains only.
+
 #### Examples
 
 ````markdown
@@ -246,7 +255,8 @@ about routes holds for them — a route restricts its whole domain.
 
 The short form only narrows. A route that injects a secret needs a table, since
 `secret`, `header` and `prefix` have nowhere to go, and so does a route on an IP
-address: a short-form route names a domain, not an IP, a CIDR block or `*`. Its
+single IPv4 address (plain HTTP only, see above): a short-form route names a
+domain, not an IP, a CIDR block or `*`. Its
 ports must not cover 22 either, since a route is HTTP; write `"host:22"` as an
 entry of its own for SSH. `agent-sandbox ctl policy export` always writes routes
 back as tables.

@@ -185,7 +185,10 @@ allowed_hosts = [
 
 Methods are separated by commas alone, then whitespace before the domain. No
 path means `/**`; no method list means `*`. A secret route or a route on an IP
-still needs the table form, and a short-form route may not cover port 22.
+still needs the table form, and a short-form route may not cover port 22. A
+route on an IPv4 address filters plain HTTP only: HTTPS to an address is denied
+(`sni-missing`), since there is no server name to pin. A CIDR block or an IPv6
+address cannot carry a route at all.
 
 ### Combinations the launcher refuses
 

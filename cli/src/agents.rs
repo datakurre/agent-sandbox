@@ -785,9 +785,26 @@ fn route_entry_specs(
         )));
     }
     if host_part == "*" || is_ip_or_cidr(&host_part) {
+        // An address can carry a route, but only over plain HTTP: HTTPS to an
+        // address has no SNI to pin the intercepted tunnel to, so the proxy
+        // refuses it. That limit belongs in a table, written on purpose.
+        // "GET 10.0.0.0/8" splits into an address and the path "/8", but it
+        // names a block, which no table can route either.
+        let block = is_ip_or_cidr(&format!(
+            "{}{}",
+            host_part,
+            path.split(':').next().unwrap_or_default()
+        ));
+        let address = if host_part.parse::<std::net::Ipv4Addr>().is_err() || block {
+            String::new()
+        } else {
+            " A route on an address filters plain HTTP only, since HTTPS to an address \
+             carries no name the proxy can pin; for that, write a [[network.allowed_routes]] table."
+                .to_string()
+        };
         return Err(ConfigError::msg(format!(
-            "{}: a route needs a domain name, not '{}'. Allow it without a method or path instead.",
-            ctx, host_part
+            "{}: a short-form route needs a domain name, not '{}'. Allow it without a method or path instead.{}",
+            ctx, host_part, address
         )));
     }
     _proxy_domain(&ctx, &host_part)?;
@@ -891,6 +908,16 @@ fn ports_are_only_ssh(spec: &str) -> bool {
 fn validate_route_host(ctx: &str, host: &str) -> Result<(), ConfigError> {
     let host_ctx = format!("{}.host", ctx);
     let (host_part, port_part) = parse_host_port(host);
+    if is_ip_or_cidr(&host_part) && host_part.parse::<std::net::Ipv4Addr>().is_err() {
+        // The proxy matches a route against the one host a request names, so
+        // a block never matches, and it writes an IPv6 host bracketed, which
+        // the compiled route is not: either would allow the address outright
+        // while looking filtered.
+        return Err(ConfigError::msg(format!(
+            "{}: {:?} cannot carry a route, which the proxy matches against a domain or a single IPv4 address. Allow it in allowed_hosts instead, unfiltered, or route a single IPv4 address.",
+            host_ctx, host_part
+        )));
+    }
     if host_part != "*" && !is_ip_or_cidr(&host_part) {
         _proxy_domain(&host_ctx, &host_part)?;
     }
@@ -2093,7 +2120,11 @@ mod export_tests {
             ("GET a.example /x", "unexpected space"),
             ("GET :443/x", "missing domain"),
             ("GET /x", "missing domain"),
-            ("GET 10.0.0.1/x", "needs a domain name, not '10.0.0.1'"),
+            (
+                "GET 10.0.0.1/x",
+                "needs a domain name, not '10.0.0.1'. Allow it without a method or path \
+                 instead. A route on an address filters plain HTTP only",
+            ),
             ("GET 10.0.0.0/8", "needs a domain name, not '10.0.0.0'"),
             ("GET *:443/x", "needs a domain name, not '*'"),
             ("GET a.example:22/x", "cannot cover port 22"),
@@ -2474,6 +2505,28 @@ mod export_tests {
             table("a.example:443", "").replace("/x", "/y")
         ));
         parse_proxy(&agents_md).expect("two routes on one host");
+    }
+
+    #[test]
+    fn a_route_on_a_block_or_an_ipv6_address_is_refused() {
+        for host in ["10.0.0.0/8", "10.0.0.0/8:80", "::1", "[::1]:8080", "fd00::/8"] {
+            let err = parse_proxy(&network(&format!(
+                "[[network.allowed_routes]]\nhost = \"{host}\"\nmethod = \"GET\"\n"
+            )))
+            .expect_err(host)
+            .to_string();
+            assert!(err.contains("cannot carry a route"), "{host}: {err}");
+        }
+        // A single IPv4 address still can, over plain HTTP.
+        parse_proxy(&network(
+            "[[network.allowed_routes]]\nhost = \"10.1.2.3:8080\"\nmethod = \"GET\"\n",
+        ))
+        .expect("a route on one IPv4 address");
+        // The short form points at a table only where a table would work.
+        let err = parse_proxy(&network("allowed_hosts = [\"GET 10.0.0.0/8\"]\n"))
+            .expect_err("a short-form route on a block")
+            .to_string();
+        assert!(!err.contains("write a [[network.allowed_routes]] table"), "{err}");
     }
 
     #[test]
