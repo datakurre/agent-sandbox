@@ -136,7 +136,15 @@ impl World {
             .tempdir()
             .expect("temp dir");
         let root = tmp.path().to_path_buf();
-        for sub in ["bin", "home", "run", "ws", "replies", "capture", "nix-store"] {
+        for sub in [
+            "bin",
+            "home",
+            "run",
+            "ws",
+            "replies",
+            "capture",
+            "nix-store",
+        ] {
             fs::create_dir_all(root.join(sub)).expect("scaffold");
         }
 

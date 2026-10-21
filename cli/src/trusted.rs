@@ -497,9 +497,9 @@ pub fn mounts_refusal(unauthorized: &[MountDecl], path: &Path) -> String {
 /// Returns true if every host in the unauthorized list has at least one built-in pinned key.
 pub fn all_hosts_have_pinned_keys(unauthorized: &[String]) -> bool {
     !unauthorized.is_empty()
-        && unauthorized.iter().all(|host| {
-            !agent_sandbox_proxy::known_hosts::pinned_keys_for(host).is_empty()
-        })
+        && unauthorized
+            .iter()
+            .all(|host| !agent_sandbox_proxy::known_hosts::pinned_keys_for(host).is_empty())
 }
 
 /// Generates the `[[network.known_hosts]]` TOML block for the given unauthorized hosts.
@@ -605,7 +605,11 @@ pub fn prompt_and_update_io<R: std::io::BufRead, W: std::io::Write>(
     let _ = writeln!(
         writer,
         "               but no host key for {} is trusted in {}.",
-        if unauthorized.len() == 1 { "it" } else { "them" },
+        if unauthorized.len() == 1 {
+            "it"
+        } else {
+            "them"
+        },
         path.display()
     );
     let _ = writeln!(
@@ -1172,7 +1176,9 @@ mod tests {
             "github.com".to_string(),
             "git.example.com".to_string()
         ]));
-        assert!(!all_hosts_have_pinned_keys(&["git.example.com".to_string()]));
+        assert!(!all_hosts_have_pinned_keys(
+            &["git.example.com".to_string()]
+        ));
         assert!(!all_hosts_have_pinned_keys(&[]));
     }
 
@@ -1196,14 +1202,23 @@ mod tests {
         // Non-existent file diff
         let diff = render_diff(&path, &toml, style);
         assert!(diff.contains("--- /dev/null"), "{diff}");
-        assert!(diff.contains(&format!("+++ b/{}", path.display())), "{diff}");
+        assert!(
+            diff.contains(&format!("+++ b/{}", path.display())),
+            "{diff}"
+        );
         assert!(diff.contains("+[[network.known_hosts]]"), "{diff}");
 
         // Existing file diff
         std::fs::write(&path, "# existing content\n").unwrap();
         let diff_existing = render_diff(&path, &toml, style);
-        assert!(diff_existing.contains(&format!("--- a/{}", path.display())), "{diff_existing}");
-        assert!(diff_existing.contains(&format!("+++ b/{}", path.display())), "{diff_existing}");
+        assert!(
+            diff_existing.contains(&format!("--- a/{}", path.display())),
+            "{diff_existing}"
+        );
+        assert!(
+            diff_existing.contains(&format!("+++ b/{}", path.display())),
+            "{diff_existing}"
+        );
         assert!(diff_existing.contains("@@ -1,0 +2,"), "{diff_existing}");
     }
 

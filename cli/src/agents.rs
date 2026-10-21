@@ -291,10 +291,7 @@ pub fn allocate(mapping: Mapping) -> Result<Mapping, ConfigError> {
         sock.local_addr().map_err(ConfigError::msg)?.port()
     } else {
         let listener = TcpListener::bind((bind_addr, 0)).map_err(ConfigError::msg)?;
-        listener
-            .local_addr()
-            .map_err(ConfigError::msg)?
-            .port()
+        listener.local_addr().map_err(ConfigError::msg)?.port()
     };
     let mut m = mapping;
     m.host = host_port;
@@ -1006,8 +1003,10 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
                 .as_table()
                 .ok_or_else(|| ConfigError::msg("[network] must be a table"))?;
 
-            let allowed_net: HashSet<&str> =
-                ["allowed_hosts", "allowed_routes"].iter().cloned().collect();
+            let allowed_net: HashSet<&str> = ["allowed_hosts", "allowed_routes"]
+                .iter()
+                .cloned()
+                .collect();
             let unknown: Vec<_> = net_table
                 .keys()
                 .filter(|k| !allowed_net.contains(k.as_str()))
@@ -1700,7 +1699,10 @@ mod export_tests {
     fn roundtrip_allow_with_ports() {
         let cfg = parse_policy("allow_host *.jyu.fi:443\n").unwrap();
         let toml = format_policy_as_network_toml(&cfg);
-        assert!(toml.contains("allowed_hosts = [\"*.jyu.fi:443\"]"), "{toml}");
+        assert!(
+            toml.contains("allowed_hosts = [\"*.jyu.fi:443\"]"),
+            "{toml}"
+        );
         assert!(!toml.contains("allow_port"), "{toml}");
     }
 
@@ -2509,7 +2511,13 @@ mod export_tests {
 
     #[test]
     fn a_route_on_a_block_or_an_ipv6_address_is_refused() {
-        for host in ["10.0.0.0/8", "10.0.0.0/8:80", "::1", "[::1]:8080", "fd00::/8"] {
+        for host in [
+            "10.0.0.0/8",
+            "10.0.0.0/8:80",
+            "::1",
+            "[::1]:8080",
+            "fd00::/8",
+        ] {
             let err = parse_proxy(&network(&format!(
                 "[[network.allowed_routes]]\nhost = \"{host}\"\nmethod = \"GET\"\n"
             )))
@@ -2526,7 +2534,10 @@ mod export_tests {
         let err = parse_proxy(&network("allowed_hosts = [\"GET 10.0.0.0/8\"]\n"))
             .expect_err("a short-form route on a block")
             .to_string();
-        assert!(!err.contains("write a [[network.allowed_routes]] table"), "{err}");
+        assert!(
+            !err.contains("write a [[network.allowed_routes]] table"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2653,10 +2664,7 @@ mod export_tests {
 
     #[test]
     fn bracketed_ipv6_policy_targets_round_trip_to_proxy_syntax() {
-        let policy = parse_policy_file(
-            "[network]\nallowed_hosts = [\"[::1]:4000\"]\n",
-        )
-        .unwrap();
+        let policy = parse_policy_file("[network]\nallowed_hosts = [\"[::1]:4000\"]\n").unwrap();
         assert_eq!(policy.allow_ip, vec!["[::1]:4000"]);
         let text = format_proxy_policy(&policy, "policy");
         agent_sandbox_proxy::policy::parse_policy(&text)

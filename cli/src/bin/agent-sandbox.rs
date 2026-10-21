@@ -31,8 +31,7 @@ use tempfile::Builder;
 // so only the output-format flag suppresses status/warning chatter and switches `fail`
 // and `refuse` to the JSON envelope.
 static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static NIX_SERVE_PROCESS_GROUP: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(0);
+static NIX_SERVE_PROCESS_GROUP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// The first SIGINT/SIGTERM/SIGHUP a launch received, or 0.  Decides the exit
 /// status (128 + signal) once `run` has unwound through its cleanup guard.
 static SHUTDOWN_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -259,7 +258,10 @@ fn attach_browsers(
 /// the sandbox then gets no keyring, as before.  Said aloud only for keyboxd,
 /// where that breaks signing; a home with no keyring file at all got none
 /// before this export existed, and stays as quiet as it was.
-fn export_public_keys(gnupg_home: &Path, reason: launch::KeyExport) -> Option<tempfile::NamedTempFile> {
+fn export_public_keys(
+    gnupg_home: &Path,
+    reason: launch::KeyExport,
+) -> Option<tempfile::NamedTempFile> {
     let out = match ProcessCommand::new("gpg")
         .arg("--homedir")
         .arg(gnupg_home)
@@ -283,7 +285,10 @@ fn export_public_keys(gnupg_home: &Path, reason: launch::KeyExport) -> Option<te
         }
         Err(_) if reason != launch::KeyExport::Keyboxd => return None,
         Err(e) => {
-            eprintln!("agent-sandbox: --gpg: could not run gpg to export public keys: {}", e);
+            eprintln!(
+                "agent-sandbox: --gpg: could not run gpg to export public keys: {}",
+                e
+            );
             return None;
         }
     };
@@ -311,7 +316,11 @@ const NIX_SERVE_PREFERRED_PORT: u16 = 7419;
 fn choose_nix_serve_internal_port(host_ports: &[HostPort]) -> Option<u16> {
     (NIX_SERVE_PREFERRED_PORT..=u16::MAX)
         .chain(1..NIX_SERVE_PREFERRED_PORT)
-        .find(|port| !host_ports.iter().any(|host_port| host_port.sandbox == *port))
+        .find(|port| {
+            !host_ports
+                .iter()
+                .any(|host_port| host_port.sandbox == *port)
+        })
 }
 
 fn public_host_ports(host_ports: &[HostPort], nix_internal_port: Option<u16>) -> String {
@@ -453,8 +462,7 @@ fn spawn_nix_serve(secret_key: &Path) -> Result<(std::process::Child, u16), Stri
 }
 
 fn terminate_nix_serve_process_group() {
-    let process_group =
-        NIX_SERVE_PROCESS_GROUP.load(std::sync::atomic::Ordering::SeqCst);
+    let process_group = NIX_SERVE_PROCESS_GROUP.load(std::sync::atomic::Ordering::SeqCst);
     if process_group <= 0 {
         return;
     }
@@ -603,10 +611,9 @@ fn wait_for_nix_serve(child: &mut std::process::Child, port: u16) -> Result<(), 
 
 fn probe_nix_serve(port: u16) -> bool {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &address,
-        std::time::Duration::from_millis(100),
-    ) else {
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&address, std::time::Duration::from_millis(100))
+    else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
@@ -626,8 +633,12 @@ fn nix_cache_info_response_ok(response: &str) -> bool {
     };
     headers.lines().next().is_some_and(|line| {
         line.starts_with("HTTP/1.") && line.split_whitespace().nth(1) == Some("200")
-    }) && body.lines().any(|line| line.trim() == "StoreDir: /nix/store")
-        && body.lines().any(|line| line.trim().starts_with("WantMassQuery:"))
+    }) && body
+        .lines()
+        .any(|line| line.trim() == "StoreDir: /nix/store")
+        && body
+            .lines()
+            .any(|line| line.trim().starts_with("WantMassQuery:"))
 }
 
 /// The default for `--selinux`: relabel exactly when the host enforces.
@@ -647,7 +658,9 @@ fn selinux_is_enforcing() -> bool {
 /// that fails to parse here is not a bind this launcher wrote -- treated as
 /// non-loopback, because the refusal is the safe answer.
 fn is_loopback_bind(bind: &str) -> bool {
-    bind.parse::<IpAddr>().map(|a| a.is_loopback()).unwrap_or(false)
+    bind.parse::<IpAddr>()
+        .map(|a| a.is_loopback())
+        .unwrap_or(false)
 }
 
 /// A bind whose host side is a socket owned by someone other than the
@@ -888,36 +901,132 @@ Use flags to opt-in to integrations like mounting the current directory,
 forwarding SSH, or exposing Git identity.
 "#
     );
-    print_help_option("agent-sandbox", None, "launch interactive bash (no agent state mounted)");
-    print_help_option("agent-sandbox opencode", None, "launch opencode with its own state mounted");
-    print_help_option("agent-sandbox --agent-mounts", None, "launch interactive bash with every agent's state mounted");
-    print_help_option("agent-sandbox --podman opencode", None, "launch opencode with podman enabled");
-    print_help_option("agent-sandbox opencode -- bash", None, "launch bash with opencode's state mounted");
-    print_help_option("agent-sandbox --privileged opencode", None, "pass --privileged to podman run");
-    print_help_option("agent-sandbox ctl --help", None, "manage sandboxes that are already running");
+    print_help_option(
+        "agent-sandbox",
+        None,
+        "launch interactive bash (no agent state mounted)",
+    );
+    print_help_option(
+        "agent-sandbox opencode",
+        None,
+        "launch opencode with its own state mounted",
+    );
+    print_help_option(
+        "agent-sandbox --agent-mounts",
+        None,
+        "launch interactive bash with every agent's state mounted",
+    );
+    print_help_option(
+        "agent-sandbox --podman opencode",
+        None,
+        "launch opencode with podman enabled",
+    );
+    print_help_option(
+        "agent-sandbox opencode -- bash",
+        None,
+        "launch bash with opencode's state mounted",
+    );
+    print_help_option(
+        "agent-sandbox --privileged opencode",
+        None,
+        "pass --privileged to podman run",
+    );
+    print_help_option(
+        "agent-sandbox ctl --help",
+        None,
+        "manage sandboxes that are already running",
+    );
     print_help_option("agent-sandbox browser", None, "start a throwaway host browser behind a deny-by-default allow list, for cooperative testing over CDP");
     println!("\nAgents:\n  {agent_list}");
     println!("\nIntegrations (use --X to enable, --no-X to disable):");
-    print_help_option("--workspace", Some(fmt(want_workspace)), "Mounts the host's current working directory into /workspace/<dirname>.");
-    print_help_option("--name NAME", None, "Use NAME instead of a random ctl selector.");
-    print_help_option("--ssh", Some(fmt(want_ssh)), "Forwards the host's SSH_AUTH_SOCK to the container.");
-    print_help_option("--git", Some(fmt(want_git)), "Passes the host's Git configuration (with a blocklist) and identity env vars.");
-    print_help_option("--gpg", Some(fmt(want_gpg)), "Enables host GnuPG agent forwarding and git commit signing behavior.");
-    print_help_option("--gpg-private", Some(fmt(want_gpg_private)), "Exposes ~/.gnupg even if it holds on-disk secret keys.");
-    print_help_option("--devenv", Some(fmt(want_devenv)), "Persists ~/.local/share/devenv across sessions.");
-    print_help_option("--nix", Some(fmt(want_nix)), "Uses the host's Nix store as a signed substituter; builds stay in the container.");
-    print_help_option("--podman", Some(fmt(want_podman)), "Forwards the host rootless Podman socket (sibling containers).");
+    print_help_option(
+        "--workspace",
+        Some(fmt(want_workspace)),
+        "Mounts the host's current working directory into /workspace/<dirname>.",
+    );
+    print_help_option(
+        "--name NAME",
+        None,
+        "Use NAME instead of a random ctl selector.",
+    );
+    print_help_option(
+        "--ssh",
+        Some(fmt(want_ssh)),
+        "Forwards the host's SSH_AUTH_SOCK to the container.",
+    );
+    print_help_option(
+        "--git",
+        Some(fmt(want_git)),
+        "Passes the host's Git configuration (with a blocklist) and identity env vars.",
+    );
+    print_help_option(
+        "--gpg",
+        Some(fmt(want_gpg)),
+        "Enables host GnuPG agent forwarding and git commit signing behavior.",
+    );
+    print_help_option(
+        "--gpg-private",
+        Some(fmt(want_gpg_private)),
+        "Exposes ~/.gnupg even if it holds on-disk secret keys.",
+    );
+    print_help_option(
+        "--devenv",
+        Some(fmt(want_devenv)),
+        "Persists ~/.local/share/devenv across sessions.",
+    );
+    print_help_option(
+        "--nix",
+        Some(fmt(want_nix)),
+        "Uses the host's Nix store as a signed substituter; builds stay in the container.",
+    );
+    print_help_option(
+        "--podman",
+        Some(fmt(want_podman)),
+        "Forwards the host rootless Podman socket (sibling containers).",
+    );
     print_help_option("--selinux", Some(fmt(want_selinux)), "Applies SELinux shared relabeling (:z) to ordinary writable binds; special volume modes are unchanged. Defaults to on when SELinux is enforcing.");
-    print_help_option("--proxy", Some(fmt(want_proxy)), "Deny-by-default network firewall enforcing AGENTS.md's [network] policy.");
-    print_help_option("--policy NAME", None, "Merge a host-owned reusable network policy for sandbox launches; requires --proxy.");
-    print_help_option("--no-policy", None, "Ignore selected and implicit host-owned policies; keep the proxy and AGENTS.md policy.");
-    print_help_option("--secrets", Some(fmt(want_secrets)), "Injects secretspec-resolved credentials into proxied requests. Requires --proxy.");
-    print_help_option("--krun", Some(fmt(want_krun)), "Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).");
+    print_help_option(
+        "--proxy",
+        Some(fmt(want_proxy)),
+        "Deny-by-default network firewall enforcing AGENTS.md's [network] policy.",
+    );
+    print_help_option(
+        "--policy NAME",
+        None,
+        "Merge a host-owned reusable network policy for sandbox launches; requires --proxy.",
+    );
+    print_help_option(
+        "--no-policy",
+        None,
+        "Ignore selected and implicit host-owned policies; keep the proxy and AGENTS.md policy.",
+    );
+    print_help_option(
+        "--secrets",
+        Some(fmt(want_secrets)),
+        "Injects secretspec-resolved credentials into proxied requests. Requires --proxy.",
+    );
+    print_help_option(
+        "--krun",
+        Some(fmt(want_krun)),
+        "Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).",
+    );
 
     println!("\nPorts:");
-    print_help_option("--ports / --no-ports", Some(fmt(want_ports)), "Honors [ports] declarations from AGENTS.md.");
-    print_help_option("--ports-any-interface", None, "Permits port binds outside of loopback interfaces.");
-    print_help_option("--shared-network", Some(fmt(want_shared_network)), "Joins the shared bridge network so sibling containers can reach this one by name.");
+    print_help_option(
+        "--ports / --no-ports",
+        Some(fmt(want_ports)),
+        "Honors [ports] declarations from AGENTS.md.",
+    );
+    print_help_option(
+        "--ports-any-interface",
+        None,
+        "Permits port binds outside of loopback interfaces.",
+    );
+    print_help_option(
+        "--shared-network",
+        Some(fmt(want_shared_network)),
+        "Joins the shared bridge network so sibling containers can reach this one by name.",
+    );
     print_help_option("--browser", Some(fmt(want_browser)), "Attaches every running 'agent-sandbox browser' session, mapping its CDP port in automatically.");
     print_help_option("--host-loopback-port PORT", Some(fmt(want_host_ports)), "Makes a host 127.0.0.1:PORT reachable at the sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP port). Repeatable; takes HOST:SANDBOX to remap. Not with --krun.");
 
@@ -925,15 +1034,39 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--mounts / --no-mounts", Some(fmt(want_mounts)), "Honors [mounts] declarations from AGENTS.md; a source outside the workspace also needs the same entry in trusted.toml.");
 
     println!("\nAgent state:");
-    print_help_option("--agent-mounts", Some(fmt(agent_mounts_all)), "Mount every agent's state, not just the one launched.");
+    print_help_option(
+        "--agent-mounts",
+        Some(fmt(agent_mounts_all)),
+        "Mount every agent's state, not just the one launched.",
+    );
     print_help_option("--agent-mounts=AGENT[,AGENT...]", None, "Mount only these agents' state (plus any launched agent).\nOnly the \"=\" form takes a list.");
-    print_help_option("--no-agent-mounts", None, "Mount no agent state, even for the launched agent.");
+    print_help_option(
+        "--no-agent-mounts",
+        None,
+        "Mount no agent state, even for the launched agent.",
+    );
 
     println!("\nPodman / Environment:");
-    print_help_option("--privileged", None, "pass --privileged to podman run (for nested podman)");
-    print_help_option("--krun-memory MiB", None, "guest RAM under --krun (default 4096, must exceed 128)");
-    print_help_option("--krun-cpus N", None, "guest vCPUs under --krun (1-16, default: host affinity)");
-    print_help_option("-e, --env NAME=VAL", None, "pass environment variable to podman");
+    print_help_option(
+        "--privileged",
+        None,
+        "pass --privileged to podman run (for nested podman)",
+    );
+    print_help_option(
+        "--krun-memory MiB",
+        None,
+        "guest RAM under --krun (default 4096, must exceed 128)",
+    );
+    print_help_option(
+        "--krun-cpus N",
+        None,
+        "guest vCPUs under --krun (1-16, default: host affinity)",
+    );
+    print_help_option(
+        "-e, --env NAME=VAL",
+        None,
+        "pass environment variable to podman",
+    );
     print_help_option(
         "-v, --volume SPEC",
         None,
@@ -945,10 +1078,22 @@ forwarding SSH, or exposing Git identity.
         None,
         "publish a container port through podman (repeatable)",
     );
-    print_help_option("--add-host SPEC", None, "add a host entry through podman (repeatable)");
-    print_help_option("--env-file PATH", None, "load environment variables from a file");
+    print_help_option(
+        "--add-host SPEC",
+        None,
+        "add a host entry through podman (repeatable)",
+    );
+    print_help_option(
+        "--env-file PATH",
+        None,
+        "load environment variables from a file",
+    );
     print_help_option("--hostname NAME", None, "set the container hostname");
-    print_help_option("--tmpfs SPEC", None, "mount a tmpfs through podman (repeatable)");
+    print_help_option(
+        "--tmpfs SPEC",
+        None,
+        "mount a tmpfs through podman (repeatable)",
+    );
     println!("\nProgrammatic mode:");
     print_help_option(
         "--prompt -",
@@ -1138,7 +1283,10 @@ fn emit_json_envelope(
 
 /// One line of a streamed `--json` run's live output: `{type: "output", stream, line}`.
 fn emit_json_output_line(stream: &str, line: &str) {
-    println!("{}", serde_json::json!({"type": "output", "stream": stream, "line": line}));
+    println!(
+        "{}",
+        serde_json::json!({"type": "output", "stream": stream, "line": line})
+    );
 }
 
 /// How the sandboxed command's stdio is handled, derived from `--json`/`--prompt`.
@@ -1933,8 +2081,8 @@ fn run() -> Result<i32> {
 
     if is_ctl_bin || !args.is_empty() {
         let ctl_subcommands = [
-            "load", "list", "status", "policy", "proxy", "net", "logs", "log", "attach", "mount", "mounts",
-            "relay", "tui", "purge", "browser",
+            "load", "list", "status", "policy", "proxy", "net", "logs", "log", "attach", "mount",
+            "mounts", "relay", "tui", "purge", "browser",
         ];
         let mut run_ctl = false;
         let mut parse_args = vec!["agent-sandbox".to_string()];
@@ -1956,11 +2104,28 @@ fn run() -> Result<i32> {
             let mut i = 0;
             while i < pre_dash.len() {
                 match pre_dash[i].as_str() {
-                    "--name" | "--prompt" | "--model" | "--provider" | "--session"
-                    | "--fork" | "--max-ai-credits" | "--krun-memory" | "--krun-cpus"
-                    | "-e" | "--env" | "-v" | "--volume" | "--mount" | "-p" | "--publish"
-                    | "--add-host" | "--env-file" | "--hostname" | "--tmpfs"
-                    | "--host-loopback-port" | "--policy" => {
+                    "--name"
+                    | "--prompt"
+                    | "--model"
+                    | "--provider"
+                    | "--session"
+                    | "--fork"
+                    | "--max-ai-credits"
+                    | "--krun-memory"
+                    | "--krun-cpus"
+                    | "-e"
+                    | "--env"
+                    | "-v"
+                    | "--volume"
+                    | "--mount"
+                    | "-p"
+                    | "--publish"
+                    | "--add-host"
+                    | "--env-file"
+                    | "--hostname"
+                    | "--tmpfs"
+                    | "--host-loopback-port"
+                    | "--policy" => {
                         i += 2;
                     }
                     _ => {
@@ -2289,10 +2454,15 @@ fn run() -> Result<i32> {
                 } else if let Some(v) = arg.strip_prefix("--env=") {
                     env_args.push("-e".to_string());
                     env_args.push(v.to_string());
-                } else if arg == "-v" || arg == "--volume" || arg == "--mount"
-                    || arg == "-p" || arg == "--publish"
-                    || arg == "--add-host" || arg == "--env-file"
-                    || arg == "--hostname" || arg == "--tmpfs"
+                } else if arg == "-v"
+                    || arg == "--volume"
+                    || arg == "--mount"
+                    || arg == "-p"
+                    || arg == "--publish"
+                    || arg == "--add-host"
+                    || arg == "--env-file"
+                    || arg == "--hostname"
+                    || arg == "--tmpfs"
                 {
                     let flag = match arg.as_str() {
                         "-v" | "--volume" => "-v",
@@ -3334,8 +3504,7 @@ fn run() -> Result<i32> {
         let unauthorized =
             trusted::unauthorized_signing_hosts(&merged_policy.allow_signing, &trusted_known_hosts);
         if !unauthorized.is_empty() {
-            let is_interactive =
-                std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             let mut resolved = false;
 
             if is_interactive && trusted::all_hosts_have_pinned_keys(&unauthorized) {
@@ -4167,7 +4336,14 @@ fn run() -> Result<i32> {
                             status
                         );
                     }
-                    emit_json_envelope(exit_code, &out, &stdout_payload, err_msg.trim(), None, None);
+                    emit_json_envelope(
+                        exit_code,
+                        &out,
+                        &stdout_payload,
+                        err_msg.trim(),
+                        None,
+                        None,
+                    );
                 } else {
                     eprintln!(
                         "agent-sandbox: command exited before the sandbox became ready ({}).",
@@ -4256,7 +4432,10 @@ mod tests {
         let (value, format) =
             StdoutPayload::Json.render("{\"type\":\"start\"}\n{\"type\":\"end\"}\n");
         assert_eq!(format, "json");
-        assert_eq!(value, serde_json::json!([{"type": "start"}, {"type": "end"}]));
+        assert_eq!(
+            value,
+            serde_json::json!([{"type": "start"}, {"type": "end"}])
+        );
     }
 
     #[test]
@@ -4289,7 +4468,10 @@ mod tests {
         // worse than the text, which at least still has the warning in it.
         let (value, format) = StdoutPayload::Json.render("{\"type\":\"start\"}\nwarning: quota\n");
         assert_eq!(format, "text");
-        assert_eq!(value, serde_json::json!("{\"type\":\"start\"}\nwarning: quota\n"));
+        assert_eq!(
+            value,
+            serde_json::json!("{\"type\":\"start\"}\nwarning: quota\n")
+        );
     }
 
     #[test]

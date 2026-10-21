@@ -80,11 +80,10 @@ fn every_allowed_name_resolves_to_the_sidecar() {
 fn a_host_named_only_by_a_route_is_mapped_too() {
     // An `allowed_routes` host is subject to interception rather than a plain
     // tunnel, and reaching the proxy is a precondition for either.
-    let out = proxied_world().file("AGENTS.md", L7_ROUTE).run(&[
-        "--workspace",
-        "--proxy",
-        "opencode",
-    ]);
+    let out =
+        proxied_world()
+            .file("AGENTS.md", L7_ROUTE)
+            .run(&["--workspace", "--proxy", "opencode"]);
     let run = out.run_call();
 
     assert!(run.has_pair("--add-host", "api.example.com:10.89.7.2"));
@@ -301,13 +300,7 @@ fn an_l7_policy_is_accepted_and_still_denies_by_default() {
 
 #[test]
 fn a_policy_that_does_not_exist_refuses_the_launch() {
-    let out = proxied_world().run(&[
-        "--workspace",
-        "--proxy",
-        "--policy",
-        "nope",
-        "opencode",
-    ]);
+    let out = proxied_world().run(&["--workspace", "--proxy", "--policy", "nope", "opencode"]);
 
     assert!(!out.reached_podman_run());
     assert!(
@@ -353,12 +346,7 @@ fn a_policy_merges_with_agents_md() {
             ".config/agent-sandbox/policies/development.toml",
             "[network]\nallowed_hosts = [\"registry.npmjs.org:443\"]\n",
         )
-        .run(&[
-            "--workspace",
-            "--proxy",
-            "--policy",
-            "development",
-        ]);
+        .run(&["--workspace", "--proxy", "--policy", "development"]);
 
     assert!(
         out.reached_podman_run(),
@@ -542,7 +530,8 @@ secret = \"API_TOKEN\"
 
     assert!(out.reached_podman_run(), "{}", out.stderr);
     assert!(
-        out.stderr.contains("agent-sandbox: secret: injected API_TOKEN"),
+        out.stderr
+            .contains("agent-sandbox: secret: injected API_TOKEN"),
         "the injected secret should be reported by name: {}",
         out.stderr
     );
@@ -644,9 +633,10 @@ fn trusted_toml(host: &str) -> String {
 /// really does stop the launch rather than merely printing.
 #[test]
 fn an_ssh_host_with_no_trusted_key_never_reaches_podman_run() {
-    let out = proxied_world()
-        .file("AGENTS.md", SSH_HOST)
-        .run(&["--workspace", "--proxy", "opencode"]);
+    let out =
+        proxied_world()
+            .file("AGENTS.md", SSH_HOST)
+            .run(&["--workspace", "--proxy", "opencode"]);
 
     assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
     assert!(
@@ -668,7 +658,9 @@ fn an_ssh_host_with_no_trusted_key_never_reaches_podman_run() {
     // Nothing was built. A refusal that leaves a network behind is worse than
     // no refusal, because the next launch inherits it.
     assert!(
-        out.calls.iter().all(|c| c.first().map(String::as_str) != Some("run")),
+        out.calls
+            .iter()
+            .all(|c| c.first().map(String::as_str) != Some("run")),
         "the launcher started a container anyway: {:?}",
         out.calls
     );
@@ -678,9 +670,11 @@ fn an_ssh_host_with_no_trusted_key_never_reaches_podman_run() {
 /// therefore the relay, keys off.
 #[test]
 fn a_policy_that_opens_no_ssh_port_needs_no_host_key() {
-    let out = proxied_world()
-        .file("AGENTS.md", ALLOW_EXAMPLE)
-        .run(&["--workspace", "--proxy", "opencode"]);
+    let out = proxied_world().file("AGENTS.md", ALLOW_EXAMPLE).run(&[
+        "--workspace",
+        "--proxy",
+        "opencode",
+    ]);
 
     assert!(
         !out.stderr.contains("known_hosts"),
@@ -692,9 +686,10 @@ fn a_policy_that_opens_no_ssh_port_needs_no_host_key() {
 
 #[test]
 fn an_authorized_host_key_reaches_the_sidecar_and_the_sandbox() {
-    let world = proxied_world()
-        .file("AGENTS.md", SSH_HOST)
-        .home_file(".config/agent-sandbox/trusted.toml", &trusted_toml("github.com:22"));
+    let world = proxied_world().file("AGENTS.md", SSH_HOST).home_file(
+        ".config/agent-sandbox/trusted.toml",
+        &trusted_toml("github.com:22"),
+    );
     let out = world.run(&["--workspace", "--proxy", "--ssh", "opencode"]);
 
     // The sidecar's copy, in the same read-only directory as the policy: it is
@@ -767,6 +762,10 @@ fn the_new_config_wins_and_the_old_one_is_left_alone() {
         )
         .run(&["--workspace", "--proxy", "opencode"]);
 
-    assert!(out.stderr.is_empty() || !out.stderr.contains("mv "), "{}", out.stderr);
+    assert!(
+        out.stderr.is_empty() || !out.stderr.contains("mv "),
+        "{}",
+        out.stderr
+    );
     out.run_call();
 }

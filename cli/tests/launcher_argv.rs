@@ -90,7 +90,8 @@ fn an_entrypoint_exit_before_readiness_keeps_diagnostics_and_exit_code() {
 
     assert_eq!(out.code, Some(42));
     assert!(
-        out.stderr.contains("command exited before the sandbox became ready"),
+        out.stderr
+            .contains("command exited before the sandbox became ready"),
         "missing early-exit diagnostic:\n{}",
         out.stderr
     );
@@ -155,13 +156,11 @@ fn without_workspace_nothing_from_the_host_is_mounted_and_no_workspace_is_labell
         run.joined()
     );
     assert!(
-        run.values_of("-v")
-            .iter()
-            .all(|m| {
-                m.contains("/etc/passwd")
-                    || m.contains("/etc/group")
-                    || m.contains("/run/agent-sandbox-status")
-            }),
+        run.values_of("-v").iter().all(|m| {
+            m.contains("/etc/passwd")
+                || m.contains("/etc/group")
+                || m.contains("/run/agent-sandbox-status")
+        }),
         "only synthesized identity and readiness mounts: {}",
         run.joined()
     );
@@ -201,10 +200,7 @@ fn each_agent_gets_its_own_command() {
         world.run(&["opencode"]).run_call().command(),
         vec!["opencode", "."]
     );
-    assert_eq!(
-        world.run(&["claude"]).run_call().command(),
-        vec!["claude"]
-    );
+    assert_eq!(world.run(&["claude"]).run_call().command(), vec!["claude"]);
 }
 
 #[test]
@@ -241,11 +237,10 @@ fn a_state_file_with_a_seed_is_written_with_that_content_not_empty_braces() {
     let world = World::new();
     let out = world.run(&["pi"]);
 
-    assert!(
-        out.run_call()
-            .mount_to("/home/user/.pi/agent/models.json")
-            .is_some()
-    );
+    assert!(out
+        .run_call()
+        .mount_to("/home/user/.pi/agent/models.json")
+        .is_some());
     assert_eq!(
         std::fs::read_to_string(world.home().join(".pi/agent/models.json")).unwrap(),
         "SEEDED",
@@ -327,7 +322,9 @@ fn selinux_relabels_shared_binds_and_privately_labels_the_synthesized_files() {
         run.joined()
     );
     assert!(
-        run.mount_to("/run/agent-sandbox-status").unwrap().ends_with(":rw,z"),
+        run.mount_to("/run/agent-sandbox-status")
+            .unwrap()
+            .ends_with(":rw,z"),
         "the status dir takes the shared label: {}",
         run.joined()
     );
@@ -396,7 +393,11 @@ fn help_shows_the_detected_selinux_default() {
     };
     assert!(line(World::new(), &["--help"]).contains("[off]"));
     assert!(line(World::new().selinux_enforcing(), &["--help"]).contains("[on ]"));
-    assert!(line(World::new().selinux_enforcing(), &["--no-selinux", "--help"]).contains("[off]"));
+    assert!(line(
+        World::new().selinux_enforcing(),
+        &["--no-selinux", "--help"]
+    )
+    .contains("[off]"));
 }
 
 #[test]
@@ -433,10 +434,18 @@ fn nix_server_startup_failure_falls_back_without_host_mounts() {
         run.joined()
     );
     assert!(run.env_value("AGENT_SANDBOX_HOST_NIX").is_none());
-    let secret = world.home().join(".local/share/agent-sandbox/nix-serve/secret_key");
-    assert!(secret.is_file(), "the signing key is generated before serving");
+    let secret = world
+        .home()
+        .join(".local/share/agent-sandbox/nix-serve/secret_key");
+    assert!(
+        secret.is_file(),
+        "the signing key is generated before serving"
+    );
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(fs::metadata(secret).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(secret).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[test]
@@ -445,9 +454,10 @@ fn selinux_nix_without_a_store_does_not_mount_or_relabel_host_nix_paths() {
         .no_nix_store()
         .run(&["--nix", "--selinux", "opencode"]);
     let run = out.run_call();
-    assert!(run.values_of("-v").iter().all(|mount| {
-        !mount.contains("/nix/store") && !mount.contains("daemon-socket")
-    }));
+    assert!(run
+        .values_of("-v")
+        .iter()
+        .all(|mount| { !mount.contains("/nix/store") && !mount.contains("daemon-socket") }));
 }
 
 // ── declared ports ──────────────────────────────────────────────────────────
@@ -678,9 +688,21 @@ fn common_podman_args_are_forwarded_in_both_available_spellings() {
         "{}",
         run.joined()
     );
-    assert!(run.has_pair("--env-file", "/tmp/environment"), "{}", run.joined());
-    assert!(run.has_pair("--hostname", "sandbox-test"), "{}", run.joined());
-    assert!(run.has_pair("--tmpfs", "/tmp/another:rw"), "{}", run.joined());
+    assert!(
+        run.has_pair("--env-file", "/tmp/environment"),
+        "{}",
+        run.joined()
+    );
+    assert!(
+        run.has_pair("--hostname", "sandbox-test"),
+        "{}",
+        run.joined()
+    );
+    assert!(
+        run.has_pair("--tmpfs", "/tmp/another:rw"),
+        "{}",
+        run.joined()
+    );
 }
 
 #[test]
@@ -735,7 +757,11 @@ fn krun_and_host_loopback_port_are_refused_together() {
     let out = World::new().run(&["--krun", "--host-loopback-port", "18124", "opencode"]);
 
     assert!(!out.reached_podman_run());
-    assert!(out.stderr.contains("--host-loopback-port"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("--host-loopback-port"),
+        "{}",
+        out.stderr
+    );
     assert!(out.stderr.contains("--krun"), "{}", out.stderr);
 }
 
@@ -886,9 +912,11 @@ fn help_lists_exactly_the_agents_the_catalog_declares() {
 fn help_options_share_a_description_column() {
     let out = World::new().run(&["--help"]);
 
-    for line in out.stdout.lines().filter(|line| {
-        line.starts_with("  --") || line.starts_with("  -e,")
-    }) {
+    for line in out
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("  --") || line.starts_with("  -e,"))
+    {
         assert!(
             line.len() > 45,
             "help option is missing its aligned description: {line:?}"
@@ -905,9 +933,11 @@ fn ctl_help_commands_share_a_description_column() {
     let out = World::new().run(&["ctl", "--help"]);
 
     assert_eq!(out.code, Some(0));
-    for line in out.stdout.lines().filter(|line| {
-        line.starts_with("  ") && !line.starts_with("  -") && line.contains("     ")
-    }) {
+    for line in out
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("  ") && !line.starts_with("  -") && line.contains("     "))
+    {
         assert_eq!(
             line.find(|character: char| character.is_ascii_uppercase()),
             Some(11),
@@ -931,8 +961,7 @@ fn json_prompt_mode_appends_agent_prompt_arguments_and_omits_tty() {
 
     assert_eq!(run.command(), vec!["claude", "-p", "-"]);
     assert!(!run.has("--tty"), "json/prompt mode must omit --tty");
-    let json: serde_json::Value =
-        serde_json::from_str(&out.stdout).expect("valid JSON stdout");
+    let json: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON stdout");
     assert_eq!(json["type"], "exit");
     assert_eq!(json["status"], 0);
 }
@@ -946,7 +975,10 @@ fn prompt_mode_appends_agent_prompt_arguments_and_omits_tty_without_json() {
     let run = out.run_call();
 
     assert_eq!(run.command(), vec!["claude", "-p", "-"]);
-    assert!(!run.has("--tty"), "--prompt must omit --tty even without --json");
+    assert!(
+        !run.has("--tty"),
+        "--prompt must omit --tty even without --json"
+    );
 }
 
 #[test]
@@ -975,7 +1007,10 @@ fn json_prompt_mode_with_model_appends_model_flags() {
     let out = World::new().run(&["--json", "--prompt", "-", "--model", "sonnet", "claude"]);
     let run = out.run_call();
 
-    assert_eq!(run.command(), vec!["claude", "-p", "-", "--model", "sonnet"]);
+    assert_eq!(
+        run.command(),
+        vec!["claude", "-p", "-", "--model", "sonnet"]
+    );
 }
 
 #[test]
@@ -993,10 +1028,20 @@ fn model_without_prompt_fails() {
 
 #[test]
 fn json_prompt_mode_with_max_ai_credits_appends_flags() {
-    let out = World::new().run(&["--json", "--prompt", "-", "--max-ai-credits", "50", "copilot"]);
+    let out = World::new().run(&[
+        "--json",
+        "--prompt",
+        "-",
+        "--max-ai-credits",
+        "50",
+        "copilot",
+    ]);
     let run = out.run_call();
 
-    assert_eq!(run.command(), vec!["copilot", "-p", "-", "--max-ai-credits", "50"]);
+    assert_eq!(
+        run.command(),
+        vec!["copilot", "-p", "-", "--max-ai-credits", "50"]
+    );
 }
 
 #[test]
@@ -1053,7 +1098,14 @@ fn provider_without_prompt_fails() {
 
 #[test]
 fn max_ai_credits_rejects_unsupported_agent() {
-    let out = World::new().run(&["--json", "--prompt", "-", "--max-ai-credits", "50", "opencode"]);
+    let out = World::new().run(&[
+        "--json",
+        "--prompt",
+        "-",
+        "--max-ai-credits",
+        "50",
+        "opencode",
+    ]);
 
     assert_eq!(out.code, Some(1));
     assert!(!out.reached_podman_run());
@@ -1072,7 +1124,14 @@ fn max_ai_credits_rejects_unsupported_agent() {
 
 #[test]
 fn max_ai_credits_rejects_non_numeric_value() {
-    let out = World::new().run(&["--json", "--prompt", "-", "--max-ai-credits", "fifty", "copilot"]);
+    let out = World::new().run(&[
+        "--json",
+        "--prompt",
+        "-",
+        "--max-ai-credits",
+        "fifty",
+        "copilot",
+    ]);
 
     assert_eq!(out.code, Some(1));
     assert!(!out.reached_podman_run());
@@ -1091,7 +1150,14 @@ fn max_ai_credits_rejects_non_numeric_value() {
 
 #[test]
 fn max_ai_credits_rejects_zero() {
-    let out = World::new().run(&["--json", "--prompt", "-", "--max-ai-credits", "0", "copilot"]);
+    let out = World::new().run(&[
+        "--json",
+        "--prompt",
+        "-",
+        "--max-ai-credits",
+        "0",
+        "copilot",
+    ]);
 
     assert_eq!(out.code, Some(1));
     assert!(!out.reached_podman_run());
@@ -1111,7 +1177,9 @@ fn max_ai_credits_rejects_zero() {
     assert_eq!(out_plain.code, Some(1));
     assert!(!out_plain.reached_podman_run());
     assert!(
-        out_plain.stderr.contains("--max-ai-credits must be a positive integer"),
+        out_plain
+            .stderr
+            .contains("--max-ai-credits must be a positive integer"),
         "unexpected stderr: {}",
         out_plain.stderr
     );
@@ -1120,7 +1188,9 @@ fn max_ai_credits_rejects_zero() {
     assert_eq!(out_eq.code, Some(1));
     assert!(!out_eq.reached_podman_run());
     assert!(
-        out_eq.stderr.contains("--max-ai-credits must be a positive integer"),
+        out_eq
+            .stderr
+            .contains("--max-ai-credits must be a positive integer"),
         "unexpected stderr: {}",
         out_eq.stderr
     );
@@ -1190,13 +1260,12 @@ fn companion_flags_in_separate_syntax_reject_empty_strings() {
 #[test]
 fn session_and_fork_together_are_refused() {
     // `claude` maps both, so this is the launcher refusing, not the catalog.
-    let out = World::new().run(&[
-        "--prompt", "-", "--session", "a", "--fork", "b", "claude",
-    ]);
+    let out = World::new().run(&["--prompt", "-", "--session", "a", "--fork", "b", "claude"]);
     assert_eq!(out.code, Some(1));
     assert!(!out.reached_podman_run());
     assert!(
-        out.stderr.contains("--session and --fork are mutually exclusive"),
+        out.stderr
+            .contains("--session and --fork are mutually exclusive"),
         "stderr: {}",
         out.stderr
     );
@@ -1217,60 +1286,43 @@ fn no_json_cancels_earlier_json_flag() {
 
 #[test]
 fn flag_equals_value_syntax_for_companion_flags() {
-    let out = World::new().run(&[
-        "--json",
-        "--prompt=-",
-        "--model=sonnet",
-        "claude",
-    ]);
+    let out = World::new().run(&["--json", "--prompt=-", "--model=sonnet", "claude"]);
     assert_eq!(out.code, Some(0));
     assert_eq!(
         out.run_call().command(),
         vec!["claude", "-p", "-", "--model", "sonnet"]
     );
 
-    let out_session = World::new().run(&[
-        "--json",
-        "--prompt=-",
-        "--session=s1",
-        "opencode",
-    ]);
+    let out_session = World::new().run(&["--json", "--prompt=-", "--session=s1", "opencode"]);
     assert_eq!(out_session.code, Some(0));
     assert_eq!(
         out_session.run_call().command(),
         vec!["opencode", ".", "--prompt", "-", "--session", "s1"]
     );
 
-    let out_fork = World::new().run(&[
-        "--json",
-        "--prompt=-",
-        "--fork=s1",
-        "opencode",
-    ]);
+    let out_fork = World::new().run(&["--json", "--prompt=-", "--fork=s1", "opencode"]);
     assert_eq!(out_fork.code, Some(0));
     assert_eq!(
         out_fork.run_call().command(),
-        vec!["opencode", ".", "--prompt", "-", "--session", "s1", "--fork"]
+        vec![
+            "opencode",
+            ".",
+            "--prompt",
+            "-",
+            "--session",
+            "s1",
+            "--fork"
+        ]
     );
 
-    let out_provider = World::new().run(&[
-        "--json",
-        "--prompt=-",
-        "--provider=anthropic",
-        "pi",
-    ]);
+    let out_provider = World::new().run(&["--json", "--prompt=-", "--provider=anthropic", "pi"]);
     assert_eq!(out_provider.code, Some(0));
     assert_eq!(
         out_provider.run_call().command(),
         vec!["pi", "-p", "--mode", "json", "--provider", "anthropic"]
     );
 
-    let out_credits = World::new().run(&[
-        "--json",
-        "--prompt=-",
-        "--max-ai-credits=50",
-        "copilot",
-    ]);
+    let out_credits = World::new().run(&["--json", "--prompt=-", "--max-ai-credits=50", "copilot"]);
     assert_eq!(out_credits.code, Some(0));
     assert_eq!(
         out_credits.run_call().command(),
@@ -1303,7 +1355,8 @@ fn prompt_cannot_be_combined_with_custom_command_after_double_dash() {
     assert_eq!(out_bare.code, Some(1));
     assert!(!out_bare.reached_podman_run());
     assert!(
-        out_bare.stderr
+        out_bare
+            .stderr
             .contains("--prompt cannot be combined with a custom command after '--'"),
         "stderr: {}",
         out_bare.stderr
@@ -1326,7 +1379,8 @@ fn prompt_bundled_cannot_be_combined_with_custom_command_after_double_dash() {
     assert_eq!(out_bare.code, Some(1));
     assert!(!out_bare.reached_podman_run());
     assert!(
-        out_bare.stderr
+        out_bare
+            .stderr
             .contains("--prompt cannot be combined with a custom command after '--'"),
         "stderr: {}",
         out_bare.stderr
@@ -1384,7 +1438,6 @@ fn json_prompt_mode_on_exit_failure_returns_json_with_nonzero_status() {
     assert_eq!(json["type"], "exit");
     assert_eq!(json["status"], 42);
 }
-
 
 #[test]
 fn json_prompt_mode_with_pi_appends_correct_prompt_flags() {
@@ -1471,7 +1524,14 @@ fn a_mapping_without_a_placeholder_appends_the_value() {
 
 #[test]
 fn provider_is_refused_for_an_agent_that_declares_no_mapping() {
-    let out = World::new().run(&["--json", "--prompt", "-", "--provider", "anthropic", "claude"]);
+    let out = World::new().run(&[
+        "--json",
+        "--prompt",
+        "-",
+        "--provider",
+        "anthropic",
+        "claude",
+    ]);
 
     assert_eq!(out.code, Some(1));
     assert!(!out.reached_podman_run());
@@ -1555,7 +1615,15 @@ fn the_built_in_catalog_spells_session_per_agent() {
     for (agent, expected) in [
         (
             "claude",
-            vec!["claude", "-p", "-", "--output-format", "json", "--resume", "s1"],
+            vec![
+                "claude",
+                "-p",
+                "-",
+                "--output-format",
+                "json",
+                "--resume",
+                "s1",
+            ],
         ),
         (
             "copilot",
@@ -1586,9 +1654,14 @@ fn the_built_in_catalog_spells_session_per_agent() {
             vec!["opencode", "run", "--format", "json", "--session", "s1"],
         ),
     ] {
-        let out = World::new()
-            .env_unset("AGENT_SANDBOX_AGENT_SPECS")
-            .run(&["--json", "--prompt", "-", "--session", "s1", agent]);
+        let out = World::new().env_unset("AGENT_SANDBOX_AGENT_SPECS").run(&[
+            "--json",
+            "--prompt",
+            "-",
+            "--session",
+            "s1",
+            agent,
+        ]);
         assert_eq!(out.run_call().command(), expected, "for agent {}", agent);
     }
 }
@@ -1598,9 +1671,14 @@ fn the_built_in_catalog_refuses_session_for_codex() {
     // Resuming codex is `codex exec resume <id> [PROMPT]`, a subcommand that has
     // to precede the prompt argument, which an appended mapping cannot express.
     // Refused rather than mis-spelled.
-    let out = World::new()
-        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
-        .run(&["--json", "--prompt", "-", "--session", "s1", "codex"]);
+    let out = World::new().env_unset("AGENT_SANDBOX_AGENT_SPECS").run(&[
+        "--json",
+        "--prompt",
+        "-",
+        "--session",
+        "s1",
+        "codex",
+    ]);
 
     assert_eq!(out.code, Some(1));
     assert!(!out.reached_podman_run());
@@ -1621,9 +1699,14 @@ fn the_built_in_catalog_no_longer_claims_copilot_takes_max_ai_credits() {
     // github-copilot-cli 1.0.61 answers `--max-ai-credits` with "error: unknown
     // option". The mapping is gone until the flag comes back, so the launcher
     // refuses instead of building an argv copilot rejects.
-    let out = World::new()
-        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
-        .run(&["--json", "--prompt", "-", "--max-ai-credits", "50", "copilot"]);
+    let out = World::new().env_unset("AGENT_SANDBOX_AGENT_SPECS").run(&[
+        "--json",
+        "--prompt",
+        "-",
+        "--max-ai-credits",
+        "50",
+        "copilot",
+    ]);
 
     assert_eq!(out.code, Some(1));
     assert!(!out.reached_podman_run());
@@ -1913,15 +1996,23 @@ fn flags_with_values_matching_subcommands_are_not_intercepted_by_ctl() {
     assert_eq!(out_env.run_call().env_value("ACTION"), Some("purge"));
 
     let out_ctl = World::new().run(&["--name", "ctl", "opencode"]);
-    assert!(out_ctl.reached_podman_run(), "container was not launched: stdout: {}\nstderr: {}", out_ctl.stdout, out_ctl.stderr);
-    assert_eq!(out_ctl.run_call().value_of("--name"), Some("agent-sandbox-ws-ctl"));
+    assert!(
+        out_ctl.reached_podman_run(),
+        "container was not launched: stdout: {}\nstderr: {}",
+        out_ctl.stdout,
+        out_ctl.stderr
+    );
+    assert_eq!(
+        out_ctl.run_call().value_of("--name"),
+        Some("agent-sandbox-ws-ctl")
+    );
 }
 
 #[test]
 fn ctl_subcommands_run_without_ctl_prefix() {
     for cmd in [
-        "list", "status", "policy", "proxy", "logs", "log", "mount", "mounts",
-        "purge", "tui", "relay", "net", "browser",
+        "list", "status", "policy", "proxy", "logs", "log", "mount", "mounts", "purge", "tui",
+        "relay", "net", "browser",
     ] {
         let out = World::new().run(&[cmd, "--help"]);
         assert!(
@@ -1957,13 +2048,23 @@ fn direct_ctl_proxy_runs_ctl_policy() {
 #[test]
 fn agent_name_takes_precedence_over_subcommand_shortcut() {
     let out = World::new()
-        .env("AGENT_SANDBOX_AGENT_SPECS", "list\t[\"list_agent\"]\t[]\t[]")
+        .env(
+            "AGENT_SANDBOX_AGENT_SPECS",
+            "list\t[\"list_agent\"]\t[]\t[]",
+        )
         .run(&["list"]);
-    assert!(out.reached_podman_run(), "agent was not launched: stderr: {}", out.stderr);
+    assert!(
+        out.reached_podman_run(),
+        "agent was not launched: stderr: {}",
+        out.stderr
+    );
     assert_eq!(out.run_call().command(), vec!["list_agent"]);
 
     let out_ctl = World::new()
-        .env("AGENT_SANDBOX_AGENT_SPECS", "list\t[\"list_agent\"]\t[]\t[]")
+        .env(
+            "AGENT_SANDBOX_AGENT_SPECS",
+            "list\t[\"list_agent\"]\t[]\t[]",
+        )
         .run(&["ctl", "list"]);
     assert!(!out_ctl.reached_podman_run(), "ctl list reached podman run");
     assert_eq!(out_ctl.code, Some(0));
@@ -2010,9 +2111,14 @@ fn sigterm_while_the_sandbox_runs_removes_it_and_exits_143() {
     let world = World::new().env("STUB_PODMAN_RUN_BLOCKS", "1");
     let out = world.run_signalled(&["opencode"], "running", 15);
 
-    let name = out.run_call().value_of("--name").expect("a named sandbox").to_string();
+    let name = out
+        .run_call()
+        .value_of("--name")
+        .expect("a named sandbox")
+        .to_string();
     assert!(
-        out.call_starting(&["rm", "-f"]).map_or(false, |rm| rm.has(&name)),
+        out.call_starting(&["rm", "-f"])
+            .map_or(false, |rm| rm.has(&name)),
         "the sandbox {} was not removed: {:?}",
         name,
         out.calls

@@ -297,10 +297,12 @@ pub fn resolve_secrets_logic(
     file: &Path,
     workspace: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    Ok(resolve_secrets_with_policies(policy, config, file, workspace, &[])?
-        .into_iter()
-        .map(|secret| secret.binding)
-        .collect())
+    Ok(
+        resolve_secrets_with_policies(policy, config, file, workspace, &[])?
+            .into_iter()
+            .map(|secret| secret.binding)
+            .collect(),
+    )
 }
 
 pub fn resolve_secrets_logic_with_policies(
@@ -310,10 +312,12 @@ pub fn resolve_secrets_logic_with_policies(
     workspace: &Path,
     policy_files: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<String>> {
-    Ok(resolve_secrets_with_policies(policy, config, file, workspace, policy_files)?
-        .into_iter()
-        .map(|secret| secret.binding)
-        .collect())
+    Ok(
+        resolve_secrets_with_policies(policy, config, file, workspace, policy_files)?
+            .into_iter()
+            .map(|secret| secret.binding)
+            .collect(),
+    )
 }
 
 pub fn resolve_secrets_with_policies(
@@ -853,7 +857,10 @@ prefix = "Bearer "
             let dir = scratch(&[
                 ("policy", "secret_route\tapi.example.com\tGET\t/user\n"),
                 ("trusted.toml", rule.as_str()),
-                ("AGENTS.md", format!("```agent-sandbox\n{rule}```\n").as_str()),
+                (
+                    "AGENTS.md",
+                    format!("```agent-sandbox\n{rule}```\n").as_str(),
+                ),
                 ("secretspec.toml", ""),
             ]);
             resolve_secrets_logic(
@@ -865,7 +872,11 @@ prefix = "Bearer "
             .expect_err("either refused or stopped at the absent secretspec")
             .to_string()
         };
-        for host in ["api.example.com:8443", "api.example.com:443,8443", "api.example.com:*"] {
+        for host in [
+            "api.example.com:8443",
+            "api.example.com:443,8443",
+            "api.example.com:*",
+        ] {
             let err = resolve(host);
             assert!(err.contains("only on HTTPS port 443"), "{host}: {err}");
         }
