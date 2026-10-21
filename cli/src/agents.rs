@@ -1124,20 +1124,121 @@ pub fn format_policy_lines_as_network_toml(lines: &[String]) -> Option<String> {
 }
 
 pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
+    // A route line carries no port: its ports are those of the allow line the
+    // route's `host` compiled to. Fold that line back into the route, or a
+    // re-import would give the route's domain the default ports instead of the
+    // ones it had, and keep a redundant plain entry beside it.
+    let mut folded_hosts: HashSet<usize> = HashSet::new();
+    let mut folded_ips: HashSet<usize> = HashSet::new();
+    let mut route_hosts: HashMap<&str, Option<String>> = HashMap::new();
+    for rule in &cfg.l7_rules {
+        let domain = rule.domain.as_str();
+        if route_hosts.contains_key(domain) {
+            continue;
+        }
+        let ip = domain.parse::<IpAddr>().ok();
+        // An entry covering 22 also authorized the SSH relay, which a route
+        // cannot carry: such a line stays a plain entry, unless the relay was
+        // never authorized for this host, in which case it came from a route.
+        let signs = cfg.allow_signing.iter().any(|h| h == domain);
+        let foldable = |ports: &Option<Vec<agent_sandbox_proxy::policy::PortRange>>| {
+            !signs || !ports.iter().flatten().any(|r| r.contains(22))
+        };
+        let lines: Vec<(usize, &Option<Vec<agent_sandbox_proxy::policy::PortRange>>)> = match ip {
+            None => cfg
+                .allow_host
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.target == domain && foldable(&h.ports))
+                .map(|(i, h)| (i, &h.ports))
+                .collect(),
+            // An IP route names one address, so it folds only a host-length
+            // network on it, not a wider block that happens to contain it.
+            Some(ip) => cfg
+                .allow_ip
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| {
+                    n.target.addr() == ip
+                        && n.target.prefix_len() == n.target.max_prefix_len()
+                        && foldable(&n.ports)
+                })
+                .map(|(i, n)| (i, &n.ports))
+                .collect(),
+        };
+        let folded = if ip.is_some() {
+            &mut folded_ips
+        } else {
+            &mut folded_hosts
+        };
+        let ports: Option<Option<Vec<agent_sandbox_proxy::policy::PortRange>>> =
+            if let Some((i, _)) = lines.iter().find(|(_, p)| p.is_none()) {
+                // The default ports; any explicit line beside it stays a plain
+                // entry of its own.
+                folded.insert(*i);
+                Some(None)
+            } else if !lines.is_empty() {
+                let mut ranges = Vec::new();
+                for (i, p) in &lines {
+                    folded.insert(*i);
+                    ranges.extend(p.iter().flatten().copied());
+                }
+                Some(Some(ranges))
+            } else {
+                // No allow line of its own (`ctl policy allow --l7` writes
+                // none): the route reaches what the rest of the policy allows
+                // its domain, and nothing at all if that is nothing.
+                let (allowed, ports) = match ip {
+                    Some(ip) => cfg.check_ip(ip),
+                    None => cfg.check_domain(domain),
+                };
+                allowed.then_some(ports)
+            };
+        let host = ports.map(|ports| match ports {
+            None => domain.to_string(),
+            Some(mut ranges) => {
+                ranges.sort_by_key(|r| (r.start, r.end));
+                ranges.dedup();
+                let ranges: Vec<String> = ranges.iter().map(|r| r.to_string()).collect();
+                format_host_port(domain, Some(&ranges.join(",")))
+            }
+        });
+        route_hosts.insert(domain, host);
+    }
+
     let mut allowed_hosts: Vec<String> = cfg
         .allow_host
         .iter()
-        .map(|r| r.to_string())
-        .chain(cfg.allow_ip.iter().map(|n| n.to_string()))
+        .enumerate()
+        .filter(|(i, _)| !folded_hosts.contains(i))
+        .map(|(_, r)| r.to_string())
+        .chain(
+            cfg.allow_ip
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !folded_ips.contains(i))
+                .map(|(_, n)| n.to_string()),
+        )
         .collect();
     allowed_hosts.sort();
     allowed_hosts.dedup();
 
+    let mut unreachable_routes: Vec<String> = Vec::new();
     let mut allowed_routes: Vec<RouteToml> = cfg
         .l7_rules
         .iter()
-        .map(|r| RouteToml {
-            host: r.domain.clone(),
+        .filter_map(|r| {
+            let host = route_hosts.get(r.domain.as_str()).cloned().flatten();
+            if host.is_none() {
+                unreachable_routes.push(format!(
+                    "allow_route {} {} {}",
+                    r.domain, r.method, r.path_pattern
+                ));
+            }
+            host.map(|host| (host, r))
+        })
+        .map(|(host, r)| RouteToml {
+            host,
             method: r.method.clone(),
             path: r.path_pattern.clone(),
             // The compiled policy records that a route is secret, not
@@ -1175,6 +1276,9 @@ pub fn format_policy_as_network_toml(cfg: &ProxyConfig) -> String {
             }
         }
     }
+    // A route whose domain nothing allows reaches nothing live; as a table it
+    // would allow its host on the default ports.
+    advisory.extend(unreachable_routes);
     if !advisory.is_empty() {
         out.push_str(
             "\n# The following have no [network] TOML equivalent (it only supports 'allowed_hosts'\n",
@@ -1200,6 +1304,7 @@ mod export_tests {
     fn exports_allow_entries_and_l7_rules_as_toml() {
         let cfg = parse_policy(
             "allow_host github.com\n\
+             allow_host api.github.com:443\n\
              allow_ip 10.0.0.0/8\n\
              secret_route\tapi.github.com\tGET\t/repos/*\n\
              allow_route\tapi.github.com\tGET\t/repos/*\n",
@@ -1212,10 +1317,159 @@ mod export_tests {
             "{toml}"
         );
         assert!(toml.contains("[[network.allowed_routes]]"), "{toml}");
-        assert!(toml.contains("host = \"api.github.com\""), "{toml}");
+        assert!(toml.contains("host = \"api.github.com:443\""), "{toml}");
         assert!(toml.contains("method = \"GET\""), "{toml}");
         assert!(toml.contains("path = \"/repos/*\""), "{toml}");
         assert!(toml.contains("secret = true"), "{toml}");
+    }
+
+    /// Compiles AGENTS.md, exports the result the way `ctl policy export`
+    /// does, and compiles the export again.
+    fn export_round_trip(agents_md: &str) -> (ProxyPolicy, String, ProxyPolicy) {
+        let first = parse_proxy(agents_md).expect("the original must parse");
+        let cfg = parse_policy(&format_proxy_policy(&first, "AGENTS.md")).unwrap();
+        let toml = format_policy_as_network_toml(&cfg);
+        let second = parse_policy_file(&toml)
+            .unwrap_or_else(|e| panic!("the export must re-import: {e}\n{toml}"));
+        (first, toml, second)
+    }
+
+    fn sorted_lines(policy: &ProxyPolicy) -> Vec<String> {
+        let mut lines: Vec<String> = format_proxy_policy(policy, "x")
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        lines.dedup();
+        lines
+    }
+
+    #[test]
+    fn an_exported_route_keeps_its_port() {
+        let (first, toml, second) = export_round_trip(
+            "```agent-sandbox\n[network]\n\
+             allowed_hosts = [\"github.com:443\", \"GET,POST api.example.com:443/v1/**\"]\n\
+             [[network.allowed_routes]]\nhost = \"*.example.org:8443,9443\"\nmethod = \"GET\"\n```\n",
+        );
+        assert!(toml.contains("host = \"api.example.com:443\""), "{toml}");
+        assert!(
+            toml.contains("host = \"*.example.org:8443,9443\""),
+            "{toml}"
+        );
+        // Folded into the routes, not left beside them as a plain entry.
+        assert!(
+            toml.contains("allowed_hosts = [\"github.com:443\"]"),
+            "{toml}"
+        );
+        assert_eq!(sorted_lines(&first), sorted_lines(&second), "{toml}");
+    }
+
+    #[test]
+    fn an_exported_route_on_default_ports_stays_portless() {
+        // A portless route host means the default ports; an explicit entry
+        // for the same domain beside it is a plain entry of its own.
+        let cfg = parse_policy(
+            "allow_host api.example.com\n\
+             allow_host api.example.com:8443\n\
+             allow_route\tapi.example.com\tGET\t/v1/**\n",
+        )
+        .unwrap();
+        let toml = format_policy_as_network_toml(&cfg);
+        assert!(toml.contains("host = \"api.example.com\"\n"), "{toml}");
+        assert!(
+            toml.contains("allowed_hosts = [\"api.example.com:8443\"]"),
+            "{toml}"
+        );
+        let second = parse_policy_file(&toml).expect("the export must re-import");
+        let reparsed = parse_policy(&format_proxy_policy(&second, "x")).unwrap();
+        // Whatever the original allowed, and no more: a portless line means
+        // the default ports for the domain, explicit lines beside it included.
+        for port in [22, 80, 443, 8443] {
+            assert_eq!(
+                reparsed.is_allowed("api.example.com", port),
+                cfg.is_allowed("api.example.com", port),
+                "{port}\n{toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exported_route_beside_an_ssh_entry_keeps_the_relay_authorized() {
+        let (first, toml, second) = export_round_trip(
+            "```agent-sandbox\n[network]\n\
+             allowed_hosts = [\"github.com:22\", \"GET github.com:443/x\"]\n```\n",
+        );
+        assert!(toml.contains("host = \"github.com:443\""), "{toml}");
+        assert!(toml.contains("\"github.com:22\""), "{toml}");
+        assert_eq!(second.allow_signing, vec!["github.com".to_string()]);
+        assert_eq!(sorted_lines(&first), sorted_lines(&second), "{toml}");
+    }
+
+    #[test]
+    fn an_exported_route_on_ssh_ports_without_the_relay_stays_a_route() {
+        // A table route on :22 compiles no allow_signing, so its line is the
+        // route's own and folds back into it.
+        let (first, toml, second) = export_round_trip(
+            "```agent-sandbox\n[[network.allowed_routes]]\n\
+             host = \"git.example.com:22,443\"\nmethod = \"GET\"\n```\n",
+        );
+        assert!(toml.contains("host = \"git.example.com:22,443\""), "{toml}");
+        assert!(second.allow_signing.is_empty(), "{toml}");
+        assert_eq!(sorted_lines(&first), sorted_lines(&second), "{toml}");
+    }
+
+    #[test]
+    fn an_exported_ip_route_keeps_its_port() {
+        let (first, toml, second) = export_round_trip(
+            "```agent-sandbox\n[[network.allowed_routes]]\n\
+             host = \"10.1.2.3:8080\"\nmethod = \"GET\"\n```\n",
+        );
+        assert!(toml.contains("host = \"10.1.2.3:8080\""), "{toml}");
+        assert!(!toml.contains("allowed_hosts = [\"10.1.2.3"), "{toml}");
+        let live = parse_policy(&format_proxy_policy(&first, "x")).unwrap();
+        let again = parse_policy(&format_proxy_policy(&second, "x")).unwrap();
+        for port in [80, 443, 8080] {
+            assert_eq!(
+                again.is_allowed("10.1.2.3", port),
+                live.is_allowed("10.1.2.3", port),
+                "{port}\n{toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exported_route_without_its_own_allow_line_takes_what_the_policy_allows() {
+        // `ctl policy allow --l7` writes a route and nothing else.
+        let cfg = parse_policy(
+            "allow_host *.example.com:443\n\
+             allow_route\tapi.example.com\tGET\t/v1/**\n\
+             allow_route\tapi.example.org\tGET\t/v1/**\n",
+        )
+        .unwrap();
+        let toml = format_policy_as_network_toml(&cfg);
+        // Reached through the wildcard, on its ports and no others.
+        assert!(toml.contains("host = \"api.example.com:443\""), "{toml}");
+        // Reached by nothing live, so not offered as a table that would
+        // allow it on the default ports.
+        assert!(!toml.contains("host = \"api.example.org"), "{toml}");
+        assert!(
+            toml.contains("# allow_route api.example.org GET /v1/**"),
+            "{toml}"
+        );
+        parse_policy_file(&toml).expect("the export must re-import");
+    }
+
+    #[test]
+    fn exported_route_ports_are_sorted() {
+        let cfg = parse_policy(
+            "allow_host a.example:8443\n\
+             allow_host a.example:443\n\
+             allow_route\ta.example\tGET\t/\n",
+        )
+        .unwrap();
+        let toml = format_policy_as_network_toml(&cfg);
+        assert!(toml.contains("host = \"a.example:443,8443\""), "{toml}");
     }
 
     #[test]
@@ -1270,6 +1524,7 @@ mod export_tests {
     fn formatted_policy_is_valid_toml() {
         let lines = vec![
             "allow_host github.com".to_string(),
+            "allow_host api.github.com:443".to_string(),
             "allow_route\tapi.github.com\tGET\t/repos/*".to_string(),
         ];
         let output = format_policy_lines_as_network_toml(&lines).expect("policy should parse");
