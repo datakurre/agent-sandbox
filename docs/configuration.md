@@ -394,7 +394,8 @@ will fail host-key verification until you add one and relaunch.
 
 `[network]` is validated before the sandbox starts; an invalid block refuses the
 launch rather than starting with a policy that allows more than you wrote.
-Besides malformed values, these combinations are rejected:
+Besides malformed values, these combinations are rejected, comparing host names
+without regard to case, as the proxy does:
 
 - an unknown key under `[network]` (only `allowed_hosts` and `allowed_routes` exist) or an unknown
   field on a rule;
@@ -402,9 +403,15 @@ Besides malformed values, these combinations are rejected:
   [short-form route](#short-form-routes) that repeats the method, host and path
   of another one or of a `[[network.allowed_routes]]` table;
 - a host allowed outright in `allowed_hosts` that also carries a `[[network.allowed_routes]]`
-  entry *without* a secret, or a short-form route — the broad allow makes the
-  narrower rule pointless, so one of the two is a mistake. The same applies to a
-  wildcard allow (`"*"`, `"*:port"`);
+  entry *without* a secret, or a short-form route — the route holds the host to
+  its rules on every port, so the plain entry grants nothing beside it and one of
+  the two is a mistake. The domain pattern decides, whatever ports either entry
+  names: `"a.example:8443"` conflicts with a route on `a.example:443`, while
+  `"*.a.example:443"` does not conflict with a route on `a.example`. A plain entry
+  on port 22 alone is the exception, since SSH goes through the relay and never
+  meets the route. The same applies to a wildcard allow (`"*"`, `"*:port"`).
+  This is checked across every `agent-sandbox` block in the file, not only
+  within one;
 - an `allowed_hosts` entry covering port 22 for a host with no
   `[[network.known_hosts]]` entry in `trusted.toml` — SSH would be authorized to
   a host whose identity nothing has vouched for.
