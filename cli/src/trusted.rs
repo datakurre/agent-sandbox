@@ -5,14 +5,16 @@
 //! that category is authorized here instead, in a file only the operator
 //! writes, by copying the block the launcher prints.
 //!
-//! Two things live under that rule today.  `[[network.allowed_routes]]` with a
-//! `secret` authorizes an injection (see [`crate::secrets`]), and
-//! `[[network.known_hosts]]` authorizes an SSH host key.  Both refuse the
-//! launch rather than proceeding unauthorized, and both print the exact block
-//! to paste.
+//! Three things live under that rule today.  `[[network.allowed_routes]]` with
+//! a `secret` authorizes an injection (see [`crate::secrets`]),
+//! `[[network.known_hosts]]` authorizes an SSH host key, and `[mounts]`
+//! authorizes a bind mount whose source is outside the workspace.  All three
+//! refuse the launch rather than proceeding unauthorized, and all three print
+//! the exact block to paste.
 //!
 //! The file was called `secrets.toml` until it grew its second job.
 
+use crate::agents::{mount_decls_from_table, MountDecl};
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
@@ -315,6 +317,183 @@ pub fn refusal(unauthorized: &[String], path: &Path) -> String {
     out.trim_end().to_string()
 }
 
+/// Reads the `[mounts]` the host authorizes, in the same syntax as AGENTS.md.
+///
+/// A missing file authorizes nothing, and is an error only once a mount needs
+/// authorizing.
+pub fn load_trusted_mounts(path: &Path) -> Result<Vec<MountDecl>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!(
+            "agent-sandbox: cannot read the trusted config at {}: {}",
+            path.display(),
+            e
+        ),
+    };
+    let value: toml::Value = toml::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "agent-sandbox: the trusted config at {} is malformed: {}",
+            path.display(),
+            e
+        )
+    })?;
+    match value.get("mounts") {
+        None => Ok(Vec::new()),
+        Some(mounts) => mount_decls_from_table(mounts).map_err(|e| {
+            anyhow::anyhow!(
+                "agent-sandbox: the trusted config at {}: {}",
+                path.display(),
+                e
+            )
+        }),
+    }
+}
+
+/// One mount split into its parts: the source with symlinks resolved, the
+/// destination, and the options, sorted so their order does not matter.
+struct ResolvedMount {
+    source: PathBuf,
+    destination: String,
+    options: Vec<String>,
+}
+
+impl ResolvedMount {
+    fn same_grant(&self, other: &ResolvedMount) -> bool {
+        self.source == other.source
+            && self.destination == other.destination
+            && self.options == other.options
+    }
+}
+
+/// Splits an expanded `src:dest[:opts]` spec the way podman reads it -- the
+/// first field is the source -- and resolves the source, which has to exist:
+/// podman would refuse the mount anyway, and only a real path can be checked
+/// against the workspace.
+fn resolve(expanded: &str) -> std::io::Result<ResolvedMount> {
+    let mut fields = expanded.splitn(3, ':');
+    let source = fields.next().unwrap_or_default();
+    let destination = fields.next().unwrap_or_default();
+    let mut options: Vec<String> = fields
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .map(|o| o.trim().to_string())
+        .filter(|o| !o.is_empty())
+        .collect();
+    options.sort();
+    options.dedup();
+    let destination = match destination.trim().trim_end_matches('/') {
+        "" => "/",
+        d => d,
+    };
+    Ok(ResolvedMount {
+        source: std::fs::canonicalize(source).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("cannot mount {}: {}", source, e))
+        })?,
+        destination: destination.to_string(),
+        options,
+    })
+}
+
+/// What the launcher mounts, and what it may not.
+#[derive(Debug, Default)]
+pub struct MountCheck {
+    /// The `-v` specs to hand podman, sources resolved: a symlink swapped in
+    /// after the check cannot redirect what was checked.
+    pub specs: Vec<String>,
+    /// The entries that need a `trusted.toml` entry and have none, rewritten
+    /// with the resolved source and expanded destination -- the form to paste.
+    pub unauthorized: Vec<MountDecl>,
+}
+
+/// Checks the declared mounts against the workspace and `trusted.toml`.
+///
+/// `declared` and `trusted` pair each entry with its spec as the launcher
+/// expands it.  A source inside the workspace -- the repository's own tree --
+/// needs no authorization.  Anything else, `~/.ssh` or `/` or a workspace
+/// path that leads out through a symlink the repository planted, is mounted
+/// only when a trusted entry names the same resolved source, destination and
+/// options, so a read-only authorization does not cover a read-write mount.
+///
+/// A trusted source has to be absolute (or `~`-relative), and one that lies in
+/// this workspace authorizes nothing: resolving it would follow the very
+/// symlinks the repository controls, so it could be repointed after the fact.
+pub fn check_mounts(
+    declared: &[(MountDecl, String)],
+    trusted: &[(MountDecl, String)],
+    workspace: &Path,
+) -> Result<MountCheck> {
+    let workspace_canonical = std::fs::canonicalize(workspace)?;
+    let in_workspace =
+        |path: &Path| path.starts_with(workspace) || path.starts_with(&workspace_canonical);
+
+    let mut grants = Vec::new();
+    for (decl, expanded) in trusted {
+        if !(decl.source.starts_with('/') || decl.source.starts_with('~')) {
+            bail!(
+                "agent-sandbox: trusted.toml [mounts] {}: a source must be an absolute path \
+                 (or start with ~), not one relative to whichever workspace is launching.",
+                toml::Value::String(decl.source.clone())
+            );
+        }
+        let lexical = Path::new(expanded.split(':').next().unwrap_or_default());
+        if in_workspace(lexical) {
+            continue;
+        }
+        // A trusted source that no longer exists authorizes nothing.
+        if let Ok(grant) = resolve(expanded) {
+            grants.push(grant);
+        }
+    }
+
+    let mut check = MountCheck::default();
+    for (decl, expanded) in declared {
+        let mount = resolve(expanded)
+            .map_err(|e| anyhow::anyhow!("agent-sandbox: [mounts] \"{}\": {}", decl.source, e))?;
+        if !mount.source.starts_with(&workspace_canonical)
+            && !grants.iter().any(|g| g.same_grant(&mount))
+        {
+            check.unauthorized.push(MountDecl {
+                source: mount.source.display().to_string(),
+                destination: mount.destination.clone(),
+                options: mount.options.join(","),
+            });
+        }
+        let mut spec = format!("{}:{}", mount.source.display(), mount.destination);
+        if !mount.options.is_empty() {
+            spec.push(':');
+            spec.push_str(&mount.options.join(","));
+        }
+        check.specs.push(spec);
+    }
+    Ok(check)
+}
+
+/// The refusal for mounts outside the workspace, with the block to paste.
+/// Flush-left, like the other refusals in this file.
+pub fn mounts_refusal(unauthorized: &[MountDecl], path: &Path) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "agent-sandbox: AGENTS.md [mounts] names host paths outside the workspace,\n\
+         \x20              which only {} can authorize:\n\n",
+        path.display()
+    ));
+    for decl in unauthorized {
+        out.push_str(&format!("\x20                  {}\n", decl.source));
+    }
+    out.push_str(&format!(
+        "\n\x20              To authorize them, add to {}:\n\n[mounts]\n",
+        path.display()
+    ));
+    for decl in unauthorized {
+        out.push_str(&decl.to_toml_line());
+        out.push('\n');
+    }
+    out.push_str("\n\x20              Or launch without --mounts, or with --no-mounts.");
+    out
+}
+
 /// Returns true if every host in the unauthorized list has at least one built-in pinned key.
 pub fn all_hosts_have_pinned_keys(unauthorized: &[String]) -> bool {
     !unauthorized.is_empty()
@@ -490,6 +669,154 @@ pub fn prompt_and_update_io<R: std::io::BufRead, W: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod mounts {
+        use super::*;
+
+        fn decl(source: &str, destination: &str, options: &str) -> MountDecl {
+            MountDecl {
+                source: source.to_string(),
+                destination: destination.to_string(),
+                options: options.to_string(),
+            }
+        }
+
+        /// Pairs an entry with its expanded spec: the sources here are
+        /// already absolute, so the spec is the expansion.
+        fn pair(d: MountDecl) -> (MountDecl, String) {
+            let spec = d.spec();
+            (d, spec)
+        }
+
+        fn scratch() -> (tempfile::TempDir, PathBuf, PathBuf) {
+            let root = tempfile::tempdir().unwrap();
+            let ws = root.path().join("ws");
+            let outside = root.path().join("outside");
+            std::fs::create_dir_all(ws.join("data")).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            (root, ws, outside)
+        }
+
+        fn unauthorized(
+            declared: &[(MountDecl, String)],
+            trusted: &[(MountDecl, String)],
+            ws: &Path,
+        ) -> Vec<MountDecl> {
+            check_mounts(declared, trusted, ws).unwrap().unauthorized
+        }
+
+        #[test]
+        fn a_source_inside_the_workspace_needs_no_authorization() {
+            let (_root, ws, _) = scratch();
+            let inside = decl(ws.join("data").to_str().unwrap(), "/workspace/data", "");
+            assert!(unauthorized(&[pair(inside)], &[], &ws).is_empty());
+        }
+
+        #[test]
+        fn a_source_outside_needs_the_same_entry_in_trusted_toml() {
+            let (_root, ws, outside) = scratch();
+            let src = outside.to_str().unwrap();
+            let real = std::fs::canonicalize(&outside).unwrap();
+            let declared = [pair(decl(src, "/mnt/x", "ro"))];
+
+            assert_eq!(
+                unauthorized(&declared, &[], &ws),
+                vec![decl(real.to_str().unwrap(), "/mnt/x", "ro")]
+            );
+            assert!(unauthorized(&declared, &[pair(decl(src, "/mnt/x", "ro"))], &ws).is_empty());
+
+            // Option order, spacing and a trailing slash are not differences...
+            let respelled = [pair(decl(src, "/mnt/x/", " ro "))];
+            assert!(unauthorized(
+                &[pair(decl(src, "/mnt/x", "Z,ro"))],
+                &[pair(decl(src, "/mnt/x", "ro,Z"))],
+                &ws
+            )
+            .is_empty());
+            assert!(unauthorized(&declared, &respelled, &ws).is_empty());
+
+            // ...but read-write is not read-only, nor is another destination.
+            for other in [decl(src, "/mnt/x", ""), decl(src, "/mnt/y", "ro")] {
+                assert_eq!(unauthorized(&declared, &[pair(other)], &ws).len(), 1);
+            }
+        }
+
+        #[test]
+        fn a_symlink_out_of_the_workspace_is_outside() {
+            let (_root, ws, outside) = scratch();
+            std::os::unix::fs::symlink(&outside, ws.join("escape")).unwrap();
+            let via_link = || pair(decl(ws.join("escape").to_str().unwrap(), "/mnt/x", ""));
+            assert_eq!(unauthorized(&[via_link()], &[], &ws).len(), 1);
+
+            // Authorizing the real path authorizes the link to it.
+            let real = [pair(decl(outside.to_str().unwrap(), "/mnt/x", ""))];
+            assert!(unauthorized(&[via_link()], &real, &ws).is_empty());
+
+            // Authorizing the link does not: it lies in the workspace, where
+            // the repository can repoint it after the fact.
+            let link = [via_link()];
+            assert_eq!(unauthorized(&[via_link()], &link, &ws).len(), 1);
+        }
+
+        #[test]
+        fn a_relative_trusted_source_is_refused() {
+            let (_root, ws, _) = scratch();
+            let err = check_mounts(&[], &[(decl("escape", "/mnt/x", ""), "x".into())], &ws)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must be an absolute path"), "{err}");
+        }
+
+        #[test]
+        fn podman_gets_the_resolved_source() {
+            let (_root, ws, outside) = scratch();
+            std::os::unix::fs::symlink(&outside, ws.join("escape")).unwrap();
+            let real = std::fs::canonicalize(&outside).unwrap();
+            let check = check_mounts(
+                &[pair(decl(
+                    ws.join("escape").to_str().unwrap(),
+                    "/mnt/x",
+                    "ro",
+                ))],
+                &[pair(decl(real.to_str().unwrap(), "/mnt/x", "ro"))],
+                &ws,
+            )
+            .unwrap();
+            assert_eq!(check.specs, vec![format!("{}:/mnt/x:ro", real.display())]);
+        }
+
+        #[test]
+        fn a_missing_source_is_refused_by_name() {
+            let (_root, ws, _) = scratch();
+            let gone = decl(ws.join("gone").to_str().unwrap(), "/mnt/x", "");
+            let err = check_mounts(&[pair(gone)], &[], &ws)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot mount"), "{err}");
+            assert!(err.contains("gone"), "{err}");
+        }
+
+        #[test]
+        fn the_refusal_prints_a_block_that_authorizes_what_was_refused() {
+            let (_root, ws, outside) = scratch();
+            let declared = [pair(decl(outside.to_str().unwrap(), "/mnt/x", "Z,ro"))];
+            let refused = unauthorized(&declared, &[], &ws);
+            let text = mounts_refusal(&refused, Path::new("/h/trusted.toml"));
+            let block = text
+                .split_once("[mounts]\n")
+                .map(|(_, rest)| format!("[mounts]\n{}", rest.split("\n\n").next().unwrap()))
+                .expect("a [mounts] block");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("trusted.toml");
+            std::fs::write(&path, &block).unwrap();
+            let pasted: Vec<(MountDecl, String)> = load_trusted_mounts(&path)
+                .unwrap()
+                .into_iter()
+                .map(pair)
+                .collect();
+            assert!(unauthorized(&declared, &pasted, &ws).is_empty(), "{text}");
+        }
+    }
 
     const ED25519: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";

@@ -106,7 +106,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Ports & mounts | `--shared-network` | Joins the shared bridge network so other containers can reach this one by name. See below. |
 | Ports & mounts | `--browser` | Attaches every browser `agent-sandbox browser` is running: maps each of their CDP ports and tells the agent which is which. `--browser=alice,bob` picks some of them. See [Cooperative Browser](browser.md). |
 | Ports & mounts | `--host-loopback-port PORT` | Makes the host's `127.0.0.1:PORT` reachable at the sandbox's own `127.0.0.1:PORT`, and exports the list as `$AGENT_SANDBOX_HOST_PORTS`. Repeatable; takes `HOST:SANDBOX`. Refused under `--krun`. See below. |
-| Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`. |
+| Ports & mounts | `--mounts` | Honors `[mounts]` declarations from `AGENTS.md`; a source outside the workspace also needs the same entry in `trusted.toml`. |
 | Ports & mounts | `--agent-mounts` | Mounts every known agent's state; `--agent-mounts=a,b` mounts just those (plus any launched agent). |
 
 A few flags are one-off pass-throughs rather than persistent toggles, so they have no `--no-flag` form:

@@ -301,48 +301,72 @@ pub fn allocate(mapping: Mapping) -> Result<Mapping, ConfigError> {
     Ok(m)
 }
 
-pub fn parse_mounts(text: &str) -> Result<Vec<String>, ConfigError> {
-    let mut specs = Vec::new();
-    let blocks = iter_tagged_blocks(text);
-    for body in blocks {
-        let block: Value = body.parse().map_err(|e| {
-            ConfigError::msg(format!("malformed TOML in agent-sandbox block: {}", e))
-        })?;
-        if let Some(mounts) = block.get("mounts") {
-            let mounts_table = mounts
-                .as_table()
-                .ok_or_else(|| ConfigError::msg("[mounts] must be a table"))?;
-            for (src, value) in mounts_table {
-                let (dest, opts) = if let Some(s) = value.as_str() {
-                    (s.to_string(), String::new())
-                } else if let Some(table) = value.as_table() {
-                    let dest = table
-                        .get("destination")
-                        .and_then(|d| d.as_str())
-                        .ok_or_else(|| {
-                            ConfigError::msg(format!(
-                                "mounts.{}: missing required field 'destination' or not a string",
-                                src
-                            ))
-                        })?
-                        .to_string();
-                    let mut opts = String::new();
-                    if let Some(opts_val) = table.get("options") {
-                        if let Some(s) = opts_val.as_str() {
-                            opts = s.to_string();
-                        } else if let Some(arr) = opts_val.as_array() {
-                            let mut opt_strings = Vec::new();
-                            for o in arr {
-                                if let Some(s) = o.as_str() {
-                                    opt_strings.push(s.to_string());
-                                } else {
-                                    return Err(ConfigError::msg(format!(
-                                        "mounts.{}.options: expected a string or list of strings",
-                                        src
-                                    )));
-                                }
-                            }
-                            opts = opt_strings.join(",");
+/// One `[mounts]` entry, as written: the source key, its destination, and its
+/// options joined with `,` (empty when it names none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountDecl {
+    pub source: String,
+    pub destination: String,
+    pub options: String,
+}
+
+impl MountDecl {
+    /// The `src:dest[:opts]` form podman's `-v` takes, before expansion.
+    pub fn spec(&self) -> String {
+        let mut spec = format!("{}:{}", self.source, self.destination);
+        if !self.options.is_empty() {
+            spec.push(':');
+            spec.push_str(&self.options);
+        }
+        spec
+    }
+
+    /// The entry as a line of a `[mounts]` table, for a block to paste.
+    pub fn to_toml_line(&self) -> String {
+        let quote = |s: &str| Value::String(s.to_string()).to_string();
+        if self.options.is_empty() {
+            format!("{} = {}", quote(&self.source), quote(&self.destination))
+        } else {
+            format!(
+                "{} = {{ destination = {}, options = {} }}",
+                quote(&self.source),
+                quote(&self.destination),
+                quote(&self.options)
+            )
+        }
+    }
+}
+
+/// The entries of one `[mounts]` table -- an AGENTS.md block's, or the host's
+/// own in `trusted.toml`, which uses the same syntax.
+pub fn mount_decls_from_table(mounts: &Value) -> Result<Vec<MountDecl>, ConfigError> {
+    let mounts_table = mounts
+        .as_table()
+        .ok_or_else(|| ConfigError::msg("[mounts] must be a table"))?;
+    let mut decls = Vec::new();
+    for (src, value) in mounts_table {
+        let (dest, opts) = if let Some(s) = value.as_str() {
+            (s.to_string(), String::new())
+        } else if let Some(table) = value.as_table() {
+            let dest = table
+                .get("destination")
+                .and_then(|d| d.as_str())
+                .ok_or_else(|| {
+                    ConfigError::msg(format!(
+                        "mounts.{}: missing required field 'destination' or not a string",
+                        src
+                    ))
+                })?
+                .to_string();
+            let mut opts = String::new();
+            if let Some(opts_val) = table.get("options") {
+                if let Some(s) = opts_val.as_str() {
+                    opts = s.to_string();
+                } else if let Some(arr) = opts_val.as_array() {
+                    let mut opt_strings = Vec::new();
+                    for o in arr {
+                        if let Some(s) = o.as_str() {
+                            opt_strings.push(s.to_string());
                         } else {
                             return Err(ConfigError::msg(format!(
                                 "mounts.{}.options: expected a string or list of strings",
@@ -350,35 +374,59 @@ pub fn parse_mounts(text: &str) -> Result<Vec<String>, ConfigError> {
                             )));
                         }
                     }
-                    let allowed: HashSet<&str> =
-                        ["destination", "options"].iter().cloned().collect();
-                    let unknown: Vec<_> = table
-                        .keys()
-                        .filter(|k| !allowed.contains(k.as_str()))
-                        .collect();
-                    if !unknown.is_empty() {
-                        return Err(ConfigError::msg(format!(
-                            "mounts.{}: unknown field(s) {:?}",
-                            src, unknown
-                        )));
-                    }
-                    (dest, opts)
+                    opts = opt_strings.join(",");
                 } else {
                     return Err(ConfigError::msg(format!(
-                        "mounts.{}: expected a string or table",
+                        "mounts.{}.options: expected a string or list of strings",
                         src
                     )));
-                };
-                let mut spec = format!("{}:{}", src, dest);
-                if !opts.is_empty() {
-                    spec.push(':');
-                    spec.push_str(&opts);
                 }
-                specs.push(spec);
             }
+            let allowed: HashSet<&str> = ["destination", "options"].iter().cloned().collect();
+            let unknown: Vec<_> = table
+                .keys()
+                .filter(|k| !allowed.contains(k.as_str()))
+                .collect();
+            if !unknown.is_empty() {
+                return Err(ConfigError::msg(format!(
+                    "mounts.{}: unknown field(s) {:?}",
+                    src, unknown
+                )));
+            }
+            (dest, opts)
+        } else {
+            return Err(ConfigError::msg(format!(
+                "mounts.{}: expected a string or table",
+                src
+            )));
+        };
+        decls.push(MountDecl {
+            source: src.clone(),
+            destination: dest,
+            options: opts,
+        });
+    }
+    Ok(decls)
+}
+
+pub fn parse_mount_decls(text: &str) -> Result<Vec<MountDecl>, ConfigError> {
+    let mut decls = Vec::new();
+    for body in iter_tagged_blocks(text) {
+        let block: Value = body.parse().map_err(|e| {
+            ConfigError::msg(format!("malformed TOML in agent-sandbox block: {}", e))
+        })?;
+        if let Some(mounts) = block.get("mounts") {
+            decls.extend(mount_decls_from_table(mounts)?);
         }
     }
-    Ok(specs)
+    Ok(decls)
+}
+
+pub fn parse_mounts(text: &str) -> Result<Vec<String>, ConfigError> {
+    Ok(parse_mount_decls(text)?
+        .iter()
+        .map(MountDecl::spec)
+        .collect())
 }
 
 fn is_valid_domain(mut d: &str) -> bool {

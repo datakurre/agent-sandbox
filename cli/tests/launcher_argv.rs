@@ -567,6 +567,44 @@ fn a_declared_mount_keeps_the_options_it_declared() {
     );
 }
 
+#[test]
+fn a_declared_mount_outside_the_workspace_needs_trusted_toml() {
+    let agents_md =
+        "```toml agent-sandbox\n[mounts]\n\"~/shared\" = { destination = \"/mnt/shared\", options = \"ro\" }\n```\n";
+    let refused = World::new()
+        .file("AGENTS.md", agents_md)
+        .home_file("shared/keep", "")
+        .run(&["--workspace", "--mounts", "opencode"]);
+    assert!(!refused.reached_podman_run(), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("outside the workspace")
+            && refused.stderr.contains("[mounts]\n\"/")
+            && refused
+                .stderr
+                .contains("/shared\" = { destination = \"/mnt/shared\", options = \"ro\" }"),
+        "the refusal names the resolved source and prints the block: {}",
+        refused.stderr
+    );
+
+    let authorized = World::new()
+        .file("AGENTS.md", agents_md)
+        .home_file("shared/keep", "")
+        .home_file(
+            ".config/agent-sandbox/trusted.toml",
+            "[mounts]\n\"~/shared\" = { destination = \"/mnt/shared\", options = \"ro\" }\n",
+        )
+        .run(&["--workspace", "--mounts", "opencode"]);
+    assert!(authorized.reached_podman_run(), "{}", authorized.stderr);
+    assert!(
+        authorized
+            .run_call()
+            .mount_to("/mnt/shared")
+            .is_some_and(|m| m.ends_with(":ro")),
+        "{}",
+        authorized.run_call().joined()
+    );
+}
+
 // ── passthrough ─────────────────────────────────────────────────────────────
 
 #[test]

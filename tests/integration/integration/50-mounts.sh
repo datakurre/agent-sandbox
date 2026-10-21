@@ -37,3 +37,16 @@ assert_eq "written" "$(cat "$ws/data/f")" "that write, seen on the host"
 # the failure text too.
 out="$(sandbox_run --workspace -- bash -c 'cat /mnt/ro/file 2>&1 || echo ABSENT')"
 assert_not_contains "$out" "payload" "the declared mount without --mounts"
+
+# A source outside the workspace is the repository reaching into the host, so
+# it is mounted only once trusted.toml names it. /etc is one no operator's
+# trusted.toml should; the launch must stop before any container starts.
+cat > "$ws/AGENTS.md" <<'EOF2'
+```toml agent-sandbox
+[mounts]
+"/etc" = { destination = "/mnt/etc", options = "ro" }
+```
+EOF2
+out="$(sandbox_run --workspace --mounts -- bash -c 'cat /mnt/etc/hostname 2>&1; echo LAUNCHED')"
+assert_not_contains "$out" "LAUNCHED" "a mount from outside the workspace, unauthorized"
+assert_contains "$out" "outside the workspace" "and the refusal says why"

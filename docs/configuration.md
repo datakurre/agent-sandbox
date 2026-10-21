@@ -66,8 +66,27 @@ inside the container, or a table with additional options. A relative destination
 is placed under `/workspace` (`"data"` mounts at `/workspace/data`, and `"."` at
 `/workspace` itself); an absolute one is used as written.
 
-A source is not confined to the workspace: `[mounts]` can name any host path
-you can read, which is why the block is honored only with `--mounts`. See
+The block is honored only with `--mounts`. A source inside the workspace — the
+repository's own tree — is mounted as declared. A source anywhere else —
+`~/.cache/pip`, `/etc`, or a workspace path that only leads outside through a
+symlink — is the repository reaching into your host, so it is mounted only once
+`~/.config/agent-sandbox/trusted.toml` carries the same entry, with the same
+destination and options:
+
+```toml
+# ~/.config/agent-sandbox/trusted.toml
+[mounts]
+"~/.cache/pip" = { destination = "/home/user/.cache/pip", options = "ro" }
+```
+
+Without it the launch refuses, naming the sources and printing the block to
+paste, with each source written as the real path it resolves to. A trusted source
+must be absolute or start with `~`; sources are compared with symlinks resolved,
+so `~/x` and `/home/you/x` are the same entry, and options are compared as a set.
+A read-only authorization does not cover a read-write mount, nor one at another
+destination. A trusted path that lies inside the workspace being launched
+authorizes nothing, since the repository controls the symlinks along it. A source
+that does not exist refuses the launch too, as podman would. See
 [Trust model](trust-model.md).
 
 Fields when using a table:
@@ -235,7 +254,7 @@ Anything in that category is authorized in a file only you write,
 `~/.config/agent-sandbox/trusted.toml` (or under `$XDG_CONFIG_HOME`). Profile
 rules go through the same check.
 
-Two things live under that rule, and both work the same way — the launcher
+Three things live under that rule, and all work the same way — the launcher
 prints the exact block to paste, and refuses the launch rather than proceeding
 unauthorized:
 
@@ -243,6 +262,7 @@ unauthorized:
 | --- | --- |
 | `[[network.allowed_routes]]` with a `secret` | the identical `[[network.allowed_routes]]` block |
 | an `allowed_hosts` entry covering port 22 | a `[[network.known_hosts]]` entry for that host |
+| a `[mounts]` entry whose source is outside the workspace | the identical `[mounts]` entry |
 
 #### Secrets
 

@@ -922,7 +922,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--host-loopback-port PORT", Some(fmt(want_host_ports)), "Makes a host 127.0.0.1:PORT reachable at the sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP port). Repeatable; takes HOST:SANDBOX to remap. Not with --krun.");
 
     println!("\nMounts:");
-    print_help_option("--mounts / --no-mounts", Some(fmt(want_mounts)), "Honors [mounts] declarations from AGENTS.md.");
+    print_help_option("--mounts / --no-mounts", Some(fmt(want_mounts)), "Honors [mounts] declarations from AGENTS.md; a source outside the workspace also needs the same entry in trusted.toml.");
 
     println!("\nAgent state:");
     print_help_option("--agent-mounts", Some(fmt(agent_mounts_all)), "Mount every agent's state, not just the one launched.");
@@ -2981,19 +2981,53 @@ fn run() -> Result<i32> {
 
     if want_mounts && agents_md_path.exists() {
         let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
-        let declared = match agents::parse_mounts(&text) {
-            Ok(specs) => specs,
+        let declared = match agents::parse_mount_decls(&text) {
+            Ok(decls) => decls,
             Err(e) => {
                 eprintln!("agent-sandbox: {}", e);
                 fail("agent-sandbox: refusing to launch on an invalid [mounts] block (use --no-mounts to skip).");
             }
         };
-        for spec in declared {
-            // Kept out of `mounts`: the options in a [mounts] declaration are
-            // the operator's, like the ones passed through --podman-args, and
-            // --selinux governs the launcher's own binds only.
+        let expand = |decl: &agents::MountDecl| expand_v(&decl.spec(), Path::new(&pwd), &home);
+        let declared: Vec<(agents::MountDecl, String)> = declared
+            .into_iter()
+            .map(|d| {
+                let e = expand(&d);
+                (d, e)
+            })
+            .collect();
+
+        // AGENTS.md is the repository's: a source outside the workspace is
+        // mounted only once trusted.toml names the same entry.
+        let trusted_config = trusted::config_path(&home);
+        let trusted_mounts = match trusted::load_trusted_mounts(&trusted_config) {
+            Ok(decls) => decls,
+            Err(e) => fail(&e.to_string()),
+        };
+        let trusted_mounts: Vec<(agents::MountDecl, String)> = trusted_mounts
+            .into_iter()
+            .map(|d| {
+                let e = expand(&d);
+                (d, e)
+            })
+            .collect();
+        let check = match trusted::check_mounts(&declared, &trusted_mounts, Path::new(&pwd)) {
+            Ok(check) => check,
+            Err(e) => fail(&e.to_string()),
+        };
+        if !check.unauthorized.is_empty() {
+            fail(&trusted::mounts_refusal(
+                &check.unauthorized,
+                &trusted_config,
+            ));
+        }
+
+        for spec in check.specs {
+            // Kept out of `mounts`: --selinux governs the launcher's own
+            // binds only, and a declaration's options are its own -- inside
+            // the workspace, or authorized as written in trusted.toml.
             declared_mounts.push("-v".to_string());
-            declared_mounts.push(expand_v(&spec, Path::new(&pwd), &home));
+            declared_mounts.push(spec);
         }
     }
 
