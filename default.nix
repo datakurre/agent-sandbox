@@ -114,6 +114,19 @@ let
       "$out/share/agent-sandbox/fonts.conf"
   '';
   imageFontsConfFile = "${imageFontsConf}/share/agent-sandbox/fonts.conf";
+  # This image is assembled with dockerTools rather than the NixOS module
+  # system, so apply NixOS's CA blacklist directly to its cacert package.
+  caCertificates = pkgs.cacert.override {
+    blacklist = [
+      # CVE-2026-111943
+      "Comodo AAA Services root"
+      # https://hg-edge.mozilla.org/projects/nss/rev/26d38a0c3fb81e7fb2acedbaf4c42dd21dce0517
+      "emSign ECC Root CA - G3"
+      # https://hg-edge.mozilla.org/projects/nss/rev/8159223c48ceeb1273a1915bca95a517294ab0e0
+      "emSign Root CA - C1"
+      "emSign ECC Root CA - C3"
+    ];
+  };
   unknownAgent = throw "agent-sandbox: unknown default agent '${defaultAgent}'";
   defaultAgentDef = lib.findFirst (a: a.name == defaultAgent) unknownAgent agents;
   agentTools = map (a: a.package) agents;
@@ -298,7 +311,7 @@ let
   # All paths baked into the image root; rootEnv links them in, and the
   # store registration follows from rootEnv's closure.
   containerPaths = tools ++ [
-    pkgs.cacert
+    caCertificates
     # Referenced only from the image's FONTCONFIG_FILE, so it has to be named
     # here or it would not be in the closure the image ships.
     imageFontsConf
@@ -423,8 +436,8 @@ let
         "HOME=/home/user"
         "USER=user"
         "TERM=xterm-256color"
-        "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-        "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "SSL_CERT_FILE=${caCertificates}/etc/ssl/certs/ca-bundle.crt"
+        "NIX_SSL_CERT_FILE=${caCertificates}/etc/ssl/certs/ca-bundle.crt"
         "LANG=en_US.UTF-8"
         "LOCALE_ARCHIVE=${pkgs.glibcLocales}/lib/locale/locale-archive"
         # See `imageFonts`: without this a headless screenshot is a flat colour

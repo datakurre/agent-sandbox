@@ -550,8 +550,11 @@ CA it generates per session and writes to `/sidecar_shared/ca.pem`. The launcher
 binds *that file alone* into the sandbox and points
 `AGENT_SANDBOX_PROXY_CA_FILE` at it; the entrypoint merges it with the image's
 bundle into `~/.cache` and exports the result under every variable the usual
-clients read. The directory itself is never mounted into the sandbox — the
-connection log lives there.
+clients read. The image bundle comes from `pkgs.cacert` with NixOS's CA
+blacklist applied, so `Comodo AAA Services root`, `emSign ECC Root CA - G3`,
+`emSign Root CA - C1`, and `emSign ECC Root CA - C3` are not accepted as trust
+anchors for TLS connections. The directory itself is never mounted into the
+sandbox — the connection log lives there.
 
 The mount is gated on the launch policy actually carrying an `allow_route` line.
 With none, `skip_l7` is true for every host and the leaf issuer is never
