@@ -400,6 +400,42 @@ pub fn mount_decls_from_table(mounts: &Value) -> Result<Vec<MountDecl>, ConfigEr
                 src
             )));
         };
+        // podman reads `-v src:dest:opts` by splitting on ':', so a colon in
+        // any part would move the rest into another field.
+        for (field, value) in [
+            ("source", src.as_str()),
+            ("destination", &dest),
+            ("options", &opts),
+        ] {
+            if value.contains(':') {
+                let hint = match (field, dest.split_once(':')) {
+                    ("destination", Some((path, options))) => format!(
+                        " Write options in their own field: {{ destination = {}, options = {} }}",
+                        Value::String(path.to_string()),
+                        Value::String(options.to_string())
+                    ),
+                    _ => String::new(),
+                };
+                return Err(ConfigError::msg(format!(
+                    "mounts.{}: the {} {:?} contains ':', which podman reads as a field separator.{}",
+                    Value::String(src.clone()),
+                    field,
+                    value,
+                    hint
+                )));
+            }
+        }
+        if src.trim().is_empty() {
+            return Err(ConfigError::msg("mounts: a source path must not be empty"));
+        }
+        // An empty destination would fall back to the source's own host path,
+        // which nobody wrote.
+        if dest.trim().is_empty() {
+            return Err(ConfigError::msg(format!(
+                "mounts.{}: the destination must not be empty; name the path inside the container",
+                Value::String(src.clone())
+            )));
+        }
         decls.push(MountDecl {
             source: src.clone(),
             destination: dest,
@@ -2344,6 +2380,49 @@ mod export_tests {
             policy.allow_route,
             vec!["api.example.com\tGET\t/v1/**".to_string()]
         );
+    }
+
+    #[test]
+    fn a_mount_that_podman_would_split_differently_is_refused() {
+        let refused = |mounts: &str| {
+            parse_mount_decls(&format!("```agent-sandbox\n[mounts]\n{mounts}```\n"))
+                .expect_err(mounts)
+                .to_string()
+        };
+        for (mounts, expected) in [
+            (
+                "\"data:/etc\" = \"/mnt/x\"\n",
+                "the source \"data:/etc\" contains ':'",
+            ),
+            (
+                "\"data\" = \"/mnt/x:ro\"\n",
+                "mounts.\"data\": the destination \"/mnt/x:ro\" contains ':', which podman \
+                 reads as a field separator. Write options in their own field: \
+                 { destination = \"/mnt/x\", options = \"ro\" }",
+            ),
+            (
+                "\"data\" = { destination = \"/mnt/x\", options = \"ro:z\" }\n",
+                "the options \"ro:z\" contains ':'",
+            ),
+            ("\"data\" = \"\"\n", "the destination must not be empty"),
+            (
+                "\"data\" = { destination = \" \" }\n",
+                "the destination must not be empty",
+            ),
+            ("\"\" = \"/mnt/x\"\n", "a source path must not be empty"),
+        ] {
+            let err = refused(mounts);
+            assert!(
+                err.contains(expected),
+                "{mounts}\n  expected: {expected}\n  got: {err}"
+            );
+        }
+        // Commas in options are the list separator, not a problem.
+        let ok = parse_mount_decls(
+            "```agent-sandbox\n[mounts]\n\"data\" = { destination = \"/mnt/x\", options = [\"ro\", \"Z\"] }\n```\n",
+        )
+        .expect("a list of options");
+        assert_eq!(ok[0].spec(), "data:/mnt/x:ro,Z");
     }
 
     #[test]

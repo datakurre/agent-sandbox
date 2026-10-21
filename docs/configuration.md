@@ -94,6 +94,11 @@ Fields when using a table:
 - **`destination`** (required): The path inside the container, absolute or relative to `/workspace` as above.
 - **`options`** (optional): A string or list of strings representing mount options (e.g., `"ro"`, `"rw"`, `"Z"`).
 
+Neither the source nor the destination may be empty, in either form, and no part
+of an entry may contain `:`, which podman reads as the separator between source,
+destination and options: write `{ destination = "/mnt/x", options = "ro" }`, not
+`"/mnt/x:ro"`.
+
 #### Examples
 
 ````markdown
