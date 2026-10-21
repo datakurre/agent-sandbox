@@ -924,7 +924,7 @@ fn validate_route_host(ctx: &str, host: &str) -> Result<(), ConfigError> {
             host_ctx, host_part
         )));
     }
-    if host_part != "*" && !is_ip_or_cidr(&host_part) {
+    if !is_ip_or_cidr(&host_part) {
         _proxy_domain(&host_ctx, &host_part)?;
     }
     if let Some(port) = port_part {
@@ -939,27 +939,14 @@ fn validate_route_host(ctx: &str, host: &str) -> Result<(), ConfigError> {
 fn add_route(policy: &mut ProxyPolicy, route: &RouteSpec) {
     let (host_part, port_part) = parse_host_port(&route.host);
 
-    if host_part != "*" {
-        let combined = format_host_port(&host_part, port_part.as_deref());
-        if is_ip_or_cidr(&host_part) {
-            if !policy.allow_ip.contains(&combined) {
-                policy.allow_ip.push(combined);
-            }
-        } else if !policy.allow_host.contains(&combined) {
-            policy.allow_host.push(combined);
+    // A route names a domain or one IPv4 address; `*` was refused with it.
+    let combined = format_host_port(&host_part, port_part.as_deref());
+    if is_ip_or_cidr(&host_part) {
+        if !policy.allow_ip.contains(&combined) {
+            policy.allow_ip.push(combined);
         }
-    }
-
-    if let Some(port) = port_part {
-        if host_part == "*" {
-            // One line per element, as for allowed_hosts.
-            for element in port.split(',') {
-                let element = element.to_string();
-                if !policy.allow_port.contains(&element) {
-                    policy.allow_port.push(element);
-                }
-            }
-        }
+    } else if !policy.allow_host.contains(&combined) {
+        policy.allow_host.push(combined);
     }
 
     let line = format!("{}\t{}\t{}", host_part, route.method, route.path);

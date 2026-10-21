@@ -137,13 +137,16 @@ enum AgentMountsMode {
 /// Expand a `src[:dest[:opts]]` spec declared in `AGENTS.md` against the
 /// workspace: a relative source is relative to the host CWD, a relative
 /// destination lands under `/workspace`.
-fn expand_v(spec: &str, current_dir: &Path, home_dir: &str) -> String {
-    let parts: Vec<&str> = spec.split(':').collect();
+/// The `-v src:dest[:opts]` spec for a declared mount: a leading `~` is the
+/// home directory, a relative source is in the workspace, and a relative
+/// destination under `/workspace`.  The parser has already refused an empty
+/// source or destination and a ':' in any part.
+fn expand_v(mount: &agents::MountDecl, current_dir: &Path, home_dir: &str) -> String {
     // Only a leading `~` is the home directory, as in a shell: `backup~1`
     // names a file, not one with the home spliced into it.
-    let mut src = match parts[0].strip_prefix('~') {
+    let mut src = match mount.source.strip_prefix('~') {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{}{}", home_dir, rest),
-        _ => parts[0].to_string(),
+        _ => mount.source.clone(),
     };
     if src == "." {
         src = current_dir.to_string_lossy().into_owned();
@@ -152,24 +155,16 @@ fn expand_v(spec: &str, current_dir: &Path, home_dir: &str) -> String {
         src = format!("{}/{}", current_dir.to_string_lossy(), src);
     }
 
-    let dest = if parts.len() > 1 && !parts[1].is_empty() {
-        let mut d = parts[1].to_string();
-        if !d.starts_with('/') {
-            if d == "." {
-                d = "/workspace".to_string();
-            } else {
-                d = format!("/workspace/{}", d);
-            }
-        }
-        d
-    } else {
-        src.clone()
+    let dest = match mount.destination.as_str() {
+        d if d.starts_with('/') => d.to_string(),
+        "." => "/workspace".to_string(),
+        d => format!("/workspace/{}", d),
     };
 
-    if parts.len() > 2 {
-        format!("{}:{}:{}", src, dest, parts[2..].join(":"))
-    } else {
+    if mount.options.is_empty() {
         format!("{}:{}", src, dest)
+    } else {
+        format!("{}:{}:{}", src, dest, mount.options)
     }
 }
 
@@ -3158,7 +3153,7 @@ fn run() -> Result<i32> {
                 fail("agent-sandbox: refusing to launch on an invalid [mounts] block (use --no-mounts to skip).");
             }
         };
-        let expand = |decl: &agents::MountDecl| expand_v(&decl.spec(), Path::new(&pwd), &home);
+        let expand = |decl: &agents::MountDecl| expand_v(decl, Path::new(&pwd), &home);
         let declared: Vec<(agents::MountDecl, String)> = declared
             .into_iter()
             .map(|d| {
@@ -4661,32 +4656,31 @@ mod tests {
     #[test]
     fn expand_v_roots_relative_paths_in_the_workspace() {
         let cwd = Path::new("/home/ada/repo");
+        let expand = |source: &str, destination: &str, options: &str| {
+            let mount = agents::MountDecl {
+                source: source.to_string(),
+                destination: destination.to_string(),
+                options: options.to_string(),
+            };
+            expand_v(&mount, cwd, "/home/ada")
+        };
         assert_eq!(
-            expand_v("data:/workspace/data", cwd, "/home/ada"),
+            expand("data", "/workspace/data", ""),
             "/home/ada/repo/data:/workspace/data"
         );
         assert_eq!(
-            expand_v("cache:tmp:ro", cwd, "/home/ada"),
+            expand("cache", "tmp", "ro"),
             "/home/ada/repo/cache:/workspace/tmp:ro"
         );
+        assert_eq!(expand(".", ".", ""), "/home/ada/repo:/workspace");
         assert_eq!(
-            expand_v("~/.cache/x:/cache", cwd, "/home/ada"),
+            expand("~/.cache/x", "/cache", ""),
             "/home/ada/.cache/x:/cache"
         );
-        assert_eq!(
-            expand_v("/etc/hosts", cwd, "/home/ada"),
-            "/etc/hosts:/etc/hosts"
-        );
-        assert_eq!(expand_v("~:/h", cwd, "/home/ada"), "/home/ada:/h");
+        assert_eq!(expand("~", "/h", ""), "/home/ada:/h");
         // Only a leading `~` is the home directory.
-        assert_eq!(
-            expand_v("backup~1:/b", cwd, "/home/ada"),
-            "/home/ada/repo/backup~1:/b"
-        );
-        assert_eq!(
-            expand_v("~other/x:/o", cwd, "/home/ada"),
-            "/home/ada/repo/~other/x:/o"
-        );
+        assert_eq!(expand("backup~1", "/b", ""), "/home/ada/repo/backup~1:/b");
+        assert_eq!(expand("~other/x", "/o", ""), "/home/ada/repo/~other/x:/o");
     }
 
     #[test]
