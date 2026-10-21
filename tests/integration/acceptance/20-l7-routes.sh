@@ -45,6 +45,35 @@ assert_denied "$out" "a method the route does not allow"
 out="$(sandbox_run --workspace --proxy -- bash -c 'ls /run/agent-sandbox-proxy-ca.pem 2>&1 || echo ABSENT')"
 assert_contains "$out" "/run/agent-sandbox-proxy-ca.pem" "the session CA under an L7 policy"
 
+# The same route written as one allowed_hosts entry, restricted to port 443:
+# the unit tests can only check the policy file it compiles to, not that the
+# proxy enforces it.
+cat > AGENTS.md <<'EOF'
+```toml agent-sandbox
+[network]
+allowed_hosts = ["GET example.com:443/"]
+```
+EOF
+
+out="$(sandbox_run --workspace --proxy -- bash -c "$code https://example.com/ || echo BLOCKED")"
+assert_contains "$out" "200" "the method and path a short-form route allows"
+
+out="$(sandbox_run --workspace --proxy -- bash -c "$code https://example.com/admin || echo BLOCKED")"
+assert_denied "$out" "a path the short-form route does not cover"
+
+out="$(sandbox_run --workspace --proxy -- \
+  bash -c "$code -X POST https://example.com/ || echo BLOCKED")"
+assert_denied "$out" "a method the short-form route does not allow"
+
+# Unlike the table above, which names no port, this entry names 443 alone, so
+# the route must not have widened the host to plain HTTP. Refused before the
+# origin is contacted, so the answer cannot be the origin's.
+out="$(sandbox_run --workspace --proxy -- bash -c "$code http://example.com/ || echo BLOCKED")"
+assert_denied "$out" "a port the short-form route does not name"
+
+out="$(sandbox_run --workspace --proxy -- bash -c 'ls /run/agent-sandbox-proxy-ca.pem 2>&1 || echo ABSENT')"
+assert_contains "$out" "/run/agent-sandbox-proxy-ca.pem" "the session CA under a short-form route"
+
 # With no L7 rule there is nothing to intercept, so no CA should be trusted:
 # a CA that can mint any name is not something to hand over for free.
 cat > AGENTS.md <<'EOF'

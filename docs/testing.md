@@ -137,7 +137,8 @@ launcher leaked.
 **Acceptance** asks whether the security promises hold. Deny-by-default egress,
 including the ways around it — a bare IP, a direct DNS query, an unset
 `HTTP_PROXY`, a port the rule does not name. L7 routes narrowing a host to a
-method and path, with the session CA handed over only when a rule needs it.
+method and path, written as a table or as a short-form `allowed_hosts` entry,
+with the session CA handed over only when a rule needs it.
 Secret injection reaching the origin while remaining unreadable inside the
 sandbox. The SSH and GPG relays working for allowed hosts and refusing others,
 with the private key never entering the container. A live policy widening and
