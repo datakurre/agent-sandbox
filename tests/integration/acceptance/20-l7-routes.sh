@@ -27,7 +27,7 @@ path = "/"
 ```
 EOF
 
-code='curl --silent --show-error --max-time 20 -o /dev/null -w "%{http_code}"'
+code='curl --silent --show-error --max-time 20 -o /dev/null -w "%{http_code}\n"'
 
 out="$(sandbox_run --workspace --proxy -- bash -c "$code https://example.com/ || echo BLOCKED")"
 assert_contains "$out" "200" "the method and path the route allows"

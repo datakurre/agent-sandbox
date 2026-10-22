@@ -21,7 +21,7 @@ allowed_hosts = ["example.com:443"]
 ```
 EOF
 
-fetch='curl --silent --show-error --max-time 15 -o /dev/null -w "%{http_code}"'
+fetch='curl --silent --show-error --max-time 15 -o /dev/null -w "%{http_code}\n"'
 
 # The allowed host, on the allowed port.
 out="$(sandbox_run --workspace --proxy -- bash -c "$fetch https://example.com/ || echo BLOCKED")"
@@ -39,7 +39,7 @@ assert_denied "$out" "the allowed host on a port the rule does not name"
 # Raw IP, bypassing the name entirely: the proxy checks the resolved address
 # too, so this must not be a way around a domain rule.
 out="$(sandbox_run --workspace --proxy -- bash -c \
-  "curl --silent --max-time 15 -o /dev/null -w '%{http_code}' https://1.1.1.1/ || echo BLOCKED")"
+  "curl --silent --max-time 15 -o /dev/null -w '%{http_code}\n' https://1.1.1.1/ || echo BLOCKED")"
 assert_denied "$out" "a bare IP address"
 
 # DNS is not an escape hatch either: without the proxy's resolver in the path

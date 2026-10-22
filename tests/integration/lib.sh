@@ -146,12 +146,17 @@ wait_for_sandbox() {
 # refuses a CONNECT tunnel, so curl fails outright, or it answers a plain HTTP
 # request with 403.  A test that accepts only one of them is asserting an
 # implementation detail rather than the policy.
+# A denial is a whole line of the case's own output: the proxy's 403 as the
+# status curl printed (`-w '%{http_code}\n'`), or BLOCKED when curl itself
+# failed, as a refused tunnel does. Not a "403" anywhere: the launcher's
+# stderr is merged in, and a 403 there says nothing about this request.
 assert_denied() {
   local out="$1" what="${2:-the request}"
-  case "$out" in
-    *BLOCKED*|*403*) pass_note "$what was denied ($(echo "$out" | tr -d '\n'))" ;;
-    *) _fail "$what was not denied; got: $out" ;;
-  esac
+  if printf '%s\n' "$out" | grep -qxE '403|([0-9]{3})?BLOCKED'; then
+    pass_note "$what was denied ($(echo "$out" | tr '\n' ' '))"
+  else
+    _fail "$what was not denied; got: $out"
+  fi
 }
 
 # Start a static HTTP server on the host, in the background, and echo its PID.

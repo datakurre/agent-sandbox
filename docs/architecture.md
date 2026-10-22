@@ -497,7 +497,10 @@ launcher writes it directly whenever `--gpg` is passed, independent of any
 `deny_ip` is written only by the launcher: there is no domain deny list, and
 `install_policy` refuses a live edit that changes the deny set.  One host on two
 ports is two `allow_host` lines carrying the same pattern; the proxy unions the
-ports of every line tied at the winning specificity, so both are in force.
+ports of every line tied at the winning specificity, so both are in force --
+unless one of the lines carries no port, which makes the union the global
+`allow_port` set alone (80, 443 and 22 unless the policy names others, and every
+port under a bare `"*"`; see `union_ports` in `proxy/src/policy.rs`).
 `agent-sandbox-proxy --check-policy FILE` validates it: the launcher writes the
 file, the proxy reads it, and the host-side `proxy` command vets its own writes
 with the same parser, so there is no second implementation to drift.

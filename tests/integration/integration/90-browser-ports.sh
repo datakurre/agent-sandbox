@@ -101,7 +101,7 @@ code="$(curl --silent --max-time 5 -o /dev/null -w '%{http_code}' \
 assert_eq "200" "$code" "the same app under localhost"
 
 # Nothing else on the operator's loopback.
-out="$(curl --silent --max-time 5 -o /dev/null -w '%{http_code}' \
+out="$(curl --silent --max-time 5 -o /dev/null -w '%{http_code}\n' \
   -x "http://127.0.0.1:$proxy_port" "http://127.0.0.1:$undeclared/" 2>&1 || echo BLOCKED)"
 assert_denied "$out" "a port nobody declared"
 

@@ -93,7 +93,7 @@ that does not exist refuses the launch too, as podman would. See
 
 Fields when using a table:
 
-- **`destination`** (required): The path inside the container, absolute or relative to `/workspace` as above.
+- **`destination`** (required): The path inside the container, absolute or relative to `/workspace` as above. It is not checked against the sandbox's own files, so a mount may overlay anything in the container, `/etc` included. Under `--proxy` that stays inside the sandbox — egress is enforced by the proxy's separate container — but it is the repository's choice, not yours, unless the source is one `trusted.toml` authorizes.
 - **`options`** (optional): A string or list of strings representing mount options (e.g., `"ro"`, `"rw"`, `"Z"`).
 
 Neither the source nor the destination may be empty, in either form, and no part
@@ -130,7 +130,12 @@ The `[network]` table configures the egress proxy's firewall policy. The sandbox
   `"github.com:22,443"` and `"internal.example.com:8000-8100,9000"` are both
   one entry. Writing them as separate entries works identically — the proxy
   unions the ports of every rule sharing a pattern — so the list is a
-  convenience, not a different semantics.
+  convenience, not a different semantics. The exception is an entry without a
+  port: it stands for the default ports (80, 443 and 22, unless a `"*:port"`
+  entry names others), and beside it an explicit entry for the same pattern adds
+  nothing, so `"api.example.com"` with `"api.example.com:8443"` allows 80, 443
+  and 22 but not 8443. Write every port explicitly instead
+  (`"api.example.com:80,443,8443"`).
 
   An entry can also carry an HTTP method list, a path, or both, which makes it
   a route rather than a plain allow — see [Short-form routes](#short-form-routes).
