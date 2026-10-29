@@ -20,6 +20,7 @@ mod l7;
 mod secret;
 mod tls;
 
+use agent_sandbox_proxy::dns::resolve_via_host_with_timeout;
 use agent_sandbox_proxy::logfile::rotate_if_needed;
 use secret::{SecretBinding, SecretBindings};
 use std::collections::HashMap;
@@ -56,7 +57,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Name resolved to decide the sidecar's network is actually usable.  Only
 /// resolved, never connected to, so this stays policy-neutral under
 /// `--proxy`.
-const READY_PROBE_HOST: &str = "cloudflare.com:443";
+const READY_PROBE_HOST: &str = "cloudflare.com";
+const READY_PROBE_PORT: u16 = 443;
 /// Directory the proxy writes its own state into.  In the sidecar this is the
 /// launcher-owned volume the sandbox cannot see; `agent-sandbox browser` runs
 /// this same binary on the host and points it at a per-instance runtime dir
@@ -113,13 +115,73 @@ use policy::*;
 /// cache removes a resolver round trip from most connections.
 struct Resolver {
     cache: Mutex<HashMap<String, (Vec<SocketAddr>, Instant)>>,
+    host_socket: Option<std::path::PathBuf>,
 }
 
 impl Resolver {
     fn new() -> Self {
         Resolver {
             cache: Mutex::new(HashMap::new()),
+            host_socket: env::var_os(agent_sandbox_proxy::dns::SOCKET_ENV)
+                .map(std::path::PathBuf::from),
         }
+    }
+
+    #[cfg(test)]
+    fn with_host_socket(socket: &std::path::Path) -> Self {
+        Resolver {
+            cache: Mutex::new(HashMap::new()),
+            host_socket: Some(socket.to_path_buf()),
+        }
+    }
+
+    fn resolve_name(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, io::Error> {
+        self.resolve_name_with_timeout(host, port, agent_sandbox_proxy::dns::SOCKET_TIMEOUT)
+    }
+
+    fn resolve_name_with_timeout(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Vec<SocketAddr>, io::Error> {
+        if let Some(socket) = &self.host_socket {
+            return resolve_via_host_with_timeout(socket, host, port, timeout);
+        }
+        format!("{}:{}", host, port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect())
+    }
+
+    fn resolve_with_timeout(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Vec<SocketAddr>, io::Error> {
+        let key = format!("{}:{}", host, port);
+        if let Ok(cache) = self.cache.lock() {
+            if let Some((addrs, cached_at)) = cache.get(&key) {
+                if cached_at.elapsed() < DNS_TTL {
+                    return Ok(addrs.clone());
+                }
+            }
+        }
+
+        let addrs = self.resolve_name_with_timeout(host, port, timeout)?;
+        if addrs.is_empty() {
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                "resolver returned no addresses",
+            ));
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            if cache.len() >= DNS_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(key, (addrs.clone(), Instant::now()));
+        }
+        Ok(addrs)
     }
 
     /// Drop every cached lookup.  Called on a policy change: cached *addresses*
@@ -154,9 +216,8 @@ impl Resolver {
         let deadline = (Instant::now() + RETRY_WINDOW).max(retry_until);
         let mut last_err;
         loop {
-            match key.to_socket_addrs() {
-                Ok(found) => {
-                    let addrs: Vec<SocketAddr> = found.collect();
+            match self.resolve_name(host, port) {
+                Ok(addrs) => {
                     if !addrs.is_empty() {
                         if let Ok(mut cache) = self.cache.lock() {
                             if cache.len() >= DNS_CACHE_MAX {
@@ -1644,8 +1705,8 @@ fn watch_policy(path: String, shared: Arc<Shared>) {
 /// could not yet reach anything — an instant 502 on the agent's first request.
 ///
 /// Resolution only, never a connection: a DNS query goes to the configured
-/// resolver and reaches no third-party host, so this stays policy-neutral under
-/// `--proxy`, where dialling out would be egress the allow list never
+/// host resolver relay and reaches no destination host, so this stays
+/// policy-neutral under `--proxy`, where dialling out would be egress the allow list never
 /// authorised.
 ///
 /// Never fatal.  If egress does not come up we start anyway and say so, because
@@ -1655,13 +1716,15 @@ fn watch_policy(path: String, shared: Arc<Shared>) {
 /// session looked healthy until the agent's first request came back 502.  The
 /// reason is now also left in `EGRESS_DEGRADED` for the launcher to surface on
 /// the terminal the person is actually looking at.
-fn wait_for_egress(shared_dir: &str) {
+fn wait_for_egress(shared_dir: &str, resolver: &Resolver) {
     let started = Instant::now();
+    let deadline = started + READY_TIMEOUT;
     let mut last_err = String::new();
-    while started.elapsed() < READY_TIMEOUT {
-        match READY_PROBE_HOST.to_socket_addrs() {
-            Ok(mut addrs) => {
-                if addrs.next().is_some() {
+    while Instant::now() < deadline {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        match resolver.resolve_with_timeout(READY_PROBE_HOST, READY_PROBE_PORT, timeout) {
+            Ok(addrs) => {
+                if !addrs.is_empty() {
                     eprintln!("proxy: egress ready after {:?}", started.elapsed());
                     return;
                 }
@@ -1669,7 +1732,11 @@ fn wait_for_egress(shared_dir: &str) {
             }
             Err(e) => last_err = short_err(&e),
         }
-        thread::sleep(Duration::from_millis(100));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100).min(remaining));
     }
     eprintln!(
         "proxy: WARNING egress not ready after {:?} ({}); starting anyway",
@@ -1679,8 +1746,8 @@ fn wait_for_egress(shared_dir: &str) {
     if let Ok(mut f) = File::create(egress_degraded_path(shared_dir)) {
         let _ = writeln!(
             f,
-            "{} did not resolve within {:?}: {}",
-            READY_PROBE_HOST, READY_TIMEOUT, last_err
+            "{}:{}, did not resolve within {:?}: {}",
+            READY_PROBE_HOST, READY_PROBE_PORT, READY_TIMEOUT, last_err
         );
     }
 }
@@ -1933,8 +2000,9 @@ fn main() {
     // On the host -- `agent-sandbox browser` -- egress readiness is not in
     // question and the 30s ceiling would only be a stall on the way to a
     // browser window, so that caller passes --no-egress-probe.
+    let resolver = Resolver::new();
     if !opts.no_egress_probe {
-        wait_for_egress(&opts.shared_dir);
+        wait_for_egress(&opts.shared_dir, &resolver);
     }
 
     // Started after the egress probe so the grace covers the window right after
@@ -1943,7 +2011,7 @@ fn main() {
         config: RwLock::new(Arc::new(config)),
         secrets: Arc::new(secrets),
         session_ca,
-        resolver: Resolver::new(),
+        resolver,
         metrics,
         startup_until: Instant::now() + STARTUP_GRACE,
     });
@@ -2493,6 +2561,17 @@ mod tests {
             !err.to_string().is_empty(),
             "resolver error must carry a message"
         );
+    }
+
+    #[test]
+    fn configured_host_relay_failure_does_not_fall_back_to_sidecar_dns() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("missing.sock");
+        let resolver = Resolver::with_host_socket(&socket);
+        let error = resolver
+            .resolve("localhost", 443, Instant::now())
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 
     #[test]

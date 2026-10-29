@@ -382,6 +382,12 @@ impl Drop for ChildGuard {
 
 fn main() -> Result<()> {
     let config = Config::new();
+    if !config.dry_run && env::var_os(agent_sandbox_proxy::dns::SOCKET_ENV).is_none() {
+        anyhow::bail!(
+            "host resolver socket is missing ({})",
+            agent_sandbox_proxy::dns::SOCKET_ENV
+        );
+    }
 
     if !Path::new(&config.policy_file).exists() {
         eprintln!("sidecar: {} is missing", config.policy_file);

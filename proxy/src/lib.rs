@@ -4,3 +4,4 @@ pub mod logfile;
 pub mod policy;
 pub mod policy_io;
 pub mod secret;
+pub mod dns;

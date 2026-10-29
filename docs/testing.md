@@ -48,7 +48,10 @@ It contains three kinds of test:
 the pure functions: policy matching, the `AGENTS.md` parser, the mount and env
 fragments in `launch.rs`, the network summary renderer, the GnuPG home scan.
 This is where the largest share of the suite lives, and where new pure logic
-belongs.
+belongs. The host DNS relay's bounded request protocol, socket permissions,
+host-side lookup, fail-closed behavior, and total frame/probe deadlines are
+covered here too. Concurrent relay requests are handled by a bounded worker
+queue with backpressure rather than dropped at the worker limit.
 
 **Stub-podman tests** (`cli/tests/`) drive the real launcher binary with a
 recording `podman` on `$PATH` and assert on the argv it produced —
@@ -57,7 +60,8 @@ wiring. The harness in `cli/tests/common/mod.rs` builds a throwaway `$HOME`,
 workspace and runtime directory per test, and the stub answers the lookups the
 sidecar path makes (the network's subnet, the sidecar's address) and writes the
 readiness marker the launcher waits on, so a `--proxy` test finishes in
-milliseconds rather than timing out.
+milliseconds rather than timing out. The proxy tests also assert that `--proxy`
+mounts and configures the host resolver socket only for the sidecar.
 
 The stub also snapshots the directories the launcher mounts into the sidecar,
 because the launcher's own cleanup removes them on the way out; `World::captured`

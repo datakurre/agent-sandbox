@@ -4,6 +4,7 @@ use agent_sandbox_cli::agents::{self, format_proxy_policy, parse_policy_file, pa
 use agent_sandbox_cli::ctl;
 use agent_sandbox_cli::gpg::{scan_gnupg_home, GpgScanStatus};
 use agent_sandbox_cli::host_bridge;
+use agent_sandbox_cli::host_dns::HostDnsRelay;
 use agent_sandbox_cli::launch;
 use agent_sandbox_cli::net_summary;
 use agent_sandbox_cli::secrets::{
@@ -1409,6 +1410,7 @@ struct CleanupGuard {
     /// `None` when `--nix` was not passed, or its store/key/spawn
     /// preconditions were not met.
     nix_serve_child: Option<std::process::Child>,
+    host_dns_relay: Option<HostDnsRelay>,
 }
 
 impl CleanupGuard {
@@ -1559,6 +1561,7 @@ impl CleanupGuard {
             ),
             quiet: false,
             nix_serve_child: None,
+            host_dns_relay: None,
         }
     }
 
@@ -1741,6 +1744,7 @@ impl Drop for CleanupGuard {
         }
 
         if self.sidecar_id.is_empty() {
+            self.host_dns_relay.take();
             // A session can have host-port sockets without ever having had a
             // proxy; those are still resources that must be removed.
             if !self.quiet {
@@ -1771,6 +1775,7 @@ impl Drop for CleanupGuard {
             ProcessCommand::new("podman").args(["rm", "-f", &self.sidecar_id]),
             "stopping proxy",
         );
+        self.host_dns_relay.take();
 
         if !self.sidecar_shared.is_empty() && !self.quiet {
             let log = format!("{}/connections.jsonl", self.sidecar_shared);
@@ -3766,7 +3771,7 @@ fn run() -> Result<i32> {
         let sidecar_policy = format!("/tmp/agent-sandbox-policy-{}", uuid);
         let sidecar_secrets = format!("/tmp/agent-sandbox-secrets-{}", uuid);
 
-        fs::create_dir_all(&sidecar_shared)?;
+        create_private_dir(Path::new(&sidecar_shared))?;
         fs::create_dir_all(&sidecar_policy)?;
 
         cleanup_guard.sidecar_id = sidecar_id.clone();
@@ -3774,6 +3779,18 @@ fn run() -> Result<i32> {
         cleanup_guard.sidecar_policy = sidecar_policy.clone();
         cleanup_guard.session_word = session_word.clone();
         cleanup_guard.policies = policies.clone();
+
+        let host_dns_socket = Path::new(&sidecar_shared).join(agent_sandbox_proxy::dns::SOCKET_NAME);
+        let host_dns_relay = match HostDnsRelay::start(&host_dns_socket) {
+            Ok(relay) => relay,
+            Err(error) => {
+                return refuse(&format!(
+                    "agent-sandbox: could not start the host DNS relay: {}",
+                    error
+                ))
+            }
+        };
+        cleanup_guard.host_dns_relay = Some(host_dns_relay);
 
         // --disable-dns is load-bearing: podman routes a container's whole
         // resolver through aardvark-dns as soon as any of its networks has
@@ -3943,6 +3960,14 @@ fn run() -> Result<i32> {
             .args(["-v", &format!("{}:/sidecar_policy:ro", sidecar_policy)])
             .args(&sidecar_extra_mounts)
             .args(["-e", "AGENT_SANDBOX_SKIP_NIX_INIT=1"])
+            .args([
+                "-e",
+                &format!(
+                    "{}=/sidecar_shared/{}",
+                    agent_sandbox_proxy::dns::SOCKET_ENV,
+                    agent_sandbox_proxy::dns::SOCKET_NAME
+                ),
+            ])
             .args(["-e", &format!("SIDECAR_SUBNET={}", sidecar_subnet)])
             .args(&sidecar_extra_env)
             .args(["--label", "agent-sandbox.role=proxy"])

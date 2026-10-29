@@ -168,6 +168,16 @@ special-case loopback -- curl and requests do not -- would send a request aimed
 at a server in this very container to the sidecar and collect a `403`.  The
 exemption grants nothing, since the sandbox already owns its own netns.
 
+The launcher also runs a per-session host DNS relay while the sandbox is alive.
+The proxy asks it to resolve request destinations over a private Unix socket in
+the sidecar's shared directory; the sandbox does not mount that directory and
+gets no DNS or host-network access. The relay uses the host's ordinary OS
+resolver, so systemd-resolved can apply VPN and per-link DNS routing. If the
+socket is unavailable, the proxy reports a DNS failure rather than trying the
+sidecar's upstream nameservers. Resolved addresses still pass through the
+proxy's existing `deny_ip` check before it connects. The sidecar's configured
+nameservers remain available to its SSH relay subprocess.
+
 **`--disable-dns` is load-bearing.**  Podman routes a container's whole resolver
 through aardvark-dns as soon as *any* of its networks has `dns_enabled` --
 `podman-run(1)`, under `--dns`: "passing a custom network whose `dns_enabled` is
@@ -610,13 +620,12 @@ permitted by the proxy and then dropped on the floor by the route, with
 `policy show` reporting the rule as in force.
 
 The sidecar's nameservers, read from its own `/etc/resolv.conf`, are exempted
-unconditionally.  Resolution happens in the sidecar via libc, before any rule is
-consulted, so a `deny_ip` range containing the resolver blackholes DNS itself
-and fails every request rather than only the ones aimed at that range -- and the
-baseline's `192.168.0.0/16` does exactly that to a home router.  This is not a
+unconditionally because the SSH relay subprocess uses them. A `deny_ip` range
+containing a resolver would otherwise blackhole its name lookups, and the
+baseline's `192.168.0.0/16` does exactly that to a home router. This is not a
 way out: the sandbox has no route into this netns, its only egress is CONNECT to
-the proxy, and `is_denied_address` still runs over every resolved address, so a
-CONNECT aimed at the resolver stays refused.
+the proxy, and `is_denied_address` still runs over every resolved proxy
+destination, so a CONNECT aimed at the resolver stays refused.
 
 Because the sidecar is on that bridge, the proxy binds only the address it holds
 on the internal network, selected by subnet membership from `SIDECAR_SUBNET`
@@ -629,13 +638,9 @@ installs the routes and writes `ready`; only then does the launcher start the
 sandbox.  So routes are in place before any traffic can exist, and a bad policy
 exits 2 before touching the kernel table.
 
-The corollary is that the probe runs *before* the routes exist and so cannot
-catch a policy that blackholes the sidecar's own resolver: it proves egress,
-`sync_routes` then breaks it, and the session 502s with a clean startup behind
-it.  That is why the nameserver exemption above is unconditional rather than a
-reaction to a failed probe.  Reordering the markers would not help either --
-proving egress after the routes are installed would only turn a silent failure
-into a degraded launch, when the routes can simply be right.
+The readiness probe uses the host resolver relay before the routes exist. The
+nameserver exemption remains unconditional for SSH relay lookups, which happen
+after `sync_routes` installs the blackholes.
 
 The egress probe is never fatal -- a degraded launch beats a hung one -- but it
 is no longer silent: when it gives up it writes `egress-degraded` with the

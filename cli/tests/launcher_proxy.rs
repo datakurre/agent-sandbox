@@ -77,6 +77,24 @@ fn every_allowed_name_resolves_to_the_sidecar() {
 }
 
 #[test]
+fn host_resolver_socket_is_mounted_only_into_the_sidecar() {
+    let out = proxied_world().file("AGENTS.md", ALLOW_EXAMPLE).run(&[
+        "--workspace",
+        "--proxy",
+        "opencode",
+    ]);
+    let sidecar = out.sidecar_call().expect("proxy sidecar");
+    let sandbox = out.run_call();
+
+    assert_eq!(
+        sidecar.env_value("AGENT_SANDBOX_DNS_SOCKET"),
+        Some("/sidecar_shared/host-resolver.sock")
+    );
+    assert!(sidecar.mount_to("/sidecar_shared").is_some());
+    assert!(sandbox.mount_to("/sidecar_shared").is_none());
+}
+
+#[test]
 fn a_host_named_only_by_a_route_is_mapped_too() {
     // An `allowed_routes` host is subject to interception rather than a plain
     // tunnel, and reaching the proxy is a precondition for either.

@@ -229,25 +229,31 @@ the sidecar's routing table: the kernel's longest-prefix match is the same rule 
 applies, so a re-allowed range is genuinely reachable rather than permitted by the policy and
 then dropped by a route.
 
-**The sidecar's own resolvers are always reachable, whatever the policy says.** Names are
-resolved in the sidecar, by libc, before any rule is consulted, so a `deny_ip` range that
-happens to contain your nameserver would otherwise blackhole resolution itself and fail
-*every* request, not only the ones aimed at that range — and the startup egress probe cannot
-catch it, because it runs before the routes are installed. The baseline `192.168.0.0/16`
-alone covers a great many home resolvers. Exempting them is not a way out of the sandbox: the
-sandbox has no route into the sidecar at all, its only egress is `CONNECT` to the proxy, and
-the proxy still checks every resolved address against the policy's `deny_ip` ranges. A `CONNECT` aimed at your
-resolver stays refused.
+**The sidecar's own resolvers are always reachable, whatever the policy says.** They are
+used by the SSH relay subprocess, so a `deny_ip` range that happens to contain a nameserver
+would otherwise blackhole SSH name lookups. The baseline `192.168.0.0/16` alone covers a
+great many home resolvers. Exempting them is not a way out of the sandbox: the sandbox has
+no route into the sidecar at all, its only egress is `CONNECT` to the proxy, and the proxy
+still checks every resolved address against the policy's `deny_ip` ranges. A `CONNECT`
+aimed at your resolver stays refused.
 
-The nameservers themselves come from the host's `/etc/resolv.conf` (falling back to
-systemd-resolved's own `/run/systemd/resolve/resolv.conf`, since the `127.0.0.53` stub is
-not reachable from the sidecar). The host's `search` domains and resolver `options` travel
-with them, so an unqualified name that resolves on the host resolves in the sandbox too.
-When the host offers no usable nameserver at all, the sidecar falls back to the public
-`8.8.8.8` and `1.1.1.1`, and the search list is dropped along with the host's servers —
-a public resolver cannot answer for an internal zone. Names are resolved in the sidecar,
-so that fallback decides where the *proxy's* lookups go; `--podman-args` configures the
-sandbox container and cannot change it.
+The proxy resolves request destinations through a private, per-session Unix
+socket to the launcher's normal host resolver. This preserves systemd-resolved's
+per-link and VPN routing instead of copying the flattened nameserver list from
+`/run/systemd/resolve/resolv.conf`. The socket is mounted only into the
+sidecar, accepts bounded hostname lookups, and does not provide a route from the
+sandbox to the host. If the relay is missing or fails, proxy name resolution
+fails closed; it does not fall back to direct upstream DNS. The proxy continues
+to check every returned address against `deny_ip` before connecting.
+
+The sidecar still receives host nameserver and search configuration for its SSH
+relay subprocess. It reads `/etc/resolv.conf`, falling back to
+systemd-resolved's `/run/systemd/resolve/resolv.conf` when the former contains
+only the unreachable `127.0.0.53` stub; if neither provides a usable server it
+uses the public `8.8.8.8` and `1.1.1.1`. Those upstream resolvers remain
+exempted from the sidecar's blackhole routes. This is separate from the proxy's
+host-mediated lookups; `--podman-args` configures the sandbox container and
+cannot change either path.
 
 Hostnames are normalised before matching, so a trailing dot (`github.com.`) and an
 IPv4-mapped IPv6 literal (`[::ffff:10.0.0.1]`) match the same rules as their plain forms.
