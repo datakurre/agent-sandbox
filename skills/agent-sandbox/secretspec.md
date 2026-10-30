@@ -142,10 +142,11 @@ The secret is never in the sandbox's environment, filesystem, or process table.
 If a task requires reading the token itself, the answer is that it cannot be done
 this way — say so rather than looking for a workaround.
 
-For now, declare secret-bearing `[[network.allowed_routes]]` in the workspace
-`AGENTS.md`, not in an additional `--config FILE`: the launcher's secret-request
-collection reads `AGENTS.md` and host-owned policy files, but does not yet
-collect requested secret routes from `--config` files.
+Secret-bearing `[[network.allowed_routes]]` may be declared in `AGENTS.md`, an
+explicit `--config FILE`, or a selected host-owned policy. Every requested
+route is still checked against the shared host-side
+`~/.config/agent-sandbox/trusted.toml`; a project config file cannot authorize
+its own secret request.
 
 ## The three files that must agree
 
@@ -156,7 +157,8 @@ collect requested secret routes from `--config` files.
 GITHUB_TOKEN = { description = "GitHub API token", required = true }
 ```
 
-**2. `AGENTS.md`** (in the repo) binds it to one route:
+**2. `AGENTS.md` or `--config FILE`** (project-controlled configuration) binds
+it to one route:
 
 ````markdown
 ```toml agent-sandbox

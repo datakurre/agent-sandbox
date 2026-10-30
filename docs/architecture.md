@@ -525,12 +525,11 @@ The source of authority is a host-controlled TOML file
 (`~/.config/agent-sandbox/trusted.toml`), which defines the exact bindings --
 host and port, method, path, secret, header, prefix. The launcher calls the
 resolver in `cli/src/secrets.rs`, which cross-references that config with the
-policy's `secret_route` routes from `AGENTS.md`, and then runs `secretspec export`
-on the host to fetch the values. The filtered bindings are written 0600 into
+policy's `secret_route` routes from `AGENTS.md`, explicit `--config` files,
+and selected host-owned policies, and then runs `secretspec export` on the host
+to fetch the values. The filtered bindings are written 0600 into
 `/sidecar_secrets/bindings`, which only the sidecar mounts, as
 `domain<TAB>method<TAB>path<TAB>header<TAB>value`.
-Secret-bearing routes in additional `--config` files are not currently
-collected by the resolver; declare those routes in `AGENTS.md`.
 
 The route travels with the binding, and that is the design.  `AGENTS.md` is
 untrusted and controls the *other* rules on a host, so recording only the

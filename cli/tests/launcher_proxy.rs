@@ -584,6 +584,123 @@ secret = \"API_TOKEN\"
 }
 
 #[test]
+fn configured_secret_routes_require_shared_trusted_authorization() {
+    let config = "\
+[network]
+[[network.allowed_routes]]
+host = \"api.example.com:443\"
+method = \"GET\"
+path = \"/v1/*\"
+secret = \"API_TOKEN\"
+";
+    let trusted = "\
+[[network.allowed_routes]]
+host = \"api.example.com:443\"
+method = \"GET\"
+path = \"/v1/*\"
+secret = \"API_TOKEN\"
+";
+    let unauthorized_world = proxied_world()
+        .file("config.toml", config)
+        .file("secretspec.toml", "")
+        .stub_bin(
+            "secretspec",
+            "#!/bin/sh\nprintf '%s\\n' '{\"secrets\":{\"API_TOKEN\":\"config-secret\"}}'\n",
+        );
+
+    let unauthorized = unauthorized_world.run(&[
+        "--workspace",
+        "--proxy",
+        "--config",
+        "config.toml",
+        "--secrets",
+        "opencode",
+    ]);
+    assert!(
+        unauthorized
+            .stderr
+            .contains("selected network policy requests secret 'API_TOKEN'"),
+        "an untrusted config secret request must be refused:\n{}",
+        unauthorized.stderr
+    );
+    assert!(
+        unauthorized.stderr.contains("trusted.toml"),
+        "the refusal must identify the host authorization file:\n{}",
+        unauthorized.stderr
+    );
+
+    let authorized_world = proxied_world()
+        .file("config.toml", config)
+        .file("secretspec.toml", "")
+        .stub_bin(
+            "secretspec",
+            "#!/bin/sh\nprintf '%s\\n' '{\"secrets\":{\"API_TOKEN\":\"config-secret\"}}'\n",
+        )
+        .home_file(".config/agent-sandbox/trusted.toml", trusted);
+    let bindings_path = authorized_world
+        .captured("sidecar_secrets")
+        .join("bindings");
+    let authorized = authorized_world.run(&[
+        "--workspace",
+        "--proxy",
+        "--config",
+        "config.toml",
+        "--secrets",
+        "opencode",
+    ]);
+    assert!(authorized.reached_podman_run(), "{}", authorized.stderr);
+    assert!(
+        authorized
+            .stderr
+            .contains("agent-sandbox: secret: injected API_TOKEN"),
+        "authorized config route was not resolved:\n{}",
+        authorized.stderr
+    );
+    let bindings = fs::read_to_string(bindings_path)
+        .expect("the sidecar should receive the authorized config binding");
+    assert!(bindings.contains("config-secret"));
+}
+
+#[test]
+fn identical_agents_and_config_secret_routes_register_only_once() {
+    let route = "\
+[[network.allowed_routes]]
+host = \"api.example.com:443\"
+method = \"GET\"
+path = \"/v1/*\"
+secret = \"API_TOKEN\"
+";
+    let agents = format!("```toml agent-sandbox\n[network]\n{}\n```\n", route);
+    let config = format!("[network]\n{}", route);
+    let trusted = route.to_string();
+    let world = proxied_world()
+        .file("AGENTS.md", &agents)
+        .file("config.toml", &config)
+        .file("secretspec.toml", "")
+        .home_file(".config/agent-sandbox/trusted.toml", &trusted)
+        .stub_bin(
+            "secretspec",
+            "#!/bin/sh\nprintf '%s\\n' '{\"secrets\":{\"API_TOKEN\":\"config-secret\"}}'\n",
+        );
+    let out = world.run(&[
+        "--workspace",
+        "--proxy",
+        "--config",
+        "config.toml",
+        "--secrets",
+        "opencode",
+    ]);
+
+    assert!(out.reached_podman_run(), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("agent-sandbox: secret: injected API_TOKEN"),
+        "duplicate source declarations should resolve once:\n{}",
+        out.stderr
+    );
+}
+
+#[test]
 fn the_sidecar_is_torn_down_when_the_launch_ends() {
     let out = proxied_world().file("AGENTS.md", ALLOW_EXAMPLE).run(&[
         "--workspace",

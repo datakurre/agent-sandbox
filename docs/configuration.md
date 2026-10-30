@@ -38,11 +38,12 @@ Use `--no-agents-md` to ignore the workspace file as a launcher configuration
 source while continuing to apply explicit `--config` files and host-owned
 `--policy` files. This does not hide or remove `AGENTS.md` from an agent when
 the workspace itself is mounted. Current limitation: when `--secrets` is
-enabled, secret-request collection still reads `AGENTS.md`.
+enabled, secret-request collection still reads `AGENTS.md` even when this flag
+is used.
 
 Treat both `AGENTS.md` and explicit `--config` files as project-controlled
-input. Secret-bearing routes currently need to be declared in `AGENTS.md`:
-`--secrets` does not yet collect secret requests from `--config` files.
+input. When `--secrets` is active, secret-bearing routes from either source
+must still be authorized in the host's shared `trusted.toml`.
 
 ## Supported Tables
 
@@ -321,9 +322,10 @@ unauthorized:
 #### Secrets
 
 A rule's `secret` names a secret, never its value. The launcher will only
-inject a secret you have also authorized host-side. Secret-bearing routes must
-currently be declared in `AGENTS.md`; `--config` route declarations are not yet
-collected as secret requests.
+inject a secret you have also authorized host-side. Secret-bearing routes may
+be declared in `AGENTS.md` or an explicit `--config` file; both are
+project-controlled requests and require a matching entry in
+`~/.config/agent-sandbox/trusted.toml`.
 
 **Copy the block verbatim.** Authorization matches on every field — `host`
 (including its port), `method`, `path`, `secret`, `header` and `prefix` — so

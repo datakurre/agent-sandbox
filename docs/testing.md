@@ -154,9 +154,10 @@ secret key, `30-secret-injection` needs `AGENT_SANDBOX_TEST_SECRET` set to any
 value.
 
 `30-secret-injection` needs one thing more, and deliberately does not arrange it
-for itself. A `secret` in an `AGENTS.md` route is a *request* that the host must
-authorize in `~/.config/agent-sandbox/trusted.toml` before anything is injected
-— an untrusted project file cannot spend your credentials on its own. The case
+for itself. A `secret` in an `AGENTS.md` or `--config` route is a *request* that
+the host must authorize in `~/.config/agent-sandbox/trusted.toml` before
+anything is injected — an untrusted project file cannot spend your credentials
+on its own. The case
 skips on that refusal and prints the block to add. Authorizing it from inside
 the test would forge the very approval the feature exists to require, so that
 one step stays yours:

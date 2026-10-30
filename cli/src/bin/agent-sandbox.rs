@@ -3979,14 +3979,16 @@ fn run() -> Result<i32> {
             cleanup_guard.sidecar_secrets = sidecar_secrets.clone();
             let config = trusted::config_path(&home);
             let manifest = Path::new(&pwd).join("secretspec.toml");
-            let mut policy_paths: Vec<PathBuf> = policies
-                .iter()
-                .filter_map(|name| policy_path(&home, name).ok())
-                .collect();
+            let mut route_sources = config_files.clone();
+            route_sources.extend(
+                policies
+                    .iter()
+                    .filter_map(|name| policy_path(&home, name).ok()),
+            );
             if policy_enabled && !agent.is_empty() {
                 if let Ok(path) = policy_path(&home, &agent) {
                     if path.exists() {
-                        policy_paths.push(path);
+                        route_sources.push(path);
                     }
                 }
             }
@@ -3995,7 +3997,7 @@ fn run() -> Result<i32> {
                 &config,
                 &manifest,
                 &agents_md_path,
-                &policy_paths,
+                &route_sources,
             ) {
                 Ok(bindings) => bindings,
                 Err(e) => return refuse(e.to_string().trim_end()),

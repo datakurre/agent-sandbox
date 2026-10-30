@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SecretRule {
     pub host: String,
     pub method: String,
@@ -325,7 +325,7 @@ pub fn resolve_secrets_with_policies(
     config: &Path,
     file: &Path,
     workspace: &Path,
-    policy_files: &[std::path::PathBuf],
+    route_sources: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<ResolvedSecret>> {
     let secret_routes = policy_secret_routes(policy);
 
@@ -334,9 +334,14 @@ pub fn resolve_secrets_with_policies(
     }
 
     let mut requested_rules = get_requested_rules(workspace);
-    for policy_file in policy_files {
-        if let Ok(content) = std::fs::read_to_string(policy_file) {
-            requested_rules.extend(requested_rules_from_toml(&content));
+    let mut seen_rules: std::collections::HashSet<_> = requested_rules.iter().cloned().collect();
+    for source in route_sources {
+        if let Ok(content) = std::fs::read_to_string(source) {
+            for rule in requested_rules_from_toml(&content) {
+                if seen_rules.insert(rule.clone()) {
+                    requested_rules.push(rule);
+                }
+            }
         }
     }
 
