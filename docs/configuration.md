@@ -1,6 +1,6 @@
 # Configuration
 
-`AGENTS.md` in the root of a project can contain a fenced code block tagged `agent-sandbox` with TOML configuration. The launcher reads it when starting the sandbox and uses it to expose ports, bind host paths, and enforce a network firewall policy. Network policies can also be kept as reusable host-owned policy files.
+`AGENTS.md` in the root of a project can contain a fenced code block tagged `agent-sandbox` with TOML configuration. The launcher reads it when starting the sandbox and uses it to expose ports, bind host paths, set container environment variables, and enforce a network firewall policy. Repeatable `--config FILE` options add bare TOML configuration files with the same supported tables. Network policies can also be kept as reusable host-owned policy files.
 
 Configurations must be written in TOML and placed inside a fenced code block tagged with `agent-sandbox`:
 
@@ -11,6 +11,33 @@ Configurations must be written in TOML and placed inside a fenced code block tag
 ````
 
 The launcher parses this configuration when starting the sandbox environment.
+
+## Additional Configuration Files
+
+Pass one or more bare TOML files with `--config`. Each file can contain any
+combination of `[ports]`, `[mounts]`, `[network]`, and `[env]`; it does not need a
+Markdown code fence:
+
+```toml
+[ports]
+web = 3000
+
+[network]
+allowed_hosts = ["github.com:443"]
+```
+
+The launcher reads the workspace `AGENTS.md` first, followed by `--config`
+files in command-line order. Port and network declarations combine under their
+existing strict validation rules, so duplicate port names and conflicting
+network rules refuse the launch; `[env]` uses the later-source precedence
+described below. The relevant opt-in flags still gate application: use
+`--ports` to publish declared ports, `--mounts` to apply mounts, and `--proxy`
+to enforce network rules.
+
+Use `--no-agents-md` to ignore the workspace file as a launcher configuration
+source while continuing to apply explicit `--config` files and host-owned
+`--policy` files. This does not hide or remove `AGENTS.md` from an agent when
+the workspace itself is mounted.
 
 ## Supported Tables
 
@@ -468,6 +495,27 @@ without regard to case, as the proxy does:
 There is no `deny` key. The firewall is deny-by-default, and the only deny rules
 a policy carries are the built-in private and loopback ranges the launcher adds
 to every session. See [Trust model](trust-model.md).
+
+### `[env]`
+
+`[env]` maps environment-variable names to literal string values. The launcher
+passes these values into the sandbox whenever their configuration source is
+selected; unlike ports, mounts, and network rules, there is no separate opt-in
+flag. For example:
+
+```toml
+[env]
+APP_MODE = "development"
+FEATURE_X = "enabled"
+```
+
+Names must match `[A-Za-z_][A-Za-z0-9_]*`. Values must be strings, are not
+expanded from the host environment, and may not contain NUL. Names beginning
+with `AGENT_SANDBOX_` are reserved for launcher-managed settings. When a name
+appears more than once, a later `--config` file replaces the earlier value;
+explicit `-e`/`--env` arguments take precedence over configuration. Use
+`--no-agents-md` to omit the workspace file while keeping explicit config
+files active.
 
 ## Reusable Network Policies
 

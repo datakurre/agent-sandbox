@@ -95,10 +95,13 @@ are unit-tested without a podman.  Call flow:
     are selected — the positionally-launched one by default, or the set chosen
     via `--agent-mounts`/`--agent-mounts=…` — sourced from `agents.nix`
     (opencode, claude, copilot, antigravity, codex, pi).
-3. Build the env array from toggles (SSH_AUTH_SOCK, the flattened git config
-   and identity, CONTAINER_HOST, DOCKER_HOST, TERM, COLORTERM).
-4. Add `[ports]` and `[mounts]` declared in `AGENTS.md` (`cli/src/agents.rs`),
-   under `--ports`/`--mounts`.  An invalid block refuses the launch.
+3. Build the env array from toggles and configured `[env]` values
+   (SSH_AUTH_SOCK, the flattened git config and identity, CONTAINER_HOST,
+   DOCKER_HOST, TERM, COLORTERM).
+4. Add `[ports]` and `[mounts]` declared in workspace configuration
+   (`AGENTS.md` plus any `--config` TOML files, unless `--no-agents-md` is
+   passed) under `--ports`/`--mounts`. The same sources supply `[network]`
+   under `--proxy`. An invalid active declaration refuses the launch.
 5. Create ephemeral `/etc/passwd` and `/etc/group` with the host user's uid/gid,
    and name the container `agent-sandbox-<workspace>-<selector>`, where the
    selector is the random session word unless `--name NAME` supplies a
@@ -469,7 +472,8 @@ log of what it did. Changing policy is therefore a host-side operation
 `agent-sandbox-allow` was deleted rather than repaired.
 
 **Policy format.** The proxy enforces the merged declarative `[network]` blocks
-from `AGENTS.md`, any explicitly selected host-owned policies (`--policy`), and
+from `AGENTS.md` and any `--config` TOML files (unless `--no-agents-md` skips
+the workspace file), any explicitly selected host-owned policies (`--policy`), and
 the launched agent's own policy file if one exists
 (`~/.config/agent-sandbox/policies/<agent>.toml`).
 `[network].allowed_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each

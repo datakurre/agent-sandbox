@@ -983,7 +983,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option(
         "--proxy",
         Some(fmt(want_proxy)),
-        "Deny-by-default network firewall enforcing AGENTS.md's [network] policy.",
+        "Deny-by-default network firewall enforcing [network] from AGENTS.md and --config files.",
     );
     print_help_option(
         "--policy NAME",
@@ -1006,11 +1006,23 @@ forwarding SSH, or exposing Git identity.
         "Runs the sandbox as a KVM microVM with its own kernel (needs /dev/kvm).",
     );
 
+    println!("\nConfiguration:");
+    print_help_option(
+        "--no-agents-md",
+        None,
+        "Ignore launcher configuration in the workspace AGENTS.md; explicit --config files remain active.",
+    );
+    print_help_option(
+        "--config FILE",
+        None,
+        "Load bare TOML with [ports], [mounts], [network], and/or [env]. Repeatable; [env] applies automatically.",
+    );
+
     println!("\nPorts:");
     print_help_option(
         "--ports / --no-ports",
         Some(fmt(want_ports)),
-        "Honors [ports] declarations from AGENTS.md.",
+        "Honors [ports] declarations from AGENTS.md and --config files.",
     );
     print_help_option(
         "--ports-any-interface",
@@ -1026,7 +1038,7 @@ forwarding SSH, or exposing Git identity.
     print_help_option("--host-loopback-port PORT", Some(fmt(want_host_ports)), "Makes a host 127.0.0.1:PORT reachable at the sandbox's own 127.0.0.1:PORT (e.g. a browser's CDP port). Repeatable; takes HOST:SANDBOX to remap. Not with --krun.");
 
     println!("\nMounts:");
-    print_help_option("--mounts / --no-mounts", Some(fmt(want_mounts)), "Honors [mounts] declarations from AGENTS.md; a source outside the workspace also needs the same entry in trusted.toml.");
+    print_help_option("--mounts / --no-mounts", Some(fmt(want_mounts)), "Honors [mounts] declarations from AGENTS.md and --config files; a source outside the workspace also needs the same entry in trusted.toml.");
 
     println!("\nAgent state:");
     print_help_option(
@@ -1981,6 +1993,8 @@ fn run() -> Result<i32> {
     let mut want_browser = false;
     let mut want_browser_names: Vec<String> = Vec::new();
     let mut want_mounts = false;
+    let mut use_agents_md = true;
+    let mut config_files: Vec<PathBuf> = Vec::new();
     let mut want_agent_mounts_mode = AgentMountsMode::Auto;
     let mut want_proxy = false;
     let mut use_agents_network = false;
@@ -2121,6 +2135,9 @@ fn run() -> Result<i32> {
                     | "--tmpfs"
                     | "--host-loopback-port"
                     | "--policy" => {
+                        i += 2;
+                    }
+                    "--config" => {
                         i += 2;
                     }
                     _ => {
@@ -2304,6 +2321,7 @@ fn run() -> Result<i32> {
             }
             "--mounts" => want_mounts = true,
             "--no-mounts" => want_mounts = false,
+            "--no-agents-md" => use_agents_md = false,
             "--agent-mounts" => want_agent_mounts_mode = AgentMountsMode::All,
             "--no-agent-mounts" => want_agent_mounts_mode = AgentMountsMode::None,
             "--proxy" => {
@@ -2423,6 +2441,21 @@ fn run() -> Result<i32> {
                     // not itself turn the proxy on: --policy without --proxy
                     // is refused below, once the whole command line is read.
                     policies.push(value);
+                } else if arg == "--config" || arg.starts_with("--config=") {
+                    let value = match arg.strip_prefix("--config=") {
+                        Some(v) => v.to_string(),
+                        None => {
+                            i += 1;
+                            if i >= args.len() {
+                                fail("agent-sandbox: --config needs a TOML file path");
+                            }
+                            args[i].clone()
+                        }
+                    };
+                    if value.is_empty() {
+                        fail("agent-sandbox: --config needs a TOML file path");
+                    }
+                    config_files.push(PathBuf::from(value));
                 } else if arg == "--krun-memory" {
                     i += 1;
                     if i >= args.len() {
@@ -2840,6 +2873,75 @@ fn run() -> Result<i32> {
         .to_string_lossy()
         .into_owned();
     let agents_md_path = Path::new(&pwd).join("AGENTS.md");
+    let mut config_text = String::new();
+    let mut config_sources = Vec::new();
+    if use_agents_md && agents_md_path.exists() {
+        match fs::read_to_string(&agents_md_path) {
+            Ok(text) => {
+                config_text.push_str(&text);
+                config_sources.push(agents_md_path.display().to_string());
+            }
+            Err(e) => fail(&format!(
+                "agent-sandbox: cannot read {}: {}",
+                agents_md_path.display(),
+                e
+            )),
+        }
+    }
+    for path in &config_files {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                fail(&format!(
+                    "agent-sandbox: cannot read config '{}': {}",
+                    path.display(),
+                    e
+                ))
+            }
+        };
+        let block = match agents::config_file_block(&text) {
+            Ok(block) => block,
+            Err(e) => {
+                fail(&format!(
+                    "agent-sandbox: invalid config '{}': {}",
+                    path.display(),
+                    e
+                ))
+            }
+        };
+        config_text.push_str(&block);
+        config_sources.push(path.display().to_string());
+    }
+    let config_source_summary = if config_sources.is_empty() {
+        "configuration".to_string()
+    } else {
+        config_sources.join(", ")
+    };
+    if !config_text.is_empty() {
+        let configured_env = match agents::parse_env(&config_text) {
+            Ok(values) => values,
+            Err(e) => fail(&format!(
+                "agent-sandbox: invalid environment configuration in {}: {}",
+                config_source_summary, e
+            )),
+        };
+        let explicit_env_keys: HashSet<String> = env_args
+            .chunks_exact(2)
+            .filter(|pair| pair[0] == "-e")
+            .map(|pair| {
+                pair[1]
+                    .split_once('=')
+                    .map_or(pair[1].as_str(), |(name, _)| name)
+                    .to_string()
+            })
+            .collect();
+        for (key, value) in configured_env {
+            if !explicit_env_keys.contains(&key) {
+                env_args.push("-e".to_string());
+                env_args.push(format!("{}={}", key, value));
+            }
+        }
+    }
     let runtime_dir = env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
 
@@ -3108,14 +3210,17 @@ fn run() -> Result<i32> {
     // no block at all.  Nothing from AGENTS.md is ever passed to podman as an
     // argument of its own.
 
-    if want_ports && agents_md_path.exists() {
-        let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
-        let declared = match agents::parse_ports(&text, want_ports_any_interface, agents::MAX_PORTS)
+    if want_ports && !config_text.is_empty() {
+        let declared = match agents::parse_ports(
+            &config_text,
+            want_ports_any_interface,
+            agents::MAX_PORTS,
+        )
         {
             Ok(mappings) => mappings,
             Err(e) => {
-                eprintln!("agent-sandbox: {}", e);
-                fail("agent-sandbox: refusing to launch on an invalid [ports] block (use --no-ports to skip).");
+                eprintln!("agent-sandbox: {}: {}", config_source_summary, e);
+                fail("agent-sandbox: refusing to launch on invalid [ports] configuration (use --no-ports to skip).");
             }
         };
         for mapping in declared {
@@ -3144,13 +3249,12 @@ fn run() -> Result<i32> {
         }
     }
 
-    if want_mounts && agents_md_path.exists() {
-        let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
-        let declared = match agents::parse_mount_decls(&text) {
+    if want_mounts && !config_text.is_empty() {
+        let declared = match agents::parse_mount_decls(&config_text) {
             Ok(decls) => decls,
             Err(e) => {
-                eprintln!("agent-sandbox: {}", e);
-                fail("agent-sandbox: refusing to launch on an invalid [mounts] block (use --no-mounts to skip).");
+                eprintln!("agent-sandbox: {}: {}", config_source_summary, e);
+                fail("agent-sandbox: refusing to launch on invalid [mounts] configuration (use --no-mounts to skip).");
             }
         };
         let expand = |decl: &agents::MountDecl| expand_v(decl, Path::new(&pwd), &home);
@@ -3353,35 +3457,32 @@ fn run() -> Result<i32> {
     let mut policy_sources = HashMap::new();
     let mut startup_info = StartupInfo::new(want_json);
 
-    if use_agents_network && agents_md_path.exists() {
-        let text = fs::read_to_string(&agents_md_path).unwrap_or_default();
-        match parse_proxy(&text) {
+    if use_agents_network && !config_text.is_empty() {
+        match parse_proxy(&config_text) {
             Ok(policy) => {
                 merged_policy.merge(policy);
-                startup_info.policy(&format!("loaded {}", agents_md_path.display()));
+                startup_info.policy(&format!("loaded {}", config_source_summary));
             }
             Err(e) => {
-                eprintln!("agent-sandbox: {}", e);
-                return refuse("agent-sandbox: refusing to launch on an invalid [network] block (use --no-proxy to skip).");
+                eprintln!("agent-sandbox: {}: {}", config_source_summary, e);
+                return refuse("agent-sandbox: refusing to launch on invalid [network] configuration (use --no-proxy to skip).");
             }
         }
-    } else if !want_proxy && agents_md_path.exists() {
+    } else if !want_proxy && !config_text.is_empty() {
         // Preserve the existing diagnostic when a project declares network
         // rules but the caller did not enable proxy mode.
-        if let Ok(text) = fs::read_to_string(&agents_md_path) {
-            match parse_proxy(&text) {
-                Ok(policy) => {
-                    proxy_configured = !policy.allow_host.is_empty()
-                        || !policy.allow_ip.is_empty()
-                        || !policy.allow_port.is_empty()
-                        || !policy.allow_route.is_empty();
-                    secrets_configured = !policy.secret_route.is_empty();
-                }
-                Err(e) => eprintln!(
-                    "agent-sandbox: warning: invalid [network] block in AGENTS.md: {}",
-                    e
-                ),
+        match parse_proxy(&config_text) {
+            Ok(policy) => {
+                proxy_configured = !policy.allow_host.is_empty()
+                    || !policy.allow_ip.is_empty()
+                    || !policy.allow_port.is_empty()
+                    || !policy.allow_route.is_empty();
+                secrets_configured = !policy.secret_route.is_empty();
             }
+            Err(e) => eprintln!(
+                "agent-sandbox: warning: invalid [network] configuration: {}",
+                e
+            ),
         }
     }
 

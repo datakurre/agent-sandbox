@@ -3,7 +3,7 @@
 use agent_sandbox_proxy::policy::ProxyConfig;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, TcpListener, UdpSocket};
 use thiserror::Error;
 use toml::Value;
@@ -101,6 +101,79 @@ pub fn iter_tagged_blocks(text: &str) -> Vec<String> {
         }
     }
     blocks
+}
+
+/// Validate a bare TOML config file and wrap it as a tagged block so the
+/// existing AGENTS.md parsers apply the same table and field validation.
+pub fn config_file_block(text: &str) -> Result<String, ConfigError> {
+    let value: Value = text
+        .parse()
+        .map_err(|e| ConfigError::msg(format!("malformed TOML config file: {}", e)))?;
+    let table = value
+        .as_table()
+        .ok_or_else(|| ConfigError::msg("config file must contain a TOML table"))?;
+    if table.is_empty() {
+        return Err(ConfigError::msg(
+            "config file must contain at least one of [ports], [mounts], [network], or [env]",
+        ));
+    }
+    if let Some(unknown) = table
+        .keys()
+        .find(|key| !["ports", "mounts", "network", "env"].contains(&key.as_str()))
+    {
+        return Err(ConfigError::msg(format!(
+            "config file: unknown top-level table '{}'; supported tables are [ports], [mounts], [network], and [env]",
+            unknown
+        )));
+    }
+    Ok(format!("```toml agent-sandbox\n{}\n```\n", text))
+}
+
+/// Read configured environment values in source order. Later sources replace
+/// earlier values; host environment expansion is deliberately not supported.
+pub fn parse_env(text: &str) -> Result<Vec<(String, String)>, ConfigError> {
+    let mut values = BTreeMap::new();
+    for body in iter_tagged_blocks(text) {
+        let block: Value = body.parse().map_err(|e| {
+            ConfigError::msg(format!("malformed TOML in agent-sandbox block: {}", e))
+        })?;
+        let Some(env) = block.get("env") else {
+            continue;
+        };
+        let env_table = env
+            .as_table()
+            .ok_or_else(|| ConfigError::msg("[env] must be a table"))?;
+        for (key, value) in env_table {
+            let mut chars = key.chars();
+            let valid_name = chars
+                .next()
+                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+            if !valid_name {
+                return Err(ConfigError::msg(format!(
+                    "[env].{}: invalid environment variable name",
+                    key
+                )));
+            }
+            if key.starts_with("AGENT_SANDBOX_") {
+                return Err(ConfigError::msg(format!(
+                    "[env].{}: names beginning with AGENT_SANDBOX_ are reserved",
+                    key
+                )));
+            }
+            let value = value.as_str().ok_or_else(|| {
+                ConfigError::msg(format!("[env].{}: expected a string value", key))
+            })?;
+            if value.contains('\0') {
+                return Err(ConfigError::msg(format!(
+                    "[env].{}: values must not contain NUL",
+                    key
+                )));
+            }
+            values.insert(key.clone(), value.to_string());
+        }
+    }
+    Ok(values.into_iter().collect())
 }
 
 fn _port(name: &str, field: &str, value: &Value, allow_zero: bool) -> Result<u16, ConfigError> {
@@ -981,8 +1054,10 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
         })?;
 
         if let Some(table) = block.as_table() {
-            let allowed_tables: HashSet<&str> =
-                ["network", "ports", "mounts"].iter().cloned().collect();
+            let allowed_tables: HashSet<&str> = ["network", "ports", "mounts", "env"]
+                .iter()
+                .cloned()
+                .collect();
             let unknown: Vec<_> = table
                 .keys()
                 .filter(|k| !allowed_tables.contains(k.as_str()))
@@ -1541,6 +1616,52 @@ fn network_toml(emit: &ProxyConfig, reach: &ProxyConfig) -> String {
 mod export_tests {
     use super::*;
     use agent_sandbox_proxy::policy::parse_policy;
+
+    #[test]
+    fn wraps_bare_config_toml_and_rejects_unknown_top_level_tables() {
+        let wrapped = config_file_block(
+            "[ports]\nweb = 3000\n[network]\nallowed_hosts = []\n[env]\nMODE = \"dev\"",
+        )
+            .expect("supported TOML config");
+        assert_eq!(
+            parse_ports(&wrapped, false, MAX_PORTS)
+                .expect("valid ports")
+                .len(),
+            1
+        );
+        assert!(config_file_block("[unsupported]\nvalue = 1")
+            .expect_err("unknown table")
+            .to_string()
+            .contains("unknown top-level table"));
+    }
+
+    #[test]
+    fn env_values_merge_in_source_order() {
+        let earlier = "```toml agent-sandbox\n[env]\nMODE = \"dev\"\nKEEP = \"yes\"\n```\n";
+        let later = config_file_block("[env]\nMODE = \"prod\"").expect("valid TOML config");
+
+        assert_eq!(
+            parse_env(&format!("{earlier}{later}")).expect("valid environment config"),
+            vec![
+                ("KEEP".to_string(), "yes".to_string()),
+                ("MODE".to_string(), "prod".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_rejects_invalid_names_reserved_names_and_non_string_values() {
+        for (declaration, expected) in [
+            ("BAD-NAME = \"value\"", "invalid environment variable name"),
+            ("AGENT_SANDBOX_RELAY_SSH = \"1\"", "are reserved"),
+            ("COUNT = 3", "expected a string value"),
+        ] {
+            let config = config_file_block(&format!("[env]\n{declaration}"))
+                .expect("TOML structure is valid");
+            let err = parse_env(&config).expect_err(declaration).to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
 
     #[test]
     fn exports_allow_entries_and_l7_rules_as_toml() {

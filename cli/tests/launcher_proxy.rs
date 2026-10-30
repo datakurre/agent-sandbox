@@ -77,6 +77,44 @@ fn every_allowed_name_resolves_to_the_sidecar() {
 }
 
 #[test]
+fn no_agents_md_uses_explicit_full_config_toml_for_network_policy() {
+    let world = proxied_world()
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[network]\nallowed_hosts = [\"agents.example.com:443\"]\n```\n",
+        )
+        .file(
+            "sandbox.toml",
+            "[env]\nMODE = \"config\"\n[network]\nallowed_hosts = [\"config.example.com:443\"]\n",
+        );
+    let out = world.run(&[
+        "--workspace",
+        "--proxy",
+        "--no-agents-md",
+        "--config",
+        "sandbox.toml",
+        "opencode",
+    ]);
+
+    assert!(out.reached_podman_run(), "{}", out.stderr);
+    assert!(
+        out.run_call().values_of("-e").contains(&"MODE=config"),
+        "{}",
+        out.run_call().joined()
+    );
+    let dir = world.captured("sidecar_policy");
+    let policy = fs::read_to_string(dir.join("policy")).expect("the live policy file");
+    assert!(
+        policy.lines().any(|line| line == "allow_host config.example.com:443"),
+        "{policy}"
+    );
+    assert!(
+        !policy.lines().any(|line| line == "allow_host agents.example.com:443"),
+        "{policy}"
+    );
+}
+
+#[test]
 fn a_host_named_only_by_a_route_is_mapped_too() {
     // An `allowed_routes` host is subject to interception rather than a plain
     // tunnel, and reaching the proxy is a precondition for either.

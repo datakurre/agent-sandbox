@@ -508,6 +508,108 @@ fn ports_publishes_the_declared_mappings_on_loopback_by_default() {
 }
 
 #[test]
+fn bare_config_toml_supplies_ports_and_mounts() {
+    let out = World::new()
+        .file(
+            "sandbox.toml",
+            "[ports]\nweb = 3001\n[mounts]\n\"cache\" = \"/workspace/cache\"\n",
+        )
+        .file("cache/keep", "")
+        .run(&[
+            "--workspace",
+            "--ports",
+            "--mounts",
+            "--config",
+            "sandbox.toml",
+            "opencode",
+        ]);
+    let run = out.run_call();
+
+    assert!(
+        run.values_of("-p").contains(&"127.0.0.1:3001:3001/tcp"),
+        "{}",
+        run.joined()
+    );
+    assert!(run.mount_to("/workspace/cache").is_some(), "{}", run.joined());
+}
+
+#[test]
+fn no_agents_md_keeps_explicit_config_files_active() {
+    let out = World::new()
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[ports]\nfrom_agents = 3001\n```\n",
+        )
+        .file("sandbox.toml", "[ports]\nfrom_file = 3002\n")
+        .run(&[
+            "--workspace",
+            "--ports",
+            "--no-agents-md",
+            "--config=sandbox.toml",
+            "opencode",
+        ]);
+    let run = out.run_call();
+    let published = run.values_of("-p");
+
+    assert_eq!(published, vec!["127.0.0.1:3002:3002/tcp"]);
+}
+
+#[test]
+fn configured_env_merges_in_source_order_and_cli_env_wins() {
+    let out = World::new()
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[env]\nMODE = \"agents\"\nAGENT_ONLY = \"yes\"\nCLI_MODE = \"agents\"\n```\n",
+        )
+        .file(
+            "first.toml",
+            "[env]\nMODE = \"first\"\nCLI_MODE = \"first\"\nLONG_MODE = \"first\"\n",
+        )
+        .file(
+            "second.toml",
+            "[env]\nMODE = \"second\"\nCLI_MODE = \"second\"\nLONG_MODE = \"second\"\n",
+        )
+        .run(&[
+            "--config",
+            "first.toml",
+            "--config=second.toml",
+            "-e",
+            "CLI_MODE=explicit",
+            "--env",
+            "LONG_MODE=explicit",
+            "opencode",
+        ]);
+    let run = out.run_call();
+    let env = run.values_of("-e");
+
+    assert!(env.contains(&"MODE=second"), "{env:?}");
+    assert!(env.contains(&"AGENT_ONLY=yes"), "{env:?}");
+    assert!(env.contains(&"CLI_MODE=explicit"), "{env:?}");
+    assert!(env.contains(&"LONG_MODE=explicit"), "{env:?}");
+    assert_eq!(
+        env.iter().filter(|value| value.starts_with("CLI_MODE=")).count(),
+        1,
+        "{env:?}"
+    );
+}
+
+#[test]
+fn no_agents_md_omits_declared_env_but_keeps_config_file_env() {
+    let out = World::new()
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[env]\nFROM_AGENTS = \"ignored\"\n```\n",
+        )
+        .file("env.toml", "[env]\nFROM_FILE = \"active\"\n")
+        .run(&["--no-agents-md", "--config", "env.toml", "opencode"]);
+    let run = out.run_call();
+    let env = run.values_of("-e");
+
+    assert!(env.contains(&"FROM_FILE=active"), "{env:?}");
+    assert!(!env.iter().any(|value| value.starts_with("FROM_AGENTS=")), "{env:?}");
+}
+
+#[test]
 fn a_wider_bind_needs_the_flag_that_names_the_risk() {
     let agents_md = "\
 ```toml agent-sandbox
