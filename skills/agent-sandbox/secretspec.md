@@ -197,6 +197,12 @@ for but the host has not authorized **refuses the launch** and prints the exact
 block to paste — when a user reports that refusal, the fix is to copy the printed
 block unchanged, not to retype it.
 
+`method` may be a comma-separated list such as `"HEAD,GET"` (no spaces), which
+expands into separate method-specific secret bindings. The trusted route must
+name the same methods in the same order; trusted-side method comparison remains
+case-insensitive for compatibility. Do not authorize a wider list by adding
+extra methods.
+
 A secret route's `host` must name port `443` or no port. Secrets are injected
 only into HTTPS the proxy intercepts, which is port 443, so the launcher refuses
 a rule like `api.example.com:8443` with a `secret` instead of authorizing it.

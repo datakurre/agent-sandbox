@@ -290,7 +290,8 @@ fn grant_lines(row: &DeniedEntry) -> Vec<String> {
     }
 }
 
-/// The route policy line that would let an L7-denied row through.
+/// The route policy line that would let an L7-denied row through. It
+/// intentionally grants only the method observed on that request.
 ///
 /// Returns `None` for non-egress decisions (SSH/GPG relay) or before a real
 /// HTTP method is known (e.g. CONNECT-level denials). Uses the path captured
@@ -875,9 +876,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let legend_text = match view {
                 View::Requests | View::Connections if show_detail => "↑/↓ scroll   [d]/[Esc] Back   [q] Quit",
-                View::Requests => "↑/↓ select   [d] Details   [a] Allow (domain / SSH host)   [h] Allow HTTP route   [A] Allow IP\n[v] Connections view   [r] Rules view   [c] Clear   [q]/[Esc] Quit",
+                View::Requests => "↑/↓ select   [d] Details   [a] Allow (domain / SSH host)   [h] Allow observed HTTP method/path   [A] Allow IP\n[v] Connections view   [r] Rules view   [c] Clear   [q]/[Esc] Quit",
                 View::Connections => "↑/↓ select   [d] Details   [v] Denied requests   [r] Rules view   [q]/[Esc] Quit",
-                View::Rules => "↑/↓ select   [x] Remove rule (blocked for launch-time rules)\n[r] Requests view   [q]/[Esc] Quit",
+                View::Rules => "↑/↓ select   [x] Remove rule (blocked for launch-time rules)\n[r] Requests view   Config method lists appear as separate rules   [q]/[Esc] Quit",
             };
             let instructions = Paragraph::new(legend_text)
                 .block(Block::default().borders(Borders::ALL).title("Keybindings"));

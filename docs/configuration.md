@@ -187,7 +187,9 @@ sufficient, in a proxied sandbox exactly as in an unproxied one. See
 For finer-grained HTTP proxy control and secret injection, you can specify an array of tables under `[[network.allowed_routes]]`.
 
 - **`host`** (required): The target host and port to match (e.g., `"api.github.com:443"`).
-- **`method`** (required): The HTTP method (e.g., `"GET"`, `"POST"`, or `"*"`) in uppercase.
+- **`method`** (required): One uppercase HTTP method, a comma-separated list such as
+  `"HEAD,GET"` (commas only, no spaces), or `"*"` for every method. `*` must
+  stand alone. A list compiles to a separate rule for each method.
 - **`path`** (optional): The path pattern to match (must start with `/`). `*` matches a single
   segment, `**` matches several. Omitted or empty, it defaults to `"/**"`, every path, so a
   rule with only `host` and `method` narrows a host by method alone.
@@ -206,6 +208,14 @@ is still ambiguous — a `.` or `..` segment, an empty `//` segment, a backslash
 (literal or `%5C`), or a control byte — is refused outright with `400 Bad Request`
 rather than normalised, so it cannot be matched against one route and forwarded to
 another.
+
+For a route table, `method = "HEAD,GET"` is equivalent to two otherwise
+identical tables, one with `method = "HEAD"` and one with `method = "GET"`.
+This also applies to secret-bearing routes: each listed method receives the
+secret only on that route's path. In `trusted.toml`, authorize the same methods
+in the same order. The trusted-side comparison is case-insensitive for
+compatibility, while project policy requires uppercase; the launcher checks the
+whole field before expanding it into per-method secret bindings.
 
 A rule restricts a whole domain, not one port. The proxy matches a route by its
 domain pattern alone — the port in `host` reaches the policy as an ordinary
@@ -240,10 +250,10 @@ allowed_hosts = [
     "10.0.0.0/8:80"
 ]
 
-# Allow GET requests to specific GitHub API endpoints and inject a secret token
+# Allow HEAD and GET requests to specific endpoints and inject a secret token
 [[network.allowed_routes]]
 host = "api.github.com:443"
-method = "GET"
+method = "HEAD,GET"
 path = "/user/repos"
 secret = "GITHUB_TOKEN"
 header = "Authorization"
@@ -335,7 +345,7 @@ the host-side entry is the `AGENTS.md` rule with nothing changed:
 # ~/.config/agent-sandbox/trusted.toml
 [[network.allowed_routes]]
 host = "api.github.com:443"
-method = "GET"
+method = "HEAD,GET"
 path = "/user/repos"
 secret = "GITHUB_TOKEN"
 header = "Authorization"

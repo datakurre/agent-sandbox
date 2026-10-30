@@ -751,7 +751,7 @@ struct RouteSpec {
     has_secret: bool,
 }
 
-fn parse_route_table(i: usize, rule_val: &Value) -> Result<RouteSpec, ConfigError> {
+fn parse_route_table(i: usize, rule_val: &Value) -> Result<Vec<RouteSpec>, ConfigError> {
     let rule = rule_val.as_table().ok_or_else(|| {
         ConfigError::msg(format!(
             "[[network.allowed_routes]][{}]: must be a table",
@@ -771,15 +771,15 @@ fn parse_route_table(i: usize, rule_val: &Value) -> Result<RouteSpec, ConfigErro
     }
 
     let host_val = rule.get("host").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'host'. Example: host = \"registry.npmjs.org:443\".", i)))?;
-    let method = rule.get("method").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'method'. Specify an HTTP method (e.g. method = \"GET\", method = \"POST\", or method = \"*\").", i)))?;
+    let method = rule.get("method").and_then(|v| v.as_str()).ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}]: missing required field 'method'. Specify an HTTP method (e.g. method = \"GET\", method = \"HEAD,GET\", or method = \"*\").", i)))?;
+    let methods = parse_route_methods(method).map_err(|e| {
+        ConfigError::msg(format!("[[network.allowed_routes]][{}].method: {}", i, e))
+    })?;
     let path = match rule.get("path") {
         None => DEFAULT_ROUTE_PATH,
         Some(v) => route_path(Some(v.as_str().ok_or_else(|| ConfigError::msg(format!("[[network.allowed_routes]][{}].path: must be a string. Example: path = \"/api/*\", or omit it to allow every path.", i)))?)),
     };
 
-    if method != "*" && (!method.chars().all(|c| c.is_ascii_uppercase()) || method.is_empty()) {
-        return Err(ConfigError::msg(format!("[[network.allowed_routes]][{}].method: '{}' must be uppercase (e.g. method = \"GET\" or method = \"*\").", i, method)));
-    }
     if !path.starts_with('/') {
         return Err(ConfigError::msg(format!("[[network.allowed_routes]][{}].path: 'path' must start with '/'. Change to path = \"/{}\".", i, path.trim_start_matches('/'))));
     }
@@ -794,13 +794,43 @@ fn parse_route_table(i: usize, rule_val: &Value) -> Result<RouteSpec, ConfigErro
     let ctx = format!("[[network.allowed_routes]][{}]", i);
     validate_route_host(&ctx, host_val)?;
 
-    Ok(RouteSpec {
-        entry: None,
-        host: host_val.to_string(),
-        method: method.to_string(),
-        path: path.to_string(),
-        has_secret: rule.contains_key("secret"),
-    })
+    Ok(methods
+        .into_iter()
+        .map(|method| RouteSpec {
+            entry: None,
+            host: host_val.to_string(),
+            method,
+            path: path.to_string(),
+            has_secret: rule.contains_key("secret"),
+        })
+        .collect())
+}
+
+/// One method or a comma-separated method list; `*` must stand alone.
+pub fn parse_route_methods(methods: &str) -> Result<Vec<String>, String> {
+    if methods == "*" {
+        return Ok(vec!["*".to_string()]);
+    }
+
+    let methods: Vec<_> = methods.split(',').collect();
+    if methods.len() > 1 && methods.contains(&"*") {
+        return Err("'*' already covers every method; list it alone.".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    for method in &methods {
+        if method.is_empty() || !method.chars().all(|c| c.is_ascii_uppercase()) {
+            return Err(format!(
+                "method '{}' must be uppercase (e.g. GET, or * for every method), and methods are separated by commas alone.",
+                method
+            ));
+        }
+        if !seen.insert(*method) {
+            return Err(format!("method '{}' is listed twice.", method));
+        }
+    }
+
+    Ok(methods.into_iter().map(str::to_string).collect())
 }
 
 /// The short form of a route, written straight into `allowed_hosts`:
@@ -888,40 +918,19 @@ fn route_entry_specs(
         }
     }
 
-    let methods: Vec<&str> = match methods {
-        None => vec!["*"],
-        Some(list) => list.split(',').collect(),
+    let methods = match methods {
+        None => vec!["*".to_string()],
+        Some(list) => {
+            parse_route_methods(list).map_err(|e| ConfigError::msg(format!("{}: {}", ctx, e)))?
+        }
     };
-    let mut seen = HashSet::new();
-    for method in &methods {
-        let valid = *method == "*"
-            || (!method.is_empty() && method.chars().all(|c| c.is_ascii_uppercase()));
-        if !valid {
-            return Err(ConfigError::msg(format!(
-                "{}: method '{}' must be uppercase (e.g. GET, or * for every method), and methods are separated by commas alone.",
-                ctx, method
-            )));
-        }
-        if !seen.insert(*method) {
-            return Err(ConfigError::msg(format!(
-                "{}: method '{}' is listed twice.",
-                ctx, method
-            )));
-        }
-    }
-    if methods.len() > 1 && methods.contains(&"*") {
-        return Err(ConfigError::msg(format!(
-            "{}: '*' already covers every method; list it alone.",
-            ctx
-        )));
-    }
 
     Ok(methods
         .into_iter()
         .map(|method| RouteSpec {
             entry: Some(entry.to_string()),
             host: host.to_string(),
-            method: method.to_string(),
+            method,
             path: path.to_string(),
             has_secret: false,
         })
@@ -1091,24 +1100,27 @@ pub fn parse_proxy(text: &str) -> Result<ProxyPolicy, ConfigError> {
             let mut allow_has_wildcard = false;
 
             let mut routes = Vec::new();
+            let mut route_origins = Vec::new();
             if let Some(rules) = net_table.get("allowed_routes") {
                 let rules_arr = rules.as_array().ok_or_else(|| {
                     ConfigError::msg("[network].allowed_routes must be an array of tables")
                 })?;
                 for (i, rule_val) in rules_arr.iter().enumerate() {
-                    let route = parse_route_table(i, rule_val)?;
-                    // The same route twice compiles to two identical lines;
-                    // with a secret on only one of them, one is a mistake.
-                    if let Some(j) = routes
-                        .iter()
-                        .position(|r: &RouteSpec| r.identity() == route.identity())
-                    {
-                        return Err(ConfigError::msg(format!(
-                            "[[network.allowed_routes]][{}] repeats the domain, method and path of [[network.allowed_routes]][{}]; remove one (keep the one with the secret, if either has one), and list every port on the one that stays.",
-                            i, j
-                        )));
+                    for route in parse_route_table(i, rule_val)? {
+                        // The same route twice compiles to two identical lines;
+                        // with a secret on only one of them, one is a mistake.
+                        if let Some(j) = routes
+                            .iter()
+                            .position(|r: &RouteSpec| r.identity() == route.identity())
+                        {
+                            return Err(ConfigError::msg(format!(
+                                "[[network.allowed_routes]][{}] repeats the domain, method and path of [[network.allowed_routes]][{}]; remove one (keep the one with the secret, if either has one), and list every port on the one that stays.",
+                                i, route_origins[j]
+                            )));
+                        }
+                        routes.push(route);
+                        route_origins.push(i);
                     }
-                    routes.push(route);
                 }
             }
 
@@ -2150,7 +2162,7 @@ mod export_tests {
             ),
             (
                 route("host = \"a.example\"\nmethod = \"get\"\n"),
-                "[[network.allowed_routes]][0].method: 'get' must be uppercase",
+                "[[network.allowed_routes]][0].method: method 'get' must be uppercase",
             ),
             (
                 route("host = \"a.example\"\nmethod = \"GET\"\npath = \"api\"\n"),
@@ -2320,8 +2332,7 @@ mod export_tests {
         .expect("the short form must parse");
         let long = parse_proxy(&network(
             "[[network.allowed_routes]]\nhost = \"*.example.com:443\"\nmethod = \"POST\"\npath = \"/foo/*\"\n\
-             [[network.allowed_routes]]\nhost = \"*.example.com:80,443\"\nmethod = \"GET\"\npath = \"/foo/**\"\n\
-             [[network.allowed_routes]]\nhost = \"*.example.com:80,443\"\nmethod = \"POST\"\npath = \"/foo/**\"\n\
+             [[network.allowed_routes]]\nhost = \"*.example.com:80,443\"\nmethod = \"GET,POST\"\npath = \"/foo/**\"\n\
              [[network.allowed_routes]]\nhost = \"api.example.org\"\nmethod = \"PUT\"\n\
              [[network.allowed_routes]]\nhost = \"api.example.net:8443\"\nmethod = \"*\"\npath = \"/v2/**\"\n",
         ))
@@ -2338,6 +2349,39 @@ mod export_tests {
             ]
         );
         assert!(short.secret_route.is_empty());
+    }
+
+    #[test]
+    fn a_route_table_method_list_expands_to_individual_rules() {
+        let policy = parse_proxy(&network(
+            "[[network.allowed_routes]]\nhost = \"api.example.com:443\"\n\
+             method = \"HEAD,GET\"\npath = \"/health\"\n",
+        ))
+        .expect("comma-separated table methods");
+
+        assert_eq!(
+            policy.allow_route,
+            vec![
+                "api.example.com\tHEAD\t/health".to_string(),
+                "api.example.com\tGET\t/health".to_string(),
+            ]
+        );
+
+        for (methods, expected) in [
+            ("GET,,POST", "method '' must be uppercase"),
+            ("GET,GET", "method 'GET' is listed twice"),
+            ("GET,*", "'*' already covers every method"),
+            ("HEAD, GET", "method ' GET' must be uppercase"),
+            ("get,HEAD", "method 'get' must be uppercase"),
+        ] {
+            let err = parse_proxy(&network(&format!(
+                "[[network.allowed_routes]]\nhost = \"api.example.com:443\"\n\
+                 method = \"{methods}\"\n"
+            )))
+            .expect_err(methods)
+            .to_string();
+            assert!(err.contains(expected), "{methods}: {err}");
+        }
     }
 
     #[test]
@@ -2756,6 +2800,28 @@ mod export_tests {
             table("a.example:443", "").replace("/x", "/y")
         ));
         parse_proxy(&agents_md).expect("two routes on one host");
+    }
+
+    #[test]
+    fn a_duplicate_after_a_method_list_names_the_original_table() {
+        let agents_md = network(
+            "[[network.allowed_routes]]\nhost = \"a.example:443\"\n\
+             method = \"GET,POST\"\npath = \"/x\"\n\
+             [[network.allowed_routes]]\nhost = \"a.example:443\"\n\
+             method = \"PUT\"\npath = \"/x\"\n\
+             [[network.allowed_routes]]\nhost = \"a.example:443\"\n\
+             method = \"PUT\"\npath = \"/x\"\n",
+        );
+        let err = parse_proxy(&agents_md)
+            .expect_err("the third table repeats the second")
+            .to_string();
+        assert!(
+            err.contains(
+                "[[network.allowed_routes]][2] repeats the domain, method and path of \
+                 [[network.allowed_routes]][1]"
+            ),
+            "{err}"
+        );
     }
 
     #[test]

@@ -196,6 +196,12 @@ route on an IPv4 address filters plain HTTP only: HTTPS to an address is denied
 (`sni-missing`), since there is no server name to pin. A CIDR block or an IPv6
 address cannot carry a route at all.
 
+The table form accepts the same comma-separated method lists:
+`method = "HEAD,GET"` compiles to two routes. `*` must stand alone, and commas
+must not be followed by spaces. The TUI's `h` action remains intentionally
+narrow: it adds only the observed request's method and path; config method lists
+show up as separate rules in the Rules view.
+
 ### Combinations the launcher refuses
 
 An invalid policy refuses the launch outright, so a bad suggestion costs the user

@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use crate::agents::{parse_host_port, route_path, DEFAULT_ROUTE_PATH};
+use crate::agents::{parse_host_port, parse_route_methods, route_path, DEFAULT_ROUTE_PATH};
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
@@ -51,6 +51,30 @@ pub struct HostBinding {
     #[serde(default = "default_header")]
     pub header: String,
     pub prefix: Option<String>,
+}
+
+fn expand_host_binding_methods(
+    bindings: Vec<HostBinding>,
+    config: &Path,
+) -> anyhow::Result<Vec<HostBinding>> {
+    let mut expanded = Vec::new();
+    for (i, binding) in bindings.into_iter().enumerate() {
+        let methods =
+            parse_route_methods(&binding.method.to_ascii_uppercase()).map_err(|error| {
+                anyhow::anyhow!(
+                    "agent-sandbox: {}: trusted secret binding[{}].method: {}",
+                    config.display(),
+                    i,
+                    error
+                )
+            })?;
+        for method in methods {
+            let mut binding = binding.clone();
+            binding.method = method;
+            expanded.push(binding);
+        }
+    }
+    Ok(expanded)
 }
 
 fn default_path() -> String {
@@ -109,23 +133,23 @@ pub fn iter_tagged_blocks(content: &str) -> Vec<String> {
     blocks
 }
 
-pub fn get_requested_rules(workspace: &Path) -> Vec<SecretRule> {
+pub fn get_requested_rules(workspace: &Path) -> anyhow::Result<Vec<SecretRule>> {
     let mut requested_rules = Vec::new();
     if let Ok(content) = std::fs::read_to_string(workspace) {
-        requested_rules.extend(requested_rules_from_agents(&content));
+        requested_rules.extend(requested_rules_from_agents(&content)?);
     }
-    requested_rules
+    Ok(requested_rules)
 }
 
-fn requested_rules_from_agents(content: &str) -> Vec<SecretRule> {
+fn requested_rules_from_agents(content: &str) -> anyhow::Result<Vec<SecretRule>> {
     let mut requested_rules = Vec::new();
     for block in iter_tagged_blocks(content) {
-        requested_rules.extend(requested_rules_from_toml(&block));
+        requested_rules.extend(requested_rules_from_toml(&block)?);
     }
-    requested_rules
+    Ok(requested_rules)
 }
 
-fn requested_rules_from_toml(content: &str) -> Vec<SecretRule> {
+fn requested_rules_from_toml(content: &str) -> anyhow::Result<Vec<SecretRule>> {
     let mut requested_rules = Vec::new();
     if let Ok(block_data) = content.parse::<toml::Value>() {
         if let Some(network) = block_data.get("network").and_then(|v| v.as_table()) {
@@ -152,6 +176,13 @@ fn requested_rules_from_toml(content: &str) -> Vec<SecretRule> {
                                     .get("prefix")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
+                                parse_route_methods(method).map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "invalid method list in secret route for host {:?}: {}",
+                                        host,
+                                        error
+                                    )
+                                })?;
                                 requested_rules.push(SecretRule {
                                     host: host.to_string(),
                                     method: method.to_string(),
@@ -167,7 +198,7 @@ fn requested_rules_from_toml(content: &str) -> Vec<SecretRule> {
             }
         }
     }
-    requested_rules
+    Ok(requested_rules)
 }
 
 pub fn validate_domain(domain: &str) -> Result<(), ValidationError> {
@@ -333,11 +364,11 @@ pub fn resolve_secrets_with_policies(
         return Ok(Vec::new());
     }
 
-    let mut requested_rules = get_requested_rules(workspace);
+    let mut requested_rules = get_requested_rules(workspace)?;
     let mut seen_rules: std::collections::HashSet<_> = requested_rules.iter().cloned().collect();
     for source in route_sources {
         if let Ok(content) = std::fs::read_to_string(source) {
-            for rule in requested_rules_from_toml(&content) {
+            for rule in requested_rules_from_toml(&content)? {
                 if seen_rules.insert(rule.clone()) {
                     requested_rules.push(rule);
                 }
@@ -382,13 +413,27 @@ pub fn resolve_secrets_with_policies(
                         continue;
                     }
                     match rule.get("method") {
-                        Some(m) if m.is_str() => {}
-                        Some(_) => problems.push(format!(
-                            "agent-sandbox: {}: {}[{}].method: must be a string (e.g. method = \"GET\" or method = \"*\").",
-                            config.display(),
-                            label,
-                            i
-                        )),
+                        Some(m) => match m.as_str() {
+                            Some(method) => {
+                                if let Err(error) =
+                                    parse_route_methods(&method.to_ascii_uppercase())
+                                {
+                                    problems.push(format!(
+                                        "agent-sandbox: {}: {}[{}].method: {}",
+                                        config.display(),
+                                        label,
+                                        i,
+                                        error
+                                    ));
+                                }
+                            }
+                            None => problems.push(format!(
+                                "agent-sandbox: {}: {}[{}].method: must be a string (e.g. method = \"GET\", method = \"HEAD,GET\", or method = \"*\").",
+                                config.display(),
+                                label,
+                                i
+                            )),
+                        },
                         None => {
                             missing = true;
                             problems.push(format!(
@@ -510,28 +555,30 @@ pub fn resolve_secrets_with_policies(
             );
         }
 
-        let route = SecretRoute {
-            domain: hb_domain.clone(),
-            method: hb.method.to_uppercase(),
-            path: hb.path.clone(),
-        };
+        for binding in expand_host_binding_methods(vec![hb], config)? {
+            let route = SecretRoute {
+                domain: hb_domain.clone(),
+                method: binding.method.to_uppercase(),
+                path: binding.path.clone(),
+            };
 
-        // Only an exact repeat is unresolvable.  Two routes on one host --
-        // which the old domain-overlap check refused outright, aborting any
-        // launch with two secret rules for the same host -- are ordinary now
-        // that injection is scoped to the route.
-        if seen_routes.contains(&route) {
-            anyhow::bail!(
-                "agent-sandbox: duplicate secret binding for {} {} {}",
-                route.domain,
-                route.method,
-                route.path
-            );
-        }
+            // Only an exact repeat is unresolvable.  Two routes on one host --
+            // which the old domain-overlap check refused outright, aborting any
+            // launch with two secret rules for the same host -- are ordinary now
+            // that injection is scoped to the route.
+            if seen_routes.contains(&route) {
+                anyhow::bail!(
+                    "agent-sandbox: duplicate secret binding for {} {} {}",
+                    route.domain,
+                    route.method,
+                    route.path
+                );
+            }
 
-        if secret_routes.contains(&route) {
-            filtered_bindings.push(hb);
-            seen_routes.push(route);
+            if secret_routes.contains(&route) {
+                filtered_bindings.push(binding);
+                seen_routes.push(route);
+            }
         }
     }
 
@@ -733,7 +780,7 @@ mod tests {
                      host = \"api.example.com:443\"\n\
                      method = \"GET\"\n\
                      secret = \"TOKEN\"\n";
-        let requested = requested_rules_from_toml(block);
+        let requested = requested_rules_from_toml(block).expect("a valid route method");
         assert_eq!(requested.len(), 1);
         assert_eq!(requested[0].path, "/**");
 
@@ -754,6 +801,56 @@ mod tests {
         // trusted.toml does not authorize the broader rule.
         hb.path = "/".to_string();
         assert!(!requested[0].matches_host_binding(&hb));
+    }
+
+    #[test]
+    fn comma_separated_secret_methods_expand_on_both_sides() {
+        let block = "[[network.allowed_routes]]\n\
+                     host = \"api.example.com:443\"\n\
+                     method = \"HEAD,GET\"\n\
+                     path = \"/health\"\n\
+                     secret = \"TOKEN\"\n";
+        let requested = requested_rules_from_toml(block).expect("valid methods");
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].method, "HEAD,GET");
+
+        let value: toml::Value = block.parse().expect("valid TOML");
+        let binding: HostBinding = value["network"]["allowed_routes"][0]
+            .clone()
+            .try_into()
+            .expect("trusted route shape");
+        assert!(requested[0].matches_host_binding(&binding));
+        let trusted = expand_host_binding_methods(vec![binding.clone()], Path::new("trusted.toml"))
+            .expect("valid trusted methods");
+        assert_eq!(
+            trusted
+                .iter()
+                .map(|binding| binding.method.as_str())
+                .collect::<Vec<_>>(),
+            ["HEAD", "GET"]
+        );
+
+        let mut reordered = binding.clone();
+        reordered.method = "GET,HEAD".to_string();
+        assert!(
+            !requested[0].matches_host_binding(&reordered),
+            "trusted method lists must name the same methods in the same order"
+        );
+
+        let mut lowercase = binding;
+        lowercase.method = "head,get".to_string();
+        assert!(
+            requested[0].matches_host_binding(&lowercase),
+            "trusted methods keep their prior case-insensitive matching"
+        );
+        assert_eq!(
+            expand_host_binding_methods(vec![lowercase], Path::new("trusted.toml"))
+                .expect("lowercase trusted methods are normalized")
+                .iter()
+                .map(|binding| binding.method.as_str())
+                .collect::<Vec<_>>(),
+            ["HEAD", "GET"]
+        );
     }
 
     #[test]
@@ -1036,7 +1133,7 @@ allowed_hosts = ["github.com:443"]
 
 [[network.allowed_routes]]
 host = "api.github.com:443"
-method = "POST"
+method = "POST,PUT"
 path = "/graphql"
 secret = "GITHUB_TOKEN"
 header = "Authorization"
@@ -1052,10 +1149,10 @@ secret = "NPM_TOKEN"
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
 
-        let rules = get_requested_rules(tmp.path());
+        let rules = get_requested_rules(tmp.path()).expect("valid route methods");
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].host, "api.github.com:443");
-        assert_eq!(rules[0].method, "POST");
+        assert_eq!(rules[0].method, "POST,PUT");
         assert_eq!(rules[0].path, "/graphql");
         assert_eq!(rules[0].secret, "GITHUB_TOKEN");
         assert_eq!(rules[0].header, "Authorization");
