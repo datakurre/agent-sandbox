@@ -28,7 +28,9 @@
 //! CDP, which is the threat this is for.
 
 use super::resolve::*;
-use crate::agents::{format_proxy_policy, parse_policy_file, parse_proxy, ProxyPolicy};
+use crate::agents::{
+    config_file_block, format_proxy_policy, parse_policy_file, parse_proxy, ProxyPolicy,
+};
 use crate::launch::{policy_path, valid_session_name, BASELINE_DENY_IPS};
 use crate::net_summary;
 use anyhow::{Context, Result};
@@ -83,7 +85,18 @@ pub struct BrowserArgs {
     pub policy: Vec<String>,
     #[arg(
         long,
-        help = "Do not seed the allow list from ports (neither AGENTS.md [ports] nor a running sandbox's published ports)"
+        value_name = "FILE",
+        help = "Read browser [ports] and [network] config from a bare TOML file; repeatable"
+    )]
+    pub config: Vec<PathBuf>,
+    #[arg(
+        long,
+        help = "Do not read AGENTS.md for browser [ports] or [network] configuration"
+    )]
+    pub no_agents_md: bool,
+    #[arg(
+        long,
+        help = "Do not seed the allow list from declared or running-sandbox ports"
     )]
     pub no_published_ports: bool,
     #[arg(
@@ -206,9 +219,9 @@ pub fn declared_loopback_ports(text: &str) -> std::result::Result<Vec<u16>, Stri
 /// Turn everything the operator named into one ordered rule list.
 ///
 /// Order is additive and deliberately boring -- published ports, then
-/// `AGENTS.md` and policies, then `--allow` -- because the proxy resolves
-/// specificity itself and a rule's position in the file has never meant
-/// anything.
+/// workspace/config declarations and policies, then `--allow` -- because the
+/// proxy resolves specificity itself and a rule's position in the file has
+/// never meant anything.
 pub fn build_allow_list(
     published: &[u16],
     declared: &ProxyPolicy,
@@ -228,7 +241,7 @@ pub fn build_allow_list(
 
     // `format_proxy_policy` renders a whole file, header and `default` line
     // included; only the rule lines are wanted here.
-    for line in format_proxy_policy(declared, "AGENTS.md and policies").lines() {
+    for line in format_proxy_policy(declared, "workspace/config and policies").lines() {
         let line = line.trim_end();
         if is_rule_line(line) {
             rules.push(line.to_string());
@@ -905,6 +918,23 @@ pub fn run(args: BrowserArgs) -> Result<()> {
         &std::env::var("AGENT_SANDBOX_BROWSER_EXTENSIONS").unwrap_or_default(),
     );
 
+    let agents_text = if args.no_agents_md {
+        None
+    } else {
+        fs::read_to_string("AGENTS.md").ok()
+    };
+    let configs = args
+        .config
+        .iter()
+        .map(|path| {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("cannot read config file {}", path.display()))?;
+            let block = config_file_block(&text)
+                .map_err(|e| anyhow::anyhow!("invalid config file {}: {}", path.display(), e))?;
+            Ok((path, block))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     // A sandbox is optional.  Without one there are no published ports to seed
     // from, which is a thinner allow list, not an error -- someone may well
     // want a policed browser before the sandbox exists.
@@ -926,7 +956,7 @@ pub fn run(args: BrowserArgs) -> Result<()> {
         Vec::new()
     } else {
         let mut ports = BTreeSet::new();
-        if let Ok(text) = fs::read_to_string("AGENTS.md") {
+        if let Some(text) = agents_text.as_deref() {
             match declared_loopback_ports(&text) {
                 Ok(declared) => ports.extend(declared),
                 // A note, not an error: every other AGENTS.md failure in this
@@ -937,6 +967,12 @@ pub fn run(args: BrowserArgs) -> Result<()> {
                     e
                 ),
             }
+        }
+        for (path, block) in &configs {
+            let declared = declared_loopback_ports(block).map_err(|e| {
+                anyhow::anyhow!("invalid [ports] in config file {}: {}", path.display(), e)
+            })?;
+            ports.extend(declared);
         }
         if let Some(name) = &sandbox {
             ports.extend(podman_published_ports(name).unwrap_or_default());
@@ -950,14 +986,13 @@ pub fn run(args: BrowserArgs) -> Result<()> {
         ports.into_iter().collect()
     };
 
-    // Declared rules: AGENTS.md's [network] block always, same as the ports
-    // above, then any --policy files on top.  Same parsers and same merge
-    // order the launcher uses.
+    // Declared rules: AGENTS.md, then explicit config files, then host-owned
+    // --policy files. All sources are additive; --allow is applied afterward.
     let mut declared = ProxyPolicy {
         default: vec!["deny".to_string()],
         ..Default::default()
     };
-    if let Ok(text) = fs::read_to_string("AGENTS.md") {
+    if let Some(text) = agents_text.as_deref() {
         match parse_proxy(&text) {
             Ok(policy) => declared.merge(policy),
             // A note, not an error: every other AGENTS.md failure in this
@@ -968,6 +1003,12 @@ pub fn run(args: BrowserArgs) -> Result<()> {
                 e
             ),
         }
+    }
+    for (path, block) in &configs {
+        let policy = parse_proxy(block).map_err(|e| {
+            anyhow::anyhow!("invalid [network] config in {}: {}", path.display(), e)
+        })?;
+        declared.merge(policy);
     }
     for name in &args.policy {
         let path = policy_path(&home, name).map_err(|e| anyhow::anyhow!(e))?;
@@ -1167,7 +1208,7 @@ fn resolve_target(args: &BrowserArgs) -> std::result::Result<String, String> {
         Ok(Err(_)) => Ok(String::new()),
         Err(e) => Err(format!(
             "cannot ask podman what is running ({}); the allow list comes from \
-             --allow, AGENTS.md and policies only",
+             --allow, workspace/config files and policies only",
             e
         )),
     }

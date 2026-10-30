@@ -59,6 +59,10 @@ sidecar path makes (the network's subnet, the sidecar's address) and writes the
 readiness marker the launcher waits on, so a `--proxy` test finishes in
 milliseconds rather than timing out.
 
+`ctl_browser.rs` similarly drives the real browser command with stub proxy and
+Chromium executables. It verifies browser-first startup, config-source merging,
+and behavior that should not require a real browser or container runtime.
+
 The stub also snapshots the directories the launcher mounts into the sidecar,
 because the launcher's own cleanup removes them on the way out; `World::captured`
 is how a test sees the policy the proxy was actually handed. Readiness tests

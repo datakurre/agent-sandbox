@@ -5,7 +5,7 @@
 ## What it provides
 
 - **Isolated container** — the agent runs in a minimal Nix-built image with no access to your host filesystem unless you pass `--workspace`.
-- **Deny-by-default network firewall** — `--proxy` puts the sandbox behind an HTTP proxy that enforces a declarative `[network]` policy from your project's `AGENTS.md`. No rules means no outbound traffic.
+- **Deny-by-default network firewall** — `--proxy` puts the sandbox behind an HTTP proxy that enforces declarative `[network]` rules from your project's `AGENTS.md` and optional bare-TOML `--config` files. No rules means no outbound traffic.
 - **Secrets injection** — `--secrets` resolves credentials with `secretspec` and injects them as HTTP headers, scoped to the exact route you authorize. Secrets never enter the sandbox environment.
 - **SSH / GPG forwarding** — `--ssh` and `--gpg` forward host agent sockets; under `--proxy` they travel through a relay that keeps the firewall intact.
 - **Cooperative browser** — `agent-sandbox browser` starts a throwaway Chromium on your host behind an allow list of its own, defaulting to the ports your sandbox publishes and nothing else, so an agent can drive a visible browser over CDP without that being an unpoliced hole.
@@ -56,6 +56,12 @@ agent-sandbox ctl attach
 # Publish a port declared in AGENTS.md's [ports] block
 agent-sandbox --workspace --ports opencode
 
+# Use standalone TOML config, including project environment defaults
+agent-sandbox --workspace --config sandbox.toml --proxy opencode
+
+# Ignore AGENTS.md config while keeping explicitly selected config files
+agent-sandbox --workspace --no-agents-md --config sandbox.toml opencode
+
 # Mount extra paths from [mounts], and persist this agent's state across runs
 agent-sandbox --workspace --mounts --agent-mounts opencode
 
@@ -71,9 +77,11 @@ agent-sandbox --workspace --browser -- claude
 | Expose current directory at `/workspace/<name>` | `--workspace` |
 | Launch a specific agent | `agent-sandbox <agent>` (`opencode`, `claude`, `copilot`, `codex`, `antigravity`, `pi`) |
 | Reattach to a sandbox already running | `agent-sandbox ctl attach` |
-| Publish a port declared in `AGENTS.md` | `--ports` + `[ports]` in `AGENTS.md` |
-| Mount extra paths, or persist agent state | `--mounts` + `[mounts]` in `AGENTS.md`, or `--agent-mounts` |
-| Allow specific outbound network traffic | `--proxy` + `[network]` in `AGENTS.md` |
+| Publish a declared port | `--ports` + `[ports]` in `AGENTS.md` or a `--config` file |
+| Mount extra paths, or persist agent state | `--mounts` + `[mounts]` in `AGENTS.md` or a `--config` file, or `--agent-mounts` |
+| Set sandbox environment defaults | `[env]` in `AGENTS.md` or a `--config` file |
+| Ignore the workspace `AGENTS.md` for launcher config | `--no-agents-md` (explicit `--config` files remain active) |
+| Allow specific outbound network traffic | `--proxy` + `[network]` in `AGENTS.md` or a `--config` file |
 | Merge a reusable host-owned network policy | `--proxy --policy NAME` |
 | Forward SSH keys (e.g. for `git push`) | `--ssh` |
 | Forward GPG agent (e.g. for signed commits) | `--gpg` |
@@ -82,4 +90,4 @@ agent-sandbox --workspace --browser -- claude
 | Inject API credentials scoped to a route | `--secrets` + `--proxy` |
 | Let the agent drive a visible browser you can watch | run `agent-sandbox browser`, then relaunch with `--browser` |
 
-See [Usage & Flags](usage.md) for the complete flags reference, [Configuration](configuration.md) for `AGENTS.md` syntax, [Cooperative Browser](browser.md) for multi-user browser sessions, and [Trust Model](trust-model.md) for the security implications of each flag.
+See [Usage & Flags](usage.md) for the complete flags reference, [Configuration](configuration.md) for `AGENTS.md`, `--config`, and `[env]` syntax, [Cooperative Browser](browser.md) for multi-user browser sessions, and [Trust Model](trust-model.md) for the security implications of each flag.

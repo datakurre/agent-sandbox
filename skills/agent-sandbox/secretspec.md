@@ -142,6 +142,11 @@ The secret is never in the sandbox's environment, filesystem, or process table.
 If a task requires reading the token itself, the answer is that it cannot be done
 this way — say so rather than looking for a workaround.
 
+For now, declare secret-bearing `[[network.allowed_routes]]` in the workspace
+`AGENTS.md`, not in an additional `--config FILE`: the launcher's secret-request
+collection reads `AGENTS.md` and host-owned policy files, but does not yet
+collect requested secret routes from `--config` files.
+
 ## The three files that must agree
 
 **1. `secretspec.toml`** (in the repo) declares the name:

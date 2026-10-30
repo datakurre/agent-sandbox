@@ -529,6 +529,8 @@ policy's `secret_route` routes from `AGENTS.md`, and then runs `secretspec expor
 on the host to fetch the values. The filtered bindings are written 0600 into
 `/sidecar_secrets/bindings`, which only the sidecar mounts, as
 `domain<TAB>method<TAB>path<TAB>header<TAB>value`.
+Secret-bearing routes in additional `--config` files are not currently
+collected by the resolver; declare those routes in `AGENTS.md`.
 
 The route travels with the binding, and that is the design.  `AGENTS.md` is
 untrusted and controls the *other* rules on a host, so recording only the

@@ -89,12 +89,16 @@ the answer is still `ctl policy allow`.
 
 | Launch flags | Policy |
 | --- | --- |
-| `--proxy` | the workspace `AGENTS.md`, plus `~/.config/agent-sandbox/policies/<agent>.toml` if it exists for the launched agent |
+| `--proxy` | workspace `[network]` from `AGENTS.md` and any `--config FILE` sources, plus `~/.config/agent-sandbox/policies/<agent>.toml` if it exists for the launched agent |
 | `--proxy --policy NAME` | the above, plus `~/.config/agent-sandbox/policies/NAME.toml`, merged additively |
-| `--proxy --no-policy` | `AGENTS.md` only — drops the agent-named policy and any `--policy` given before it |
+| `--proxy --no-policy` | workspace configuration only — drops the agent-named policy and any `--policy` given before it |
+| `--proxy --no-agents-md --config extra.toml` | `extra.toml` plus the implicit per-agent policy, if enabled |
 
 `--policy` requires `--proxy`; using it alone refuses the launch. Policies are
-host-owned; `AGENTS.md` is project-controlled and therefore untrusted. The
+host-owned; `AGENTS.md` and explicit `--config` sources are project-controlled
+and therefore untrusted. Use `--no-agents-md` to skip only `AGENTS.md`; the
+browser command has its own `--no-agents-md` and repeatable `--config FILE`
+for browser `[ports]` and `[network]`. The
 agent-named policy is the one thing loaded implicitly — it applies whenever
 `--proxy` is used with that agent, with no flag needed. Neither can express a
 deny — the firewall is deny-by-default and the only deny rules are the
@@ -102,7 +106,9 @@ built-in private and loopback ranges.
 
 ## Writing a policy block
 
-`AGENTS.md` configuration lives in a fenced block tagged `agent-sandbox`:
+`AGENTS.md` configuration lives in a fenced block tagged `agent-sandbox`.
+Repeated `--config FILE` arguments accept the same supported configuration
+tables as bare TOML:
 
 ````markdown
 ```toml agent-sandbox
@@ -261,6 +267,7 @@ inside — if you need to know what was denied, ask the user to run `ctl logs` o
 | `ctl mounts add` / `rm` | live (not under `--krun`) |
 | A new L7 route needing TLS interception | **relaunch** (session CA is mounted at launch) |
 | `[ports]`, `[mounts]` | **relaunch** |
+| `[env]`, edits to a `--config` file, or `--no-agents-md` | **relaunch** |
 | `--secrets` and any secret binding | **relaunch** |
 | Any flag: `--ssh`, `--gpg`, `--workspace`, `--nix`, `--podman`, `--privileged`, `--ports`, `--mounts` | **relaunch** |
 | Edits to `AGENTS.md` | **relaunch** |

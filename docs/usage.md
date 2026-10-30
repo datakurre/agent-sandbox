@@ -97,7 +97,7 @@ Most flags in the table below have a corresponding `--no-flag` option (e.g., `--
 | Container runtime | `--krun` | Runs the sandbox as a KVM microVM with its own kernel, using `podman --runtime krun`. See [Trust model](trust-model.md). |
 | Container runtime | `--krun-memory MiB` | Guest RAM (default `4096`). Values of 128 or below are rejected. |
 | Container runtime | `--krun-cpus N` | Guest vCPUs (1–16). Defaults to the host CPU affinity count. |
-| Configuration | `--no-agents-md` | Ignores launcher configuration in the workspace `AGENTS.md`; explicit `--config` and `--policy` files remain active. Does not hide the file from an agent when the workspace is mounted. |
+| Configuration | `--no-agents-md` | Ignores workspace config; explicit `--config` and `--policy` remain active. Does not hide the file from an agent when mounted. Current limitation: `--secrets` still reads `AGENTS.md` for secret requests. |
 | Configuration | `--config FILE` | Loads bare TOML with `[ports]`, `[mounts]`, `[network]`, and/or `[env]`. Repeatable; files follow `AGENTS.md` in command-line order. Environment values are injected automatically; later files replace earlier values, and explicit `-e`/`--env` wins. |
 | Network & firewall | `--proxy` | Isolates the container from the internet and routes HTTP(S)/SSH through a proxy enforcing `[network]` rules from `AGENTS.md` and `--config`, plus a matching `~/.config/agent-sandbox/policies/<agent>.toml` if one exists (unless `--no-policy` is given). Prints a per-host traffic summary when the session ends. See details below. |
 | Network & firewall | `--policy NAME` | For sandbox launches, merges a host-owned reusable network policy from `~/.config/agent-sandbox/policies/NAME.toml` additively with workspace configuration; requires `--proxy` and may be repeated. The browser subcommand uses its own proxy. |
@@ -300,7 +300,9 @@ agent-sandbox --host-loopback-port 9222 --host-loopback-port 5432:15432 -- bash
 Handing an agent a CDP port is a capability, not a convenience (see the
 warning above). `agent-sandbox browser` starts a Chromium behind its own
 deny-by-default allow list, seeded from `AGENTS.md`'s `[ports]` block, then
-`--browser` attaches it to the sandbox:
+`--browser` attaches it to the sandbox. The browser has separate
+`--config FILE` and `--no-agents-md` options for its own `[ports]` and
+`[network]` configuration:
 
 ```sh
 agent-sandbox browser                            # start an allow-listed browser
@@ -338,9 +340,11 @@ The proxy sources are additive, and selected explicitly:
 
 For sandbox launches, `--policy` requires `--proxy` — using it alone refuses
 the launch. The browser subcommand has its own proxy and accepts
-`agent-sandbox browser --policy NAME` without a sandbox `--proxy`. The option
-may be repeated. Policy files are plain TOML and use the same declarative
-`[network]` syntax as `AGENTS.md`:
+`agent-sandbox browser --policy NAME` without a sandbox `--proxy`. Browser
+`--config FILE` also accepts repeated bare TOML files, but only their
+`[ports]` and `[network]` tables affect the browser; `--no-agents-md` skips
+only its workspace `AGENTS.md`. Policy files are plain TOML and use the same
+declarative `[network]` syntax as `AGENTS.md`:
 
 ```toml
 [network]

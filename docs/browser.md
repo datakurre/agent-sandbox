@@ -43,9 +43,14 @@ in `[network]`. A declared port the sandbox never publishes is still reachable
 from this browser, so `[ports]` in a repo you do not trust is worth the same
 glance as `[mounts]`.
 
-`AGENTS.md` in the current directory is always consulted, the same way it is
-for `[ports]`: its `[network]` block, if any, merges into the browser's allow
-list without a flag. Widen it further, up front or while it runs:
+`AGENTS.md` in the current directory contributes `[ports]` and `[network]`
+configuration by default. `--no-agents-md` skips that file for the browser;
+repeatable `--config FILE` adds bare TOML sources after `AGENTS.md`. Browser
+configuration uses only `[ports]` and `[network]` from those files: `[mounts]`
+and `[env]` do not apply to the host browser process. A config file's declared
+ports are not used with `--no-published-ports`. Host-owned policies and
+`--allow` entries remain separate sources. Widen the allow list further, up
+front or while it runs:
 
 ```sh
 agent-sandbox browser --allow example.com:443       # at start
@@ -60,8 +65,10 @@ and the browser's own managed allow list, which Chromium re-reads.
 | --- | --- |
 | `--cdp-port PORT` | where CDP listens; walks up from 9222 if taken |
 | `--allow HOST[:PORT]` | allow a domain, IP/CIDR or host:port; repeatable |
+| `--config FILE` | add browser `[ports]` and `[network]` from bare TOML; repeatable |
+| `--no-agents-md` | skip the current directory's `AGENTS.md` for browser config |
 | `--policy NAME` | merge a host-owned policy, the same files the launcher's `--policy` takes |
-| `--no-published-ports` | do not seed the allow list from ports at all — neither `AGENTS.md`'s `[ports]` nor a running sandbox's published ones |
+| `--no-published-ports` | do not seed from any declared or published ports |
 | `--extension DIR` | load an unpacked extension; repeatable |
 | `--no-extensions` | load none, including any built into the wrapper |
 | `--keep-profile DIR` | reuse a profile directory instead of an ephemeral one |

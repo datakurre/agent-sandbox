@@ -37,7 +37,12 @@ to enforce network rules.
 Use `--no-agents-md` to ignore the workspace file as a launcher configuration
 source while continuing to apply explicit `--config` files and host-owned
 `--policy` files. This does not hide or remove `AGENTS.md` from an agent when
-the workspace itself is mounted.
+the workspace itself is mounted. Current limitation: when `--secrets` is
+enabled, secret-request collection still reads `AGENTS.md`.
+
+Treat both `AGENTS.md` and explicit `--config` files as project-controlled
+input. Secret-bearing routes currently need to be declared in `AGENTS.md`:
+`--secrets` does not yet collect secret requests from `--config` files.
 
 ## Supported Tables
 
@@ -296,8 +301,9 @@ back as tables.
 
 #### The trusted config
 
-`AGENTS.md` is part of the repository and is therefore treated as untrusted: it
-may *name* a host, but it may not decide what is trusted about that host.
+`AGENTS.md` and explicit `--config` files are project-controlled and therefore
+treated as untrusted: they may *name* a host, but may not decide what is
+trusted about that host.
 Anything in that category is authorized in a file only you write,
 `~/.config/agent-sandbox/trusted.toml` (or under `$XDG_CONFIG_HOME`). Profile
 rules go through the same check.
@@ -306,7 +312,7 @@ Three things live under that rule, and all work the same way — the launcher
 prints the exact block to paste, and refuses the launch rather than proceeding
 unauthorized:
 
-| Declared in `AGENTS.md` | Authorized in `trusted.toml` |
+| Declared in `AGENTS.md` or `--config` | Authorized in `trusted.toml` |
 | --- | --- |
 | `[[network.allowed_routes]]` with a `secret` | the identical `[[network.allowed_routes]]` block |
 | an `allowed_hosts` entry covering port 22 | a `[[network.known_hosts]]` entry for that host |
@@ -315,7 +321,9 @@ unauthorized:
 #### Secrets
 
 A rule's `secret` names a secret, never its value. The launcher will only
-inject a secret you have also authorized host-side.
+inject a secret you have also authorized host-side. Secret-bearing routes must
+currently be declared in `AGENTS.md`; `--config` route declarations are not yet
+collected as secret requests.
 
 **Copy the block verbatim.** Authorization matches on every field — `host`
 (including its port), `method`, `path`, `secret`, `header` and `prefix` — so
@@ -486,8 +494,8 @@ without regard to case, as the proxy does:
   on port 22 alone is the exception, since SSH goes through the relay and never
   meets the route. The same applies to a wildcard allow (`"*"`, `"*:port"`),
   except `"*:22"`.
-  This is checked across every `agent-sandbox` block in the file, not only
-  within one;
+  This is checked across every `agent-sandbox` block in `AGENTS.md` and the
+  combined `--config` sources, not only within one block;
 - an `allowed_hosts` entry covering port 22 for a host with no
   `[[network.known_hosts]]` entry in `trusted.toml` — SSH would be authorized to
   a host whose identity nothing has vouched for.
@@ -566,9 +574,12 @@ via its own `--policy`, so one allow list can serve both a sandbox and
 the browser testing it. They stay separate policies — selecting a policy for
 one does not select it for the other. The browser has its own deny-by-default
 proxy, so `agent-sandbox browser --policy NAME` does not need a sandbox
-`--proxy` flag. Unlike the launcher, the browser always checks the current
-directory's `AGENTS.md` for both `[ports]` and `[network]`; `--policy` only adds
-to that.
+`--proxy` flag. The browser also accepts repeatable `--config FILE` and
+`--no-agents-md` options for its own configuration: it reads `[ports]` and
+`[network]` from `AGENTS.md` by default, then adds explicit config files.
+`--no-agents-md` omits only the workspace file; host-owned policies remain
+separate. Browser config does not apply `[mounts]` or inject `[env]` into the
+host Chromium process.
 
 Live rules added during a session are not written back automatically. The exit
 summary prints a TOML block that can be added to `AGENTS.md` for project-specific

@@ -74,6 +74,28 @@ do not "fix" a missing tool by installing it into the home directory — run it
 with `nix run nixpkgs#<pkg>` or `nix shell` (see the `nix` skill), or ask the
 user for the flag that would provide it.
 
+## Project configuration
+
+The launcher reads a fenced `agent-sandbox` TOML block from workspace
+`AGENTS.md`. Repeated `--config FILE` options load additional bare TOML files
+supporting `[ports]`, `[mounts]`, `[network]`, and `[env]`; config files follow
+`AGENTS.md` in command-line order. Ports, mounts, and network declarations keep
+their normal opt-in flags (`--ports`, `--mounts`, `--proxy`). `[env]` values are
+injected automatically as literal strings; they are not expanded from host
+environment values, and names beginning `AGENT_SANDBOX_` are reserved. Later
+config sources override earlier `[env]` values; explicit `-e`/`--env` wins.
+
+Use `--no-agents-md` to skip `AGENTS.md` as a launcher configuration source;
+explicit `--config` files and host-owned `--policy` files remain active. This
+does not hide the file from the agent when the workspace is mounted. The
+separate `agent-sandbox browser` command has its own `--no-agents-md` and
+repeatable `--config FILE` for browser `[ports]` and `[network]`; it does not
+apply `[env]` to the host Chromium process.
+
+Treat `[env]` as project-controlled input, not a way to pass host secrets.
+Keep credentials out of repository TOML and use the documented `--secrets`
+route flow for supported proxied HTTP credentials.
+
 ## Symptom → cause → what to ask for
 
 | Symptom | Cause | What the user runs on the host |

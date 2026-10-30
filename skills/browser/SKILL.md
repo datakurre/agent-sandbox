@@ -293,6 +293,12 @@ in `[ports]` and `[network]`, and nothing else** — so it can load the app
 under test and not the internet. That is the common case for UI work and
 needs no configuration.
 
+The browser has its own `--no-agents-md` and repeatable `--config FILE`
+options. Config files are bare TOML; the browser consumes their `[ports]` and
+`[network]` tables, not `[mounts]` or `[env]` (the browser is a host process).
+`--no-published-ports` disables declared as well as running-sandbox port seeds.
+Its `--policy` and `--allow` sources remain independent.
+
 Anything wider is opt-in, and the escalation is the same shape as everywhere
 else — ask the user, don't route around it:
 

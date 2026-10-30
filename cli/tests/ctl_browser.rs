@@ -19,6 +19,12 @@ const STUB_PROXY: &str = r#"#!/bin/sh
 while [ $# -gt 0 ]; do
   case "$1" in
     --shared-dir) shift; : > "$1/proxy-ready" ;;
+    --policy)
+      shift
+      if [ -n "${STUB_BROWSER_POLICY_CAPTURE:-}" ]; then
+        cp "$1" "$STUB_BROWSER_POLICY_CAPTURE"
+      fi
+      ;;
   esac
   shift
 done
@@ -49,6 +55,15 @@ fn sandbox_running_elsewhere(world: World) -> World {
             0,
         )
         .podman_reply("inspect", "/some/other/workspace\n", 0)
+}
+
+fn with_policy_capture(world: World) -> (World, std::path::PathBuf) {
+    let path = world.workspace().join("browser-policy");
+    let configured = world.env(
+        "STUB_BROWSER_POLICY_CAPTURE",
+        &path.display().to_string(),
+    );
+    (configured, path)
 }
 
 /// The regression: resolving the sandbox to seed ports from used to go through
@@ -112,6 +127,117 @@ fn a_named_sandbox_that_cannot_be_found_is_said_out_loud() {
         Some(0),
         "a sandbox that cannot be found is a note, not a failure\n\
          --- stderr ---\n{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn config_files_add_ports_and_network_rules_in_order() {
+    let (world, policy_path) = with_policy_capture(browser_world());
+    let world = world
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[ports]\n\"3000\" = 3000\n[network]\nallowed_hosts = [\"agents.example:443\"]\n```\n",
+        )
+        .file(
+            "first.toml",
+            "[ports]\n\"3100\" = 3100\n[network]\nallowed_hosts = [\"first.example:443\"]\n",
+        )
+        .file(
+            "second.toml",
+            "[network]\nallowed_hosts = [\"second.example:443\"]\n",
+        );
+    let out = world.run(&[
+        "browser",
+        "--config",
+        "first.toml",
+        "--config",
+        "second.toml",
+    ]);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "browser did not run to completion:\n{}",
+        out.stderr
+    );
+    let policy = std::fs::read_to_string(policy_path).expect("captured proxy policy");
+    for rule in [
+        "allow_ip 127.0.0.1/32:3000",
+        "allow_ip 127.0.0.1/32:3100",
+        "allow_host agents.example:443",
+        "allow_host first.example:443",
+        "allow_host second.example:443",
+    ] {
+        assert!(policy.contains(rule), "missing {rule:?} in policy:\n{policy}");
+    }
+}
+
+#[test]
+fn no_agents_md_skips_workspace_config_but_keeps_explicit_config() {
+    let (world, policy_path) = with_policy_capture(browser_world());
+    let world = world
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[ports]\n\"3000\" = 3000\n[network]\nallowed_hosts = [\"agents.example:443\"]\n```\n",
+        )
+        .file(
+            "browser.toml",
+            "[ports]\n\"3100\" = 3100\n[network]\nallowed_hosts = [\"config.example:443\"]\n",
+        );
+    let out = world.run(&["browser", "--no-agents-md", "--config", "browser.toml"]);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "browser did not run to completion:\n{}",
+        out.stderr
+    );
+    let policy = std::fs::read_to_string(policy_path).expect("captured proxy policy");
+    assert!(policy.contains("allow_ip 127.0.0.1/32:3100"), "{policy}");
+    assert!(policy.contains("allow_host config.example:443"), "{policy}");
+    assert!(!policy.contains(":3000"), "{policy}");
+    assert!(!policy.contains("agents.example"), "{policy}");
+}
+
+#[test]
+fn no_published_ports_skips_config_ports_but_keeps_config_network_rules() {
+    let (world, policy_path) = with_policy_capture(browser_world());
+    let world = world.file(
+        "browser.toml",
+        "[ports]\n\"3100\" = 3100\n[network]\nallowed_hosts = [\"config.example:443\"]\n",
+    );
+    let out = world.run(&[
+        "browser",
+        "--no-published-ports",
+        "--config",
+        "browser.toml",
+    ]);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "browser did not run to completion:\n{}",
+        out.stderr
+    );
+    let policy = std::fs::read_to_string(policy_path).expect("captured proxy policy");
+    assert!(!policy.contains(":3100"), "{policy}");
+    assert!(policy.contains("allow_host config.example:443"), "{policy}");
+}
+
+#[test]
+fn missing_config_file_is_an_error_before_browser_startup() {
+    let out = browser_world().run(&["browser", "--config", "missing.toml"]);
+
+    assert_ne!(out.code, Some(0), "missing config unexpectedly succeeded");
+    assert!(
+        out.stderr.contains("cannot read config file missing.toml"),
+        "missing config path was not reported:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("no managed-policy layer"),
+        "browser startup continued after config failure:\n{}",
         out.stderr
     );
 }
