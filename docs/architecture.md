@@ -260,23 +260,58 @@ only its own variable:
 | --- | --- | --- |
 | `mvn` 3.9+ and 4, script-only `mvnw` (which execs `mvn`) | `MAVEN_ARGS` | `-gs <settings>` |
 | jar-based `mvnw` (`.mvn/wrapper/maven-wrapper.jar`) | `MAVEN_CONFIG` | `-gs <settings>` |
-| both, and the wrapper's own download of Maven | `MAVEN_OPTS` | `-Dhttp(s).proxyHost`/`proxyPort`, for plugins that download through `java.net` themselves |
+| Maven JVM (including the wrapper's Maven download) | `MAVEN_OPTS` | `-Dhttp(s).proxyHost`/`proxyPort`, for plugins that download through `java.net` themselves |
+| Every JVM, including direct Java tools | `JAVA_TOOL_OPTIONS` | the same JVM proxy properties, plus the session truststore under L7 |
 
 When the policy has an L7 rule, so the proxy terminates TLS, the JVM needs the
 session CA too, and it ignores `SSL_CERT_FILE`. The entrypoint therefore also
 writes the merged CA bundle as a JKS keystore,
 `~/.cache/agent-sandbox-ca-bundle.jks`, and adds `-Djavax.net.ssl.trustStore`
-for it to `MAVEN_OPTS`. Each certificate is parsed before it goes in, because
-a single one Java cannot read would fail the whole keystore and with it every
-TLS connection Maven makes; one that does not parse is left out, with a
-warning.
+for it to `MAVEN_OPTS` and `JAVA_TOOL_OPTIONS`. The latter reaches Java tools
+that start their own JVM, such as mvn2nix. The JVM prints a `Picked up
+JAVA_TOOL_OPTIONS` notice to stderr when it uses those options. Each
+certificate is parsed before it goes in, because a single one Java cannot read
+would fail the whole keystore and with it every TLS connection; one that does
+not parse is left out, with a warning.
 
-Ours goes first in each variable, ahead of anything the operator set. In
-`MAVEN_OPTS` that means a property the operator repeats wins, since the JVM keeps
-the last `-D`. Settings are the opposite: of two `-gs`, Maven keeps the
-*first*, so an operator `MAVEN_ARGS` or `MAVEN_CONFIG` that already names global
-settings (`-gs`, `--global-settings`, or Maven 4's `-is`/`--install-settings`) is
-left alone instead.
+An operator-specified proxy host or port in `JAVA_TOOL_OPTIONS`,
+`JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, or `MAVEN_OPTS` suppresses the generated
+host **and** port for that scheme in both generated option variables. A
+partial override is warned about; supply both properties (`proxyHost` and
+`proxyPort`) rather than relying on one generated half.
+
+For truststores, a path set in `JAVA_TOOL_OPTIONS` suppresses the generated
+session-store pair, and a path set in `MAVEN_OPTS` or `_JAVA_OPTIONS` can
+override it for Maven. `_JAVA_OPTIONS` can override it for direct Java too. A
+path in `JDK_JAVA_OPTIONS` can override the generated path for direct Java, so
+the entrypoint warns that the selected store may omit the session CA; Maven
+still gets the generated path and JKS type in its later `MAVEN_OPTS`. Any
+operator-selected store must contain the session CA for intercepted hosts to
+work. A type-only override does not remove the generated path. JKS is
+recognized case-insensitively. The generated store is JKS, and
+the supported JDK's PKCS12 implementation can read JKS keystores through its
+keystore-compatibility mode; other non-JKS types that cannot read JKS produce a
+warning for direct Java. `_JAVA_OPTIONS` is processed late enough to override
+Maven's generated truststore type too, so an incompatible type there is warned
+about for Maven as well.
+
+We put generated flags first in `MAVEN_OPTS` and `JAVA_TOOL_OPTIONS`, ahead of
+anything the operator set there. Proxy pairs are the exception: when either
+member is operator-set, neither generated member is added. For other repeated
+properties, later JVM arguments win; proxy properties set in
+`JDK_JAVA_OPTIONS` and `_JAVA_OPTIONS` are therefore not reintroduced in
+`MAVEN_OPTS`. Settings are the opposite: of two `-gs`, Maven keeps the *first*,
+so an operator
+`MAVEN_ARGS` or `MAVEN_CONFIG` that already names global settings (`-gs`,
+`--global-settings`, or Maven 4's `-is`/`--install-settings`) is left alone
+instead.
+
+For Maven, a truststore type in `JAVA_TOOL_OPTIONS` or `JDK_JAVA_OPTIONS` is
+followed by the generated JKS type in `MAVEN_OPTS`, keeping Maven's generated
+path/type pair readable. Direct Java receives the generated path/type through
+`JAVA_TOOL_OPTIONS`, but later `JDK_JAVA_OPTIONS` or `_JAVA_OPTIONS` can
+override one member; unsupported type overrides are warned about because they
+can make the generated JKS unreadable and omit the session CA.
 
 Maven 4's `mvn` runs `MAVEN_OPTS` through `eval`. So every path and address
 that goes into these variables must stay one word, unchanged, through word

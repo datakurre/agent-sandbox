@@ -40,10 +40,11 @@ Two consequences worth internalizing:
 - The entrypoint compensates for the common cases: it writes an `~/.ssh/config`
   that routes SSH through the proxy, sets `NODE_USE_ENV_PROXY=1` for Node, and
   points Maven (`mvn`, `mvnw`) at the proxy through `MAVEN_ARGS`,
-  `MAVEN_CONFIG` and `MAVEN_OPTS`, plus a Java truststore for the session CA
-  when one is mounted. Don't hand-write `~/.m2/settings.xml` proxy settings
-  over it. Anything else with its own HTTP stack may need `--proxy`-style
-  flags of its own.
+  `MAVEN_CONFIG` and `MAVEN_OPTS`. It also sets `JAVA_TOOL_OPTIONS` so direct
+  JVM tools get the proxy properties too, with a Java truststore for the
+  session CA when one is mounted. Don't hand-write `~/.m2/settings.xml` proxy
+  settings over it. Anything else with its own HTTP stack may need
+  `--proxy`-style flags of its own.
 
 The firewall governs *egress*, not the sandbox's own loopback. A server you
 start here stays reachable at `localhost` — `$NO_PROXY` carries

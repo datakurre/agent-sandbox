@@ -607,6 +607,7 @@ const ATTACH_ENV_VARS: &[&str] = &[
     "MAVEN_ARGS",
     "MAVEN_CONFIG",
     "MAVEN_OPTS",
+    "JAVA_TOOL_OPTIONS",
     "AGENT_SANDBOX_PROXY_HOST",
 ];
 
@@ -728,11 +729,11 @@ const MAVEN_USER_SETTINGS_MARKER: &str =
 /// counterpart: Maven 3.9 parses `<port>` as a number before it interpolates.
 const PROXY_HOST_ENV: &str = "AGENT_SANDBOX_PROXY_HOST";
 
-/// Points Maven at the proxy -- see "Maven" in docs/architecture.md.  Returns
-/// the variables to set and what went wrong, and never fails: a sandbox whose
-/// Maven is not proxied is still a sandbox.  `existing` is the operator's
-/// value of a variable.  Without a proxy it only removes what this
-/// entrypoint wrote before.
+/// Points Maven and direct JVMs at the proxy -- see "Maven" in
+/// docs/architecture.md. Returns the variables to set and what went wrong,
+/// and never fails: a sandbox whose Maven is not proxied is still a sandbox.
+/// `existing` is the operator's value of a variable. Without a proxy it only
+/// removes what this entrypoint wrote before.
 fn setup_maven(
     home_path: &Path,
     http_proxy: Option<&str>,
@@ -793,7 +794,7 @@ fn setup_maven(
             }
             Err(e) => {
                 warnings.push(format!(
-                    "no Java truststore, so hosts the proxy intercepts will fail in Maven: {e:#}"
+                    "no Java truststore, so hosts the proxy intercepts will fail in Java processes: {e:#}"
                 ));
                 None
             }
@@ -965,23 +966,184 @@ fn maven_env(
 ) -> MavenEnv {
     let mut plan = MavenEnv::default();
 
-    // The JVM properties are for what settings do not reach: plugins that
-    // download through java.net themselves, and the wrapper jar fetching Maven.
-    let mut opts = vec![format!(
-        "-Dhttp.proxyHost={proxy_host} -Dhttp.proxyPort={proxy_port} \
-         -Dhttps.proxyHost={proxy_host} -Dhttps.proxyPort={proxy_port}"
-    )];
+    // Maven reads MAVEN_OPTS; JAVA_TOOL_OPTIONS also reaches JVMs launched
+    // directly, such as mvn2nix's URL probe. JDK_JAVA_OPTIONS is prepended to
+    // the Java command line, and _JAVA_OPTIONS is processed by the JVM too.
+    let java_tool_options = existing("JAVA_TOOL_OPTIONS");
+    let jdk_java_options = existing("JDK_JAVA_OPTIONS");
+    let underscore_java_options = existing("_JAVA_OPTIONS");
+    let operator_maven_opts = existing("MAVEN_OPTS");
+    let mut jvm_properties = vec![
+        ("http.proxyHost", format!("-Dhttp.proxyHost={proxy_host}")),
+        ("http.proxyPort", format!("-Dhttp.proxyPort={proxy_port}")),
+        ("https.proxyHost", format!("-Dhttps.proxyHost={proxy_host}")),
+        ("https.proxyPort", format!("-Dhttps.proxyPort={proxy_port}")),
+    ];
     match truststore {
-        Some(path) if shell_word(path) => opts.push(format!(
-            "-Djavax.net.ssl.trustStore={path} -Djavax.net.ssl.trustStoreType=JKS"
-        )),
+        Some(path) if shell_word(path) => {
+            jvm_properties.push((
+                "javax.net.ssl.trustStore",
+                format!("-Djavax.net.ssl.trustStore={path}"),
+            ));
+            jvm_properties.push((
+                "javax.net.ssl.trustStoreType",
+                "-Djavax.net.ssl.trustStoreType=JKS".to_string(),
+            ));
+        }
         Some(path) => plan
             .warnings
-            .push(format!("truststore path {path} is not shell-safe; MAVEN_OPTS does not name it")),
+            .push(format!(
+                "truststore path {path} is not shell-safe; MAVEN_OPTS and JAVA_TOOL_OPTIONS do not name it"
+            )),
         None => {}
     }
-    plan.vars
-        .push(("MAVEN_OPTS", prepend_flags(&opts.join(" "), &existing("MAVEN_OPTS"))));
+    let java_sets_truststore_path =
+        java_options_sets_property(&java_tool_options, "javax.net.ssl.trustStore");
+    let maven_sets_truststore_path =
+        java_options_sets_property(&operator_maven_opts, "javax.net.ssl.trustStore");
+    let underscore_sets_truststore_path =
+        java_options_sets_property(&underscore_java_options, "javax.net.ssl.trustStore");
+    let suppress_generated_java_truststore_path =
+        java_sets_truststore_path || underscore_sets_truststore_path;
+    let suppress_generated_maven_truststore =
+        java_sets_truststore_path || maven_sets_truststore_path || underscore_sets_truststore_path;
+    let direct_truststore_path_override = [
+        &java_tool_options,
+        &jdk_java_options,
+        &underscore_java_options,
+    ]
+    .iter()
+    .any(|options| java_options_sets_property(options, "javax.net.ssl.trustStore"));
+    if truststore.is_some() && direct_truststore_path_override {
+        plan.warnings.push(
+            "operator Java options override the generated session truststore path; direct Java connections to L7-intercepted hosts may omit the session CA"
+                .to_string(),
+        );
+    }
+    if truststore.is_some() && (maven_sets_truststore_path || underscore_sets_truststore_path) {
+        plan.warnings.push(
+            "operator MAVEN_OPTS or _JAVA_OPTIONS overrides the generated session truststore path; Maven connections to L7-intercepted hosts may omit the session CA"
+                .to_string(),
+        );
+    }
+
+    let proxy_options = [
+        java_tool_options.as_str(),
+        jdk_java_options.as_str(),
+        underscore_java_options.as_str(),
+        operator_maven_opts.as_str(),
+    ];
+    let mut operator_proxy_overrides = Vec::new();
+    for (scheme, host, port) in [
+        ("http", "http.proxyHost", "http.proxyPort"),
+        ("https", "https.proxyHost", "https.proxyPort"),
+    ] {
+        let host_set = proxy_options
+            .iter()
+            .any(|options| java_options_sets_property(options, host));
+        let port_set = proxy_options
+            .iter()
+            .any(|options| java_options_sets_property(options, port));
+        if host_set || port_set {
+            operator_proxy_overrides.push((host, port));
+            if host_set != port_set {
+                plan.warnings.push(format!(
+                    "operator Java options set only one of {host} and {port}; the generated {scheme} proxy pair is omitted, so supply both properties"
+                ));
+            }
+        }
+    }
+
+    let java_tool_truststore_type =
+        last_java_option_property(&java_tool_options, "javax.net.ssl.trustStoreType");
+    let jdk_truststore_type =
+        last_java_option_property(&jdk_java_options, "javax.net.ssl.trustStoreType");
+    let underscore_truststore_type =
+        last_java_option_property(&underscore_java_options, "javax.net.ssl.trustStoreType");
+    let direct_effective_type = underscore_truststore_type
+        .or(jdk_truststore_type)
+        .or(java_tool_truststore_type);
+    if truststore.is_some()
+        && !suppress_generated_java_truststore_path
+        && direct_effective_type.is_some_and(|value| {
+            !value.eq_ignore_ascii_case("JKS") && !value.eq_ignore_ascii_case("PKCS12")
+        })
+    {
+        plan.warnings.push(
+            "operator Java options select a truststore type that cannot read the generated JKS; direct Java connections to L7-intercepted hosts may omit the session CA"
+                .to_string(),
+        );
+    }
+    let maven_effective_type = last_java_option_property(
+        &underscore_java_options,
+        "javax.net.ssl.trustStoreType",
+    )
+    .or_else(|| {
+        last_java_option_property(&operator_maven_opts, "javax.net.ssl.trustStoreType")
+    });
+    if truststore.is_some()
+        && !suppress_generated_maven_truststore
+        && maven_effective_type.is_some_and(|value| {
+            !value.eq_ignore_ascii_case("JKS") && !value.eq_ignore_ascii_case("PKCS12")
+        })
+    {
+        plan.warnings.push(
+            "operator JVM options select a truststore type that cannot read the generated JKS; Maven connections to L7-intercepted hosts may omit the session CA"
+                .to_string(),
+        );
+    }
+    let maven_flags = jvm_properties
+        .iter()
+        .filter(|(name, _)| {
+            let proxy_pair_override = operator_proxy_overrides
+                .iter()
+                .any(|(host, port)| *name == *host || *name == *port);
+            let truststore_path_suppressed =
+                *name == "javax.net.ssl.trustStore" && suppress_generated_maven_truststore;
+            let truststore_type_suppressed = *name == "javax.net.ssl.trustStoreType"
+                && (suppress_generated_maven_truststore
+                    || java_options_sets_property(
+                        &operator_maven_opts,
+                        "javax.net.ssl.trustStoreType",
+                    )
+                    || java_options_sets_property(
+                        &underscore_java_options,
+                        "javax.net.ssl.trustStoreType",
+                    ));
+            !proxy_pair_override && !truststore_path_suppressed && !truststore_type_suppressed
+        })
+        .map(|(_, flag)| flag.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let jvm_flags = jvm_properties
+        .iter()
+        .filter(|(name, _)| {
+            let proxy_pair_override = operator_proxy_overrides
+                .iter()
+                .any(|(host, port)| *name == *host || *name == *port);
+            !proxy_pair_override
+                && !(*name == "javax.net.ssl.trustStore"
+                    && suppress_generated_java_truststore_path)
+                && !(*name == "javax.net.ssl.trustStoreType"
+                    && (suppress_generated_java_truststore_path
+                        || java_options_sets_property(
+                            &java_tool_options,
+                            "javax.net.ssl.trustStoreType",
+                        )))
+        })
+        .map(|(_, flag)| flag.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let maven_opts = if maven_flags.is_empty() {
+        existing("MAVEN_OPTS")
+    } else {
+        prepend_flags(&maven_flags, &existing("MAVEN_OPTS"))
+    };
+    plan.vars.push(("MAVEN_OPTS", maven_opts));
+    plan.vars.push((
+        "JAVA_TOOL_OPTIONS",
+        prepend_flags(&jvm_flags, &java_tool_options),
+    ));
 
     for name in ["MAVEN_ARGS", "MAVEN_CONFIG"] {
         let theirs = existing(name);
@@ -999,6 +1161,26 @@ fn maven_env(
         }
     }
     plan
+}
+
+/// Whether a Java options environment variable explicitly sets the named property.
+fn java_options_sets_property(options: &str, name: &str) -> bool {
+    options.split_whitespace().any(|option| {
+        option.strip_prefix("-D").is_some_and(|property| {
+            property.split_once('=').map_or(property, |(key, _)| key) == name
+        })
+    })
+}
+
+fn last_java_option_property<'a>(options: &'a str, name: &str) -> Option<&'a str> {
+    options
+        .split_whitespace()
+        .filter_map(|option| {
+            let property = option.strip_prefix("-D")?;
+            let (key, value) = property.split_once('=').unwrap_or((property, ""));
+            (key == name).then_some(value)
+        })
+        .last()
 }
 
 /// Ours first, so an operator's own value -- later on the java command line,
@@ -1222,13 +1404,10 @@ mod tests {
         let gs = format!("-gs {SETTINGS}");
         assert_eq!(var(&plan, "MAVEN_ARGS"), Some(gs.as_str()));
         assert_eq!(var(&plan, "MAVEN_CONFIG"), Some(gs.as_str()));
-        assert_eq!(
-            var(&plan, "MAVEN_OPTS"),
-            Some(
-                "-Dhttp.proxyHost=10.89.7.2 -Dhttp.proxyPort=8888 \
-                 -Dhttps.proxyHost=10.89.7.2 -Dhttps.proxyPort=8888"
-            )
-        );
+        let jvm_flags = "-Dhttp.proxyHost=10.89.7.2 -Dhttp.proxyPort=8888 \
+                         -Dhttps.proxyHost=10.89.7.2 -Dhttps.proxyPort=8888";
+        assert_eq!(var(&plan, "MAVEN_OPTS"), Some(jvm_flags));
+        assert_eq!(var(&plan, "JAVA_TOOL_OPTIONS"), Some(jvm_flags));
         assert!(plan.unproxied.is_empty() && plan.warnings.is_empty(), "{plan:?}");
     }
 
@@ -1238,14 +1417,419 @@ mod tests {
         let opts = var(&plan, "MAVEN_OPTS").unwrap();
         assert!(opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
         assert!(opts.contains("-Djavax.net.ssl.trustStoreType=JKS"));
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(java_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(java_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"));
     }
 
     #[test]
     fn the_operators_values_follow_ours() {
-        let theirs = [("MAVEN_OPTS", " -Xmx1g "), ("MAVEN_ARGS", "-T 4")];
-        let plan = maven_env("10.89.7.2", "8888", Some(SETTINGS), None, &operator(&theirs));
+        let theirs = [
+            ("MAVEN_OPTS", " -Xmx1g "),
+            ("JAVA_TOOL_OPTIONS", " -Xms256m "),
+            ("MAVEN_ARGS", "-T 4"),
+        ];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            None,
+            &operator(&theirs),
+        );
         assert!(var(&plan, "MAVEN_OPTS").unwrap().ends_with("-Dhttps.proxyPort=8888 -Xmx1g"));
+        assert!(var(&plan, "JAVA_TOOL_OPTIONS")
+            .unwrap()
+            .ends_with("-Dhttps.proxyPort=8888 -Xms256m"));
         assert_eq!(var(&plan, "MAVEN_ARGS").unwrap(), format!("-gs {SETTINGS} -T 4"));
+    }
+
+    #[test]
+    fn jdk_java_options_proxy_properties_are_not_overridden_by_maven_opts() {
+        let theirs = [(
+            "JDK_JAVA_OPTIONS",
+            "-Dhttp.proxyHost=operator.proxy -Dhttps.proxyPort=9443",
+        )];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            None,
+            &operator(&theirs),
+        );
+
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(!maven_opts.contains("-Dhttp.proxyHost="), "{maven_opts}");
+        assert!(!maven_opts.contains("-Dhttps.proxyPort="), "{maven_opts}");
+        assert!(!maven_opts.contains("-Dhttp.proxyPort="), "{maven_opts}");
+        assert!(!maven_opts.contains("-Dhttps.proxyHost="), "{maven_opts}");
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().all(|warning| warning.contains("supply both")), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn partial_proxy_pairs_in_java_options_never_receive_a_generated_half() {
+        for (name, value, host, port) in [
+            (
+                "JAVA_TOOL_OPTIONS",
+                "-Dhttp.proxyPort=9000",
+                "http.proxyHost",
+                "http.proxyPort",
+            ),
+            (
+                "JDK_JAVA_OPTIONS",
+                "-Dhttps.proxyHost=operator.proxy",
+                "https.proxyHost",
+                "https.proxyPort",
+            ),
+            (
+                "_JAVA_OPTIONS",
+                "-Dhttp.proxyHost=operator.proxy",
+                "http.proxyHost",
+                "http.proxyPort",
+            ),
+            (
+                "JDK_JAVA_OPTIONS",
+                "-Dhttps.proxyPort=9443",
+                "https.proxyHost",
+                "https.proxyPort",
+            ),
+        ] {
+            let theirs = [(name, value)];
+            let plan = maven_env(
+                "10.89.7.2",
+                "8888",
+                Some(SETTINGS),
+                None,
+                &operator(&theirs),
+            );
+            for variable in ["MAVEN_OPTS", "JAVA_TOOL_OPTIONS"] {
+                let options = var(&plan, variable).unwrap();
+                let operator_property = if value.contains(host) { host } else { port };
+                let other_property = if operator_property == host { port } else { host };
+                assert_eq!(
+                    options.matches(&format!("-D{operator_property}=")).count(),
+                    usize::from(variable == name),
+                    "{variable}: {options}"
+                );
+                assert!(
+                    !options.contains(&format!("-D{other_property}=")),
+                    "{variable}: {options}"
+                );
+            }
+            assert!(plan.warnings.iter().any(|warning| {
+                warning.contains(host) && warning.contains(port) && warning.contains("supply both")
+            }), "{name}={value}: {:?}", plan.warnings);
+        }
+    }
+
+    #[test]
+    fn java_tool_options_values_are_not_overridden_by_maven_opts() {
+        let theirs = [(
+            "JAVA_TOOL_OPTIONS",
+            "-Dhttp.proxyHost=operator.proxy \
+             -Djavax.net.ssl.trustStore=/operator/custom.p12 \
+             -Djavax.net.ssl.trustStoreType=PKCS12",
+        )];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(!maven_opts.contains("-Dhttp.proxyHost="), "{maven_opts}");
+        assert!(!maven_opts.contains("-Dhttp.proxyPort="), "{maven_opts}");
+        assert!(
+            !maven_opts.contains("javax.net.ssl.trustStore"),
+            "{maven_opts}"
+        );
+
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(
+            java_opts.ends_with(
+                "-Dhttp.proxyHost=operator.proxy \
+                                 -Djavax.net.ssl.trustStore=/operator/custom.p12 \
+                                 -Djavax.net.ssl.trustStoreType=PKCS12"
+            ),
+            "{java_opts}"
+        );
+        assert!(!java_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(!java_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"));
+    }
+
+    #[test]
+    fn java_tool_options_truststore_path_override_suppresses_generated_pair() {
+        let theirs = [(
+            "JAVA_TOOL_OPTIONS",
+            "-Djavax.net.ssl.trustStore=/operator/custom.p12",
+        )];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(
+            !maven_opts.contains("javax.net.ssl.trustStore"),
+            "{maven_opts}"
+        );
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(java_opts.contains("-Djavax.net.ssl.trustStore=/operator/custom.p12"));
+        assert!(!java_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(!java_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"));
+        assert!(java_opts.contains("-Dhttps.proxyPort=8888"), "{java_opts}");
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("override the generated session truststore path")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn java_tool_options_type_only_keeps_generated_path_and_warns_for_incompatible_jceks() {
+        let theirs = [("JAVA_TOOL_OPTIONS", "-Djavax.net.ssl.trustStoreType=JCEKS")];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(
+            maven_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")),
+            "{maven_opts}"
+        );
+        assert!(
+            maven_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"),
+            "{maven_opts}"
+        );
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(java_opts.contains("-Djavax.net.ssl.trustStoreType=JCEKS"));
+        assert!(java_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(!java_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"));
+        assert!(java_opts.contains("-Dhttps.proxyPort=8888"), "{java_opts}");
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("cannot read the generated JKS")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn java_tool_options_pkcs12_type_keeps_generated_jks_path_for_compatible_jdks() {
+        let theirs = [("JAVA_TOOL_OPTIONS", "-Djavax.net.ssl.trustStoreType=PKCS12")];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(java_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(java_opts.contains("-Djavax.net.ssl.trustStoreType=PKCS12"));
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn java_tool_options_lowercase_jks_type_keeps_generated_truststore_path() {
+        let theirs = [("JAVA_TOOL_OPTIONS", "-Djavax.net.ssl.trustStoreType=jks")];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(
+            maven_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")),
+            "{maven_opts}"
+        );
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(
+            java_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")),
+            "{java_opts}"
+        );
+        assert_eq!(
+            java_opts
+                .matches("-Djavax.net.ssl.trustStoreType=jks")
+                .count(),
+            1,
+            "{java_opts}"
+        );
+        assert!(
+            !java_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"),
+            "{java_opts}"
+        );
+        assert!(java_opts.ends_with("-Djavax.net.ssl.trustStoreType=jks"));
+        assert!(java_opts.contains("-Dhttps.proxyPort=8888"), "{java_opts}");
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn jdk_truststore_path_does_not_suppress_maven_store_with_java_tool_jks_type() {
+        let theirs = [
+            ("JAVA_TOOL_OPTIONS", "-Djavax.net.ssl.trustStoreType=JKS"),
+            (
+                "JDK_JAVA_OPTIONS",
+                "-Djavax.net.ssl.trustStore=/operator/custom.jks",
+            ),
+        ];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(
+            maven_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")),
+            "{maven_opts}"
+        );
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(
+            java_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")),
+            "{java_opts}"
+        );
+        assert!(
+            java_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"),
+            "{java_opts}"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("direct Java connections")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn jdk_truststore_type_conflict_keeps_generated_maven_path_and_jks_type_together() {
+        let theirs = [
+            ("JAVA_TOOL_OPTIONS", "-Djavax.net.ssl.trustStoreType=jks"),
+            ("JDK_JAVA_OPTIONS", "-Djavax.net.ssl.trustStoreType=PKCS12"),
+        ];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(
+            maven_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")),
+            "{maven_opts}"
+        );
+        assert!(
+            maven_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"),
+            "{maven_opts}"
+        );
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(
+            java_opts.contains("-Djavax.net.ssl.trustStoreType=jks"),
+            "{java_opts}"
+        );
+        assert!(
+            java_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")),
+            "{java_opts}"
+        );
+        assert!(
+            java_opts.contains("-Djavax.net.ssl.trustStoreType=JKS")
+                || java_opts.contains("-Djavax.net.ssl.trustStoreType=jks"),
+            "{java_opts}"
+        );
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn jdk_jceks_type_is_reported_for_direct_jvms_but_maven_keeps_jks_pair() {
+        let theirs = [("JDK_JAVA_OPTIONS", "-Djavax.net.ssl.trustStoreType=JCEKS")];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(maven_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(maven_opts.contains("-Djavax.net.ssl.trustStoreType=JKS"));
+        assert!(var(&plan, "JAVA_TOOL_OPTIONS")
+            .unwrap()
+            .contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("direct Java connections")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn underscore_java_options_truststore_path_and_type_are_reported() {
+        let theirs = [(
+            "_JAVA_OPTIONS",
+            "-Djavax.net.ssl.trustStore=/operator/custom -Djavax.net.ssl.trustStoreType=JCEKS",
+        )];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+        assert!(!var(&plan, "MAVEN_OPTS").unwrap().contains("trustStore"));
+        assert!(!var(&plan, "JAVA_TOOL_OPTIONS").unwrap().contains("trustStore"));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("override the generated session truststore path")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn maven_opts_truststore_path_override_warns_that_maven_may_omit_the_session_ca() {
+        let theirs = [(
+            "MAVEN_OPTS",
+            "-Djavax.net.ssl.trustStore=/operator/custom.jks",
+        )];
+        let plan = maven_env(
+            "10.89.7.2",
+            "8888",
+            Some(SETTINGS),
+            Some(TRUSTSTORE),
+            &operator(&theirs),
+        );
+        let maven_opts = var(&plan, "MAVEN_OPTS").unwrap();
+        assert!(maven_opts.contains("-Djavax.net.ssl.trustStore=/operator/custom.jks"));
+        assert!(!maven_opts.contains(&format!("-Djavax.net.ssl.trustStore={TRUSTSTORE}")));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("Maven connections")),
+            "{:?}",
+            plan.warnings
+        );
     }
 
     #[test]
@@ -1288,6 +1872,8 @@ mod tests {
         assert_eq!(plan.unproxied.len(), 2, "so the fallback takes over: {plan:?}");
         let opts = var(&plan, "MAVEN_OPTS").unwrap();
         assert!(!opts.contains("trustStore"), "{opts}");
+        let java_opts = var(&plan, "JAVA_TOOL_OPTIONS").unwrap();
+        assert!(!java_opts.contains("trustStore"), "{java_opts}");
         assert_eq!(plan.warnings.len(), 1, "{plan:?}");
 
         for word in ["a|b", "a;b", "$HOME", "'q'", "a*", "a b", "`x`", "a&b", "[::1]", ""] {
@@ -1315,6 +1901,10 @@ mod tests {
         let plan = maven_env("10.89.7.2", "8888", None, None, &operator(&[]));
         assert_eq!(plan.unproxied.len(), 2);
         assert!(var(&plan, "MAVEN_OPTS").is_some(), "the JVM properties still go out");
+        assert!(
+            var(&plan, "JAVA_TOOL_OPTIONS").is_some(),
+            "direct JVMs still get the properties"
+        );
     }
 
     #[test]
@@ -1350,7 +1940,16 @@ mod tests {
         assert!(tmp.path().join(MAVEN_GLOBAL_SETTINGS).exists());
         assert!(!tmp.path().join(MAVEN_USER_SETTINGS).exists());
         let names: Vec<_> = vars.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["MAVEN_OPTS", "MAVEN_ARGS", "MAVEN_CONFIG", PROXY_HOST_ENV]);
+        assert_eq!(
+            names,
+            [
+                "MAVEN_OPTS",
+                "JAVA_TOOL_OPTIONS",
+                "MAVEN_ARGS",
+                "MAVEN_CONFIG",
+                PROXY_HOST_ENV
+            ]
+        );
         assert!(vars.contains(&(PROXY_HOST_ENV, "10.89.7.2".to_string())));
     }
 
