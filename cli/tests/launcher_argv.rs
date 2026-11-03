@@ -218,6 +218,18 @@ fn only_the_selected_agents_state_is_mounted() {
         "another agent's state must not follow along: {}",
         run.joined()
     );
+    let active_mounts = run
+        .values_of("--label")
+        .into_iter()
+        .find_map(|label| label.strip_prefix("agent-sandbox.agent-state-mounts="))
+        .map(|value| serde_json::from_str::<Vec<(String, String)>>(value).unwrap())
+        .unwrap();
+    assert!(active_mounts
+        .iter()
+        .any(|(_, destination)| destination == "/home/user/.claude"));
+    assert!(!active_mounts
+        .iter()
+        .any(|(_, destination)| destination == "/home/user/.config/opencode"));
 }
 
 #[test]
@@ -287,6 +299,13 @@ fn agent_mounts_none_starts_the_agent_with_no_history() {
         "{}",
         run.joined()
     );
+    let active_mounts = run
+        .values_of("--label")
+        .into_iter()
+        .find_map(|label| label.strip_prefix("agent-sandbox.agent-state-mounts="))
+        .map(|value| serde_json::from_str::<Vec<(String, String)>>(value).unwrap())
+        .unwrap();
+    assert!(active_mounts.is_empty());
     assert_eq!(run.command(), vec!["opencode", "."]);
 }
 
@@ -298,7 +317,7 @@ fn the_writable_home_subdirectories_are_tmpfs_owned_by_the_mapped_user() {
     let run = out.run_call();
     let mounts = run.values_of("--mount");
 
-    for dir in [".config", ".cache", ".local"] {
+    for dir in [".config", ".cache", ".local", ".local/share"] {
         let want = format!("type=tmpfs,dst=/home/user/{},U=true", dir);
         assert!(
             mounts.contains(&want.as_str()),
@@ -307,6 +326,99 @@ fn the_writable_home_subdirectories_are_tmpfs_owned_by_the_mapped_user() {
             mounts
         );
     }
+}
+
+#[test]
+fn an_explicit_local_share_mount_does_not_collide_with_the_default_tmpfs() {
+    let out = World::new()
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[mounts]\n\".\" = \"/home/user/.local/share\"\n```\n",
+        )
+        .run(&["--workspace", "--mounts"]);
+    let run = out.run_call();
+
+    assert!(
+        run.mount_to("/home/user/.local/share").is_some(),
+        "{}",
+        run.joined()
+    );
+    assert!(
+        !run.values_of("--mount").contains(&"type=tmpfs,dst=/home/user/.local/share,U=true"),
+        "the user's mount must replace, not duplicate, the default tmpfs: {}",
+        run.joined()
+    );
+}
+
+#[test]
+fn an_explicit_volume_at_local_share_does_not_collide_with_the_default_tmpfs() {
+    let world = World::new();
+    let spec = format!("{}:/home/user/.local/share", world.home().display());
+    let out = world.run(&["-v", &spec]);
+    let run = out.run_call();
+
+    assert!(
+        run.mount_to("/home/user/.local/share").is_some(),
+        "{}",
+        run.joined()
+    );
+    assert!(
+        !run.values_of("--mount").contains(&"type=tmpfs,dst=/home/user/.local/share,U=true"),
+        "the user's volume must replace, not duplicate, the default tmpfs: {}",
+        run.joined()
+    );
+}
+
+#[test]
+fn destination_only_volume_forms_replace_the_default_local_share_tmpfs() {
+    for args in [
+        &["-v", "/home/user/.local/share"][..],
+        &["--volume", "/home/user/.local/share"][..],
+        &["--volume=/home/user/.local/share"][..],
+    ] {
+        let world = World::new();
+        let tmpdir = world
+            .home()
+            .parent()
+            .expect("world root")
+            .to_string_lossy()
+            .into_owned();
+        let out = world.env("TMPDIR", &tmpdir).run(args);
+        let run = out.run_call();
+
+        assert!(
+            run.has_pair("-v", "/home/user/.local/share"),
+            "{:?}: {}",
+            args,
+            run.joined()
+        );
+        assert!(
+            !run.values_of("--mount").contains(&"type=tmpfs,dst=/home/user/.local/share,U=true"),
+            "{:?} must not be followed by a duplicate tmpfs: {}",
+            args,
+            run.joined()
+        );
+    }
+}
+
+#[test]
+fn devenv_host_directory_creation_errors_are_reported_before_podman() {
+    let out = World::new()
+        .home_file(".local", "not a directory")
+        .run(&["--devenv"]);
+
+    assert!(out.failed(), "{}", out.stderr);
+    assert!(
+        !out.reached_podman_run(),
+        "podman must not be asked to mount a path that could not be created: {:?}",
+        out.calls
+    );
+    assert!(
+        out.stderr.contains("--devenv could not create host directory")
+            && out.stderr.contains(".local/share/devenv"),
+        "the diagnostic should name the option and path: {}",
+        out.stderr
+    );
 }
 
 // ── SELinux ─────────────────────────────────────────────────────────────────

@@ -131,8 +131,9 @@ Cases declare what they need with `require_image`, `require_network`,
 **Integration** asks whether the container comes up the way the flags said it
 would: a command runs and its exit code comes back, `--workspace` is writable
 and owned by the host user, the tmpfs home does not leak between sessions while
-the agent's own state does, a declared port carries traffic and an undeclared
-one does not, `ro` really is read-only, `ctl` finds a running sandbox by the
+the agent's own state does, `~/.local/share` stays writable beside a persistent
+`--devenv` bind, a declared port carries traffic and an undeclared one does not,
+`ro` really is read-only, `ctl` finds a running sandbox by the
 labels the launcher wrote, `--host-loopback-port` splices a host service into
 the sandbox, `agent-sandbox browser` reaches a declared port from a browser
 started before the sandbox existed, and `ctl purge` reclaims what a killed

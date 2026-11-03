@@ -498,7 +498,7 @@ discovery paths.
 | `logs [-f] [--tail N] [WORD] [--sandbox WORD]` | the proxy sidecar's log |
 | `tui [WORD] [--sandbox WORD]` | interactive terminal UI: shows denied requests live so you can add the missing rule, a Connections view (`v`) of all recent connections including currently-open ones, plus a Rules view (`r`) to inspect and remove existing rules, without leaving the dashboard |
 | `policy show\|allow\|rm\|reset\|export\|check [WORD] [--sandbox WORD]` | read and change the policy of a running sandbox; `export` prints its `[network]` section as a fenced AGENTS.md block (`--plain` for a bare-TOML policy file); `check HOST[:PORT]` dry-runs whether a target would be allowed |
-| `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage bind mounts into a running sandbox; `export` prints its `[mounts]` section as AGENTS.md TOML |
+| `mounts ls\|add\|rm\|export [WORD] [--sandbox WORD]` | inspect and manage user bind mounts into a running sandbox; agent-state paths are hidden only when their launcher bind is active; `export` prints its `[mounts]` section as AGENTS.md TOML |
 | `relay [-f] [WORD] [--sandbox WORD]` | show whether GPG signing is enabled and which hosts SSH push/pull may reach, plus what the relay has been asked for |
 | `attach [WORD] [-- CMD...]` | execute an interactive command inside a running sandbox, with the environment the entrypoint built (see below) |
 | `browser [WORD] [--sandbox WORD]` | start a throwaway host browser behind a deny-by-default allow list, for cooperative testing over CDP; `--name` runs several at once (see below) |

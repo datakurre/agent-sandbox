@@ -91,9 +91,11 @@ and Nix store registration.  No other changes needed.
   double-single-quote string mechanism.
 - The container runs with `--userns=keep-id`, so the uid/gid inside the
   container match the host user.  Passwd/group files are synthesized per-run.
-- Tmpfs mounts on `~/.config`, `~/.cache`, `~/.local` provide writable home
-  subdirectories by default; persistent tool data (opencode, devenv, …) is
-  layered on top via explicit `-v` bind mounts.
+- Tmpfs mounts on `~/.config`, `~/.cache`, `~/.local`, and `~/.local/share`
+  provide writable home subdirectories by default; the nested `share` mount
+  keeps its parent writable when persistent tool data (opencode, devenv, …) is
+  layered on top via explicit `-v` bind mounts. An explicit mount at exactly
+  `~/.local/share` suppresses the nested tmpfs to avoid duplicate destinations.
 - Nested rootless podman inside the container requires `--privileged`.
   The image ships a full podman stack and `/etc/containers` config, so nested
   podman works out of the box when the privilege flag is passed.

@@ -168,6 +168,61 @@ fn expand_v(mount: &agents::MountDecl, current_dir: &Path, home_dir: &str) -> St
     }
 }
 
+const LOCAL_SHARE_DIR: &str = "/home/user/.local/share";
+
+fn same_mount_destination(candidate: &str, destination: &str) -> bool {
+    Path::new(candidate) == Path::new(destination)
+}
+
+fn volume_destination(spec: &str) -> Option<&str> {
+    let mut fields = spec.splitn(3, ':');
+    let first = fields.next()?;
+    Some(fields.next().unwrap_or(first))
+}
+
+fn volume_targets(args: &[String], destination: &str) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (kind, spec) = match arg {
+            "-v" | "--volume" => {
+                i += 1;
+                ("volume", args.get(i).map(String::as_str))
+            }
+            "--mount" | "--tmpfs" => {
+                i += 1;
+                let kind = if arg == "--mount" { "mount" } else { "tmpfs" };
+                (kind, args.get(i).map(String::as_str))
+            }
+            _ if arg.starts_with("--volume=") => ("volume", arg.strip_prefix("--volume=")),
+            _ if arg.starts_with("--mount=") => ("mount", arg.strip_prefix("--mount=")),
+            _ if arg.starts_with("--tmpfs=") => ("tmpfs", arg.strip_prefix("--tmpfs=")),
+            _ => ("volume", arg.strip_prefix("-v").filter(|s| !s.is_empty())),
+        };
+        if let Some(spec) = spec {
+            let targets_destination = match kind {
+                "mount" => spec.split(',').any(|field| {
+                    field.split_once('=').is_some_and(|(key, value)| {
+                        matches!(key, "dst" | "destination" | "target")
+                            && same_mount_destination(value, destination)
+                    })
+                }),
+                "tmpfs" => spec
+                    .split(':')
+                    .next()
+                    .is_some_and(|target| same_mount_destination(target, destination)),
+                _ => volume_destination(spec)
+                    .is_some_and(|target| same_mount_destination(target, destination)),
+            };
+            if targets_destination {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Where the sandbox finds the sockets backing `--host-loopback-port`.  A
 /// directory rather than one socket per mount, so the count of mapped ports is
 /// not baked into the podman command line.
@@ -2970,6 +3025,7 @@ fn run() -> Result<i32> {
         }
     }
 
+    let mut agent_state_mounts = Vec::new();
     for a in &agent_mount_set {
         if let Some(json_str) = agent_state_json.get(a) {
             if let Ok(val) = serde_json::from_str::<Value>(json_str) {
@@ -2981,6 +3037,7 @@ fn run() -> Result<i32> {
                             fs::create_dir_all(&host).unwrap_or(());
                             mounts.push("-v".to_string());
                             mounts.push(format!("{}:{}:{}", host, container, rw_mount_opts));
+                            agent_state_mounts.push((host, container));
                         }
                     }
                 }
@@ -3006,6 +3063,7 @@ fn run() -> Result<i32> {
                             }
                             mounts.push("-v".to_string());
                             mounts.push(format!("{}:{}:{}", host, container, rw_mount_opts));
+                            agent_state_mounts.push((host, container));
                         }
                     }
                 }
@@ -3160,7 +3218,12 @@ fn run() -> Result<i32> {
 
     if want_devenv {
         let devenv_dir = format!("{}/.local/share/devenv", home);
-        fs::create_dir_all(&devenv_dir).unwrap_or(());
+        if let Err(e) = fs::create_dir_all(&devenv_dir) {
+            fail(&format!(
+                "agent-sandbox: --devenv could not create host directory {}: {}",
+                devenv_dir, e
+            ));
+        }
         mounts.push("-v".to_string());
         mounts.push(format!(
             "{}:/home/user/.local/share/devenv:{}",
@@ -4288,11 +4351,27 @@ fn run() -> Result<i32> {
         "--label",
         &format!("agent-sandbox.command={}", cmd_args.join(" ")),
     ]);
+    podman_cmd.args([
+        "--label",
+        &format!(
+            "agent-sandbox.agent-state-mounts={}",
+            serde_json::to_string(&agent_state_mounts).unwrap_or_else(|_| "[]".to_string())
+        ),
+    ]);
     podman_cmd.args(["--workdir", &workspace_dir]);
 
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.config,U=true"]);
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.cache,U=true"]);
     podman_cmd.args(["--mount", "type=tmpfs,dst=/home/user/.local,U=true"]);
+    if !volume_targets(&mounts, LOCAL_SHARE_DIR)
+        && !volume_targets(&declared_mounts, LOCAL_SHARE_DIR)
+        && !volume_targets(&podman_args, LOCAL_SHARE_DIR)
+    {
+        podman_cmd.args([
+            "--mount",
+            "type=tmpfs,dst=/home/user/.local/share,U=true",
+        ]);
+    }
     podman_cmd.args([
         "-e",
         "AGENT_SANDBOX_READY_FILE=/run/agent-sandbox-status/ready",
@@ -4529,6 +4608,42 @@ fn run() -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_mounts_at_local_share_are_detected_in_podman_argument_forms() {
+        assert!(volume_targets(
+            &["-v".into(), "source:/home/user/.local/share".into()],
+            LOCAL_SHARE_DIR
+        ));
+        assert!(volume_targets(
+            &["-v".into(), LOCAL_SHARE_DIR.into()],
+            LOCAL_SHARE_DIR
+        ));
+        assert!(volume_targets(
+            &["--volume".into(), LOCAL_SHARE_DIR.into()],
+            LOCAL_SHARE_DIR
+        ));
+        assert!(volume_targets(
+            &[format!("--volume={}", LOCAL_SHARE_DIR)],
+            LOCAL_SHARE_DIR
+        ));
+        assert!(volume_targets(
+            &["-v".into(), "source:/home/user/.local/share/".into()],
+            LOCAL_SHARE_DIR
+        ));
+        assert!(volume_targets(
+            &["--mount=type=bind,dst=/home/user/.local/share".into()],
+            LOCAL_SHARE_DIR
+        ));
+        assert!(volume_targets(
+            &["--tmpfs".into(), "/home/user/.local/share:rw".into()],
+            LOCAL_SHARE_DIR
+        ));
+        assert!(!volume_targets(
+            &["-v".into(), "source:/home/user/.local/share/devenv".into()],
+            LOCAL_SHARE_DIR
+        ));
+    }
 
     #[test]
     fn jsonl_from_an_agent_becomes_one_array_element_per_event() {

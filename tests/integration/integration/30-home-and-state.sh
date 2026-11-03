@@ -8,7 +8,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 require_image
 
-for dir in .config .cache .local; do
+for dir in .config .cache .local .local/share; do
   out="$(sandbox_run -- bash -c "touch ~/$dir/probe && echo written")"
   assert_contains "$out" "written" "~/$dir is writable"
 done
@@ -28,3 +28,20 @@ rm -f "$HOME/.config/opencode/probe"
 # ...and only for the agent that was selected.
 out="$(sandbox_run claude -- bash -c 'ls ~/.config/opencode 2>&1 || true')"
 assert_not_contains "$out" "probe" "another agent's state directory"
+
+# --devenv persists only its own subdirectory, while the parent remains a
+# writable per-session tmpfs. Use an isolated host home so this case never
+# touches the operator's real devenv data.
+ws="$(make_workspace)"
+trap 'rm -rf "$ws"' EXIT
+home="$ws/home"
+mkdir -p "$home"
+marker="devenv-persisted-$$"
+out="$(HOME="$home" sandbox_run --devenv -- bash -c \
+  "touch ~/.local/share/parent-probe && echo $marker > ~/.local/share/devenv/probe && echo written")"
+assert_contains "$out" "written" "--devenv writable parent"
+out="$(HOME="$home" sandbox_run --devenv -- bash -c \
+  'cat ~/.local/share/devenv/probe && test ! -e ~/.local/share/parent-probe && echo parent-absent')"
+assert_contains "$out" "$marker" "--devenv data in a later session"
+assert_not_contains "$out" "parent-probe" "--devenv parent does not persist"
+assert_contains "$out" "parent-absent" "--devenv parent does not persist"

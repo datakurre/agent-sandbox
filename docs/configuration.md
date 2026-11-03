@@ -124,6 +124,13 @@ authorizes nothing, since the repository controls the symlinks along it. A sourc
 that does not exist refuses the launch too, as podman would. See
 [Trust model](trust-model.md).
 
+The launcher normally gives `~/.local` and `~/.local/share` session-only
+tmpfs mounts. If an explicit mount targets `/home/user/.local/share` exactly,
+the launcher omits that nested tmpfs so Podman does not receive two mounts at
+the same destination; the explicit mount takes over the directory. `--devenv`
+creates its host-side persistence directory before launch and refuses to start
+if that directory cannot be created.
+
 Fields when using a table:
 
 - **`destination`** (required): The path inside the container, absolute or relative to `/workspace` as above. It is not checked against the sandbox's own files, so a mount may overlay anything in the container, `/etc` included. Under `--proxy` that stays inside the sandbox — egress is enforced by the proxy's separate container — but it is the repository's choice, not yours, unless the source is one `trusted.toml` authorizes.

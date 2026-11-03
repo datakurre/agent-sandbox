@@ -84,15 +84,40 @@ struct PodmanMount {
 /// *different* path under `/workspace` is a declared `[mounts]` entry and
 /// stays in the listing.
 fn is_launcher_bind(destination: &str, workspace_dir: &str) -> bool {
-    let baseline = [
+    let exact_destinations = [
         "/workspace",
         "/agent.sock",
         "/home/user/.local/share/devenv",
+        "/home/user/.gitconfig",
+        "/etc/passwd",
+        "/etc/group",
     ];
-    if baseline.contains(&destination) || destination == workspace_dir {
+    if exact_destinations.contains(&destination) || destination == workspace_dir {
         return true;
     }
-    let prefixes = [
+    let launcher_roots = [
+        "/home/user/.gnupg",
+        "/home/user/.ssh",
+        "/run",
+        "/sidecar_shared",
+        "/sidecar_policy",
+        "/sidecar_secrets",
+        "/nix",
+    ];
+    launcher_roots.iter().any(|root| {
+        destination == *root
+            || destination
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+/// Before the agent-state-mounts label was added, agent state binds could only
+/// be recognized by their destination. Keep that classification for old
+/// containers; new containers use the exact source/destination pairs in their
+/// label so user mounts at inactive agent paths remain visible.
+fn is_legacy_agent_state_bind(destination: &str) -> bool {
+    let legacy_roots = [
         "/home/user/.local/share/opencode",
         "/home/user/.local/share/antigravity-cli",
         "/home/user/.config/",
@@ -100,16 +125,29 @@ fn is_launcher_bind(destination: &str, workspace_dir: &str) -> bool {
         "/home/user/.claude",
         "/home/user/.copilot",
         "/home/user/.gemini",
-        "/home/user/.gitconfig",
-        "/home/user/.gnupg",
-        "/home/user/.ssh",
         "/home/user/.pi",
-        "/run/",
-        "/sidecar_",
-        "/nix",
-        "/etc/",
     ];
-    prefixes.iter().any(|p| destination.starts_with(p))
+    legacy_roots
+        .iter()
+        .any(|root| destination.starts_with(root))
+}
+
+fn is_active_agent_state_bind(mount: &PodmanMount, active_mounts: &[(String, String)]) -> bool {
+    mount.kind == "bind"
+        && active_mounts.iter().any(|(source, destination)| {
+            source == &mount.source && destination == &mount.destination
+        })
+}
+
+fn parse_agent_state_mounts(label: &str) -> Option<Vec<(String, String)>> {
+    serde_json::from_str(label).ok()
+}
+
+fn is_agent_state_bind(mount: &PodmanMount, active_mounts: Option<&[(String, String)]>) -> bool {
+    match active_mounts {
+        Some(active_mounts) => is_active_agent_state_bind(mount, active_mounts),
+        None => is_legacy_agent_state_bind(&mount.destination),
+    }
 }
 
 /// The container path the workspace was mounted at, derived from the label the
@@ -130,10 +168,17 @@ fn added_mounts(sandbox: &str) -> Result<Vec<PodmanMount>> {
         return Ok(Vec::new());
     }
     let workspace_dir = workspace_dir(sandbox);
+    let active_agent_mounts = podman_inspect_label(sandbox, "agent-sandbox.agent-state-mounts")
+        .ok()
+        .and_then(|label| parse_agent_state_mounts(&label));
     let parsed: Vec<PodmanMount> = serde_json::from_slice(&out.stdout).unwrap_or_default();
     Ok(parsed
         .into_iter()
-        .filter(|m| m.kind == "bind" && !is_launcher_bind(&m.destination, &workspace_dir))
+        .filter(|m| {
+            m.kind == "bind"
+                && !is_launcher_bind(&m.destination, &workspace_dir)
+                && !is_agent_state_bind(m, active_agent_mounts.as_deref())
+        })
         .collect())
 }
 
@@ -397,8 +442,6 @@ mod tests {
             "/nix/store",
             "/run/host-gpg-agent",
             "/sidecar_policy",
-            "/home/user/.claude",
-            "/home/user/.local/share/opencode",
             "/home/user/.local/share/devenv",
         ] {
             assert!(
@@ -412,6 +455,153 @@ mod tests {
                 !is_launcher_bind(added, "/workspace/repo"),
                 "{} should be listed",
                 added
+            );
+        }
+        for added in [
+            "/etc",
+            "/etc/hosts",
+            "/etc/passwd-backup",
+            "/etc/group-extra",
+        ] {
+            assert!(!is_launcher_bind(added, ""), "{} should be listed", added);
+        }
+    }
+
+    #[test]
+    fn launcher_paths_match_only_themselves_and_descendants() {
+        for launcher_path in ["/home/user/.gnupg", "/home/user/.ssh"] {
+            assert!(
+                is_launcher_bind(launcher_path, ""),
+                "{} should be filtered",
+                launcher_path
+            );
+            assert!(
+                is_launcher_bind(&format!("{}/state", launcher_path), ""),
+                "descendant of {} should be filtered",
+                launcher_path
+            );
+        }
+
+        for user_mount in [
+            "/home/user/.config/pi",
+            "/home/user/.cache/pi",
+            "/home/user/.local/share/pipeline",
+            "/home/user/.codex-backup",
+            "/home/user/.config-backup",
+            "/home/user/.gitconfig/extra",
+        ] {
+            assert!(
+                !is_launcher_bind(user_mount, ""),
+                "{} should be listed",
+                user_mount
+            );
+        }
+    }
+
+    #[test]
+    fn only_active_launcher_agent_state_binds_are_filtered() {
+        let active_codex = PodmanMount {
+            kind: "bind".to_string(),
+            source: "/host/home/.codex".to_string(),
+            destination: "/home/user/.codex".to_string(),
+            options: vec![],
+        };
+        let active_codex_label = vec![(
+            "/host/home/.codex".to_string(),
+            "/home/user/.codex".to_string(),
+        )];
+        assert!(is_active_agent_state_bind(
+            &active_codex,
+            &active_codex_label
+        ));
+
+        for inactive_user_mount in [
+            PodmanMount {
+                kind: "bind".to_string(),
+                source: "/user/data/codex".to_string(),
+                destination: "/home/user/.codex".to_string(),
+                options: vec![],
+            },
+            PodmanMount {
+                kind: "bind".to_string(),
+                source: "/user/data/pi".to_string(),
+                destination: "/home/user/.local/share/pi".to_string(),
+                options: vec![],
+            },
+            PodmanMount {
+                kind: "bind".to_string(),
+                source: "/user/data/pi-config".to_string(),
+                destination: "/home/user/.config/pi".to_string(),
+                options: vec![],
+            },
+            PodmanMount {
+                kind: "bind".to_string(),
+                source: "/user/data/pi-cache".to_string(),
+                destination: "/home/user/.cache/pi".to_string(),
+                options: vec![],
+            },
+        ] {
+            assert!(
+                !is_agent_state_bind(&inactive_user_mount, Some(&active_codex_label)),
+                "user mounts at inactive agent paths must remain visible"
+            );
+            assert!(
+                !is_launcher_bind(&inactive_user_mount.destination, ""),
+                "inactive agent paths must not be hidden by destination alone"
+            );
+        }
+
+        let active_pi = PodmanMount {
+            kind: "bind".to_string(),
+            source: "/host/home/.local/share/pi".to_string(),
+            destination: "/home/user/.local/share/pi".to_string(),
+            options: vec![],
+        };
+        let active_pi_label = vec![(
+            "/host/home/.local/share/pi".to_string(),
+            "/home/user/.local/share/pi".to_string(),
+        )];
+        assert!(
+            is_agent_state_bind(&active_pi, Some(&active_pi_label)),
+            "an active launcher state bind must still be filtered"
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_agent_state_metadata_uses_legacy_classification() {
+        let legacy_mount = PodmanMount {
+            kind: "bind".to_string(),
+            source: "/host/home/.config/pi".to_string(),
+            destination: "/home/user/.config/pi".to_string(),
+            options: vec![],
+        };
+        for label in ["", "not-json"] {
+            let metadata = parse_agent_state_mounts(label);
+            assert!(
+                metadata.is_none(),
+                "invalid/absent metadata should be unknown"
+            );
+            assert!(
+                is_agent_state_bind(&legacy_mount, metadata.as_deref()),
+                "old containers should retain destination-based filtering"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_agent_state_metadata_does_not_use_legacy_classification() {
+        let metadata = parse_agent_state_mounts("[]");
+        assert_eq!(metadata, Some(Vec::new()));
+        for destination in ["/home/user/.config/pi", "/home/user/.cache/pi"] {
+            let user_mount = PodmanMount {
+                kind: "bind".to_string(),
+                source: "/user/data/pi".to_string(),
+                destination: destination.to_string(),
+                options: vec![],
+            };
+            assert!(
+                !is_agent_state_bind(&user_mount, metadata.as_deref()),
+                "an explicit empty list means no agent-state binds are active"
             );
         }
     }
