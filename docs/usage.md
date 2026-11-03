@@ -16,6 +16,8 @@ agent-sandbox codex                              # codex
 agent-sandbox pi                                 # pi
 echo "prompt" | agent-sandbox --workspace --json --prompt - pi  # headless pi, JSON result
 echo "prompt" | agent-sandbox --workspace --prompt - pi         # headless pi, agent's own output
+echo "prompt" | agent-sandbox --workspace --prompt - copilot    # headless Copilot, piped prompt
+echo "prompt" | agent-sandbox --workspace --json --prompt - copilot  # headless Copilot, JSON result
 agent-sandbox --workspace --json -- make build                  # deterministic command, streamed JSON
 agent-sandbox opencode --no-selinux              # skip :z relabeling on an enforcing host
 agent-sandbox                                    # interactive bash (every agent's binary on PATH)
@@ -152,6 +154,8 @@ Two independent flags cover it: `--prompt -` controls where the agent's input
 comes from, `--json` controls whether stdout is machine-readable. Combine them
 as `--prompt - --json` for one JSON result per agent run; each also works alone,
 and `--json` works with no agent at all, on a plain `-- COMMAND`.
+Copilot reads a piped prompt directly; the launcher uses its silent mode without
+`-p`, because `-p` supplies prompt text and causes piped input to be ignored.
 
 Every value-taking flag below accepts both `--flag VALUE` and `--flag=VALUE`,
 and an empty value is refused rather than passed on.

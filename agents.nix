@@ -99,9 +99,10 @@
     name = "copilot";
     package = pkgs.github-copilot-cli;
     command = [ "copilot" ];
+    # Piped stdin is Copilot's programmatic prompt. Do not pass -p: a prompt
+    # value overrides stdin. -s suppresses session metadata in captured output.
     programmaticArgs = [
-      "-p"
-      "-"
+      "-s"
     ];
     # "'text' (default) or 'json' (JSONL, one JSON object per line)".
     jsonArgs = [

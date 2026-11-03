@@ -1843,6 +1843,48 @@ fn the_built_in_catalog_gives_pi_no_stdin_marker() {
 }
 
 #[test]
+fn the_built_in_catalog_uses_copilot_stdin_without_a_prompt_argument() {
+    let out = World::new()
+        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+        .run(&["--prompt", "-", "--model", "claude-haiku-5.5", "copilot"]);
+    let run = out.run_call();
+
+    assert_eq!(
+        run.command(),
+        vec!["copilot", "-s", "--model", "claude-haiku-5.5"]
+    );
+    assert!(run.has("--interactive"), "stdin must reach the container");
+}
+
+#[test]
+fn the_built_in_catalog_keeps_copilot_json_mode_with_stdin_prompt() {
+    let out = World::new()
+        .env_unset("AGENT_SANDBOX_AGENT_SPECS")
+        .run(&[
+            "--json",
+            "--prompt",
+            "-",
+            "--model",
+            "claude-haiku-5.5",
+            "copilot",
+        ]);
+    let run = out.run_call();
+
+    assert_eq!(
+        run.command(),
+        vec![
+            "copilot",
+            "-s",
+            "--output-format",
+            "json",
+            "--model",
+            "claude-haiku-5.5"
+        ]
+    );
+    assert!(run.has("--interactive"), "stdin must reach the container");
+}
+
+#[test]
 fn the_built_in_catalog_spells_session_per_agent() {
     // Each of these was read off the agent's own --help, and none of them is the
     // launcher's own `--session`.
@@ -1863,8 +1905,7 @@ fn the_built_in_catalog_spells_session_per_agent() {
             "copilot",
             vec![
                 "copilot",
-                "-p",
-                "-",
+                "-s",
                 "--output-format",
                 "json",
                 "--session-id",
