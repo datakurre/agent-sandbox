@@ -30,18 +30,15 @@ out="$(sandbox_run claude -- bash -c 'ls ~/.config/opencode 2>&1 || true')"
 assert_not_contains "$out" "probe" "another agent's state directory"
 
 # --devenv persists only its own subdirectory, while the parent remains a
-# writable per-session tmpfs. Use an isolated host home so this case never
-# touches the operator's real devenv data.
-ws="$(make_workspace)"
-trap 'rm -rf "$ws"' EXIT
-home="$ws/home"
-mkdir -p "$home"
+# writable per-session tmpfs.
+probe="probe-$$"
 marker="devenv-persisted-$$"
-out="$(HOME="$home" sandbox_run --devenv -- bash -c \
-  "touch ~/.local/share/parent-probe && echo $marker > ~/.local/share/devenv/probe && echo written")"
+trap 'rm -f "$HOME/.local/share/devenv/$probe"' EXIT
+out="$(sandbox_run --devenv -- bash -c \
+  "touch ~/.local/share/parent-$probe && echo $marker > ~/.local/share/devenv/$probe && echo written")"
 assert_contains "$out" "written" "--devenv writable parent"
-out="$(HOME="$home" sandbox_run --devenv -- bash -c \
-  'cat ~/.local/share/devenv/probe && test ! -e ~/.local/share/parent-probe && echo parent-absent')"
+out="$(sandbox_run --devenv -- bash -c \
+  "cat ~/.local/share/devenv/$probe && test ! -e ~/.local/share/parent-$probe && echo parent-absent")"
 assert_contains "$out" "$marker" "--devenv data in a later session"
-assert_not_contains "$out" "parent-probe" "--devenv parent does not persist"
+assert_not_contains "$out" "parent-$probe" "--devenv parent does not persist"
 assert_contains "$out" "parent-absent" "--devenv parent does not persist"
