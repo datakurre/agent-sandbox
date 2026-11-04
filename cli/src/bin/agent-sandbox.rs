@@ -739,7 +739,7 @@ fn enforce_selinux_mount_flags(mount_opt: &str, want_selinux: bool) -> String {
     // The immutable host Nix store cannot be recursively relabeled by a
     // rootless launcher. `--nix` no longer mounts it, but an explicit volume
     // passed through podman args may still name it.
-    let immutable_nix_store = parts[0] == "/nix/store";
+    let immutable_nix_store = parts[0] == "/nix/store" || parts[0].starts_with("/nix/store/");
     let want_selinux = want_selinux && !immutable_nix_store && !is_foreign_socket(parts[0]);
 
     let mut new_parts = parts.clone();
@@ -775,6 +775,46 @@ fn enforce_selinux_mount_flags(mount_opt: &str, want_selinux: bool) -> String {
     }
 
     new_parts.join(":")
+}
+
+fn declared_mount_selinux_flags(mount_opt: &str, want_selinux: bool) -> String {
+    if !want_selinux {
+        return mount_opt.to_string();
+    }
+
+    let mut parts = mount_opt.splitn(3, ':');
+    let Some(source) = parts.next() else {
+        return mount_opt.to_string();
+    };
+    let _destination = parts.next();
+    let options = parts.next().unwrap_or_default();
+    if options
+        .split(',')
+        .any(|option| option == "z" || option == "Z")
+    {
+        return mount_opt.to_string();
+    }
+
+    let source_path = Path::new(source);
+    let nix_store = Path::new("/nix/store");
+    if source_path.starts_with(nix_store) || nix_store.starts_with(source_path) {
+        eprintln!(
+            "agent-sandbox: warning: skipping automatic SELinux relabeling for declared mount '{}': it overlaps the immutable /nix/store",
+            source
+        );
+        return mount_opt.to_string();
+    }
+
+    use std::os::unix::fs::MetadataExt;
+    if fs::metadata(source).is_ok_and(|metadata| metadata.uid() != nix::unistd::getuid().as_raw()) {
+        eprintln!(
+            "agent-sandbox: warning: skipping automatic SELinux relabeling for declared mount '{}': its source is not owned by the invoking user and cannot be relabeled rootlessly",
+            source
+        );
+        return mount_opt.to_string();
+    }
+
+    enforce_selinux_mount_flags(mount_opt, true)
 }
 
 /// Nameservers for the sidecar, read from the host.  With DNS disabled on both
@@ -1034,7 +1074,7 @@ forwarding SSH, or exposing Git identity.
         Some(fmt(want_podman)),
         "Forwards the host rootless Podman socket (sibling containers).",
     );
-    print_help_option("--selinux", Some(fmt(want_selinux)), "Applies SELinux shared relabeling (:z) to ordinary writable binds; special volume modes are unchanged. Defaults to on when SELinux is enforcing.");
+    print_help_option("--selinux", Some(fmt(want_selinux)), "Relabels ordinary binds (shared :z for launcher-managed writable binds, private :Z for declared mounts); special volume modes and foreign-owned sockets stay unchanged. Declared mounts with non-user-owned sources or paths overlapping /nix/store are not automatically relabeled. Defaults to on when SELinux is enforcing.");
     print_help_option(
         "--proxy",
         Some(fmt(want_proxy)),
@@ -3360,9 +3400,9 @@ fn run() -> Result<i32> {
         }
 
         for spec in check.specs {
-            // Kept out of `mounts`: --selinux governs the launcher's own
-            // binds only, and a declaration's options are its own -- inside
-            // the workspace, or authorized as written in trusted.toml.
+            // Trust is checked against the declared options above. SELinux
+            // labeling is then added just like it is for the launcher's binds.
+            let spec = declared_mount_selinux_flags(&spec, want_selinux);
             declared_mounts.push("-v".to_string());
             declared_mounts.push(spec);
         }
@@ -4920,6 +4960,33 @@ mod tests {
             enforce_selinux_mount_flags("/nix/store:/nix/store:ro", true),
             "/nix/store:/nix/store:ro"
         );
+        assert_eq!(
+            enforce_selinux_mount_flags("/nix/store/path:/nix/store/path:ro", true),
+            "/nix/store/path:/nix/store/path:ro"
+        );
+    }
+
+    #[test]
+    fn declared_selinux_relabeling_skips_nix_store_ancestors() {
+        assert_eq!(
+            declared_mount_selinux_flags("/nix:/mnt:ro", true),
+            "/nix:/mnt:ro"
+        );
+        assert_eq!(declared_mount_selinux_flags("/:host:ro", true), "/:host:ro");
+    }
+
+    #[test]
+    fn declared_selinux_relabeling_skips_foreign_owned_sources() {
+        let source = "/etc/passwd";
+        use std::os::unix::fs::MetadataExt;
+        if fs::metadata(source)
+            .is_ok_and(|metadata| metadata.uid() != nix::unistd::getuid().as_raw())
+        {
+            assert_eq!(
+                declared_mount_selinux_flags("/etc/passwd:/mnt/passwd:ro", true),
+                "/etc/passwd:/mnt/passwd:ro"
+            );
+        }
     }
 
     #[test]

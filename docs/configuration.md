@@ -134,7 +134,7 @@ if that directory cannot be created.
 Fields when using a table:
 
 - **`destination`** (required): The path inside the container, absolute or relative to `/workspace` as above. It is not checked against the sandbox's own files, so a mount may overlay anything in the container, `/etc` included. Under `--proxy` that stays inside the sandbox — egress is enforced by the proxy's separate container — but it is the repository's choice, not yours, unless the source is one `trusted.toml` authorizes.
-- **`options`** (optional): A string or list of strings representing mount options (e.g., `"ro"`, `"rw"`, `"Z"`).
+- **`options`** (optional): A string or list of strings representing mount options (e.g., `"ro"`, `"rw"`, `"Z"`). When SELinux relabeling is enabled (by default on enforcing hosts), the launcher adds private relabeling (`Z`) to ordinary declared binds unless they already specify `z` or `Z`. This also relabels the host source of a read-only mount. Automatic relabeling is skipped with a warning when the source's top-level path is not owned by the invoking user or overlaps `/nix/store`. Directories are not checked recursively, so a foreign-owned descendant may still make Podman fail during relabeling. Use `--no-selinux` to opt out of automatic relabeling.
 
 Neither the source nor the destination may be empty, in either form, and no part
 of an entry may contain `:`, which podman reads as the separator between source,

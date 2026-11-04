@@ -792,6 +792,37 @@ fn a_declared_mount_keeps_the_options_it_declared() {
 }
 
 #[test]
+fn declared_read_only_mounts_are_relabelled_when_selinux_is_enforcing() {
+    let world = World::new()
+        .selinux_enforcing()
+        .file(
+            "AGENTS.md",
+            "```toml agent-sandbox\n[mounts]\n\"cache\" = { destination = \"/tmp/cache\", options = \"ro\" }\n```\n",
+        )
+        .file("cache/keep", "");
+
+    let relabelled = world.run(&["--workspace", "--mounts", "opencode"]);
+    assert!(
+        relabelled
+            .run_call()
+            .mount_to("/tmp/cache")
+            .is_some_and(|m| m.ends_with(":ro,Z")),
+        "{}",
+        relabelled.run_call().joined()
+    );
+
+    let unchanged = world.run(&["--workspace", "--mounts", "--no-selinux", "opencode"]);
+    assert!(
+        unchanged
+            .run_call()
+            .mount_to("/tmp/cache")
+            .is_some_and(|m| m.ends_with(":ro")),
+        "{}",
+        unchanged.run_call().joined()
+    );
+}
+
+#[test]
 fn without_the_workspace_a_mount_from_it_needs_trusted_toml_too() {
     let world = World::new()
         .file(
