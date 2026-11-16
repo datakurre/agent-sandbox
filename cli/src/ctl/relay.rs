@@ -84,7 +84,7 @@ pub fn run(args: RelayArgs) -> Result<()> {
     if hosts.is_empty() {
         println!("  ssh (push/pull) (none) -- git push/pull through the relay are refused");
         println!(
-            "                 Declare an SSH port in AGENTS.md, e.g. allowed_hosts = [\"github.com:22\"]."
+            "                 Declare an SSH port in AGENTS.md, e.g. allow = [\"github.com:22\"]."
         );
     } else {
         for host in hosts {

@@ -277,7 +277,7 @@ pub fn refusal(unauthorized: &[String], path: &Path) -> String {
     for host in unauthorized {
         out.push_str(&format!(
             "agent-sandbox: the selected network policy authorizes SSH to '{}'\n\
-             \x20              (an allowed_hosts entry covering port 22), but no host key for\n\
+             \x20              (an allow entry covering port 22), but no host key for\n\
              \x20              it is trusted in {}.\n\n\
              \x20              To authorize it, add:\n\n",
             host,
@@ -311,7 +311,7 @@ pub fn refusal(unauthorized: &[String], path: &Path) -> String {
         }
 
         out.push_str(
-            "\x20              Or drop port 22 from the allowed_hosts entry if SSH is not needed.\n\n",
+            "\x20              Or drop port 22 from the allow entry if SSH is not needed.\n\n",
         );
     }
     out.trim_end().to_string()

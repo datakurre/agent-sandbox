@@ -511,7 +511,7 @@ from `AGENTS.md` and any `--config` TOML files (unless `--no-agents-md` skips
 the workspace file), any explicitly selected host-owned policies (`--policy`), and
 the launched agent's own policy file if one exists
 (`~/.config/agent-sandbox/policies/<agent>.toml`).
-`[network].allowed_hosts` contains domains, wildcard domains, IPs, or CIDR blocks, each
+`[network].allow` (with `allowed_hosts` accepted as a legacy synonym) contains domains, wildcard domains, IPs, or CIDR blocks, each
 with a port, a port range, or a comma-separated list of both; an entry written
 without one is matched against the compiled-in `DEFAULT_ALLOW_PORTS`
 (80, 443, 22) instead, which is also what `allow_port` defaults to when the
@@ -521,10 +521,11 @@ entry like `"*:80,443"` compiles to one `allow_port` line per element.
 `[[network.allowed_routes]]` configures L7 routes and optional secret injection.
 A comma-separated `method` field expands to one compiled rule per method, with
 secret bindings expanded the same way after the trusted route is matched.
-An `allowed_hosts` entry carrying a method list or a path
+An `allow` entry carrying a method list or a path
 (`"GET,POST api.example.com:443/v1/**"`) is a route in short form, which the
 launcher compiles exactly as the tables it stands for, one per method.
-Those two keys are the whole surface: an unknown key under `[network]` refuses
+Non-secret domain routes prefer short form directly in `allow`.
+These keys (`allow`, legacy `allowed_hosts`, and `allowed_routes`) are the whole surface: an unknown key under `[network]` refuses
 the launch rather than being ignored.
 
 The launcher merges and compiles those blocks into the flat, line-oriented policy file the
@@ -611,7 +612,7 @@ rather than failing later at certificate validation.
 The launcher appends a baseline `deny_ip` list (loopback, RFC1918, link-local,
 CGNAT, ULA) to every policy it writes, under `--proxy`.
 
-**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol. The relay authorizes the two independently: `relay-gpg` requests are allowed whenever `signing_enabled` is `true` in the policy file — a flag the launcher writes unconditionally whenever `--gpg` wires up the relay, with no host to name, since gpg has no destination of its own. `relay-ssh` requests are allowed only when the destination host matches an `allow_signing` entry, which an `allowed_hosts` entry on port 22 is what populates — so `git push` still needs an explicit `"host:22"` declaration even though signing does not.
+**Relay Architecture.** When `--ssh` or `--gpg` are used with `--proxy`, the sandbox cannot mount the host sockets directly (they bypass the proxy firewall). Instead, the sidecar runs `relay-server`, exposing a TCP port to the sandbox. Inside the sandbox, `relay-ssh` and `relay-gpg` binaries forward requests to the sidecar over a custom binary protocol. The relay authorizes the two independently: `relay-gpg` requests are allowed whenever `signing_enabled` is `true` in the policy file — a flag the launcher writes unconditionally whenever `--gpg` wires up the relay, with no host to name, since gpg has no destination of its own. `relay-ssh` requests are allowed only when the destination host matches an `allow_signing` entry, which an `allow` entry on port 22 is what populates — so `git push` still needs an explicit `"host:22"` declaration even though signing does not.
 
 Because the relay runs the real `ssh` in the sidecar, host-key verification has
 to be solved there too. `relay-server` reads `/sidecar_policy/known_hosts` —
@@ -646,7 +647,7 @@ longest-prefix match *is* the specificity comparison the proxy makes, so every
 blackhole by itself; the one case a routing table cannot express is the
 equal-prefix tie, there being room for a single route per prefix, and that is
 handled by not installing the blackhole at all.  Until it did this, a re-allowed
-range -- including the documented `allowed_hosts = ["10.0.0.0/8"]` for corporate
+range -- including the documented `allow = ["10.0.0.0/8"]` for corporate
 git over a VPN, which compiles to `allow_ip` against the baseline -- was
 permitted by the proxy and then dropped on the floor by the route, with
 `policy show` reporting the rule as in force.

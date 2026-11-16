@@ -103,12 +103,12 @@ route flow for supported proxied HTTP credentials.
 | `403 Forbidden` from the proxy, empty body | host not in the policy | `agent-sandbox ctl policy allow <host>:443` |
 | `Could not resolve host` in a proxied session | internal network has no DNS; only proxy-aware clients work | make the tool honour `$HTTP_PROXY`, or add a rule |
 | Certificate error after a rule was added mid-session | an L7 route added live has no session CA behind it | add the rule to `AGENTS.md`, then relaunch |
-| `agent-sandbox: ssh to X denied by allow_signing policy` | relay not authorized for that host | `agent-sandbox ctl policy allow X:22` (live), or add `"X:22"` to `allowed_hosts` to persist it |
+| `agent-sandbox: ssh to X denied by allow_signing policy` | relay not authorized for that host | `agent-sandbox ctl policy allow X:22` (live), or add `"X:22"` to `allow` to persist it |
 | `Host key verification failed` on an allowed SSH host | no authorized key for it in this session | add `[[network.known_hosts]]` to `~/.config/agent-sandbox/trusted.toml`, relaunch |
 | `agent-sandbox: ssh denied: host keys are authorized on the host` | you passed `-o StrictHostKeyChecking=`/`UserKnownHostsFile=`/`-F` | drop the flag; the key goes in `trusted.toml`, and no flag substitutes for it |
 | `agent-sandbox: ssh denied: a jump host would move the connection` | you passed `-J`/`ProxyJump` | drop it; the relay only connects to hosts the policy named |
 | Launch refuses: "authorizes SSH to X ... no host key" | `":22"` declared with no key authorized host-side | paste the block the refusal prints into `trusted.toml` |
-| `agent-sandbox: gpg denied: signing not enabled` | `--gpg` was not passed; unrelated to `allowed_hosts` | relaunch with `--gpg` |
+| `agent-sandbox: gpg denied: signing not enabled` | `--gpg` was not passed; unrelated to `allow` | relaunch with `--gpg` |
 | `git push` prompts for a password | no `--ssh`, so no agent forwarding | relaunch with `--ssh` |
 | Commit signing fails or is disabled | no `--gpg` (the launcher then sets `commit.gpgsign=false`) | relaunch with `--gpg` |
 | `Permission denied` writing outside `/workspace` | read-only or tmpfs path | keep the file in the workspace or `$TMPDIR` |
@@ -147,9 +147,12 @@ durable fix:
 > ````markdown
 > ```toml agent-sandbox
 > [network]
-> allowed_hosts = ["api.example.com:443"]
+> allow = ["api.example.com:443"]
 > ```
 > ````
+>
+> For an HTTP endpoint that only needs specific methods or paths, prefer short-form
+> routes straight in `allow` (e.g. `allow = ["GET api.example.com:443/v1/**"]`).
 
 Ask for the narrowest rule that unblocks the task — one host and port, not `"*"`.
 If you genuinely need several, list them with a reason each.

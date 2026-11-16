@@ -23,7 +23,7 @@ Markdown code fence:
 web = 3000
 
 [network]
-allowed_hosts = ["github.com:443"]
+allow = ["github.com:443"]
 ```
 
 The launcher reads the workspace `AGENTS.md` first, followed by `--config`
@@ -159,7 +159,8 @@ destination and options: write `{ destination = "/mnt/x", options = "ro" }`, not
 
 The `[network]` table configures the egress proxy's firewall policy. The sandbox is **deny-by-default**, meaning all traffic is blocked unless explicitly allowed.
 
-- **`allowed_hosts`** (optional): A list of IP addresses, CIDR blocks, or domains, each with the port it may be reached on (e.g., `"github.com:443"`, `"10.0.0.0/8:80"`). Wildcard domains (e.g., `"*.github.com:443"`) are supported. To allow all traffic (wildcard allow), you can use `"*"` or `"*:port"`.
+- **`allow`** (optional): A list of IP addresses, CIDR blocks, or domains, each with the port it may be reached on (e.g., `"github.com:443"`, `"10.0.0.0/8:80"`), or short-form domain routes (`"GET,POST api.example.com:443/v1/**"`). Wildcard domains (e.g., `"*.github.com:443"`) are supported. To allow all traffic (wildcard allow), you can use `"*"` or `"*:port"`.
+  `allowed_hosts` is accepted as a legacy synonym with identical behavior; specifying both in the same `[network]` table is an error.
 
   An entry may omit the port (`"github.com"`), in which case the built-in
   default ports **80, 443 and 22** apply to it — not every port. Write the
@@ -180,7 +181,7 @@ The `[network]` table configures the egress proxy's firewall policy. The sandbox
   An entry can also carry an HTTP method list, a path, or both, which makes it
   a route rather than a plain allow — see [Short-form routes](#short-form-routes).
 
-An `allowed_hosts` entry covering port `22` is what authorizes the SSH relay for that
+An `allow` entry covering port `22` is what authorizes the SSH relay for that
 host. Under `--proxy` the host agent sockets are held by the proxy sidecar
 rather than mounted into the sandbox, and the relay refuses every SSH request
 until a matching entry exists — so `"github.com:22"` is what makes `git push`
@@ -233,7 +234,7 @@ and a `CONNECT` tunnel to any other port (`:8443`, say) is refused outright,
 because only port 443 is intercepted. Plain HTTP to a host carrying a `secret`
 rule is refused before any matching, since a secret is never sent in cleartext.
 A wildcard rule reaches as far as its pattern: a rule on `*.example.com` also
-restricts `example.com` and `api.example.com`, even where `allowed_hosts` lists
+restricts `example.com` and `api.example.com`, even where `allow` lists
 them on their own. SSH is the exception: the relay that carries `git push` under
 `--proxy` is authorized by the port-22 entry alone and never consults routes.
 
@@ -251,7 +252,7 @@ and `ctl policy allow --l7` take domains only.
 ````markdown
 ```toml agent-sandbox
 [network]
-allowed_hosts = [
+allow = [
     "github.com:443",
     "*.pypi.org:443",
     "10.0.0.0/8:80"
@@ -284,13 +285,13 @@ prefix = "Bearer "
 
 #### Short-form routes
 
-A route without a secret can also be written as one `allowed_hosts` entry, with
-a method list before the domain, a path after it, or both:
+Non-secret domain routes are preferred in short form directly in `allow`,
+with a method list before the domain, a path after it, or both:
 
 ````markdown
 ```toml agent-sandbox
 [network]
-allowed_hosts = [
+allow = [
     "github.com:443",                         # a plain allow entry
     "POST *.example.com:443/foo/*",           # one route
     "GET,POST *.example.com:80,443/foo/**",   # one route per method
@@ -308,14 +309,19 @@ such as `"10.0.0.0/8:80"`, whose `/` is a prefix length. A missing path means
 compiles to exactly the `[[network.allowed_routes]]` tables it stands for:
 `"GET,POST *.example.com:80,443/foo/**"` is two tables, one per method, each
 with `host = "*.example.com:80,443"` and `path = "/foo/**"`. Everything above
-about routes holds for them — a route restricts its whole domain.
+about routes holds for them — a route restricts its whole domain. Multiple
+route entries on the same host with different settings (such as different
+methods or paths) can be written directly in `allow`.
 
 The short form only narrows. A route that injects a secret needs a table, since
 `secret`, `header` and `prefix` have nowhere to go, and so does a route on a
 single IPv4 address (plain HTTP only, see above): a short-form route names a
 domain, not an IP, a CIDR block or `*`. Its ports must not cover 22 either,
-since a route is HTTP; write `"host:22"` as an entry of its own for SSH. `agent-sandbox ctl policy export` always writes routes
-back as tables.
+since a route is HTTP; write `"host:22"` as an entry of its own for SSH.
+`agent-sandbox ctl policy export` preserves this preference: it exports non-secret
+domain routes as short-form entries in `allow` (omitting default `/**`
+paths), leaving only secret routes, IP routes, or routes covering port 22 as
+`[[network.allowed_routes]]` tables.
 
 #### The trusted config
 
@@ -333,7 +339,7 @@ unauthorized:
 | Declared in `AGENTS.md` or `--config` | Authorized in `trusted.toml` |
 | --- | --- |
 | `[[network.allowed_routes]]` with a `secret` | the identical `[[network.allowed_routes]]` block |
-| an `allowed_hosts` entry covering port 22 | a `[[network.known_hosts]]` entry for that host |
+| an `allow` entry covering port 22 | a `[[network.known_hosts]]` entry for that host |
 | a `[mounts]` entry whose source is outside the workspace | the identical `[mounts]` entry |
 
 #### Secrets
@@ -455,7 +461,7 @@ provider's inline `apiKey`):
 
 #### SSH host keys
 
-An `allowed_hosts` entry covering port 22 authorizes SSH to that host — it is
+An `allow` entry covering port 22 authorizes SSH to that host — it is
 what makes `git push` work in a proxied sandbox. Which host key is trusted for
 it is a separate decision, and a host-side one:
 
@@ -494,17 +500,18 @@ launch rather than starting with a policy that allows more than you wrote.
 Besides malformed values, these combinations are rejected, comparing host names
 without regard to case, as the proxy does:
 
-- an unknown key under `[network]` (only `allowed_hosts` and `allowed_routes` exist) or an unknown
+- an unknown key under `[network]` (only `allow`, `allowed_hosts` and `allowed_routes` exist) or an unknown
   field on a rule;
+- both `allow` and `allowed_hosts` specified in the same `[network]` table;
 - two `[[network.allowed_routes]]` tables in one block with the same domain,
   method and path, with or without a secret — whatever ports their hosts name,
   since a route holds its domain on every port; list every port on one table.
   Across blocks the same route may repeat, but not with a secret on only one
   copy;
-- a duplicate entry in `allowed_hosts`, including a
+- a duplicate entry in `allow` (or `allowed_hosts`), including a
   [short-form route](#short-form-routes) that repeats the method, domain and
   path of another one or of a `[[network.allowed_routes]]` table, ports aside;
-- a host allowed outright in `allowed_hosts` that also carries a `[[network.allowed_routes]]`
+- a host allowed outright in `allow` (or `allowed_hosts`) that also carries a `[[network.allowed_routes]]`
   entry *without* a secret, or a short-form route — the route holds the host to
   its rules on every port, so the plain entry grants nothing beside it and one of
   the two is a mistake. The domain pattern decides, whatever ports either entry
@@ -515,7 +522,7 @@ without regard to case, as the proxy does:
   except `"*:22"`.
   This is checked across every `agent-sandbox` block in `AGENTS.md` and the
   combined `--config` sources, not only within one block;
-- an `allowed_hosts` entry covering port 22 for a host with no
+- an `allow` entry covering port 22 for a host with no
   `[[network.known_hosts]]` entry in `trusted.toml` — SSH would be authorized to
   a host whose identity nothing has vouched for.
 
@@ -559,11 +566,11 @@ When `XDG_CONFIG_HOME` is unset, the default location is:
 ```
 
 Policy files are plain TOML and contain only a `[network]` table. They use the
-same `allowed_hosts` and `[[network.allowed_routes]]` syntax as `AGENTS.md`:
+same `allow` and `[[network.allowed_routes]]` syntax as `AGENTS.md`:
 
 ```toml
 [network]
-allowed_hosts = ["github.com:443", "registry.npmjs.org:443"]
+allow = ["github.com:443", "registry.npmjs.org:443"]
 ```
 
 For a sandbox launch, `--policy NAME` requires `--proxy` — passing `--policy`

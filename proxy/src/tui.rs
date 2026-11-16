@@ -246,6 +246,11 @@ fn ip_available(kind: DeniedKind, host: &str) -> bool {
     if kind != DeniedKind::Egress {
         return false;
     }
+    let host = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
     match host.split_once('/') {
         Some((ip, mask)) => ip.parse::<IpAddr>().is_ok() && mask.parse::<u8>().is_ok(),
         None => host.parse::<IpAddr>().is_ok(),
@@ -269,18 +274,49 @@ fn trusts_host_key(policy_dir: &str, host: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn allow_ip_line(host: &str, port: u16) -> String {
+    let target = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
+    format!("allow_ip {}", target)
+}
+
+fn ip_grant_line(kind: DeniedKind, host: &str, port: u16) -> Result<String, String> {
+    if !ip_available(kind, host) {
+        Err(format!(
+            "'{}' is not an IP — use 'a' to allow the domain instead",
+            host
+        ))
+    } else {
+        Ok(allow_ip_line(host, port))
+    }
+}
+
 /// The policy lines that would let a denied row through, in the order they
 /// should be written.
 ///
 /// Lifted out of the key handler so the mapping from "what was refused" to
 /// "what authorizes it" is testable on its own. An SSH row needs both: the
 /// `allow_signing` entry is what the relay consults, and the `:22` host rule
-/// is what makes the exit summary render `allowed_hosts = ["host:22"]`, from
+/// is what makes the exit summary render `allow = ["host:22"]`, from
 /// which a relaunch re-derives `allow_signing`. Write only one and the grant
 /// does not survive the session.
 fn grant_lines(row: &DeniedEntry) -> Vec<String> {
     match row.kind {
-        DeniedKind::Egress => vec![format!("allow_host {}:{}", row.host, row.port)],
+        DeniedKind::Egress => {
+            let host = if row.host.starts_with('[') && row.host.ends_with(']') {
+                &row.host[1..row.host.len() - 1]
+            } else {
+                &row.host
+            };
+            if host.parse::<std::net::IpAddr>().is_ok() {
+                vec![allow_ip_line(&row.host, row.port)]
+            } else {
+                vec![format!("allow_host {}:{}", row.host, row.port)]
+            }
+        }
         DeniedKind::Ssh => vec![
             format!("allow_signing {}", row.host),
             format!("allow_host {}:{}", row.host, SSH_POLICY_PORT),
@@ -673,13 +709,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match row.kind {
                                 DeniedKind::Egress if row.method.as_deref() == Some("CONNECT") => {
                                     text.push_str(&format!(
-                                        "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[[network.allowed_routes]]\nhost = \"{}:{}\"\nmethod = \"GET\"\npath = \"/noop\"\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
+                                        "\n\nThe inner HTTPS request is unavailable because CONNECT was denied before TLS.\nTo inspect it, temporarily add:\n\n[network]\nallow = [\"GET {}:{}/noop\"]\n\nThis permits the CONNECT/MITM stage; the placeholder path remains denied. Replace it with the required path after retrying.",
                                         row.host, row.port
                                     ));
                                 }
                                 DeniedKind::Ssh => {
                                     text.push_str(&format!(
-                                        "\n\nThe relay refused to run ssh to this destination: the forwarded agent lives in the sidecar, and it will only be used for a host the policy names on port 22.\n\n[a] adds both lines this needs:\n\n  allow_signing {host}\n  allow_host {host}:22\n\nThe relay re-reads the policy on every call, so a retry works without relaunching. To make it permanent, add to AGENTS.md:\n\n[network]\nallowed_hosts = [\"{host}:22\"]",
+                                        "\n\nThe relay refused to run ssh to this destination: the forwarded agent lives in the sidecar, and it will only be used for a host the policy names on port 22.\n\n[a] adds both lines this needs:\n\n  allow_signing {host}\n  allow_host {host}:22\n\nThe relay re-reads the policy on every call, so a retry works without relaunching. To make it permanent, add to AGENTS.md:\n\n[network]\nallow = [\"{host}:22\"]",
                                         host = row.host
                                     ));
                                 }
@@ -1014,14 +1050,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('A') => {
-                                    if !ip_available(kind, &host) {
-                                        guard_msg = Some(format!(
-                                            "'{}' is not an IP — use 'a' to allow the domain instead",
-                                            host
-                                        ));
-                                    } else {
-                                        detail = format!("allow_ip {}:{}", host, port);
-                                        policy.push(detail.clone());
+                                    match ip_grant_line(kind, &host, port) {
+                                        Err(msg) => guard_msg = Some(msg),
+                                        Ok(line) => {
+                                            detail = line;
+                                            if !policy.contains(&detail) {
+                                                policy.push(detail.clone());
+                                            }
+                                        }
                                     }
                                 }
                                 KeyCode::Char('h') => {
@@ -1139,8 +1175,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         clear_allowed_request, connection_detail_text, grant_lines, h_available,
-        ingest_connection_event, ingest_relay_event, ip_available, is_denied_event, ConnEvent,
-        DeniedEntry, DeniedKind, RelayEvent, GPG_ROW_HOST, GPG_ROW_PORT, SSH_POLICY_PORT,
+        ingest_connection_event, ingest_relay_event, ip_available, ip_grant_line, is_denied_event,
+        ConnEvent, DeniedEntry, DeniedKind, RelayEvent, GPG_ROW_HOST, GPG_ROW_PORT,
+        SSH_POLICY_PORT,
     };
     use std::collections::HashMap;
 
@@ -1315,7 +1352,7 @@ mod tests {
         );
 
         // Filed under the policy port, not whatever ssh dialled: :22 is what an
-        // allowed_hosts entry has to say for the relay to be authorized.
+        // allow entry has to say for the relay to be authorized.
         let row = denied
             .get(&("github.com".to_string(), SSH_POLICY_PORT))
             .expect("a row for the refused destination");
@@ -1410,6 +1447,71 @@ mod tests {
         assert_eq!(grant_lines(&row), vec!["allow_host example.com:8443"]);
     }
 
+    #[test]
+    fn an_egress_ip_row_grants_an_allow_ip_rule() {
+        let row = DeniedEntry {
+            host: "1.2.3.4".to_string(),
+            port: 8443,
+            reason: None,
+            method: Some("CONNECT".to_string()),
+            path: None,
+            detail: None,
+            count: 1,
+            last_seen: 1,
+            kind: DeniedKind::Egress,
+        };
+        assert_eq!(grant_lines(&row), vec!["allow_ip 1.2.3.4:8443"]);
+    }
+
+    #[test]
+    fn an_egress_ipv6_row_grants_an_allow_ip_rule_in_both_handlers() {
+        let row = DeniedEntry {
+            host: "2001:db8::1".to_string(),
+            port: 80,
+            reason: None,
+            method: Some("CONNECT".to_string()),
+            path: None,
+            detail: None,
+            count: 1,
+            last_seen: 1,
+            kind: DeniedKind::Egress,
+        };
+        // Key 'a' handler via grant_lines
+        assert_eq!(grant_lines(&row), vec!["allow_ip [2001:db8::1]:80"]);
+
+        // Key 'A' handler via ip_grant_line
+        assert_eq!(
+            ip_grant_line(row.kind, &row.host, row.port),
+            Ok("allow_ip [2001:db8::1]:80".to_string())
+        );
+
+        // Already-bracketed IPv6
+        let bracketed_row = DeniedEntry {
+            host: "[2001:db8::1]".to_string(),
+            port: 80,
+            ..row.clone()
+        };
+        assert_eq!(grant_lines(&bracketed_row), vec!["allow_ip [2001:db8::1]:80"]);
+        assert_eq!(
+            ip_grant_line(bracketed_row.kind, &bracketed_row.host, bracketed_row.port),
+            Ok("allow_ip [2001:db8::1]:80".to_string())
+        );
+
+        // Deduplication in key 'A' handler
+        let mut policy = vec!["allow_ip [2001:db8::1]:80".to_string()];
+        let detail = ip_grant_line(row.kind, &row.host, row.port).unwrap();
+        if !policy.contains(&detail) {
+            policy.push(detail);
+        }
+        assert_eq!(policy.len(), 1);
+
+        // Ensure the generated line is parsed by the proxy policy parser
+        let text = format!("{}\n", grant_lines(&row)[0]);
+        let cfg = agent_sandbox_proxy::policy::parse_policy(&text)
+            .unwrap_or_else(|e| panic!("the proxy rejected an IPv6 TUI grant: {e}\n{text}"));
+        assert!(cfg.is_allowed("2001:db8::1", 80));
+    }
+
     /// Whatever the keypress writes has to be something `install_policy`
     /// accepts, or the grant fails at the moment the user asks for it.
     #[test]
@@ -1426,6 +1528,38 @@ mod tests {
             .unwrap_or_else(|e| panic!("the proxy rejected a TUI grant: {e}\n{text}"));
         assert_eq!(cfg.allow_signing, vec!["github.com".to_string()]);
         assert!(cfg.is_allowed("github.com", 22));
+
+        let egress_domain = DeniedEntry {
+            host: "example.com".to_string(),
+            port: 8443,
+            reason: None,
+            method: Some("CONNECT".to_string()),
+            path: None,
+            detail: None,
+            count: 1,
+            last_seen: 1,
+            kind: DeniedKind::Egress,
+        };
+        let text = grant_lines(&egress_domain).join("\n") + "\n";
+        let cfg = agent_sandbox_proxy::policy::parse_policy(&text)
+            .unwrap_or_else(|e| panic!("the proxy rejected a domain TUI grant: {e}\n{text}"));
+        assert!(cfg.is_allowed("example.com", 8443));
+
+        let egress_ip = DeniedEntry {
+            host: "1.2.3.4".to_string(),
+            port: 8443,
+            reason: None,
+            method: Some("CONNECT".to_string()),
+            path: None,
+            detail: None,
+            count: 1,
+            last_seen: 1,
+            kind: DeniedKind::Egress,
+        };
+        let text = grant_lines(&egress_ip).join("\n") + "\n";
+        let cfg = agent_sandbox_proxy::policy::parse_policy(&text)
+            .unwrap_or_else(|e| panic!("the proxy rejected an IP TUI grant: {e}\n{text}"));
+        assert!(cfg.is_allowed("1.2.3.4", 8443));
     }
 
     #[test]

@@ -324,7 +324,7 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
 2. **Open the TUI**: In a **separate terminal**, run `agent-sandbox ctl tui`. This interactive interface lists the requests the sandbox is making, including the denied ones.
 3. **Approve**: Use the following keybindings to update the policy in real time:
    - `a`: Allow domain — or, on an SSH row, authorize the relay for that host
-   - `h`: Allow HTTP route (domain + method + path) (creates a `[[network.allowed_routes]]` rule)
+   - `h`: Allow HTTP route (domain + method + path) (creates an HTTP route rule, exported into `allow`)
    - `A`: Allow IP
    - `v`: Switch between the live Connections view and denied requests
    - `r`: Switch to the Rules view — the live effective policy, with `x` to remove a rule (blocked for launch-time rules from `AGENTS.md`, host policies, or the built-in baseline)
@@ -332,7 +332,7 @@ When starting a sandbox on a new codebase or with an unknown set of dependencies
    - `c`: Clear the list of recorded denials
    - `q` or `Esc`: Quit the TUI
    - `Ctrl+C`: Quit the TUI — press twice within 2 seconds to confirm (a single press only shows a warning); also handles an external SIGINT sent to the process
-4. **Save Rules**: When you've trained the proxy to your liking, export the complete active policy — the original `AGENTS.md` rules plus the live additions — with `agent-sandbox ctl policy export`. It prints a fenced ```` ```toml agent-sandbox ```` block, which is the form the launcher reads, so append it to the project's `AGENTS.md` (`agent-sandbox ctl policy export >> AGENTS.md`) and delete the `[network]` block it supersedes. Redirect with a single `>` only into a scratch file: it would truncate `AGENTS.md`, prose and all. For reusable rules, `agent-sandbox ctl policy export --plain` prints the same policy without the Markdown fence — that is what a `~/.config/agent-sandbox/policies/<name>.toml` file wants, launched with `--proxy --policy <name>`. When the sandbox exits, its summary also prints only the rules added live as copy-pasteable `allowed_hosts` and `[[network.allowed_routes]]` TOML. Either way a route is written as a table whose `host` carries the ports it was reachable on, so the block allows on re-import what the session allowed; a route that nothing in the session let through — one added with `--l7` for a host never allowed — is listed in a trailing comment instead, since a table for it would open its host on the default ports. The exit summary judges that against the whole session, not only its additions: a route added live on a host `AGENTS.md` already allowed is printed with that entry's ports, and the summary names the entry to remove, since a plain entry beside the route would be refused on relaunch.
+4. **Save Rules**: When you've trained the proxy to your liking, export the complete active policy — the original `AGENTS.md` rules plus the live additions — with `agent-sandbox ctl policy export`. It prints a fenced ```` ```toml agent-sandbox ```` block, which is the form the launcher reads, so append it to the project's `AGENTS.md` (`agent-sandbox ctl policy export >> AGENTS.md`) and delete the `[network]` block it supersedes. Redirect with a single `>` only into a scratch file: it would truncate `AGENTS.md`, prose and all. For reusable rules, `agent-sandbox ctl policy export --plain` prints the same policy without the Markdown fence — that is what a `~/.config/agent-sandbox/policies/<name>.toml` file wants, launched with `--proxy --policy <name>`. When the sandbox exits, its summary also prints only the rules added live as copy-pasteable `allow` (and `[[network.allowed_routes]]` where tables are required) TOML. Non-secret domain routes are written as short-form entries in `allow` (omitting default `/**` paths), while secret-bearing routes, IP routes, or routes covering port 22 are written as tables whose `host` carries the ports reachable in the session; a route that nothing in the session let through — one added with `--l7` for a host never allowed — is listed in a trailing comment instead, since a route for it would otherwise open its host on default ports. The exit summary judges that against the whole session, not only its additions: a route added live on a host `AGENTS.md` already allowed is printed with that entry's ports, and the summary names the entry to remove, since a plain entry beside the route would be refused on relaunch.
 
 The proxy sources are additive, and selected explicitly:
 
@@ -352,7 +352,7 @@ declarative `[network]` syntax as `AGENTS.md`:
 
 ```toml
 [network]
-allowed_hosts = ["github.com:443", "registry.npmjs.org:443"]
+allow = ["github.com:443", "registry.npmjs.org:443"]
 ```
 
 Startup groups policy discovery under an `agent-sandbox: startup` heading,
@@ -380,10 +380,8 @@ The TUI tails the connection log and shows recently-denied hosts live (deduplica
 For an HTTPS domain denied at `CONNECT`, the encrypted method and path are not available yet. The TUI detail view suggests a temporary placeholder L7 rule to let the proxy terminate TLS and observe the real request:
 
 ```toml
-[[network.allowed_routes]]
-host = "pypi.org:443"
-method = "GET"
-path = "/noop"
+[network]
+allow = ["GET pypi.org:443/noop"]
 ```
 
 Retry the request, inspect the resulting L7 denial, then replace `/noop` with the required path or path pattern. The placeholder path itself remains denied; remove the temporary rule when training is complete.
@@ -394,7 +392,7 @@ The relay is a second gate, and it refuses requests the proxy never sees: under
 `--proxy --ssh` the real `ssh` runs in the sidecar, authorized by
 `allow_signing` rather than by a host/port rule. Those decisions appear in the
 same denied-requests list, with `SSH` in the Method column and port `22` — the
-port an `allowed_hosts` entry has to name, whatever port `ssh` itself dialled.
+port an `allow` entry has to name, whatever port `ssh` itself dialled.
 `a` on such a row writes both lines the grant needs:
 
 ```
@@ -404,7 +402,7 @@ allow_host github.com:22
 
 `relay-server` re-reads the policy on every call, so a retry works without
 relaunching, and the exit summary renders the pair back as
-`allowed_hosts = ["github.com:22"]` — one entry, from which a relaunch
+`allow = ["github.com:22"]` — one entry, from which a relaunch
 re-derives `allow_signing`. `h` and `A` are refused on these rows: nothing
 about a relay decision is HTTP, and it authorizes a host rather than an
 address.
@@ -430,8 +428,8 @@ When using Git inside the sandbox, be aware of how the integration flags interac
   `relay-ssh`/`relay-gpg`, which the relay authorizes each independently:
   `relay-gpg` needs only `--gpg` itself — signing has no destination to name,
   so no `AGENTS.md` declaration is required, in a proxied sandbox exactly as in
-  an unproxied one. `relay-ssh` still needs an explicit `allowed_hosts` entry
-  on port 22 for the destination, e.g. `allowed_hosts = ["github.com:22"]`,
+  an unproxied one. `relay-ssh` still needs an explicit `allow` entry
+  on port 22 for the destination, e.g. `allow = ["github.com:22"]`,
   since push/pull genuinely need to name a host; with no such entry `git push`
   is refused. `agent-sandbox ctl relay` shows both states and the decisions
   made against them.

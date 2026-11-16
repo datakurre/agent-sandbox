@@ -262,7 +262,7 @@ fn the_policy_the_sidecar_is_handed_carries_the_declared_rules_and_a_deny_baseli
 
 /// GPG signing is gated on `--gpg` alone -- host-agnostic, no AGENTS.md
 /// declaration needed -- while SSH push still needs an explicit
-/// `allowed_hosts = ["host:22"]` entry. This is the flag -> policy-line
+/// `allow = ["host:22"]` entry. This is the flag -> policy-line
 /// mapping the split relies on.
 #[test]
 fn signing_enabled_is_written_when_gpg_is_forwarded_with_no_network_declaration() {

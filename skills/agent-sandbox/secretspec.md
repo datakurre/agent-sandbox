@@ -142,6 +142,8 @@ The secret is never in the sandbox's environment, filesystem, or process table.
 If a task requires reading the token itself, the answer is that it cannot be done
 this way — say so rather than looking for a workaround.
 
+Secret-bearing routes require the `[[network.allowed_routes]]` table form: short-form
+entries in `allow` cannot carry secrets, though non-secret routes prefer short form.
 Secret-bearing `[[network.allowed_routes]]` may be declared in `AGENTS.md`, an
 explicit `--config FILE`, or a selected host-owned policy. Every requested
 route is still checked against the shared host-side
@@ -163,7 +165,7 @@ it to one route:
 ````markdown
 ```toml agent-sandbox
 [network]
-allowed_hosts = ["github.com:443"]
+allow = ["github.com:443"]
 
 [[network.allowed_routes]]
 host = "api.github.com:443"
@@ -226,4 +228,4 @@ key = "ssh-ed25519 AAAAC3Nza..."
 
 Same rule for you as with secrets: you cannot write that file, and the fix for
 the refusal is to copy the printed block unchanged. See `network.md` for how
-`:22` in `allowed_hosts` pulls the requirement in.
+`:22` in `allow` pulls the requirement in.

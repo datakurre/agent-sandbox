@@ -114,7 +114,7 @@ tables as bare TOML:
 ````markdown
 ```toml agent-sandbox
 [network]
-allowed_hosts = [
+allow = [
   "github.com:22",
   "github.com:443",
   "*.githubusercontent.com:443",
@@ -172,18 +172,17 @@ A route restricts the **whole domain** at the proxy, not just the port in its
 every subdomain — HTTPS and plain HTTP to it must match some rule, and a
 `CONNECT` to any port other than 443 is denied (`connect-l7-unintercepted`, also
 what a live-added route gets on 443, having no session CA behind it). An
-`allowed_hosts` entry for the same host does not exempt it, so a route on
+`allow` entry for the same host does not exempt it, so a route on
 `*.example.com` also denies a tunnel to `example.com:8443`; scope the route to
 the subdomain that needs it. The SSH relay is unaffected: it checks only the
 port-22 entry.
 
-A route without a secret can also be written as one `allowed_hosts` entry,
-`METHODS DOMAIN[:PORTS][/PATH]`, which compiles to exactly the tables above, one
-per method:
+Non-secret domain routes are preferred in short form straight in `allow`
+(with `allowed_hosts` supported as a legacy synonym) as `METHODS DOMAIN[:PORTS][/PATH]`:
 
 ```toml
 [network]
-allowed_hosts = [
+allow = [
   "GET,POST api.example.com:443/v1/**",  # two routes, GET and POST
   "GET registry.npmjs.org:443",          # GET only, every path
   "api.example.net:8443/v2/**",          # every method, under /v2/
@@ -191,9 +190,11 @@ allowed_hosts = [
 ```
 
 Methods are separated by commas alone, then whitespace before the domain. No
-path means `/**`; no method list means `*`. A secret route or a route on an IP
-still needs the table form, and a short-form route may not cover port 22. A
-route on an IPv4 address filters plain HTTP only: HTTPS to an address is denied
+path means `/**` (and exports as `"METHOD host:port"`); no method list means `*`.
+A route that injects a secret, names an IP address, or covers port 22 still
+requires the table form (`[[network.allowed_routes]]`), but all other domain
+routes are written and exported as short-form entries in `allow`.
+A route on an IPv4 address filters plain HTTP only: HTTPS to an address is denied
 (`sni-missing`), since there is no server name to pin. A CIDR block or an IPv6
 address cannot carry a route at all.
 
@@ -209,16 +210,17 @@ An invalid policy refuses the launch outright, so a bad suggestion costs the use
 a full relaunch. These are rejected (messages quoted from the parser):
 
 - unknown key: `[network]: unknown key 'deny'. Valid keys under [network] are
-  'allowed_hosts' and 'allowed_routes'`
-- duplicate entry: `allowed_hosts: duplicate entry 'github.com:443'`
+  'allow', 'allowed_hosts' and 'allowed_routes'`
+- both keys present in the same table: `[network]: use either 'allow' or 'allowed_hosts', not both.`
+- duplicate entry: `[network].allow: duplicate entry 'github.com:443'` (or `[network].allowed_hosts: duplicate entry …` if using the legacy key)
 - a broadly-allowed host that also carries a secretless route:
   `host 'api.github.com:443' is allowed broadly, making the non-secret
   [[network.allowed_routes]] ineffective. Remove the rule or add a secret.`, or
   for a short-form route `… making the route 'GET api.github.com:443/x' in
-  allowed_hosts ineffective. Remove one of the two entries.`
+  allow (or allowed_hosts) ineffective. Remove one of the two entries.`
 - a short-form route that is malformed, names an IP or `*`, or covers port 22:
-  `[network].allowed_hosts[1] 'GET a.example:22/x': a route is HTTP, so it
-  cannot cover port 22. …` — the message always names the entry.
+  `[network].allow[1] 'GET a.example:22/x': a route is HTTP, so it
+  cannot cover port 22. …` — the message always names the entry and key.
 
 There is no `deny` key and no `ctl policy deny` — denying something already denied
 is a no-op.
@@ -252,10 +254,8 @@ yet. The documented trick is a placeholder route that makes the proxy terminate
 TLS so the real request becomes observable:
 
 ```toml
-[[network.allowed_routes]]
-host = "pypi.org:443"
-method = "GET"
-path = "/noop"
+[network]
+allow = ["GET pypi.org:443/noop"]
 ```
 
 Retry, read the resulting L7 denial, then replace `/noop` with the real path.

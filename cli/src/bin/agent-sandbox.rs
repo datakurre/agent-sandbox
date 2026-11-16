@@ -1537,17 +1537,17 @@ impl CleanupGuard {
         let mut host_map: HashMap<String, (u64, u64, u32, Option<String>)> = HashMap::new();
 
         for r in &records {
+            let key = agents::format_host_port(&r.host, Some(&r.port.to_string()));
             let is_deny = matches!(r.verdict.as_deref(), Some("deny") | Some("error"));
             if is_deny {
                 denied_records.push(serde_json::json!({
-                    "host": format!("{}:{}", r.host, r.port),
+                    "host": key,
                     "verdict": r.verdict,
                     "err": r.err,
                     "method": r.method,
                     "path": r.path,
                 }));
             }
-            let key = format!("{}:{}", r.host, r.port);
             let entry = host_map.entry(key).or_insert((0, 0, 0, r.verdict.clone()));
             entry.0 += r.up.unwrap_or(0);
             entry.1 += r.down.unwrap_or(0);
@@ -1588,24 +1588,46 @@ impl CleanupGuard {
             }
         }
         if proposed.is_none() && !denied_records.is_empty() {
-            let denied_hosts: Vec<String> = denied_records
-                .iter()
-                .filter_map(|d| d.get("host").and_then(|h| h.as_str()).map(str::to_string))
-                .collect();
-            let mut unique_hosts = Vec::new();
-            for h in denied_hosts {
-                if !unique_hosts.contains(&h) {
-                    unique_hosts.push(h);
+            let mut unique_entries = Vec::new();
+            for d in &denied_records {
+                let host = match d.get("host").and_then(|h| h.as_str()) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let method = d.get("method").and_then(|m| m.as_str());
+                let path = d.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let formatted = match method {
+                    Some(m) if m != "CONNECT" => {
+                        let (host_part, port_part) = agents::parse_host_port(host);
+                        let is_ip_or_cidr = agents::is_ip_or_cidr(&host_part);
+                        let covers_ssh = port_part.as_deref().map(agents::ports_include_ssh).unwrap_or(false);
+                        if is_ip_or_cidr || covers_ssh {
+                            host.to_string()
+                        } else if !path.is_empty() && path != "/**" {
+                            let path_with_slash = if path.starts_with('/') {
+                                path.to_string()
+                            } else {
+                                format!("/{}", path)
+                            };
+                            format!("{} {}{}", m, host, path_with_slash)
+                        } else {
+                            format!("{} {}", m, host)
+                        }
+                    }
+                    _ => host.to_string(),
+                };
+                if !unique_entries.contains(&formatted) {
+                    unique_entries.push(formatted);
                 }
             }
-            if !unique_hosts.is_empty() {
-                let hosts_formatted = unique_hosts
+            if !unique_entries.is_empty() {
+                let hosts_formatted = unique_entries
                     .iter()
                     .map(|h| format!("    \"{}\"", h))
                     .collect::<Vec<_>>()
                     .join(",\n");
                 proposed = Some(format!(
-                    "```toml agent-sandbox\n[network]\nallowed_hosts = [\n{}\n]\n```\n",
+                    "```toml agent-sandbox\n[network]\nallow = [\n{}\n]\n```\n",
                     hosts_formatted
                 ));
             }
@@ -3700,7 +3722,7 @@ fn run() -> Result<i32> {
     };
     if want_proxy {
         // `allow_signing` is the policy's own record of "SSH to this host is
-        // authorized", and it exists only for an allowed_hosts entry covering
+        // authorized", and it exists only for an allow entry covering
         // port 22.  Keying off it rather than off the TOML means a port range
         // and a comma-separated list are caught on the same terms as a lone
         // `:22`, and an allowed_routes host on :22 is not -- it never reaches
@@ -5058,5 +5080,37 @@ mod tests {
             NIX_SERVE_PROCESS_GROUP.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[test]
+    fn network_summary_proposed_policy_prefers_short_form_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("connections.jsonl");
+        let content = concat!(
+            r#"{"ts":1,"host":"codeload.github.com","port":443,"verdict":"deny","method":"GET","path":"/**"}"#, "\n",
+            r#"{"ts":2,"host":"api.github.com","port":443,"verdict":"deny","method":"GET","path":"/repos/octocat/Hello-World"}"#, "\n",
+            r#"{"ts":3,"host":"package.elm-lang-org","port":443,"verdict":"deny","method":"POST","path":"/all-packages"}"#, "\n",
+            r#"{"ts":4,"host":"example.com","port":443,"verdict":"deny","method":"CONNECT"}"#, "\n",
+            r#"{"ts":5,"host":"10.0.0.1","port":80,"verdict":"deny","method":"GET","path":"/status"}"#, "\n",
+            r#"{"ts":6,"host":"github.com","port":22,"verdict":"deny","method":"GET","path":"/"}"#, "\n",
+        );
+        std::fs::write(&log_path, content).unwrap();
+
+        let mut guard = CleanupGuard::new();
+        guard.sidecar_shared = dir.path().to_str().unwrap().to_string();
+
+        let summary = guard.collect_network_summary();
+        let proposed = summary.get("proposed_policy").and_then(|p| p.as_str()).unwrap();
+        assert!(proposed.contains("\"GET codeload.github.com:443\""), "{proposed}");
+        assert!(proposed.contains("\"GET api.github.com:443/repos/octocat/Hello-World\""), "{proposed}");
+        assert!(proposed.contains("\"POST package.elm-lang-org:443/all-packages\""), "{proposed}");
+        assert!(proposed.contains("\"example.com:443\""), "{proposed}");
+        assert!(proposed.contains("\"10.0.0.1:80\""), "{proposed}");
+        assert!(!proposed.contains("\"GET 10.0.0.1:80\""), "{proposed}");
+        assert!(proposed.contains("\"github.com:22\""), "{proposed}");
+        assert!(!proposed.contains("\"GET github.com:22\""), "{proposed}");
+        assert!(proposed.contains("allow = ["), "{proposed}");
+        assert!(!proposed.contains("allowed_hosts"), "{proposed}");
+        assert!(!proposed.contains("allowed_routes"), "{proposed}");
     }
 }
