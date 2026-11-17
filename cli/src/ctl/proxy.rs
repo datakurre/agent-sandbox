@@ -23,7 +23,7 @@ pub struct ProxyArgs {
 pub enum ProxyCommand {
     #[command(about = "Print the running sandbox's current policy")]
     Show(TargetArgs),
-    #[command(about = "Allow a domain, IP/CIDR, port, or (with --l7) an HTTP route")]
+    #[command(about = "Allow a domain, IP/CIDR, port, or (with --method) an HTTP route")]
     Allow(AllowArgs),
     #[command(about = "Remove a previously added rule")]
     Rm(RmArgs),
@@ -79,11 +79,15 @@ pub struct AllowArgs {
         value_name = "METHOD",
         help = "Allow an HTTP route on TARGET instead of the whole domain (combine with --path)"
     )]
-    pub l7: Option<String>,
+    pub method: Option<String>,
+    /// The retired spelling of `--method`. Kept only so it can be refused with
+    /// a pointer to the new name rather than clap's generic unknown-flag error.
+    #[arg(long = "l7", value_name = "METHOD", hide = true)]
+    pub renamed_l7: Option<String>,
     #[arg(
         long,
         default_value = DEFAULT_ROUTE_PATH,
-        help = "Path pattern for --l7 (default: every path, like an AGENTS.md route without one)"
+        help = "Path pattern for --method (default: every path, like an AGENTS.md route without one)"
     )]
     pub path: String,
     #[arg(help = "Sandbox name (positional)")]
@@ -378,13 +382,22 @@ pub(crate) fn warn_if_no_trusted_host_key(policy_dir: &str, host: &str) {
     );
 }
 
+/// The refusal for the retired `--l7` spelling of `allow --method`.
+pub(crate) fn renamed_l7_refusal() -> &'static str {
+    "agent-sandbox ctl policy: --l7 has been renamed to --method; use `allow <target> --method <METHOD>`"
+}
+
 fn allow(args: AllowArgs) -> Result<()> {
+    if args.renamed_l7.is_some() {
+        eprintln!("{}", renamed_l7_refusal());
+        std::process::exit(1);
+    }
     let (_, dir) = policy_dir(&args.word, &args.container, args.browser)?;
     let mut lines = load_policy_lines(&dir);
-    if let Some(method) = args.l7 {
+    if let Some(method) = args.method {
         if is_ip_or_cidr(&args.target) {
             eprintln!(
-                "agent-sandbox ctl policy: --l7 needs a domain, not an IP/CIDR ('{}')",
+                "agent-sandbox ctl policy: --method needs a domain, not an IP/CIDR ('{}')",
                 args.target
             );
             std::process::exit(1);
@@ -589,7 +602,39 @@ fn check(args: CheckArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{signing_host, target_kind};
+    use super::{
+        renamed_l7_refusal, signing_host, target_kind, AllowArgs, ProxyArgs, ProxyCommand,
+    };
+    use clap::Parser;
+
+    fn parse_allow(args: &[&str]) -> AllowArgs {
+        let mut argv = vec!["agent-sandbox-policy", "allow"];
+        argv.extend_from_slice(args);
+        match ProxyArgs::try_parse_from(argv)
+            .expect("allow should parse")
+            .command
+        {
+            ProxyCommand::Allow(a) => a,
+            other => panic!("expected allow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allow_takes_method_for_an_http_route() {
+        let a = parse_allow(&["api.example.com", "--method", "GET", "--path", "/v1/**"]);
+        assert_eq!(a.target, "api.example.com");
+        assert_eq!(a.method.as_deref(), Some("GET"));
+        assert_eq!(a.path, "/v1/**");
+        assert!(a.renamed_l7.is_none());
+    }
+
+    #[test]
+    fn retired_l7_flag_is_parsed_only_to_be_refused() {
+        let a = parse_allow(&["api.example.com", "--l7", "GET"]);
+        assert!(a.method.is_none());
+        assert_eq!(a.renamed_l7.as_deref(), Some("GET"));
+        assert!(renamed_l7_refusal().contains("--l7 has been renamed to --method"));
+    }
 
     #[test]
     fn target_kind_infers_ip_port_or_domain() {

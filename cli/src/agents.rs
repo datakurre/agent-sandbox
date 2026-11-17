@@ -1516,7 +1516,7 @@ fn network_toml(emit: &ProxyConfig, reach: &ProxyConfig) -> String {
                 ))
             }
         } else {
-            // No allow line of its own (`ctl policy allow --l7` writes
+            // No allow line of its own (`ctl policy allow --method` writes
             // none): the route reaches what the rest of the policy allows
             // its domain, and nothing at all if that is nothing.
             let (allowed, ports) = match ip {
@@ -1937,7 +1937,7 @@ mod export_tests {
 
     #[test]
     fn an_exported_route_without_its_own_allow_line_takes_what_the_policy_allows() {
-        // `ctl policy allow --l7` writes a route and nothing else.
+        // `ctl policy allow --method` writes a route and nothing else.
         let cfg = parse_policy(
             "allow_host *.example.com:443\n\
              allow_route\tapi.example.com\tGET\t/v1/**\n\
@@ -1960,7 +1960,7 @@ mod export_tests {
     #[test]
     fn the_exit_summary_judges_live_routes_against_the_whole_session() {
         // AGENTS.md allowed the host; the route was added live with
-        // `ctl policy allow --l7`, which writes an allow_route line alone.
+        // `ctl policy allow --method`, which writes an allow_route line alone.
         let active: Vec<String> = [
             "allow_host api.example.com:443",
             "allow_host github.com:443",

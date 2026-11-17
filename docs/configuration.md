@@ -245,7 +245,7 @@ address would be allowed unfiltered while looking narrowed.
 HTTPS to an address carries no server name (clients send none for an IP), and
 the proxy pins every intercepted tunnel to the name it authorized, so once a
 route covers an address, HTTPS to it is refused (`sni-missing`). The short form
-and `ctl policy allow --l7` take domains only.
+and `ctl policy allow --method` take domains only.
 
 #### Examples
 

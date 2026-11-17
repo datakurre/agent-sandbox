@@ -606,7 +606,7 @@ The mount is gated on the launch policy actually carrying an `allow_route` line.
 With none, `skip_l7` is true for every host and the leaf issuer is never
 reached, so a CA in the sandbox's trust store would grant the proxy the ability
 to intercept anything for no purpose. The cost is that an L7 rule added
-mid-session has no CA behind it; `ctl policy allow --l7` and the TUI's `h` warn
+mid-session has no CA behind it; `ctl policy allow --method` and the TUI's `h` warn
 rather than failing later at certificate validation.
 
 The launcher appends a baseline `deny_ip` list (loopback, RFC1918, link-local,

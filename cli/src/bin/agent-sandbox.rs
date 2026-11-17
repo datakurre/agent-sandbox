@@ -4329,7 +4329,7 @@ fn run() -> Result<i32> {
         // Gated on the policy actually having an L7 rule.  With none, nothing
         // is ever intercepted, so handing the sandbox a CA that can mint any
         // name would grant trust for no purpose.  The cost is that an L7 rule
-        // added mid-session has no CA to go with it -- `ctl policy allow --l7`
+        // added mid-session has no CA to go with it -- `ctl policy allow --method`
         // and the TUI's `h` say so rather than failing silently.
         // The sandbox's own ssh still leaves through the CONNECT proxy (the
         // entrypoint writes a ProxyCommand for it), so it needs the same
